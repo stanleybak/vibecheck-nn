@@ -1,6 +1,8 @@
 """Zonotope forward propagation — dense numpy implementation."""
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 
 def is_conv(layer):
@@ -34,14 +36,22 @@ class DenseZonotope:
         self.center = center
         self.generators = generators
 
+    @property
+    def dtype(self):
+        return self.center.dtype
+
     @classmethod
-    def from_input_bounds(cls, x_lo: np.ndarray, x_hi: np.ndarray) -> 'DenseZonotope':
+    def from_input_bounds(cls, x_lo: np.ndarray, x_hi: np.ndarray,
+                          dtype=None) -> 'DenseZonotope':
         center = (x_lo + x_hi) / 2
         radii = (x_hi - x_lo) / 2
+        if dtype is not None:
+            assert center.dtype == dtype, (
+                f"x_lo/x_hi dtype {x_lo.dtype} != expected {dtype}")
         # Only create generator columns for dimensions with nonzero radius
         nonzero = np.nonzero(radii)[0]
         n = len(center)
-        generators = np.zeros((n, len(nonzero)))
+        generators = np.zeros((n, len(nonzero)), dtype=center.dtype)
         for i, j in enumerate(nonzero):
             generators[j, i] = radii[j]
         return cls(center, generators)
@@ -57,13 +67,44 @@ class DenseZonotope:
             self._propagate_conv(layer)
         else:
             W, b = layer
+            assert W.dtype == self.dtype, f"W dtype {W.dtype} != zonotope dtype {self.dtype}"
             self.center = W @ self.center + b
             self.generators = W @ self.generators
 
     def _propagate_conv(self, layer):
-        """Propagate through a Conv layer via torch conv2d."""
-        import torch
-        import torch.nn.functional as F
+        """Propagate through a Conv layer via torch conv2d.
+
+        Uses pre-cached torch tensors from params if available (set during
+        graph loading), otherwise creates them on the fly. Matches the
+        zonotope's dtype (float32 or float64).
+        """
+        kernel, bias, params = layer
+        input_shape = params['input_shape']
+        stride, padding = params['stride'], params['padding']
+        torch_dt = torch.float32 if self.dtype == np.float32 else torch.float64
+        cache_key = '_torch_kernel_f32' if torch_dt == torch.float32 else '_torch_kernel'
+        bias_key = '_torch_bias_f32' if torch_dt == torch.float32 else '_torch_bias'
+        if cache_key not in params:
+            params[cache_key] = torch.tensor(kernel, dtype=torch_dt)
+            params[bias_key] = torch.tensor(bias, dtype=torch_dt)
+        k = params[cache_key]
+        b = params[bias_key]
+
+        c_4d = torch.tensor(self.center, dtype=torch_dt).reshape(1, *input_shape)
+        self.center = F.conv2d(c_4d, k, bias=b, stride=stride, padding=padding).flatten().numpy()
+
+        n_gen = self.generators.shape[1]
+        if n_gen == 0:
+            out_shape = conv_output_shape(input_shape, kernel, params)
+            self.generators = np.zeros((out_shape[0] * out_shape[1] * out_shape[2], 0),
+                                       dtype=self.center.dtype)
+        else:
+            g_batch = torch.tensor(self.generators.T, dtype=torch_dt).reshape(n_gen, *input_shape)
+            g_out = F.conv2d(g_batch, k, stride=stride, padding=padding)
+            self.generators = g_out.reshape(n_gen, -1).numpy().T
+
+    def _propagate_conv_slow(self, layer):
+        """Original Conv implementation without kernel caching (for testing)."""
         kernel, bias, params = layer
         input_shape = params['input_shape']
         stride, padding = params['stride'], params['padding']
@@ -82,13 +123,49 @@ class DenseZonotope:
             g_out = F.conv2d(g_batch, k, stride=stride, padding=padding)
             self.generators = g_out.reshape(n_gen, -1).numpy().T
 
-    def apply_relu(self, pre_lo: np.ndarray, pre_hi: np.ndarray, relu_type: str = 'min_area'):
+    def apply_relu(self, pre_lo: np.ndarray, pre_hi: np.ndarray, relu_type: str = 'std'):
         """Apply ReLU relaxation, appending new error generators for unstable neurons.
+
+        Only touches dead and unstable neuron indices — active neurons (the
+        common case) are left untouched.  When there are no unstable neurons
+        (e.g. point propagation) the unstable block is skipped entirely.
 
         Args:
             pre_lo, pre_hi: pre-ReLU bounds (used to classify neurons)
-            relu_type: 'min_area' | 'y_bloat' | 'box'
+            relu_type: 'std' | 'y_bloat' | 'box'
         """
+        dead = np.where(pre_hi <= 0)[0]
+        unstable = np.where((pre_lo < 0) & (pre_hi > 0))[0]
+
+        if len(dead) > 0:
+            self.center[dead] = 0.0
+            self.generators[dead, :] = 0.0
+
+        if len(unstable) > 0:
+            u_lo = pre_lo[unstable]
+            u_hi = pre_hi[unstable]
+            if relu_type == 'std':
+                lam = u_hi / (u_hi - u_lo)
+                mu = -u_hi * u_lo / (2 * (u_hi - u_lo))
+            elif relu_type == 'y_bloat':
+                lam = np.ones(len(unstable), dtype=self.dtype)
+                mu = -u_lo / 2
+            elif relu_type == 'box':
+                lam = np.zeros(len(unstable), dtype=self.dtype)
+                mu = u_hi / 2
+            else:
+                assert False, f"Unknown relu_type: {relu_type}"
+
+            self.center[unstable] = lam * self.center[unstable] + mu
+            self.generators[unstable, :] = lam[:, None] * self.generators[unstable, :]
+
+            n = len(self.center)
+            new_g = np.zeros((n, len(unstable)), dtype=self.dtype)
+            new_g[unstable, np.arange(len(unstable))] = mu
+            self.generators = np.hstack([self.generators, new_g])
+
+    def apply_relu_slow(self, pre_lo: np.ndarray, pre_hi: np.ndarray, relu_type: str = 'std'):
+        """Original scalar-loop implementation of apply_relu (for testing)."""
         n = len(self.center)
         scale = np.ones(n)
         offsets = np.zeros(n)
@@ -98,9 +175,9 @@ class DenseZonotope:
             if hi <= 0:
                 scale[j] = 0.0
             elif lo < 0:
-                if relu_type == 'min_area':
-                    lam = hi / (hi - lo) if hi > -lo else 0.0
-                    mu = -hi * lo / (2 * (hi - lo)) if lam > 0 else hi / 2
+                if relu_type == 'std':
+                    lam = hi / (hi - lo)
+                    mu = -hi * lo / (2 * (hi - lo))
                 elif relu_type == 'y_bloat':
                     lam = 1.0
                     mu = -lo / 2

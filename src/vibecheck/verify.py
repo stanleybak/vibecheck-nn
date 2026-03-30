@@ -5,7 +5,7 @@ from .zonotope import DenseZonotope
 from .network import _prod
 
 
-def zonotope_verify(graph, spec):
+def zonotope_verify(graph, spec, dtype='graph'):
     """Run zonotope verification on a ComputeGraph with a VNNSpec.
 
     The algorithm:
@@ -32,6 +32,7 @@ def zonotope_verify(graph, spec):
     Args:
         graph: ComputeGraph from onnx_loader
         spec: VNNSpec with x_lo, x_hi, and output constraints (disjuncts)
+        dtype: numpy dtype for computation (np.float32 or np.float64, default float64)
 
     Returns:
         result: 'verified' or 'unknown'
@@ -46,8 +47,9 @@ def zonotope_verify(graph, spec):
     # radius, so x_lo == x_hi gives 0 generators (point propagation).
     zono_state = {}
     gen_count = {}
+    dt = graph.dtype if dtype == 'graph' else dtype
     zono_state[graph.input_name] = DenseZonotope.from_input_bounds(
-        spec.x_lo, spec.x_hi)
+        spec.x_lo, spec.x_hi, dtype=dt)
     gen_count[graph.input_name] = zono_state[graph.input_name].generators.shape[1]
 
     # Helper: get input zonotope, copying at fork points to avoid aliasing.
@@ -65,7 +67,7 @@ def zonotope_verify(graph, spec):
             continue
         node = graph.nodes[name]
         node.zonotope_propagate(
-            zono_state, gen_count, _get_input, 'min_area', graph)
+            zono_state, gen_count, _get_input, 'std', graph)
         gen_count[name] = zono_state[name].generators.shape[1]
 
     # Extract output bounds from the final zonotope.

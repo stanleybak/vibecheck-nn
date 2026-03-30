@@ -50,7 +50,7 @@ def _run_point(graph, center):
         if name in zono_state:
             continue
         graph.nodes[name].zonotope_propagate(
-            zono_state, gen_count, get, 'min_area', graph)
+            zono_state, gen_count, get, 'std', graph)
         gen_count[name] = zono_state[name].generators.shape[1]
     return zono_state[graph.output_name].center
 
@@ -122,7 +122,7 @@ def test_transpose_with_generators():
     zono_state = {'input': z_in}
     gen_count = {'input': 6}
     node.zonotope_propagate(zono_state, gen_count, lambda n: zono_state[n],
-                            'min_area', g)
+                            'std', g)
     z_out = zono_state['t']
 
     expected_center = center.reshape(1, 2, 3).transpose(0, 2, 1).flatten()
@@ -517,7 +517,7 @@ def test_conv_with_generators():
     zono_state = {g.input_name: z}
     gen_count = {g.input_name: z.generators.shape[1]}
     node.zonotope_propagate(zono_state, gen_count,
-                            lambda n: zono_state[n], 'min_area', g)
+                            lambda n: zono_state[n], 'std', g)
     z_out = zono_state['c']
     assert z_out.generators.shape[1] == 16  # same number of generators
     lo, hi = z_out.bounds()
@@ -667,7 +667,7 @@ def test_split_nd():
     zono_state = {g.input_name: DenseZonotope(center, np.zeros((10, 0)))}
     gen_count = {g.input_name: 0}
     split.zonotope_propagate(zono_state, gen_count,
-                             lambda n: zono_state[n], 'min_area', g)
+                             lambda n: zono_state[n], 'std', g)
     # First part: axis 2 [:2]
     expected_0 = center.reshape(1, 2, 5)[:, :, :2].flatten()
     np.testing.assert_array_equal(zono_state['sp'].center, expected_0)

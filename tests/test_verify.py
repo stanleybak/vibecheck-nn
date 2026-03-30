@@ -6,17 +6,24 @@ from vibecheck.spec import VNNSpec, Conjunct, Constraint, PairwiseConstraint
 from vibecheck.verify import zonotope_verify
 from vibecheck.zonotope import DenseZonotope
 
+F = np.float32  # default dtype for test graphs
 
-def _simple_fc_graph():
+
+def _a(vals):
+    """Shorthand: create float32 array from list."""
+    return np.array(vals, dtype=F)
+
+
+def _simple_fc_graph(dtype=np.float32):
     """Build a tiny graph: input(1,2) -> Gemm(2,2) -> Relu -> Gemm(2,1)."""
-    g = ComputeGraph()
+    g = ComputeGraph(dtype=dtype)
     g.input_name = 'input'
     g.input_shape = (1, 2)
 
-    W1 = np.array([[1.0, -1.0], [0.5, 0.5]])
-    b1 = np.array([0.0, 0.0])
-    W2 = np.array([[1.0, 1.0]])
-    b2 = np.array([0.0])
+    W1 = np.array([[1.0, -1.0], [0.5, 0.5]], dtype=dtype)
+    b1 = np.array([0.0, 0.0], dtype=dtype)
+    W2 = np.array([[1.0, 1.0]], dtype=dtype)
+    b2 = np.array([0.0], dtype=dtype)
 
     g.nodes['gemm1'] = GemmNode(name='gemm1', op_type='Gemm',
                                  inputs=['input'], params={'W': W1, 'b': b1})
@@ -36,20 +43,20 @@ def _simple_fc_graph():
 def test_verify_point():
     """Point zonotope (x_lo == x_hi) gives exact output."""
     g = _simple_fc_graph()
-    center = np.array([1.0, 0.5])
+    center = _a([1.0, 0.5])
     spec = VNNSpec(center, center,
                    [Conjunct([Constraint(0, '>=', 100.0)])])
     result, details = zonotope_verify(g, spec)
     assert result == 'verified'  # output is far below 100
     assert details['output_lo'].shape == (1,)
-    np.testing.assert_allclose(details['output_lo'], details['output_hi'])
+    np.testing.assert_allclose(details['output_lo'], details['output_hi'], atol=1e-6)
 
 
 def test_verify_with_range():
     """Zonotope with actual input range produces bounds."""
     g = _simple_fc_graph()
-    x_lo = np.array([0.0, 0.0])
-    x_hi = np.array([1.0, 1.0])
+    x_lo = _a([0.0, 0.0])
+    x_hi = _a([1.0, 1.0])
     spec = VNNSpec(x_lo, x_hi,
                    [Conjunct([Constraint(0, '>=', 1000.0)])])
     result, details = zonotope_verify(g, spec)
@@ -65,9 +72,9 @@ def test_verify_with_fork():
     g.input_shape = (1, 2)
 
     # Fork: input -> gemm_a and gemm_b, then Add merge
-    Wa = np.array([[1.0, 0.0], [0.0, 1.0]])
-    Wb = np.array([[0.0, 1.0], [1.0, 0.0]])
-    ba = bb = np.zeros(2)
+    Wa = _a([[1.0, 0.0], [0.0, 1.0]])
+    Wb = _a([[0.0, 1.0], [1.0, 0.0]])
+    ba = bb = _a([0.0, 0.0])
     g.nodes['ga'] = GemmNode(name='ga', op_type='Gemm', inputs=['input'],
                               params={'W': Wa, 'b': ba})
     g.nodes['gb'] = GemmNode(name='gb', op_type='Gemm', inputs=['input'],
@@ -80,8 +87,8 @@ def test_verify_with_fork():
         g.nodes[name].infer_shape(shapes)
         shapes[name] = g.nodes[name].output_shape
 
-    x_lo = np.array([1.0, 2.0])
-    x_hi = np.array([3.0, 4.0])
+    x_lo = _a([1.0, 2.0])
+    x_hi = _a([3.0, 4.0])
     spec = VNNSpec(x_lo, x_hi, [Conjunct([Constraint(0, '>=', 100.0)])])
     result, details = zonotope_verify(g, spec)
     # With range, output should have bounds
@@ -109,7 +116,7 @@ def test_verify_with_split():
         g.nodes[name].infer_shape(shapes)
         shapes[name] = g.nodes[name].output_shape
 
-    center = np.array([1, 2, 3, 4], dtype=float)
+    center = _a([1, 2, 3, 4])
     spec = VNNSpec(center, center, [Conjunct([Constraint(0, '>=', 100.0)])])
     result, details = zonotope_verify(g, spec)
     # Second split part should be [3, 4]
@@ -121,8 +128,8 @@ def test_verify_pairwise():
     g = ComputeGraph()
     g.input_name = 'input'
     g.input_shape = (1, 3)
-    W = np.eye(3)
-    b = np.zeros(3)
+    W = np.eye(3, dtype=F)
+    b = _a([0.0, 0.0, 0.0])
     g.nodes['gemm'] = GemmNode(name='gemm', op_type='Gemm',
                                 inputs=['input'], params={'W': W, 'b': b})
     g.output_name = 'gemm'
@@ -132,7 +139,7 @@ def test_verify_pairwise():
         g.nodes[name].infer_shape(shapes)
         shapes[name] = g.nodes[name].output_shape
 
-    center = np.array([10.0, 1.0, 1.0])
+    center = _a([10.0, 1.0, 1.0])
     spec = VNNSpec(center, center,
                    [Conjunct([PairwiseConstraint(pred=0, comp=1),
                               PairwiseConstraint(pred=0, comp=2)])])

@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from collections import deque
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from .zonotope import DenseZonotope
 
@@ -80,7 +82,7 @@ def _get_spatial_shape(node, graph, actual_len, kernel=None, transpose=False):
 
 def _point_zono(center):
     """Create a zero-generator zonotope from a center value."""
-    return DenseZonotope(center, np.zeros((len(center), 0)))
+    return DenseZonotope(center, np.zeros((len(center), 0), dtype=center.dtype))
 
 
 def _require_point(node, z):
@@ -132,7 +134,8 @@ def _broadcast_const_op(z, const, op_fn, node, graph):
     else:
         # Size changed via broadcast — generators can't be reused
         _require_point(node, z)
-        return DenseZonotope(new_center, np.zeros((len(new_center), 0)))
+        return DenseZonotope(new_center, np.zeros((len(new_center), 0),
+                                                   dtype=new_center.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +573,35 @@ class ConvNode(GraphNode):
             W_out = (W_in + 2 * pW - kW) // sW + 1
             self.output_shape = (1, C_out, H_out, W_out)
 
+    def precache_conv_layer(self, graph):
+        """Pre-build and cache the conv layer tuple with torch tensors.
+
+        Called during graph loading (after shape inference) so that
+        zonotope_propagate pays no tensor-creation overhead.
+        """
+        inp_name = self.inputs[0]
+        inp_shape = (graph.nodes[inp_name].output_shape
+                     if inp_name in graph.nodes else graph.input_shape)
+        n_elems = _prod(inp_shape)
+        spatial = self._spatial_shape(graph, n_elems)
+        kernel = self.params['kernel']
+        stride = self.params['stride']
+        padding = self.params['padding']
+        if kernel.ndim == 3:
+            kernel = kernel[:, :, np.newaxis, :]
+            stride = (1, stride[0])
+            padding = (0, padding[0])
+        torch_dt = torch.float32 if graph.dtype == np.float32 else torch.float64
+        cache_key = '_torch_kernel_f32' if torch_dt == torch.float32 else '_torch_kernel'
+        bias_key = '_torch_bias_f32' if torch_dt == torch.float32 else '_torch_bias'
+        self._conv_layer = (kernel, self.params['bias'], {
+            'input_shape': spatial,
+            'stride': stride,
+            'padding': padding,
+            cache_key: torch.tensor(kernel, dtype=torch_dt),
+            bias_key: torch.tensor(self.params['bias'], dtype=torch_dt),
+        })
+
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z = get_input(self.inputs[0])
@@ -578,23 +610,9 @@ class ConvNode(GraphNode):
             raise NotImplementedError(
                 f"Conv generator matrix too large ({n_gens} × {n_elems} > 5M) "
                 f"at node '{self.name}'")
-        # Extract (C, H, W) for torch conv2d
-        spatial = self._spatial_shape(graph, n_elems)
-        kernel = self.params['kernel']
-        stride = self.params['stride']
-        padding = self.params['padding']
-        if kernel.ndim == 3:
-            # 1D conv -> unsqueeze to 2D for conv2d
-            kernel = kernel[:, :, np.newaxis, :]
-            stride = (1, stride[0])
-            padding = (0, padding[0])
-        conv_params = {
-            'input_shape': spatial,
-            'stride': stride,
-            'padding': padding,
-        }
-        layer = (kernel, self.params['bias'], conv_params)
-        z.propagate_linear(layer)
+        if not hasattr(self, '_conv_layer'):
+            self.precache_conv_layer(graph)
+        z.propagate_linear(self._conv_layer)
         zono_state[self.name] = z
 
     def _spatial_shape(self, graph, n_elems):
@@ -635,22 +653,27 @@ class ConvTransposeNode(GraphNode):
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-        import torch
-        import torch.nn.functional as F
+
         z = get_input(self.inputs[0])
         _require_point(self, z)
+        torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
         inp_shape = _get_spatial_shape(
             self, graph, len(z.center), self.params['kernel'], transpose=True)
-        center_4d = torch.tensor(z.center, dtype=torch.float64).reshape(
+        center_4d = torch.tensor(z.center, dtype=torch_dt).reshape(
             1, *inp_shape)
-        k = torch.tensor(self.params['kernel'], dtype=torch.float64)
-        b = torch.tensor(self.params['bias'], dtype=torch.float64)
+        cache_attr = '_torch_kernel_f32' if torch_dt == torch.float32 else '_torch_kernel'
+        if not hasattr(self, cache_attr):
+            setattr(self, cache_attr, torch.tensor(self.params['kernel'], dtype=torch_dt))
+            setattr(self, cache_attr.replace('kernel', 'bias'),
+                    torch.tensor(self.params['bias'], dtype=torch_dt))
+        k = getattr(self, cache_attr)
+        b = getattr(self, cache_attr.replace('kernel', 'bias'))
         out = F.conv_transpose2d(
             center_4d, k, bias=b,
             stride=self.params['stride'],
             padding=self.params['padding'],
             output_padding=self.params.get('output_padding', (0, 0)))
-        zono_state[self.name] = _point_zono(out.flatten().numpy())
+        zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
 
 
 class GemmNode(GraphNode):
@@ -773,18 +796,18 @@ class MaxPoolNode(GraphNode):
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-        import torch
-        import torch.nn.functional as F
+
         z = get_input(self.inputs[0])
         _require_point(self, z)
+        torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
         inp_shape = _get_spatial_shape(self, graph, len(z.center))
-        c4d = torch.tensor(z.center, dtype=torch.float64).reshape(1, *inp_shape)
+        c4d = torch.tensor(z.center, dtype=torch_dt).reshape(1, *inp_shape)
         kH, kW = self.params['kernel_shape']
         sH, sW = self.params['stride']
         pH, pW = self.params['padding']
         out = F.max_pool2d(c4d, kernel_size=(kH, kW), stride=(sH, sW),
                            padding=(pH, pW))
-        zono_state[self.name] = _point_zono(out.flatten().numpy())
+        zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
 
 
 class AveragePoolNode(GraphNode):
@@ -803,32 +826,32 @@ class AveragePoolNode(GraphNode):
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-        import torch
-        import torch.nn.functional as F
+
         z = get_input(self.inputs[0])
         _require_point(self, z)
+        torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
         inp_shape = _get_spatial_shape(self, graph, len(z.center))
-        c4d = torch.tensor(z.center, dtype=torch.float64).reshape(1, *inp_shape)
+        c4d = torch.tensor(z.center, dtype=torch_dt).reshape(1, *inp_shape)
         kH, kW = self.params['kernel_shape']
         sH, sW = self.params['stride']
         pH, pW = self.params['padding']
         out = F.avg_pool2d(c4d, kernel_size=(kH, kW), stride=(sH, sW),
                            padding=(pH, pW))
-        zono_state[self.name] = _point_zono(out.flatten().numpy())
+        zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
 
 
 class PadNode(GraphNode):
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-        import torch
-        import torch.nn.functional as F
+
         z = get_input(self.inputs[0])
         _require_point(self, z)
+        torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
         pads = self.params.get('pads', [])
         val = self.params.get('constant_value', 0.0)
         inp_shape = _get_spatial_shape(self, graph, len(z.center))
         if pads and len(inp_shape) == 3:
-            c4d = torch.tensor(z.center, dtype=torch.float64).reshape(
+            c4d = torch.tensor(z.center, dtype=torch_dt).reshape(
                 1, *inp_shape)
             n = len(pads) // 2
             if n >= 4:
@@ -839,7 +862,7 @@ class PadNode(GraphNode):
                 zono_state[self.name] = z
                 return
             out = F.pad(c4d, torch_pad, value=val)
-            zono_state[self.name] = _point_zono(out.flatten().numpy())
+            zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
         else:
             zono_state[self.name] = z
 
@@ -1100,8 +1123,7 @@ class ResizeNode(GraphNode):
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-        import torch
-        import torch.nn.functional as F
+
         z = get_input(self.inputs[0])
         _require_point(self, z)
         scales = self.params.get('scales')
@@ -1110,11 +1132,12 @@ class ResizeNode(GraphNode):
 
         if scales is not None and len(inp_shape) == 4:
             # Use torch interpolate for nearest-neighbor upsampling
-            center_4d = torch.tensor(z.center, dtype=torch.float64).reshape(inp_shape)
+            torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
+            center_4d = torch.tensor(z.center, dtype=torch_dt).reshape(inp_shape)
             scale_h, scale_w = float(scales[2]), float(scales[3])
             out = F.interpolate(center_4d, scale_factor=(scale_h, scale_w),
                                 mode='nearest')
-            zono_state[self.name] = _point_zono(out.flatten().numpy())
+            zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
         else:
             zono_state[self.name] = z
 
@@ -1232,18 +1255,19 @@ class ComputeGraph:
     topological (Kahn's algorithm), cached after construction.
     """
 
-    def __init__(self):
+    def __init__(self, dtype=np.float32):
         self.nodes = {}          # name -> GraphNode
         self.input_name = None
         self.output_name = None
         self.input_shape = None  # without batch dim
         self.topo_order = []
+        self.dtype = dtype       # numpy dtype for computation
 
     @classmethod
-    def from_onnx(cls, onnx_path):
+    def from_onnx(cls, onnx_path, dtype=np.float32):
         """Load an ONNX model into a ComputeGraph."""
         from .onnx_loader import load_onnx
-        return load_onnx(onnx_path)
+        return load_onnx(onnx_path, dtype=dtype)
 
     def topological_sort(self):
         """Kahn's algorithm."""

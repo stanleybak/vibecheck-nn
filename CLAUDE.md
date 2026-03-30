@@ -4,8 +4,9 @@ A zonotope-based neural network verification tool. Given an ONNX network and a V
 
 ## Development Commands
 
-**Always use the venv (`.venv/bin/python`) for all commands. **
+**Always use the venv (`.venv/bin/python`) for all commands.**
 **Never run `git commit` or `git push` — the user handles all git operations.**
+**Single-threaded BLAS**: `__init__.py` sets `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1` via `setdefault` before numpy is imported. Multi-threaded OpenBLAS causes massive scheduling jitter on the small matrices typical in verification (100x variance between runs) and is slower overall. No manual env vars needed; override with explicit env vars if desired.
 
 ```bash
 # Setup

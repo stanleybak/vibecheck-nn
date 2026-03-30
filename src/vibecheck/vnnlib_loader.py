@@ -7,7 +7,7 @@ import gzip
 from .spec import VNNSpec, Conjunct, Constraint, PairwiseConstraint
 
 
-def load_vnnlib(vnnlib_path):
+def load_vnnlib(vnnlib_path, dtype=np.float32):
     """Parse a VNNLIB file into a VNNSpec object."""
     if vnnlib_path.endswith('.gz'):
         with gzip.open(vnnlib_path, 'rt') as f:
@@ -15,10 +15,10 @@ def load_vnnlib(vnnlib_path):
     else:
         with open(vnnlib_path, 'r') as f:
             text = f.read()
-    return parse_vnnlib_text(text)
+    return parse_vnnlib_text(text, dtype=dtype)
 
 
-def parse_vnnlib_text(text):
+def parse_vnnlib_text(text, dtype=np.float32):
     """Parse VNNLIB text into a VNNSpec object.
 
     Supports:
@@ -29,10 +29,10 @@ def parse_vnnlib_text(text):
     # Check for (or (and ...)) blocks first
     or_match = re.search(r'\(assert\s+\(or\s(.+)\)\s*\)', text, re.DOTALL)
     if or_match:
-        return _parse_or_and(text, or_match.group(1))
+        return _parse_or_and(text, or_match.group(1), dtype=dtype)
 
     # Parse top-level input bounds
-    x_lo, x_hi = _parse_input_bounds(text)
+    x_lo, x_hi = _parse_input_bounds(text, dtype=dtype)
 
     # Parse output constraints
     constraints = _parse_output_constraints(text)
@@ -44,7 +44,7 @@ def parse_vnnlib_text(text):
 # Input bounds parsing
 # ---------------------------------------------------------------------------
 
-def _parse_input_bounds(text):
+def _parse_input_bounds(text, dtype=np.float32):
     """Extract x_lo, x_hi arrays from top-level assertions."""
     x_bounds = {}
     for m in re.finditer(r'\(>=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)', text):
@@ -61,8 +61,8 @@ def _parse_input_bounds(text):
         raise ValueError("No input bounds found in VNNLIB")
 
     n_input = max(x_bounds.keys()) + 1
-    x_lo = np.array([x_bounds.get(i, [0, 0])[0] or 0 for i in range(n_input)])
-    x_hi = np.array([x_bounds.get(i, [0, 0])[1] or 0 for i in range(n_input)])
+    x_lo = np.array([x_bounds.get(i, [0, 0])[0] or 0 for i in range(n_input)], dtype=dtype)
+    x_hi = np.array([x_bounds.get(i, [0, 0])[1] or 0 for i in range(n_input)], dtype=dtype)
     return x_lo, x_hi
 
 
@@ -134,7 +134,7 @@ def _parse_block_x_bounds(block, x_bounds):
 # (or (and ...)) parsing
 # ---------------------------------------------------------------------------
 
-def _parse_or_and(text, or_body):
+def _parse_or_and(text, or_body, dtype=np.float32):
     """Parse (or (and ...) (and ...) ...) blocks."""
     # Find all (and ...) blocks
     and_blocks = []
@@ -173,8 +173,8 @@ def _parse_or_and(text, or_body):
     assert all_x_bounds, "No input bounds found in VNNLIB (or/and format)"
 
     n_input = max(all_x_bounds.keys()) + 1
-    x_lo = np.array([all_x_bounds.get(i, [0, 0])[0] or 0 for i in range(n_input)])
-    x_hi = np.array([all_x_bounds.get(i, [0, 0])[1] or 0 for i in range(n_input)])
+    x_lo = np.array([all_x_bounds.get(i, [0, 0])[0] or 0 for i in range(n_input)], dtype=dtype)
+    x_hi = np.array([all_x_bounds.get(i, [0, 0])[1] or 0 for i in range(n_input)], dtype=dtype)
 
     assert disjuncts, "No output constraints found in (or (and ...)) blocks"
 

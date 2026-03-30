@@ -45,7 +45,7 @@ def _run_point(graph, center):
         if name in zono_state:
             continue
         graph.nodes[name].zonotope_propagate(
-            zono_state, gen_count, get, 'min_area', graph)
+            zono_state, gen_count, get, 'std', graph)
         gen_count[name] = zono_state[name].generators.shape[1]
     return zono_state[graph.output_name].center
 
@@ -358,7 +358,7 @@ def test_matmul_bilinear_propagation():
     }
     gen_count = {'a': 0, 'b': 0}
     mm.zonotope_propagate(zono_state, gen_count, lambda n: zono_state[n],
-                          'min_area', g)
+                          'std', g)
     out = zono_state['mm'].center
     # (1,2,2) @ (1,2,2) = matmul
     expected = np.matmul(
@@ -427,7 +427,7 @@ def test_concat_with_generators():
     for name in g.topo_order:
         if name in zono_state:
             continue
-        g.nodes[name].zonotope_propagate(zono_state, gen_count, get, 'min_area', g)
+        g.nodes[name].zonotope_propagate(zono_state, gen_count, get, 'std', g)
         gen_count[name] = zono_state[name].generators.shape[1]
     z_out = zono_state['cat']
     assert z_out.generators.shape[0] == 4  # 2 + 2 concat
@@ -454,7 +454,7 @@ def test_reduce_sum_with_generators():
     zono_state = {g.input_name: z}
     gen_count = {g.input_name: z.generators.shape[1]}
     node.zonotope_propagate(zono_state, gen_count, lambda n: zono_state[n],
-                            'min_area', g)
+                            'std', g)
     z_out = zono_state['r']
     assert len(z_out.center) == 2  # (1, 2) after summing axis 1
     assert z_out.generators.shape[1] == 6  # same generators
@@ -741,7 +741,7 @@ def test_slice_with_generators():
     zono_state = {g.input_name: z}
     gen_count = {g.input_name: z.generators.shape[1]}
     node.zonotope_propagate(zono_state, gen_count, lambda n: zono_state[n],
-                            'min_area', g)
+                            'std', g)
     z_out = zono_state['s']
     assert len(z_out.center) == 4  # (1, 2, 2)
     assert z_out.generators.shape[1] == 6
@@ -927,7 +927,7 @@ def test_conv_too_many_generators():
     gen_count = {g.input_name: 5_000_001}
     with pytest.raises(NotImplementedError, match="too large"):
         node.zonotope_propagate(zono_state, gen_count,
-                                lambda n: zono_state[n], 'min_area', g)
+                                lambda n: zono_state[n], 'std', g)
 
 
 # --- _get_spatial_shape fallback to infer (line 618) ---
@@ -1017,7 +1017,7 @@ def test_concat_unequal_generators():
     zono_state = {'a': z1, 'b': z2}
     gen_count = {'a': 1, 'b': 2}
     cat.zonotope_propagate(zono_state, gen_count,
-                           lambda n: zono_state[n], 'min_area', g)
+                           lambda n: zono_state[n], 'std', g)
     z_out = zono_state['cat']
     assert z_out.generators.shape == (3, 2)  # padded to max_k=2
 
@@ -1037,7 +1037,7 @@ def test_split_with_generators():
     zono_state = {g.input_name: z}
     gen_count = {g.input_name: z.generators.shape[1]}
     node.zonotope_propagate(zono_state, gen_count,
-                            lambda n: zono_state[n], 'min_area', g)
+                            lambda n: zono_state[n], 'std', g)
     assert zono_state['s'].generators.shape[1] == 4
     assert zono_state['s1'].generators.shape[1] == 4
 
@@ -1180,7 +1180,7 @@ def test_transpose_perm_wrong_length():
     zono_state = {'input': z}
     gen_count = {'input': 0}
     node.zonotope_propagate(zono_state, gen_count,
-                            lambda n: zono_state[n], 'min_area', g)
+                            lambda n: zono_state[n], 'std', g)
     np.testing.assert_array_equal(zono_state['t'].center, z.center)
 
 
@@ -1202,7 +1202,7 @@ def test_slice_axis_skip_in_propagation():
     zono_state = {'input': z}
     gen_count = {'input': 0}
     node.zonotope_propagate(zono_state, gen_count,
-                            lambda n: zono_state[n], 'min_area', g)
+                            lambda n: zono_state[n], 'std', g)
     np.testing.assert_array_equal(zono_state['s'].center, z.center)
 
 
@@ -1223,7 +1223,7 @@ def test_resize_passthrough_no_scales():
     zono_state = {'input': z}
     gen_count = {'input': 0}
     node.zonotope_propagate(zono_state, gen_count,
-                            lambda n: zono_state[n], 'min_area', g)
+                            lambda n: zono_state[n], 'std', g)
     np.testing.assert_array_equal(zono_state['r'].center, z.center)
 
 
@@ -1276,7 +1276,7 @@ def test_resize_passthrough_3d():
     zono_state = {'input': z}
     gen_count = {'input': 0}
     node.zonotope_propagate(zono_state, gen_count,
-                            lambda n: zono_state[n], 'min_area', g)
+                            lambda n: zono_state[n], 'std', g)
     np.testing.assert_array_equal(zono_state['r'].center, z.center)
 
 

@@ -155,7 +155,7 @@ def _ort_node_compare(onnx_path, graph, center):
                     onnx.helper.make_tensor_value_info(
                         out, onnx.TensorProto.FLOAT, None))
 
-    sess = ort.InferenceSession(model.SerializeToString())
+    sess = ort.InferenceSession(model.SerializeToString(), providers=['CPUExecutionProvider'])
     inp = sess.get_inputs()[0]
     inp_shape = [d if isinstance(d, int) and d > 0 else 1 for d in inp.shape]
     feed = {inp.name: center.astype(np.float32).reshape(inp_shape)}
@@ -175,7 +175,7 @@ def _ort_node_compare(onnx_path, graph, center):
         if name in zono_state:
             continue
         graph.nodes[name].zonotope_propagate(
-            zono_state, gen_count, _get, 'min_area', graph)
+            zono_state, gen_count, _get, 'std', graph)
         gen_count[name] = 0
 
     lines = [f"{'idx':>4s}  {'op':15s}  {'size':>6s}  {'max_err':>10s}  "
@@ -245,9 +245,9 @@ def _run_benchmark(vnncomp_benchmarks, case_id, track_benchmarks):
     if onnx_path.endswith('.gz'):
         with gzip.open(onnx_path, 'rb') as f:
             model_bytes = f.read()
-        sess = ort.InferenceSession(model_bytes)
+        sess = ort.InferenceSession(model_bytes, providers=['CPUExecutionProvider'])
     else:
-        sess = ort.InferenceSession(onnx_path)
+        sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
     inp_name = sess.get_inputs()[0].name
     inp_shape = sess.get_inputs()[0].shape
     feed = {inp_name: center.astype(np.float32).reshape(

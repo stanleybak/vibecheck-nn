@@ -9,8 +9,11 @@ from .network import (
 )
 
 
-def load_onnx(onnx_path):
+def load_onnx(onnx_path, dtype=None):
     """Load an ONNX model into a ComputeGraph."""
+    import numpy as _np
+    if dtype is None:
+        dtype = _np.float32
     import onnx
     from onnx import numpy_helper
 
@@ -20,7 +23,7 @@ def load_onnx(onnx_path):
     else:
         model = onnx.load(onnx_path)
 
-    graph = ComputeGraph()
+    graph = ComputeGraph(dtype=dtype)
     inits = {init.name: numpy_helper.to_array(init).astype(np.float64)
              for init in model.graph.initializer}
 
@@ -406,6 +409,8 @@ def load_onnx(onnx_path):
     graph.topological_sort()
     _infer_shapes(graph)
     _fold_batchnorm(graph)
+    _cast_params(graph)
+    _precache_conv_tensors(graph)
     return graph
 
 
@@ -534,3 +539,25 @@ def _fold_batchnorm(graph):
 
     if to_remove:
         graph.topological_sort()
+
+
+def _cast_params(graph):
+    """Cast all float64 numpy params to graph.dtype."""
+    dt = graph.dtype
+    for node in graph.nodes.values():
+        for key, val in node.params.items():
+            if isinstance(val, np.ndarray) and val.dtype == np.float64:
+                node.params[key] = val.astype(dt)
+
+
+def _precache_conv_tensors(graph):
+    """Pre-build cached torch tensors for Conv nodes.
+
+    Called after shape inference and batchnorm folding so that
+    zonotope_propagate pays no tensor-creation overhead at runtime.
+    """
+    from .network import ConvNode
+    for name in graph.topo_order:
+        node = graph.nodes[name]
+        if isinstance(node, ConvNode):
+            node.precache_conv_layer(graph)

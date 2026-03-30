@@ -4,9 +4,14 @@ import argparse
 import sys
 import time
 
+import numpy as np
+
 from .network import ComputeGraph
 from .vnnlib_loader import load_vnnlib
 from .verify import zonotope_verify
+
+_DTYPES = {'float32': np.float32, 'float64': np.float64,
+           'f32': np.float32, 'f64': np.float64}
 
 
 def main():
@@ -14,12 +19,15 @@ def main():
         description='VibeCheck — Neural Network Verification via Zonotope Analysis')
     parser.add_argument('--net', required=True, help='Path to ONNX network')
     parser.add_argument('--spec', required=True, help='Path to VNNLIB specification')
+    parser.add_argument('--dtype', default='float32', choices=list(_DTYPES),
+                        help='Computation dtype (default: float32)')
     args = parser.parse_args()
 
+    dtype = _DTYPES[args.dtype]
     t_start = time.time()
 
     print(f'Loading network: {args.net}')
-    graph = ComputeGraph.from_onnx(args.net)
+    graph = ComputeGraph.from_onnx(args.net, dtype=dtype)
     n_relu = len(graph.relu_nodes())
     forks = graph.fork_points()
     print(f'  {len(graph.nodes)} ops, {n_relu} ReLU layers, '

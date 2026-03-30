@@ -43,7 +43,7 @@ def _run_point(graph, center):
         if name in zono_state:
             continue
         graph.nodes[name].zonotope_propagate(
-            zono_state, gen_count, get, 'min_area', graph)
+            zono_state, gen_count, get, 'std', graph)
         gen_count[name] = 0
     return zono_state[graph.output_name].center
 
@@ -217,7 +217,7 @@ def test_split_axis1():
     zono_state = {g.input_name: DenseZonotope(data, np.zeros((12, 0)))}
     gen_count = {g.input_name: 0}
     split.zonotope_propagate(zono_state, gen_count,
-                             lambda n: zono_state[n], 'min_area', g)
+                             lambda n: zono_state[n], 'std', g)
 
     # First split: elements from axis1 [0:3]
     expected_0 = data.reshape(1, 6, 2)[:, 0:3, :].flatten()
