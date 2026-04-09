@@ -431,7 +431,10 @@ class AddNode(GraphNode):
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-        if len(self.inputs) == 2 and self.inputs[1] in graph.nodes:
+        # Two computed inputs = skip connection merge
+        if (len(self.inputs) == 2
+                and (self.inputs[1] in graph.nodes
+                     or self.inputs[1] == graph.input_name)):
             z_a = get_input(self.inputs[0])
             z_b = get_input(self.inputs[1])
             shared = _find_shared_gens(
@@ -1326,6 +1329,231 @@ class ComputeGraph:
         if shape is None:
             return 0
         return _prod(shape)
+
+    def gpu_layers(self, device, dtype):
+        """Extract sequential linear layers for BnB backward pass.
+
+        Returns (gpu_layers_list, fwd_data) where:
+        - gpu_layers_list: list of dicts with 'type', weights, shapes for backward
+        - fwd_data: dict with gpu_k, gpu_W_fwd, gpu_b_fwd, layer_types for PGD forward
+        """
+        from .zonotope import conv_output_shape
+        layers = []
+        gpu_k, gpu_W_fwd, gpu_b_fwd, layer_types = [], [], [], []
+
+        for name in self.topo_order:
+            node = self.nodes[name]
+            if node.op_type == 'Conv':
+                kernel = node.params['kernel']
+                bias = node.params['bias']
+                if not hasattr(node, '_conv_layer'):
+                    node.precache_conv_layer(self)
+                _, _, conv_params = node._conv_layer
+                in_shape = conv_params['input_shape']
+                stride = conv_params['stride']
+                padding = conv_params['padding']
+                # Ensure 4D kernel for conv2d
+                k = kernel
+                if k.ndim == 3:
+                    k = k[:, :, np.newaxis, :]
+                out_shape = conv_output_shape(in_shape, k, conv_params)
+                oph = in_shape[1] - ((out_shape[1] - 1) * stride[0]
+                                     - 2 * padding[0] + k.shape[2])
+                opw = in_shape[2] - ((out_shape[2] - 1) * stride[1]
+                                     - 2 * padding[1] + k.shape[3])
+                gk = torch.tensor(k, dtype=dtype, device=device)
+                gb = torch.tensor(bias, dtype=dtype, device=device)
+                layers.append({
+                    'type': 'conv', 'kernel': gk, 'bias': gb,
+                    'in_shape': in_shape, 'out_shape': out_shape,
+                    'stride': stride, 'padding': padding,
+                    'output_padding': (oph, opw),
+                    'n_out': out_shape[0] * out_shape[1] * out_shape[2],
+                })
+                gpu_k.append(gk)
+                gpu_b_fwd.append(gb)
+                gpu_W_fwd.append(None)
+                layer_types.append(('conv', {
+                    'input_shape': in_shape, 'stride': stride,
+                    'padding': padding,
+                }))
+            elif node.op_type in ('Gemm', 'MatMul'):
+                W = node.params['W']
+                b = node.params['b']
+                gW = torch.tensor(W, dtype=dtype, device=device)
+                gb = torch.tensor(b, dtype=dtype, device=device)
+                layers.append({
+                    'type': 'fc', 'W': gW, 'bias': gb,
+                })
+                gpu_k.append(None)
+                gpu_W_fwd.append(gW)
+                gpu_b_fwd.append(gb)
+                layer_types.append(('fc', None))
+            # Skip Relu, Flatten, Reshape etc. — handled implicitly
+
+        fwd_data = {
+            'gpu_k': gpu_k, 'gpu_W_fwd': gpu_W_fwd,
+            'gpu_b_fwd': gpu_b_fwd, 'layer_types': layer_types,
+        }
+        return layers, fwd_data
+
+    def gpu_graph(self, device, dtype):
+        """Extract graph-structured ops for verification of networks with skip connections.
+
+        Returns a dict with:
+        - 'ops': list of dicts in topo order, each with 'name', 'type', 'inputs', + type-specific data
+        - 'relu_names': ordered list of ReLU node names (hidden layers only, not output)
+        - 'fork_points': set of node names with >1 consumer
+        - 'n_relu': number of hidden ReLU layers
+        - 'input_name': graph input tensor name
+        - 'input_n': number of input neurons (flat)
+        """
+        from .zonotope import conv_output_shape
+        import torch
+
+        ops = []
+        relu_idx = 0
+        relu_names = []
+        forks = self.fork_points()
+        # Track which names are the output of a node (vs graph input or initializer)
+        computed = {self.input_name}
+
+        # Determine which ReLU is the last hidden one (before the final linear layer)
+        # by checking: if ReLU's successor is the output node, it's still hidden;
+        # but ReLU IS hidden only if it's followed by more computation.
+        # Strategy: collect all ReLU names first, then strip the last one only if
+        # the output node is a ReLU (which would make it not hidden).
+        # Actually simpler: every Relu before the output linear layer is hidden.
+
+        for name in self.topo_order:
+            node = self.nodes[name]
+
+            if node.op_type == 'Conv':
+                kernel = node.params['kernel']
+                bias = node.params['bias']
+                if not hasattr(node, '_conv_layer'):
+                    node.precache_conv_layer(self)
+                _, _, conv_params = node._conv_layer
+                in_shape = conv_params['input_shape']
+                stride = conv_params['stride']
+                padding = conv_params['padding']
+                k = kernel
+                if k.ndim == 3:
+                    k = k[:, :, np.newaxis, :]
+                out_shape = conv_output_shape(in_shape, k, conv_params)
+                oph = in_shape[1] - ((out_shape[1] - 1) * stride[0]
+                                     - 2 * padding[0] + k.shape[2])
+                opw = in_shape[2] - ((out_shape[2] - 1) * stride[1]
+                                     - 2 * padding[1] + k.shape[3])
+                gk = torch.tensor(k, dtype=dtype, device=device)
+                gb = torch.tensor(bias, dtype=dtype, device=device)
+                # Map input names: use graph-level names
+                inp_names = []
+                for inp in node.inputs[:1]:  # only first input is the tensor
+                    inp_names.append(inp if inp in computed else '__input__')
+                ops.append({
+                    'name': name, 'type': 'conv', 'inputs': inp_names,
+                    'kernel': gk, 'bias': gb,
+                    'kernel_np': k.astype(np.float64),
+                    'bias_np': bias.astype(np.float64),
+                    'in_shape': in_shape, 'out_shape': out_shape,
+                    'stride': stride, 'padding': padding,
+                    'output_padding': (oph, opw),
+                    'n_out': out_shape[0] * out_shape[1] * out_shape[2],
+                })
+                computed.add(name)
+
+            elif node.op_type in ('Gemm', 'MatMul'):
+                W = node.params['W']
+                b = node.params['b']
+                gW = torch.tensor(W, dtype=dtype, device=device)
+                gb = torch.tensor(b, dtype=dtype, device=device)
+                inp_names = []
+                for inp in node.inputs[:1]:
+                    inp_names.append(inp if inp in computed else '__input__')
+                ops.append({
+                    'name': name, 'type': 'fc', 'inputs': inp_names,
+                    'W': gW, 'bias': gb,
+                    'W_np': W.astype(np.float64),
+                    'bias_np': b.astype(np.float64),
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Relu':
+                inp_names = [node.inputs[0]]
+                ops.append({
+                    'name': name, 'type': 'relu', 'inputs': inp_names,
+                    'layer_idx': relu_idx,
+                })
+                relu_names.append(name)
+                relu_idx += 1
+                computed.add(name)
+
+            elif node.op_type == 'Add':
+                inp_names = []
+                for inp in node.inputs:
+                    if inp in computed:
+                        inp_names.append(inp)
+                    elif inp == self.input_name:
+                        inp_names.append(inp)
+                    # else: constant/initializer — handled by node params
+                is_merge = len(inp_names) == 2
+                ops.append({
+                    'name': name, 'type': 'add', 'inputs': inp_names,
+                    'is_merge': is_merge,
+                    'bias': node.params.get('bias', None) if not is_merge else None,
+                })
+                computed.add(name)
+
+            elif node.op_type in ('Flatten', 'Reshape'):
+                # Passthrough — tracked so successors can find the right name
+                inp_names = [node.inputs[0]]
+                ops.append({
+                    'name': name, 'type': 'reshape', 'inputs': inp_names,
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Sub':
+                inp_names = [node.inputs[0] if node.inputs[0] in computed
+                             else self.input_name]
+                bias = node.params.get('bias')
+                ops.append({
+                    'name': name, 'type': 'sub', 'inputs': inp_names,
+                    'bias': bias,
+                })
+                computed.add(name)
+
+            # Skip other ops (Identity, Dropout, etc.)
+            else:
+                computed.add(name)
+
+        # The last relu_name may actually be the last hidden relu.
+        # If the output node is a linear layer (Gemm/Conv), then all ReLUs
+        # are hidden. If the output is a ReLU, we don't count it as hidden.
+        output_node = self.nodes.get(self.output_name)
+        if output_node and output_node.op_type == 'Relu' and relu_names:
+            relu_names.pop()
+            # Remove layer_idx from last relu op
+            for op in reversed(ops):
+                if op['type'] == 'relu' and op['name'] == self.output_name:
+                    del op['layer_idx']
+                    break
+            relu_idx -= 1
+
+        n_input = 1
+        if self.input_shape:
+            n_input = 1
+            for d in self.input_shape:
+                n_input *= d
+
+        return {
+            'ops': ops,
+            'relu_names': relu_names,
+            'fork_points': forks,
+            'n_relu': len(relu_names),
+            'input_name': self.input_name,
+            'input_n': n_input,
+        }
 
     def __repr__(self):
         return (f"ComputeGraph(input={self.input_name}, output={self.output_name}, "

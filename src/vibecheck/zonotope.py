@@ -1,4 +1,4 @@
-"""Zonotope forward propagation — dense numpy implementation."""
+"""Zonotope forward propagation — dense numpy and torch implementations."""
 
 import numpy as np
 import torch
@@ -8,6 +8,91 @@ import torch.nn.functional as F
 def is_conv(layer):
     """Check if layer is Conv (3-tuple) vs FC (2-tuple)."""
     return len(layer) == 3
+
+
+class TorchZonotope:
+    """Zonotope with torch tensors on GPU/CPU for BnB verification.
+
+    Representation: { center + G @ e | ||e||_inf <= 1 }
+    """
+
+    def __init__(self, center, generators):
+        self.center = center
+        self.generators = generators
+
+    @classmethod
+    def from_input_bounds(cls, x_lo, x_hi, device, dtype):
+        """Create zonotope from input bounds (torch tensors)."""
+        center = (x_lo + x_hi) / 2
+        radii = (x_hi - x_lo) / 2
+        nz = torch.nonzero(radii).squeeze(1)
+        n = len(center)
+        K = len(nz)
+        generators = torch.zeros(n, K, dtype=dtype, device=device)
+        generators[nz, torch.arange(K, device=device)] = radii[nz]
+        return cls(center, generators)
+
+    def bounds(self):
+        """Compute element-wise (lo, hi) bounds."""
+        abs_sum = torch.abs(self.generators).sum(dim=1)
+        return self.center - abs_sum, self.center + abs_sum
+
+    def propagate_conv(self, kernel, bias, input_shape, stride, padding):
+        """Propagate through a Conv2d layer."""
+        self.center = F.conv2d(
+            self.center.reshape(1, *input_shape), kernel, bias=bias,
+            stride=stride, padding=padding).flatten()
+        K = self.generators.shape[1]
+        if K > 0:
+            self.generators = F.conv2d(
+                self.generators.T.reshape(K, *input_shape), kernel,
+                stride=stride, padding=padding).reshape(K, -1).T
+
+    def propagate_fc(self, W, bias):
+        """Propagate through a fully-connected layer."""
+        self.center = F.linear(self.center, W, bias)
+        self.generators = W @ self.generators
+
+    def apply_relu(self):
+        """Standard min-area ReLU relaxation, appending new generators."""
+        lo, hi = self.bounds()
+        ust = (lo < 0) & (hi > 0)
+        dead = hi <= 0
+        lam = torch.where(ust, hi / (hi - lo),
+                          torch.where(dead, torch.zeros_like(hi),
+                                      torch.ones_like(hi)))
+        mu = torch.where(ust, -hi * lo / (2 * (hi - lo)),
+                         torch.zeros_like(hi))
+        self.center = lam * self.center + mu
+        self.generators = lam.unsqueeze(1) * self.generators
+        ui = torch.where(ust)[0]
+        nu = len(ui)
+        if nu > 0:
+            n = len(self.center)
+            ng = torch.zeros(n, nu, dtype=self.center.dtype,
+                             device=self.center.device)
+            ng[ui, torch.arange(nu, device=self.center.device)] = mu[ui]
+            self.generators = torch.cat([self.generators, ng], dim=1)
+        return lo, hi
+
+    def copy(self):
+        """Return an independent copy."""
+        return TorchZonotope(self.center.clone(), self.generators.clone())
+
+    def add(self, other, shared_gens):
+        """Element-wise addition for skip connections (mirrors DenseZonotope.add).
+
+        First `shared_gens` generator columns are shared noise symbols
+        (from before the fork point) — added element-wise.
+        Remaining columns are branch-specific and get concatenated.
+        """
+        g_shared = (self.generators[:, :shared_gens]
+                    + other.generators[:, :shared_gens])
+        return TorchZonotope(
+            self.center + other.center,
+            torch.cat([g_shared,
+                       self.generators[:, shared_gens:],
+                       other.generators[:, shared_gens:]], dim=1))
 
 
 def conv_output_shape(input_shape, kernel, params):

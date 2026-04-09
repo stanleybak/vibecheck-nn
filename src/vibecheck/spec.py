@@ -84,6 +84,55 @@ class VNNSpec:
             'worst_margin': float(worst),
         }
 
+    def as_pairwise(self):
+        """Extract (pred, comps_set) if all constraints are pairwise with same pred.
+
+        Returns (pred, {comp1, comp2, ...}) or None if not applicable.
+        """
+        preds = set()
+        comps = set()
+        for conj in self.disjuncts:
+            for c in conj.constraints:
+                if not isinstance(c, PairwiseConstraint):
+                    return None
+                preds.add(c.pred)
+                comps.add(c.comp)
+        if len(preds) != 1:
+            return None
+        return preds.pop(), comps
+
+    def as_linear_queries(self, n_output):
+        """Convert spec to linear queries for MILP/CROWN verification.
+
+        Each disjunct produces one or more linear queries. A disjunct is
+        verified if ALL its queries have positive minimum.
+
+        Returns list of (disjunct_idx, w, bias) where:
+        - w: numpy array of shape (n_output,) — linear weights on output
+        - bias: float — constant term
+        - Verified safe when min(w @ output + bias) > 0
+
+        For pairwise: w = e_pred - e_comp, bias = 0
+        For threshold Y[i] >= val: w = -e_i, bias = val
+        For threshold Y[i] <= val: w = e_i, bias = -val
+        """
+        queries = []
+        for di, conj in enumerate(self.disjuncts):
+            for c in conj.constraints:
+                w = np.zeros(n_output, dtype=np.float64)
+                if isinstance(c, PairwiseConstraint):
+                    w[c.pred] = 1.0
+                    w[c.comp] = -1.0
+                    queries.append((di, w, 0.0))
+                elif isinstance(c, Constraint):
+                    if c.op == '>=':
+                        w[c.index] = -1.0
+                        queries.append((di, w, c.value))
+                    else:  # '<='
+                        w[c.index] = 1.0
+                        queries.append((di, w, -c.value))
+        return queries
+
     @property
     def n_constraints(self):
         return sum(len(d.constraints) for d in self.disjuncts)

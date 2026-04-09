@@ -41,6 +41,12 @@ The codebase uses **object-oriented dispatch**: each ONNX op type is a `GraphNod
 
 - **`verify.py`** — Thin dispatch loop: `zonotope_verify(graph, spec)` iterates topo order calling `node.zonotope_propagate()`, then calls `spec.check()` on the output bounds.
 
+- **`verify_milp.py`** — MILP verification pipeline using Gurobi. Strategy: (1) GPU zonotope + CROWN for initial bounds, (2) per-layer tightening (MILP for conv, per-worker LP for FC), (3) spec MILP with racing escalation. Key functions: `_build_base_model()` / `_build_spec_model_compact()` (Gurobi model building), `_tighten_layer_parallel()` (parallel bound tightening), `_racing_escalation()` (doubling bin schedule, races feasibility 1T vs optimization (n-1)T per level), `_solve_spec_worker()` (builds cascading MILP from scratch per worker, compact LP encoding for non-binary neurons), `score_neurons_ew_frac()` (|ew|×frac scoring). Settings: `milp_scoring` ('ew_frac'|'crown'|'crown_lp_fractional'), `milp_lp_per_worker` (True = each worker builds own LP model for FC layers).
+
+- **`verify_zono_bnb.py`** — Branch-and-bound verification with zonotope/CROWN abstract domains.
+
+- **`settings.py`** — Configuration for BnB and MILP verification. `default_settings()` returns a DotMap with defaults.
+
 - **`main.py`** — CLI entry point. Exit code 0 = verified, 1 = unknown.
 
 ## Testing
@@ -90,3 +96,11 @@ The goal is **100% line coverage from unit tests alone** (without vnncomp). Curr
 # Extended track (currently has some known failures)
 .venv/bin/python -m pytest tests/ -k "extended"
 ```
+
+## Remote GPU Machine
+
+A remote machine with an NVIDIA RTX 3080 (10 GB VRAM) is available via SSH at `ssh stan@100.83.144.97`. Use for GPU profiling, benchmarking, and testing CUDA workloads that benefit from a desktop-class GPU (320W TDP, ~760 GB/s memory bandwidth). Files can be copied with `scp` or `rsync`.
+
+- **Working directory**: `~/Desktop/temp/vibecheck-temp` (create if needed)
+- **Specs**: 64 GB RAM, i9-11900KF (8C/16T), CUDA 13.0, driver 580.126.09
+- When running Python code remotely, create a venv there and install dependencies as needed.
