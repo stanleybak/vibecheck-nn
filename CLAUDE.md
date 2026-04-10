@@ -1,6 +1,6 @@
 ## What is vibecheck?
 
-A zonotope-based neural network verification tool. Given an ONNX network and a VNNLIB specification (input bounds + output property), it determines whether the property is provably satisfied ("verified") or "unknown" using abstract interpretation with zonotope domains.
+A neural network verification tool. Given an ONNX network and a VNNLIB specification (input bounds + output property), it determines whether the property is provably satisfied ("verified") or "unknown" using abstract interpretation with zonotope domains.
 
 ## Development Commands
 
@@ -58,7 +58,7 @@ Tests use pytest. Unit tests cover zonotope math and individual op propagation. 
 Run unit tests with coverage after any code change:
 
 ```bash
-# Unit tests only (fast, ~2s) — must be 100% line coverage
+# Unit tests only (fast, ~2s)
 .venv/bin/python -m pytest tests/ -k "not vnncomp" --cov=src/vibecheck --cov-report=term --cov-report=html
 ```
 
@@ -71,7 +71,7 @@ Run the full suite including vnncomp integration:
 .venv/bin/python -m pytest tests/ -k "not extended" --cov=src/vibecheck --cov-report=term --cov-report=html
 ```
 
-Coverage report at `htmlcov/index.html`.
+Coverage report at `htmlcov/index.html`. Aim for 100% code coverage (may need to add tests).
 
 ### Coverage rules
 
@@ -96,11 +96,3 @@ The goal is **100% line coverage from unit tests alone** (without vnncomp). Curr
 # Extended track (currently has some known failures)
 .venv/bin/python -m pytest tests/ -k "extended"
 ```
-
-## Remote GPU Machine
-
-A remote machine with an NVIDIA RTX 3080 (10 GB VRAM) is available via SSH at `ssh stan@100.83.144.97`. Use for GPU profiling, benchmarking, and testing CUDA workloads that benefit from a desktop-class GPU (320W TDP, ~760 GB/s memory bandwidth). Files can be copied with `scp` or `rsync`.
-
-- **Working directory**: `~/Desktop/temp/vibecheck-temp` (create if needed)
-- **Specs**: 64 GB RAM, i9-11900KF (8C/16T), CUDA 13.0, driver 580.126.09
-- When running Python code remotely, create a venv there and install dependencies as needed.
