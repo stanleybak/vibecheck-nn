@@ -1,5 +1,5 @@
 # vibecheck
-Vibe-Coded Neural Network Verification Tool
+Vibe-Coded Neural Network Verification Tool - graph branch
 
 ## Setup
 
