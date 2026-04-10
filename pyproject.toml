@@ -12,6 +12,7 @@ dependencies = [
     "scipy",
     "onnx",
     "torch",
+    "dotmap",
 ]
 
 [project.optional-dependencies]

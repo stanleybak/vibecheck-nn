@@ -9,7 +9,9 @@ _os.environ.setdefault('MKL_NUM_THREADS', '1')
 del _os
 
 from .network import ComputeGraph, GraphNode
-from .zonotope import DenseZonotope
+from .zonotope import DenseZonotope, TorchZonotope
 from .verify import zonotope_verify
+from .verify_zono_bnb import zonotope_bnb_verify
+from .settings import default_settings
 from .vnnlib_loader import load_vnnlib, parse_vnnlib_text
 from .spec import VNNSpec, Conjunct, Constraint, PairwiseConstraint
