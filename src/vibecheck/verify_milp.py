@@ -1566,7 +1566,13 @@ def _compute_dead_at(gg_ops, bounds_by_relu):
     dead_at = {}
     for op in gg_ops:
         if op['type'] == 'relu' and 'layer_idx' in op:
-            _, hi = bounds_by_relu[op['layer_idx']]
+            li = op['layer_idx']
+            if li not in bounds_by_relu:
+                # Layer bounds not yet computed (e.g., interleaved
+                # forward builder LP-probing at an earlier layer); skip
+                # this relu's dead mask — it only affects downstream.
+                continue
+            _, hi = bounds_by_relu[li]
             dead_at[op['name']] = (hi <= 0)
 
     consumer_count = {}
@@ -1654,15 +1660,6 @@ def _build_graph_model_to_relu(gg_ops, x_lo, x_hi, bounds_by_relu,
             else:
                 n_out = op['W_np'].shape[0]
 
-            # Skip entirely if all predecessors are dead
-            all_prev_dead = all(p is None for p in prev)
-            if all_prev_dead:
-                op_var_refs[nm] = [None] * n_out
-                if nm == target_input_name:
-                    target_vars = [None] * n_out
-                    break
-                continue
-
             if t == 'conv':
                 W_sp = op.get('W_sp')
                 if W_sp is None:
@@ -1670,10 +1667,22 @@ def _build_graph_model_to_relu(gg_ops, x_lo, x_hi, bounds_by_relu,
                         op['kernel_np'], op['in_shape'], op['stride'], op['padding'])
 
             my_dead = dead_at.get(nm)
+            if my_dead is not None and len(my_dead) != n_out:
+                my_dead = None
+            all_prev_dead = all(p is None for p in prev)
+
             out = []
             for j in range(n_out):
-                if my_dead is not None and j < len(my_dead) and my_dead[j]:
+                if my_dead is not None and my_dead[j]:
                     out.append(None)
+                    continue
+                if t == 'conv':
+                    b_j = float(op['bias_np'][j // spatial])
+                else:
+                    b_j = float(op['bias_np'][j])
+                if all_prev_dead:
+                    # Bug #1 fix: dead inputs → output is bias[j].
+                    out.append(m.addVar(lb=b_j, ub=b_j))
                     continue
                 expr = grb.LinExpr()
                 if t == 'conv':
@@ -1681,13 +1690,15 @@ def _build_graph_model_to_relu(gg_ops, x_lo, x_hi, bounds_by_relu,
                     for fi, w in zip(row.indices, row.data):
                         if fi < n_prev and prev[fi] is not None:
                             expr.add(prev[fi], float(w))
-                    b_j = float(op['bias_np'][j // spatial])
                 else:
                     W = op['W_np']
                     for k in range(n_prev):
                         if W[j, k] != 0 and prev[k] is not None:
                             expr.add(prev[k], float(W[j, k]))
-                    b_j = float(op['bias_np'][j])
+                if expr.size() == 0:
+                    # Bug #1 fix: every live input has zero weight.
+                    out.append(m.addVar(lb=b_j, ub=b_j))
+                    continue
                 v = m.addVar(lb=-grb.GRB.INFINITY, ub=grb.GRB.INFINITY)
                 out.append(v)
                 m.addConstr(v == expr + b_j)
@@ -1909,26 +1920,34 @@ def _solve_spec_graph_worker(args):
                 n_out = W.shape[0]
 
             my_dead = dead_at.get(name)
+            if my_dead is not None and len(my_dead) != n_out:
+                my_dead = None
 
-            # Check if all predecessors are dead (None) — output is constant
-            all_prev_dead = all(p is None for p in prev)
-            if all_prev_dead:
-                out = [None] * n_out  # all outputs are known constants, skip
-                m.update()
-                op_var_refs[name] = out
-                continue
-
-            # Use cached sparse matrix or build on demand
             if t == 'conv':
                 W_sp = op.get('W_sp')
                 if W_sp is None:
                     W_sp = _conv_sparse_matrix(kernel, in_shape, stride, padding)
                 spatial = op['out_shape'][1] * op['out_shape'][2]
 
+            all_prev_dead = all(p is None for p in prev)
+
             out = []
             for j in range(n_out):
-                if my_dead is not None and j < len(my_dead) and my_dead[j]:
+                if my_dead is not None and my_dead[j]:
                     out.append(None)
+                    continue
+
+                if t == 'conv':
+                    b_j = float(bias_np[j // spatial])
+                else:
+                    b_j = float(bias_np[j])
+
+                if all_prev_dead:
+                    # Bug #1 fix: all inputs dead → output is `bias[j]`,
+                    # not zero. Emit a fixed-bound variable so downstream
+                    # adds, subs, and the spec expression still see the
+                    # constant contribution.
+                    out.append(m.addVar(lb=b_j, ub=b_j))
                     continue
 
                 expr = grb.LinExpr()
@@ -1937,16 +1956,15 @@ def _solve_spec_graph_worker(args):
                     for fi, w in zip(row.indices, row.data):
                         if fi < n_prev and prev[fi] is not None:
                             expr.add(prev[fi], float(w))
-                    b_j = float(bias_np[j // spatial])
                 else:
                     for k in range(n_prev):
                         if W[j, k] != 0 and prev[k] is not None:
                             expr.add(prev[k], float(W[j, k]))
-                    b_j = float(bias_np[j])
 
-                # If expr is empty (all inputs dead), output is just bias — skip variable
                 if expr.size() == 0:
-                    out.append(None)
+                    # Bug #1 fix: every live input has zero weight → the
+                    # output collapses to the bias constant.
+                    out.append(m.addVar(lb=b_j, ub=b_j))
                     continue
 
                 v = m.addVar(lb=-grb.GRB.INFINITY, ub=grb.GRB.INFINITY)

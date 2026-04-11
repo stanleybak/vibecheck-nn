@@ -8,7 +8,7 @@ def default_settings(**overrides):
     """Create settings with defaults for BnB verification."""
     s = DotMap(
         device='gpu',
-        bits=32,
+        bits=64,
         pgd_restarts=100,
         pgd_iter=10,
         bnb_order='bfs',
@@ -27,6 +27,7 @@ def default_settings(**overrides):
         milp_tighten_parallel=True,     # parallel workers vs sequential
         milp_tighten_rebuild=False,     # rebuild model per worker vs copy shared
         milp_lp_encoding='compact',     # 'compact' (1 var, 2 constrs) or 'zas' (3 vars, 5 constrs)
+        graph_impl='optimized',         # 'reference' or 'optimized' for verify_graph builder
         # Callback: called at key points with (event, info) -> bool (False = stop)
         milp_callback=None,
     )

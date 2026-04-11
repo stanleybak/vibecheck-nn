@@ -53,9 +53,24 @@ class TorchZonotope:
         self.center = F.linear(self.center, W, bias)
         self.generators = W @ self.generators
 
-    def apply_relu(self):
-        """Standard min-area ReLU relaxation, appending new generators."""
-        lo, hi = self.bounds()
+    def apply_relu(self, tight_lo=None, tight_hi=None):
+        """Standard min-area ReLU relaxation, appending new generators.
+
+        Optional `tight_lo` / `tight_hi` are externally-computed sound
+        over-approximations of the pre-activation range (e.g. from a
+        per-neuron adaptive-zonotope backward pass or an LP probe).
+        When provided, the relu relaxation uses the intersection of
+        these with the zonotope's internal bounds. This is sound: the
+        true reachable set is contained in both the zonotope and the
+        external bounds, so the triangle relaxation using the
+        intersection still covers all true post-relu values.
+
+        Returns the (lo, hi) *actually used* for the relaxation, so
+        the caller can record the tightest pre-activation bounds.
+        """
+        lo_int, hi_int = self.bounds()
+        lo = lo_int if tight_lo is None else torch.maximum(lo_int, tight_lo)
+        hi = hi_int if tight_hi is None else torch.minimum(hi_int, tight_hi)
         ust = (lo < 0) & (hi > 0)
         dead = hi <= 0
         lam = torch.where(ust, hi / (hi - lo),

@@ -1,0 +1,261 @@
+vibecheck graph verification — progress snapshot
+==================================================
+
+(As of branch `graph`, after the interleaved-phase-1 work and the
+per-neuron sparse graph tightening changes.)
+
+------------------------------------------------------------------
+1. Files changed / added
+------------------------------------------------------------------
+
+NEW:
+  src/vibecheck/verify_graph.py
+      Full graph verification pipeline. Contains:
+        - _build_reference / _build_optimized (two LP builders, Bug #1 safe)
+        - _BUILDERS dispatch dict
+        - _per_neuron_adaptive_bounds (per-neuron adaptive zonotope
+          backward, tracks EW_lb and EW_ub separately)
+        - _adaptive_spec_lb (spec-level adaptive backward — proven
+          bit-exact equal to _spec_backward_graph via regression tests)
+        - _forward_zonotope_interleaved (phase 1: interleaved zono
+          forward + per-layer CROWN + per-layer LP/MILP tightening).
+          Feeds tightened bounds into TorchZonotope.apply_relu so the
+          zono state itself benefits.
+        - _tighten_sequential_with_probe (sequential subgraphs, uses
+          _tighten_layer_parallel with sparse per-neuron MILP)
+        - _collect_backward_needs + _build_sparse_neuron_graph +
+          _tighten_layer_graph_sparse (per-target-neuron sparse graph
+          LP, for layers past a merge-Add)
+        - _solve_spec_worker_graph + _racing_escalation_graph_correct
+          (phase 7a feasibility-first pre-check and phase 8 MILP
+          racing, both Bug #1 safe)
+        - _run_pipeline + verify_graph public entry
+  tests/test_verify_graph.py
+      Unit tests (14 non-CIFAR + 2 CIFAR). Notable:
+        - test_verify_milp_worker_drops_dead_bias_regression (Bug #1
+          regression — asserts verify_milp worker is correct)
+        - test_adaptive_spec_lb_equals_crown_{sequential,identity_skip,
+          dead_branch} (pins bit-exact CROWN = adaptive-zonotope
+          equality, abs diff = 0.0)
+        - test_dead_branch_bias_preserved_{reference,optimized}
+        - test_cifar100_runs_without_crash (accepts verified OR
+          unknown — the sound pipeline doesn't hit verified on the
+          flagship in 180 s)
+
+MODIFIED:
+  src/vibecheck/zonotope.py
+      TorchZonotope.apply_relu now takes optional tight_lo/tight_hi
+      and intersects them with the zono's internal bounds before
+      computing lam/mu. Sound: if both zono and external are
+      over-approximations of the true set, the intersection is too.
+  src/vibecheck/verify_milp.py
+      Bug #1 fix in two places: _solve_spec_graph_worker and
+      _build_graph_model_to_relu. When a conv/fc has all-dead inputs
+      (or all live weights are zero), the output is `bias[j]`, emitted
+      as a fixed-bound Gurobi variable rather than None.
+      _compute_dead_at tolerates missing layer_idx entries in
+      bounds_by_relu (needed because the interleaved forward probes
+      LPs before downstream layers have been processed).
+  src/vibecheck/settings.py
+      bits=64 default (was 32). graph_impl added ('reference' or
+      'optimized', default 'optimized').
+  src/vibecheck/main.py
+      --mode graph dispatch. Prints per-layer widths
+      (zono→adapt→lp→final) in verbose mode alongside build/probe/solve
+      timings.
+  CLAUDE.md
+      Process-kill warning: never broadly pkill python or grep+kill
+      — it takes down the tmux hosting Claude.
+
+------------------------------------------------------------------
+2. Current pipeline structure
+------------------------------------------------------------------
+
+Phase 1 (interleaved zono forward + tightening):
+  for each op in topological order:
+    if op is not a relu: propagate zonotope normally
+    if op is a hidden relu (li > 0):
+      1. read zono's internal bounds lo_np, hi_np
+      2. run _per_neuron_adaptive_bounds over unstable_initial
+         (backward CROWN with min-area slopes, tightened upstream
+         bounds feed in via bounds_by_relu[0..li-1])
+      3. intersect: new_lo = max(zono, adapt), new_hi = min(zono, adapt)
+      4. if has-merge-upstream: _tighten_layer_graph_sparse
+         (per-target-neuron sparse model, MILP probe → LP fallback,
+         sticky 'probe' → 'lp' → 'skip' mode)
+         else: _tighten_sequential_with_probe (existing
+         _tighten_layer_parallel with sparse conv MILP)
+      5. intersect: new_lo/new_hi with lp_lo/lp_hi
+      6. z.apply_relu(tight_lo=new_lo, tight_hi=new_hi)
+         — zonotope's relu uses the intersected bounds for slope,
+         so the downstream zono state is tighter too.
+
+Phase 2: spec CROWN backward (_spec_backward_graph, uses tightened
+         bounds_by_relu via triangle slopes)
+Phase 3: PGD attack (runs on a dedicated float32 gg_pgd — keeps PGD
+         cheap even when the main pipeline is float64)
+Phase 4: REMOVED (merged into phase 1)
+Phase 5: REMOVED (was a redundant CROWN recheck — phase 2 already
+         uses the interleaved-tightened bounds)
+Phase 6: REMOVED (redundant PGD — phase 3 already attacks the
+         tightened network)
+Phase 7a: parallel LP feasibility pre-check across all open queries
+          (via _solve_spec_worker_graph with mode='feasibility',
+          Pool sized to n_queries, each worker gets n_cores/n_queries
+          threads). LP-infeasible → query verified.
+Phase 7b: cheap CROWN-ew × width fallback scoring (no LP, since full-
+          LP scoring was hitting timeouts and returning empty dicts).
+Phase 8: per-query racing escalation (_racing_escalation_graph_correct),
+         doubling bin schedule [0, 2, 4, 8, …], three-way dispatch
+         (SAT / UNSAT / UNKNOWN).
+Phase 9: final PGD (guards the path out on timeout).
+
+------------------------------------------------------------------
+3. Key soundness fixes
+------------------------------------------------------------------
+
+(a) Bug #1 in verify_milp._solve_spec_graph_worker — dead-branch bias
+    was being dropped (out[j] = None when expr.size() == 0). The new
+    version emits a fixed-bound `bias[j]` variable and downstream
+    adds / the spec expression pick it up. Regression test
+    test_verify_milp_worker_drops_dead_bias_regression.
+
+(b) _per_neuron_adaptive_bounds upper-bound was wrong — the first
+    version tracked only one EW and negated at the input, which is
+    mathematically incorrect for upper bounds. Now tracks both
+    EW_lb and EW_ub with different slope choices:
+      lower: ew_lb = ep*lo_s + en*up_s, acc_lb += (en*up_t).sum
+      upper: ew_ub = ep*up_s + en*lo_s, acc_ub += (ep*up_t).sum
+    (ported from verify_zono_bnb._evaluate_region lines 599-675).
+    A 10,000-sample Monte Carlo test on the sequential FC network
+    confirms soundness.
+
+(c) Default bits=32 → bits=64. float32 GPU zonotope was producing
+    *unsound* under-approximations on CIFAR100 (the LP for li=2 was
+    strictly infeasible with the float32 bounds, but feasible with
+    float64). PGD is still float32 via a dedicated gg_pgd.
+
+------------------------------------------------------------------
+4. CIFAR100 flagship status
+------------------------------------------------------------------
+
+Instance:
+  benchmarks/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx.gz
+  benchmarks/cifar100_2024/vnnlib/CIFAR100_resnet_medium_prop_idx_7258_sidx_3539_eps_0.0039.vnnlib.gz
+
+Network: 40 ops, 10 hidden ReLUs, 8 fork points, (1,3,32,32) input,
+         100-output FC, 99 pairwise disjuncts.
+
+**Latest run (CPU, 180 s budget, optimized builder, phases 5/6 removed):**
+  RESULT: unknown
+  phase1_zono_tighten : 115.72 s
+  phase2_crown        :   0.47 s
+  phase3_pgd          :   2.76 s
+  phase7_feasibility  :  36.05 s
+  phase7_score        :   0.00 s
+  phase8_milp         :  26.27 s
+  phase9_pgd          :   0.00 s
+  total               : 182.3 s  (budget exhausted)
+  verified disjuncts  : 96/99
+  remaining           : 3 (qi = 25, 44, 83)
+  worst margin        : -0.7605
+
+Per-layer tightening detail (adapt / build / probe / solve / total):
+  li=0 (121):  0.00 /  0.00 /  0.00 /  0.00 /  0.00 s   [zono-only]
+  li=1 (124):  0.39 /  0.00 /  1.57 /  1.04 /  2.99 s   [adapt+seq-milp]
+                              fixed +23  w 0.138 → 0.131
+  li=2 (132):  0.46 /  1.85 /  5.24 / 19.78 / 27.34 s   [adapt+graph-lp]
+                              fixed +17  w 0.222 → 0.208
+  li=3 (138):  0.15 /  1.99 /  1.70 / 44.81 / 48.65 s   [adapt+graph-lp-partial]
+                              fixed +1   w 0.259 → 0.248    ← worst offender
+  li=4 (144):  all-stable (no unstable neurons)
+  li=5 (150):  0.83 /  8.38 /  0.00 /  0.00 /  9.21 s   [adapt+graph-skip]
+                              fixed +4   w 0.267 → 0.254
+                              build alone > sample_timeout → layer skipped
+  li=6-8   :   all-stable
+  li=9 (176):  0.25 /  0.00 /  0.00 /  0.00 /  0.25 s   [adapt-only (skip-mode)]
+                              fixed +0   w 2.177 → 1.977
+                              (adapt tightened width by ~9% even with crown_fixed=0)
+
+The old 57 s "verified" result was **unsound** — it relied on both Bug #1
+and the wrong adaptive upper bound. All subsequent sound runs have
+returned `unknown` with 3 disjuncts open.
+
+------------------------------------------------------------------
+5. What's known to be slow
+------------------------------------------------------------------
+
+Phase 1 spends 115 s, most of it on layers 2 / 3 / 5 where the graph
+sparse cone explodes:
+
+  - li=2: cone covers both branches of one residual block → ~10k var
+    sparse model per target neuron. Probe succeeds in 1.7-5 s but
+    full solve is 20 s because worst-case neurons hit the 5 s
+    per-direction timeout × 35-146 targets / 16 cores.
+  - li=3: cone covers two residual blocks → larger model. LP fixes
+    zero neurons but burns 44.81 s. The single-neuron probe at li=3
+    was FAST (1.7 s) — it's not a predictor of worst-case neurons.
+  - li=5: cone spans four residual blocks → build alone is 8.38 s
+    (exceeds sample_timeout=5 s), layer correctly skipped but the
+    build time was wasted.
+
+Phase 7a: 3 parallel LP feasibility checks, each using a big full-spec
+model (~110 k vars / 94 k constraints). Each times out at ~30 s
+returning UNKNOWN — not INFEASIBLE, so not enough to verify.
+
+Phase 8: qi=25 at bins=0 racing got `opt lb=-0.6066 (22 s) → escalate`,
+then bins=2 feasibility started and ran out of time. Effectively,
+only 1 of 3 queries gets a MILP attempt, never reaches a useful bin
+level.
+
+------------------------------------------------------------------
+6. Work in flight / next steps
+------------------------------------------------------------------
+
+Rejected (user called out as over-engineering):
+  × cumulative phase1_lp_budget hard cap — don't invent a new budget
+    system; the existing milp_sample_timeout=5 s per probe is the
+    only tightening knob.
+
+Plausible next levers:
+  (a) Probe multiple neurons (not just neuron[0]) in
+      _tighten_layer_graph_sparse so the probe is a better predictor
+      of layer cost. Mirrors _tighten_sequential_with_probe's n_cores/2
+      sampling.
+  (b) Downshift to 'skip' when lp-partial fixes 0 neurons and the
+      solve took real time. Minimal heuristic, matches user's earlier
+      guidance ("if probe times out, skip later layers").
+  (c) Parallelize phase 8 across queries. Currently serial across the
+      3 queries; each query's racing is internal-parallel (feas + opt).
+      With 3 queries × Pool(2), MILP gets 3× more wall time per query.
+  (d) Add the zonotope-direct spec bound alongside _spec_backward_graph
+      and take max(zono_direct, crown) per query. This was DISCUSSED
+      but NOT added — the user confirmed they're not mathematically
+      equal (parallelogram vs triangle), so the "free tighter bound"
+      idea only helps on networks where correlation-preservation
+      beats triangle slopes.
+
+Do-next candidate (from the user):
+  "I want to start the next idea" — not specified yet. Check with the
+  user for direction before implementing any of (a)-(d).
+
+------------------------------------------------------------------
+7. Test suite status
+------------------------------------------------------------------
+
+  tests/ -k "not vnncomp and not extended and not cifar100"
+  → 393 passing (14 of which are the new test_verify_graph tests)
+
+  tests/test_verify_graph.py -k "not cifar100"
+  → 14 passing
+
+  tests/test_verify_graph.py (all, incl. CIFAR100):
+  → 16 total. test_cifar100_runs_without_crash accepts verified OR
+    unknown; test_cifar100_reference_agrees the same. Both pass.
+
+Pre-existing failures unrelated to this work:
+  tests/test_graph_verify.py::TestSequentialGraphEquivalence::
+    test_acasxu_sequential_vs_graph
+  tests/test_graph_verify.py::TestGraphOptimizations::
+    test_oval21_graph_matches_sequential
+  (Both caused by missing module vibecheck.onnx_optimizer, not my code.)
