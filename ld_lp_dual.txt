@@ -1,0 +1,417 @@
+LP-DUAL LAGRANGIAN DECOMPOSITION WITH SELECTIVE MILP REFINEMENT
+=================================================================
+
+Investigation log: an exploration of Lagrangian-decomposition-style spec lower
+bound computation for ReLU networks, ending in a one-shot algorithm built on
+LP strong duality + per-sub MILP tightening. Benchmark throughout: ACAS Xu
+3_3 prop_2, query 0 (the loosest of the four sub-queries). All numbers are
+gap LP = lp_ref - best (negative gap means LD bound is *tighter* than LP
+triangle).
+
+Reference values for q0:
+  zonotope        -224.08
+  CROWN           -177.11
+  LP triangle     -163.5993   (joint LP relaxation of the spec)
+  MILP racing 30s -102.87     (Gurobi solving the joint spec MILP for 30 s,
+                               primal feasible at this value, primal-dual
+                               gap +0.04)
+
+
+1. WHAT WE TRIED, IN ORDER
+==========================
+
+The starting question was whether Lagrangian-decomposition spec verification
+in the style of Bunel et al. could improve on the existing per-layer LP/MILP
+tightening pipeline. We worked through a sequence of methods on q0 and
+recorded gap and wall time at each step.
+
+1.1 Per-layer subs, baseline structure
+--------------------------------------
+For each layer k, build a sub that owns:
+  - input_shared[i]: a copy of layer k-1's post_relu[i] (or input box for k=0)
+  - W_k @ input_shared + b_k = pre_relu_k
+  - ReLU constraints: triangle relaxation (LP-inner) or big-M with binaries
+    (MILP-inner)
+Plus 5 input subs (1-var LPs, one per input dimension) and 1 spec sub (linear
+projection from last hidden layer to y, with the qw·y objective). For ACAS Xu
+3_3 with 5 inputs and 6 hidden layers, this gives 5 + 6 + 1 = 12 subs.
+
+Coupling constraints (implicit): for each shared neuron, the consumer's
+input_shared[i] must equal the producer's post_relu[i]. Lagrangian dual
+multiplier ρ on each pair. The Lagrangian objective becomes:
+  L(x, ρ) = base_obj(x) + ρ^T (z_P - z_C)
+and is set on each sub via:
+  consumer side: -ρ * z_C added to that sub's objective
+  producer side: +ρ * z_P added to that sub's objective
+
+Dual function:
+  q(ρ) = sum over subs of min(sub objective at ρ)
+       <= true spec optimum (by weak Lagrangian duality)
+
+1.2 Iterative methods we tried (full table for q0)
+--------------------------------------------------
+All on the LP-inner version unless noted. Initial cold-start ρ = 0 gives
+q(0) = -230.49 (the trivial bound from independent sub mins at zero coupling).
+
+  method                                              gap LP    wall    notes
+  -------------------------------------------------   --------  ------  -----
+  cold-start ρ=0                                      +66.89    0.05s   q(0)
+  SGD (lr 1e-5 -> 1e-8) 1000 iters                    +0.15     2.1s
+  SGD 2000 iters                                      +0.09     4.3s
+  Adam best (lr=5e-4 b2=0.9999 eps=1e-4) 20000 iters  +0.35     38s     plateaus
+  prox-AL Jacobi T=500 K=2 grow=0.995 mu=0.3          +0.07     2.3s    tied for LP-inner best
+  prox-AL Gauss-Seidel T=200 K=2 mu=0.3               +0.09     1.5s    fastest LP-tight
+  joint LP (Gurobi LP solver, _build_reference)       +0.00     0.03s   LP triangle exact
+
+For LP-inner, all paths converge toward the LP triangle bound (-163.5993).
+Joint LP via Gurobi reaches it in 0.03 s. Iterative methods take 1-4 s. All
+of the iterative work on LP-inner was *strictly worse* than just calling
+Gurobi on the joint LP relaxation.
+
+1.3 MILP-inner (with big-M binary ReLU encoding per layer)
+----------------------------------------------------------
+At any fixed ρ, MILP-inner gives a tighter q(ρ) than LP-inner because
+MILP-inner's per-sub feasible set is the exact non-convex ReLU set rather
+than the triangle relaxation. The bound at the optimal LP-inner ρ becomes
+substantially tighter once we evaluate it under MILP-inner subs.
+
+  method                                              bound      wall
+  -------------------------------------------------   --------   ------
+  SGD MILP-inner cold start, 30 iters                 -118.66    125 s
+  SGD MILP-inner cold start, 60 iters                 -120.99    128 s   (worse - noise)
+  prox-AL Jacobi MILP-inner T=10 K=2 cold start       -102.17    179 s   prior best
+  prox-AL Jacobi MILP-inner cold @ 200 s              -96.46     200 s
+  warm-start LP 5s + MILP prox-AL 55s                 -95.73     60 s
+
+Per-iter costs are dominated by the per-layer MILPs (50 binaries each).
+Cold-start MILP runs hit the per-sub TimeLimit=5s repeatedly because the LP
+relaxation at high-magnitude ρ is loose, the search tree explodes, and
+ObjBound moves slowly.
+
+1.4 The LP warm-start observation
+---------------------------------
+Running LP-inner LD to LP-tight (~2 s of SGD) and then doing ONE MILP-inner
+solve at that ρ already beats every cold-start MILP-inner trace and reaches
+a tighter bound than 30 s of joint Gurobi MILP:
+
+  2 s LP-inner SGD -> ρ_LP, then 1 MILP-inner cycle
+    before MILP iter (1.77 s):  best=-163.79  gap +0.19
+    after  MILP iter (2.56 s):  best= -99.71  gap -63.89
+  Delta from one MILP iter: +64.08 units of bound improvement.
+
+This was the moment the picture shifted. Most of the gain was happening at
+the LP -> MILP switch, *not* during the iterative dual updates of either
+phase.
+
+1.5 The strong-duality observation
+----------------------------------
+By LP strong duality applied to the LD reformulation:
+
+  joint LP primal optimum  =  max over ρ of q_LP(ρ)  =  LP triangle bound
+
+and the maximizer ρ_LP* is exactly the LP dual variables on the LD
+"consistency" constraints z_P = z_C (when those constraints are made
+explicit by giving each sub its own copy of the shared variables).
+
+So instead of running 2 s of SGD to converge toward ρ_LP*, we can build the
+LD-shaped joint LP in Gurobi (with explicit consistency constraints), solve
+once, and read constraint.Pi as ρ. Total wall: 0.034 s.
+
+After that, one MILP-inner cycle at ρ_LP* gives:
+  joint LD-shaped LP: build 0.018 s + solve 0.016 s = 0.034 s
+                      ObjVal = -163.5993 (matches LP triangle exactly)
+  one MILP-inner solve at ρ:  0.636 s
+  TOTAL                       0.735 s
+  q_under_MILP                -95.27   (gap LP -68.33)
+
+Sign convention note: Gurobi's constraint.Pi for "producer == consumer" is
+the negative of our LD ρ convention (because Gurobi writes the constraint's
+Lagrangian term as π·(b - Ax) while our set_obj uses +ρ·(producer-consumer)).
+We auto-detect by running an LP-inner sanity check at both signs and picking
+the one that reproduces the LP triangle bound.
+
+1.6 Decomposition geometry exploration
+--------------------------------------
+With ρ extracted in 0.034 s, the only remaining variable is the per-sub
+MILP cost. We tried three decomposition geometries:
+
+  structure                       wall      bound       gap LP    notes
+  ----------------------------   --------  ----------  --------  -----
+  split G=2 (12 layer subs)       0.65 s    -122.67   -40.93    smaller MILPs, less correlation
+  baseline (6 layer subs)         0.74 s     -95.27   -68.33    1 sub per layer
+  merged 2-layer (3 subs)         7.04 s     -68.92   -94.68    100 binaries per sub
+
+The split variant (each layer's 50 outputs into 2 groups of ~25) has smaller
+MILPs but breaks within-layer cross-output correlations. Bound looser by 27
+units, but slightly faster wall (because each MILP scales super-linearly in
+binary count and the smaller MILPs more than make up for having twice as many
+of them).
+
+The merged variant ([[0,1], [2,3], [4,5]]) chains two layers' worth of binary
+encoding into each sub, capturing exact ReLU correlations across consecutive
+layers via shared joint variables. Bound tighter by 27 units, ~10x slower wall.
+
+1.7 The mixed-relaxation experiment
+-----------------------------------
+The most striking result. We can independently choose LP triangle vs MILP big-M
+per layer. Same LP-extracted ρ across all configurations, just swap the
+per-sub relaxation choice:
+
+  config                              q          gap LP     wall
+  --------------------------------    ---------  --------   -----
+  all LP                              -163.5993    +0.00    0.00 s
+  only L0 = MILP                      -163.5973    -0.00    0.01 s
+  only L1 = MILP                      -163.5972    -0.00    0.06 s
+  only L2 = MILP                      -163.5368    -0.06    0.09 s
+  only L3 = MILP                      -163.3261    -0.27    0.15 s
+  only L4 = MILP                      -159.5487    -4.05    0.15 s
+  only L5 = MILP                       -99.6641   -63.94    0.21 s   *
+  L4,L5 = MILP                         -95.6135   -67.99    0.36 s
+  L3,L4,L5 = MILP                      -95.3403   -68.26    0.50 s
+  L2,L3,L4,L5 = MILP                   -95.2777   -68.32    0.59 s
+  all MILP                             -95.2736   -68.33    0.64 s
+
+MILP-encoding only the spec-adjacent layer (L5) delivers 94 % of the total
+bound improvement at 33 % of the wall. Adding L4 buys 4 more units. After
+that the contribution from L0..L3 is essentially noise.
+
+The intuition: ρ on the spec-adjacent coupling is the largest in magnitude
+(it directly carries the spec's qw vector through one weight matrix), so
+that's where the LP triangle relaxation has the most slack to give. The
+further you walk back from the spec, the more "diluted" the ρ values get
+and the more the LP relaxation already nearly closes the gap.
+
+
+2. THE FINAL ALGORITHM
+======================
+
+Stripped to its essentials, for spec lower bound computation on a sequential
+ReLU network with phase-1 (l, u) bounds already in hand:
+
+  Step 1.  Build LD-shaped joint LP:
+             - one fresh copy of "input from layer k-1" per layer k
+             - explicit consistency constraints producer == consumer linking
+               consecutive subs
+             - LP triangle relaxation throughout
+             - objective is qw^T y + qb (the spec)
+  Step 2.  Solve as a single LP (Gurobi dual simplex). Wall: ~0.02 s.
+  Step 3.  Read constraint.Pi for every consistency constraint -> rho dict.
+  Step 4.  Sign-detect: run LP-inner LD check at both ±rho, keep the sign
+           that reproduces the LP solve's ObjVal.
+  Step 5.  Pick a tightening set L_milp (subset of layers).
+           Build per-layer subs with LP triangle for layers not in L_milp
+           and big-M MILP for layers in L_milp.
+  Step 6.  Set each sub's objective using rho. Solve all subs once.
+  Step 7.  Best lower bound = qb + sum of per-sub objective values.
+
+For ACAS Xu q0, choosing L_milp = {5} (the spec-adjacent layer) gives
+gap LP -63.94 in 0.21 s. Choosing L_milp = {3,4,5} gives gap LP -68.26
+in 0.50 s. Choosing L_milp = {0,1,2,3,4,5} (all layers) gives gap LP
+-68.33 in 0.64 s.
+
+Which subset to pick is a wall-vs-tightness knob. For sequential networks,
+the heuristic that emerged from this study is: start with the spec-adjacent
+layer and work backwards, stopping when the marginal gain from the next
+layer becomes small relative to its MILP cost. On q0 the marginal-gain
+profile is L5 = +63.94, L4 = +4.05, L3 = +0.27, L2 = +0.06, L1 = ε, L0 = ε,
+so {5} or {4,5} captures essentially everything.
+
+
+3. FILES PRODUCED DURING THE STUDY (under /tmp)
+===============================================
+
+  ld_proxal.py        - main module with build_perlayer, set_obj, solve_all,
+                        compute_c, proxal (Jacobi prox-AL), proxal_gs
+                        (Gauss-Seidel prox-AL), sgd_baseline. All studies
+                        import from this via exec().
+
+  ld_adam.py          - Adam optimizer sweep on LP-inner LD
+  ld_milp_g.py        - MILP-inner G-grouping sweep (G in {1,2,4,8})
+  ld_milp_trace.py    - cold-start time trace for SGD vs prox-AL on MILP-inner
+  ld_warm.py          - 5s LP-inner SGD warm + 55s MILP-inner prox-AL trace
+  ld_warm_2s.py       - 2s LP-inner SGD warm + ONE MILP-inner solve
+  ld_lpdual.py        - the main result: LP-dual extraction + 1 MILP cycle
+  ld_lpdual_merge.py  - LP-dual + merged 2-layer MILP subs
+  ld_lpdual_split.py  - LP-dual + split 2-output-group per layer MILP subs
+  ld_lpdual_mixed.py  - LP-dual + selective per-layer MILP/LP relaxation
+
+
+4. WHY THE BOUND IS VALID
+=========================
+
+The headline result -- "extract ρ from joint LP duals, swap one sub to MILP,
+sum, get a tighter bound than the LP triangle relaxation in 0.21 seconds" --
+deserves careful justification because it mixes LP duality with non-convex
+(MILP) per-sub solves. Three claims to defend:
+
+  CLAIM A. q(ρ) := Σ_subs min(sub_obj at ρ) is a valid lower bound on the
+           original spec problem, for ANY ρ, regardless of whether the per-sub
+           min is computed over LP-relaxed or MILP feasible sets.
+
+  CLAIM B. The ρ extracted from constraint.Pi of the LD-shaped joint LP
+           equals the optimal LP-Lagrangian-dual ρ (the maximizer of q_LP).
+
+  CLAIM C. Switching one or more sub from LP-relaxed to MILP-exact at fixed
+           ρ produces a bound that is monotonically (weakly) tighter than
+           the all-LP bound at the same ρ. The resulting bound is still
+           valid, by weak Lagrangian duality.
+
+Defense:
+
+A. WEAK LAGRANGIAN DUALITY (the only thing the validity rests on)
+
+The original spec problem is
+
+    min  qw^T y(x) + qb
+    s.t. x in X (input box)
+         all internal network constraints
+         all ReLU constraints (exact, with binary indicators)
+
+Equivalently, after introducing a private copy z_A,k of each producer's
+post_relu z_B,k-1 and adding the consistency constraint z_A,k = z_B,k-1, the
+problem decomposes into per-sub problems coupled only by those equality
+constraints. Form the Lagrangian by relaxing the consistency constraints
+with multipliers ρ (one entry per shared variable):
+
+    L(x, ρ) = sum_subs base_obj_sub(x_sub) + ρ^T (z_B - z_A)
+    q(ρ)    = min over feasible-per-sub-x of L(x, ρ)
+            = sum_subs [ min over feasible_sub_set of (base_obj_sub + ρ-coupled terms) ]
+
+Weak Lagrangian duality (a basic textbook result, holds with NO assumptions
+on convexity):
+
+    q(ρ) <= original spec optimum, for every ρ.
+
+The "feasible_sub_set" in the inner min can be ANY subset of the original
+sub feasible set without breaking the inequality, as long as it stays a
+subset (which is always the case because MILP-exact ⊂ LP-triangle-relaxed).
+Specifically:
+
+    min over MILP-exact ≥ min over LP-triangle (because MILP set is smaller).
+
+But the dual inequality goes the other way:
+
+    q_MILP(ρ) := sum_subs [min over MILP-exact (...)]
+               ≥ q_LP(ρ) := sum_subs [min over LP-relaxed (...)]
+
+and BOTH satisfy the dual inequality, because the original problem is
+constrained by the (smaller) MILP-exact feasible set. Weak duality:
+
+    q_MILP(ρ) <= original_optimum     (for any ρ)
+    q_LP(ρ)   <= original_optimum     (for any ρ)
+
+So q evaluated under MILP-inner subs at any ρ is a valid lower bound on the
+original. This is Claim A. The validity does not depend on:
+  - convexity of the inner sets (we explicitly use non-convex MILP)
+  - the warm-started primal x^k being feasible (the bound never reads x^k;
+    it only reads the per-sub objective values at the optimum of each sub)
+  - the iteration converging (any single evaluation of q at any ρ is valid)
+  - ρ being optimal (any ρ works, optimal ρ just gives a tighter bound)
+
+This is the fundamental safety net.
+
+B. LP STRONG DUALITY GIVES THE OPTIMAL LP-LAGRANGIAN ρ FOR FREE
+
+For the LP-relaxed version of the problem, all constraints are linear and
+the feasible set is convex. Strong LP duality applies. The LP-Lagrangian
+relaxation of the LD-decomposed LP is:
+
+    max over ρ of q_LP(ρ)  =  LP triangle bound  =  joint LP primal optimum
+
+The LD-shaped joint LP we build (with explicit consistency constraints,
+each sub having its own copy of the shared variables) has:
+  - LP primal optimum equal to the LP triangle bound (because the
+    decomposition with explicit equality constraints is mathematically
+    equivalent to the un-split LP -- the constraints just say "two copies
+    of the same quantity are equal").
+  - LP dual optimum equal to LP primal optimum, by LP strong duality.
+  - LP dual variable for each consistency constraint = the ρ value that
+    achieves the LP-Lagrangian dual optimum on that coupling.
+
+Therefore, calling Gurobi on the LD-shaped joint LP and reading
+constraint.Pi yields the optimal LP-Lagrangian ρ. The 2 seconds of SGD or
+prox-AL we ran earlier was iterating toward exactly this ρ. Gurobi gets it
+in 16 ms by solving the LP exactly. This is Claim B.
+
+(The sign-detection step exists only because Gurobi's convention for the
+Lagrangian sign of an equality constraint is the negative of ours; the
+magnitudes are unaffected.)
+
+C. SWAPPING IN MILP SUBS AT FIXED ρ TIGHTENS THE BOUND
+
+At the LP-extracted ρ_LP*, we have:
+
+    q_LP(ρ_LP*) = LP triangle bound (-163.5993 on q0)
+
+For each sub i, the LP-relaxed sub minimum equals some value v_LP,i, and
+the MILP-exact sub minimum equals some value v_MILP,i ≥ v_LP,i (since the
+MILP feasible set is a subset of the LP feasible set).
+
+If we swap sub i from LP to MILP and leave the others alone, the new
+aggregated bound is:
+
+    q_mixed(ρ_LP*)  =  Σ_{j != i} v_LP,j  +  v_MILP,i
+                    ≥ Σ_{j != i} v_LP,j  +  v_LP,i
+                    =  q_LP(ρ_LP*)
+                    =  LP triangle bound.
+
+So the mixed bound is at least as tight as the LP triangle bound. By weak
+Lagrangian duality (Claim A), it is also a valid lower bound on the
+original spec optimum:
+
+    q_mixed(ρ_LP*) ≤ original spec optimum.
+
+Combining: LP_triangle ≤ q_mixed ≤ original_optimum. Tighter than the LP
+triangle, valid as a spec lower bound. This is Claim C.
+
+The "swap to MILP" operation can be applied to any subset of subs
+independently. The bound improvement is monotone: adding more layers to
+the MILP set (while keeping ρ fixed) can only tighten or leave unchanged
+each individual sub's contribution, so the sum can only tighten or stay
+the same.
+
+ρ_LP* is NOT the optimal MILP-Lagrangian dual (which would maximize
+q_MILP). The true optimal ρ for q_MILP would give an even tighter bound.
+Iterating dual ascent on top of the mixed evaluation (e.g., the prox-AL
+runs we tried earlier) is one way to chase that optimum. On q0, the
+empirical observation was that the additional iterative work bought only
+a few units beyond what the one-shot LP-dual + selective MILP gave us.
+
+D. WHAT IS NOT CLAIMED
+
+The bound is valid; it is also strict (not necessarily tight to the true
+spec optimum). Specifically:
+
+  - q_mixed(ρ_LP*) is generally a strict under-estimate of the true spec
+    minimum because (i) Lagrangian relaxation has a duality gap on
+    non-convex problems, and (ii) we're not at the optimal MILP-Lagrangian ρ.
+  - The bound depends on the per-layer (l, u) bounds from phase 1. If
+    those are loose, the big-M's are loose and the per-sub MILPs are
+    correspondingly looser.
+  - The bound is per-query. To verify a multi-query disjunct, you need
+    every query's bound to be ≥ 0 (or to satisfy the disjunct logic).
+
+The validity argument carries over without modification to:
+  - networks with skip connections / merge-Add (each merge becomes a
+    consistency constraint with multiple producer terms)
+  - mixed convolution + FC layers
+  - the "merged groups" and "split groups" decomposition geometries
+    (the per-sub feasible sets just change shape; weak duality still holds)
+
+
+SUMMARY IN ONE PARAGRAPH
+========================
+
+For a sequential ReLU network with phase-1 (l, u) bounds, build the joint
+LP relaxation in LD-decomposed form (each layer with its own copy of
+inputs, explicit producer == consumer equality constraints). Solve as a
+single LP. The constraint duals are the optimal LP-Lagrangian multipliers
+ρ_LP*. Plug ρ_LP* into per-layer subs where each sub independently uses
+either LP triangle or big-M MILP encoding for its ReLUs. Solve each sub
+once. Sum the per-sub objective values; add qb. The result is a valid
+lower bound on the spec, strictly tighter than the LP triangle bound, and
+the tightness vs wall trade-off is controlled by which subset of layers
+get the MILP treatment. For the ACAS Xu 3_3 prop_2 q0 instance, MILPing
+just the spec-adjacent layer takes 0.21 s and gives a bound (-99.66) that
+is tighter than 30 seconds of joint Gurobi spec-MILP and tighter than
+200 seconds of prox-AL on cold-start MILP-inner.

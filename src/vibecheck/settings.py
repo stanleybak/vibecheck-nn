@@ -30,6 +30,20 @@ def default_settings(**overrides):
         graph_impl='optimized',         # 'reference' or 'optimized' for verify_graph builder
         # Callback: called at key points with (event, info) -> bool (False = stop)
         milp_callback=None,
+        # Lagrangian-decomposition solver (off by default; gated path in _run_pipeline)
+        ld_enabled=False,
+        ld_inner_mode='milp',              # 'milp' (big-M binary) or 'lp' (triangle)
+        ld_num_iterations=200,
+        ld_step_schedule='linear_decay',  # 'linear_decay' | 'adam' | 'constant'
+        ld_initial_step=1e-2,
+        ld_final_step=1e-4,
+        ld_adam_lr=1e-2,
+        ld_adam_beta1=0.9,
+        ld_adam_beta2=0.999,
+        ld_subproblem_timeout=5.0,
+        ld_early_stop=True,
+        ld_log_interval=10,
+        ld_parallel=True,
     )
     s.update(overrides)
     return s

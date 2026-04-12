@@ -30,6 +30,7 @@ from .verify_zono_bnb import (
     _find_shared_gens_count,
 )
 from .zonotope import TorchZonotope
+from . import verify_ld
 
 
 _OK_STATUSES_GLOBAL = None
@@ -2386,6 +2387,25 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         lo_t, hi_t = sb[li]
         bounds_by_relu[li] = (lo_t.cpu().numpy().astype(np.float64),
                                hi_t.cpu().numpy().astype(np.float64))
+
+    # --- Phase LD: Lagrangian decomposition (optional, off by default) ---
+    if getattr(settings, 'ld_enabled', False) and still_open_disj:
+        t0 = time.perf_counter()
+        ld_info = verify_ld.verify_ld_queries(
+            gg, gg_ops_ser, bounds_by_relu, x_lo_64, x_hi_64,
+            disj_queries, spec_lbs, still_open_disj, queries,
+            settings, time_left)
+        timing['phase_ld'] = time.perf_counter() - t0
+        details['ld'] = ld_info
+        verified_disj = {di for di, qlist in disj_queries.items()
+                          if all(spec_lbs.get(qi, -1) > 0
+                                 for qi, _, _ in qlist)}
+        still_open_disj = set(disj_queries.keys()) - verified_disj
+        if print_progress:
+            print(f'Phase LD: {timing["phase_ld"]:.2f}s  '
+                  f'verified={len(verified_disj)}/{len(disj_queries)}')
+        if not still_open_disj:
+            return _finalize('verified', 'ld')
 
     # --- Phase 7: score open queries via LP ---
     remaining_qids = set()
