@@ -9,8 +9,10 @@ Both builders preserve the Bug #1 fix: a conv/fc whose inputs are all dead
 still outputs `bias[j]`, encoded as a fixed-bound Gurobi variable — never
 returned as `None`.
 
-All `m.optimize()` calls set `DualReductions=0` (Bug #5) and raise on
-unexpected Gurobi status codes.
+All `optimize_checked(m)` calls go through `optimize_checked(m)` — they set
+`DualReductions=0` (Bug #5), raise on unexpected Gurobi status codes, and
+raise `GurobiNumericTrouble` if the solver emits any numeric-trouble
+warnings (Markowitz / basis drops / quad precision).
 """
 
 import time
@@ -20,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from .settings import resolve_torch
+from .gurobi_util import optimize_checked
 from .verify_milp import (
     VerifyStats, _fire_callback,
     _compute_dead_at, _conv_sparse_matrix,
@@ -31,6 +34,7 @@ from .verify_zono_bnb import (
 )
 from .zonotope import TorchZonotope
 from . import verify_ld
+from . import verify_gen_lp
 
 
 _OK_STATUSES_GLOBAL = None
@@ -238,9 +242,7 @@ def _build_reference(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
                 if z is None:
                     continue
                 if lo_r[j] >= 0:
-                    a = m.addVar(lb=float(lo_r[j]), ub=float(hi_r[j]))
-                    m.addConstr(a == z)
-                    out[j] = a
+                    out[j] = z
                 elif use_milp or j in ms:
                     a = m.addVar(lb=0.0, ub=float(hi_r[j]))
                     s = m.addVar(vtype=grb.GRB.BINARY)
@@ -267,13 +269,14 @@ def _build_reference(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
                 for j in range(n):
                     if va[j] is None and vb[j] is None:
                         continue
-                    expr = grb.LinExpr()
-                    if va[j] is not None:
-                        expr.add(va[j], 1.0)
-                    if vb[j] is not None:
-                        expr.add(vb[j], 1.0)
+                    if va[j] is None:
+                        out[j] = vb[j]
+                        continue
+                    if vb[j] is None:
+                        out[j] = va[j]
+                        continue
                     v = m.addVar(lb=-inf, ub=inf)
-                    m.addConstr(v == expr)
+                    m.addConstr(v == va[j] + vb[j])
                     out[j] = v
                 m.update()
                 op_var_refs[nm] = out
@@ -314,12 +317,16 @@ def _build_reference(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
 
 def _build_optimized(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
                      *, target_layer_idx=None, use_milp=False,
-                     milp_by_layer=None, n_threads=1):
+                     milp_by_layer=None, n_threads=1, compact_lp=False):
     """Batched builder using MVar + scipy.sparse for conv/fc layers.
 
     Produces identical constraints to _build_reference but with dramatically
     fewer Python<->C transitions. For conv layers the sparse weight matrix
     is applied as a single addConstr(out_mvar == W_live @ prev_mvar + b).
+
+    compact_lp: when True, fold dead-branch constants through merge-Add
+    ops instead of creating fixed-bound Gurobi variables. Produces fewer
+    vars/constrs with identical LP results.
 
     Same signature and return shape as _build_reference.
     """
@@ -350,6 +357,7 @@ def _build_optimized(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
 
     op_var_refs = {input_name: inp_vars}
     target_vars = None
+    const_offset = {}
 
     for op in gg_ops:
         nm = op['name']
@@ -389,11 +397,27 @@ def _build_optimized(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
             all_prev_dead = not live_in_mask.any()
 
             if all_prev_dead:
-                # Bug #1: outputs are constants = per-row bias; skip dead outputs
+                input_offset = const_offset.get(op['inputs'][0])
+                if compact_lp:
+                    dead_mask = my_dead if my_dead is not None else np.zeros(n_out, dtype=bool)
+                    cv = bias_per_out.copy()
+                    if input_offset is not None:
+                        cv = W_sp @ input_offset + cv
+                    cv[dead_mask] = 0.0
+                    const_offset[nm] = cv
+                    op_var_refs[nm] = out
+                    if nm == target_input_name:
+                        target_vars = out
+                        break
+                    continue
+                if input_offset is not None:
+                    full_bias = W_sp @ input_offset + bias_per_out
+                else:
+                    full_bias = bias_per_out
                 for j in range(n_out):
                     if my_dead is not None and my_dead[j]:
                         continue
-                    c = float(bias_per_out[j])
+                    c = float(full_bias[j])
                     out[j] = m.addVar(lb=c, ub=c)
                 m.update()
                 op_var_refs[nm] = out
@@ -401,6 +425,12 @@ def _build_optimized(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
                     target_vars = out
                     break
                 continue
+
+            # Fold any stored constant offset from the input into the bias
+            input_offset = const_offset.get(op['inputs'][0])
+            if compact_lp and input_offset is not None:
+                bias_per_out = bias_per_out + np.asarray(
+                    W_sp @ input_offset).flatten()
 
             # Extract submatrix for live predecessors and live outputs
             if my_dead is not None:
@@ -464,11 +494,9 @@ def _build_optimized(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
 
             out = [None] * n
 
-            # Active: a == z, bounds tightened
+            # Active: pass through (ReLU is identity when stable-on)
             for j in np.where(active_mask)[0]:
-                a = m.addVar(lb=float(lo_arr[j]), ub=float(hi_arr[j]))
-                m.addConstr(a == prev[j])
-                out[int(j)] = a
+                out[int(j)] = prev[int(j)]
 
             # Unstable: partition into MILP and LP
             if use_milp:
@@ -508,18 +536,29 @@ def _build_optimized(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
                 va = op_var_refs[op['inputs'][0]]
                 vb = op_var_refs[op['inputs'][1]]
                 n = len(va)
+                off_a = const_offset.get(op['inputs'][0]) if compact_lp else None
+                off_b = const_offset.get(op['inputs'][1]) if compact_lp else None
                 out = [None] * n
                 for j in range(n):
                     if va[j] is None and vb[j] is None:
                         continue
-                    expr = grb.LinExpr()
-                    if va[j] is not None:
-                        expr.add(va[j], 1.0)
-                    if vb[j] is not None:
-                        expr.add(vb[j], 1.0)
+                    if va[j] is None:
+                        out[j] = vb[j]
+                        continue
+                    if vb[j] is None:
+                        out[j] = va[j]
+                        continue
                     v = m.addVar(lb=-inf, ub=inf)
-                    m.addConstr(v == expr)
+                    m.addConstr(v == va[j] + vb[j])
                     out[j] = v
+                if off_a is not None or off_b is not None:
+                    merged = np.zeros(n, dtype=np.float64)
+                    if off_a is not None:
+                        merged[:len(off_a)] += off_a
+                    if off_b is not None:
+                        merged[:len(off_b)] += off_b
+                    if merged.any():
+                        const_offset[nm] = merged
                 m.update()
                 op_var_refs[nm] = out
                 if nm == target_input_name:
@@ -548,6 +587,8 @@ def _build_optimized(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
 
         elif t == 'reshape':
             op_var_refs[nm] = op_var_refs[op['inputs'][0]]
+            if compact_lp and op['inputs'][0] in const_offset:
+                const_offset[nm] = const_offset[op['inputs'][0]]
 
     m.update()
     return m, env, op_var_refs, target_vars
@@ -598,7 +639,7 @@ def _tighten_neuron_graph(args):
         grb.GRB.ITERATION_LIMIT,
     )
 
-    m.optimize()
+    optimize_checked(m)
     status = m.Status
     if status not in _OK_STATUSES:
         raise RuntimeError(f'graph tighten: unexpected gurobi status {status}')
@@ -619,7 +660,7 @@ def _tighten_neuron_graph(args):
         else:
             m.setObjective(tv, grb.GRB.MINIMIZE)
             m.setParam('BestBdStop', 1e-6)
-        m.optimize()
+        optimize_checked(m)
         status = m.Status
         if status not in _OK_STATUSES:
             raise RuntimeError(
@@ -681,7 +722,7 @@ def _tighten_layer_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
                          grb.GRB.MINIMIZE)
         cm.setParam('TimeLimit', sample_timeout)
         t_probe = time.perf_counter()
-        cm.optimize()
+        optimize_checked(cm)
         dt_probe = time.perf_counter() - t_probe
         probe_status = cm.Status
         cm.dispose()
@@ -847,8 +888,8 @@ def _solve_spec_worker_graph(args):
             input_name)
 
     Returns (result_str, elapsed, payload) where payload is:
-      - feasibility: None
-      - optimize:    ObjBound (float or None)
+      - feasibility: info_dict (status, n_vars, n_constrs, n_bins)
+      - optimize:    info_dict (lb, status, n_vars, n_constrs, n_bins)
       - score:       (scores_dict, lb_or_None)
     """
     import gurobipy as grb
@@ -861,6 +902,7 @@ def _solve_spec_worker_graph(args):
     for (li, ni) in milp_set:
         milp_by_layer.setdefault(li, set()).add(ni)
 
+    t_build = time.perf_counter()
     m, env, op_var_refs, _ = build_fn(
         gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
         target_layer_idx=None,
@@ -868,11 +910,15 @@ def _solve_spec_worker_graph(args):
         milp_by_layer=milp_by_layer,
         n_threads=n_threads,
     )
+    dt_build = time.perf_counter() - t_build
     m.setParam('DualReductions', 0)
     m.setParam('TimeLimit', float(timeout))
 
     spec_expr, const = _build_spec_expression(
         m, op_var_refs, gg_ops, query_w, query_bias)
+    m.update()
+    model_info = {'n_vars': m.NumVars, 'n_constrs': m.NumConstrs,
+                  'n_bins': m.NumBinVars, 'build_time': dt_build}
 
     t0 = time.perf_counter()
 
@@ -881,21 +927,22 @@ def _solve_spec_worker_graph(args):
     if mode == 'feasibility':
         m.addConstr(spec_expr + const <= 0)
         m.setObjective(0, grb.GRB.MINIMIZE)
-        m.optimize()
+        optimize_checked(m)
         status = m.Status
         dt = time.perf_counter() - t0
+        info = {**model_info, 'status': status}
         m.dispose(); env.dispose()
         assert status in ok, f'feasibility: unexpected status {status}'
         if status == grb.GRB.INFEASIBLE:
-            return 'UNSAT', dt, None
+            return 'UNSAT', dt, info
         if status == grb.GRB.OPTIMAL:
-            return 'SAT', dt, None
-        return 'UNKNOWN', dt, None
+            return 'SAT', dt, info
+        return 'UNKNOWN', dt, info
 
     if mode == 'optimize':
         m.setParam('BestBdStop', 0.0)
         m.setObjective(spec_expr + const, grb.GRB.MINIMIZE)
-        m.optimize()
+        optimize_checked(m)
         status = m.Status
         lb = None
         try:
@@ -904,17 +951,18 @@ def _solve_spec_worker_graph(args):
             pass
         n_sol = m.SolCount
         dt = time.perf_counter() - t0
+        info = {**model_info, 'status': status, 'lb': lb}
         m.dispose(); env.dispose()
         assert status in ok, f'optimize: unexpected status {status}'
         if status in (grb.GRB.OPTIMAL, grb.GRB.USER_OBJ_LIMIT):
-            return ('UNSAT' if lb is not None and lb > 0 else 'SAT'), dt, lb
+            return ('UNSAT' if lb is not None and lb > 0 else 'SAT'), dt, info
         if status == grb.GRB.TIME_LIMIT and n_sol > 0:
-            return 'SAT', dt, lb
-        return 'UNKNOWN', dt, lb
+            return 'SAT', dt, info
+        return 'UNKNOWN', dt, info
 
     # mode == 'score'
     m.setObjective(spec_expr + const, grb.GRB.MINIMIZE)
-    m.optimize()
+    optimize_checked(m)
     status = m.Status
     scores = {}
     lb = None
@@ -946,9 +994,14 @@ def _solve_spec_worker_graph(args):
                     except Exception:
                         pass
     dt = time.perf_counter() - t0
+    info = {**model_info, 'status': status, 'lb': lb, 'scores': scores}
     m.dispose(); env.dispose()
     assert status in ok, f'score: unexpected status {status}'
-    return 'SCORED', dt, (scores, lb)
+    if status == grb.GRB.OPTIMAL and lb is not None and lb > 0:
+        return 'UNSAT', dt, info
+    if status == grb.GRB.OPTIMAL:
+        return 'SAT', dt, info
+    return 'UNKNOWN', dt, info
 
 
 def _racing_escalation_graph_correct(impl, gg_ops, x_lo, x_hi, bounds_by_relu,
@@ -960,14 +1013,15 @@ def _racing_escalation_graph_correct(impl, gg_ops, x_lo, x_hi, bounds_by_relu,
     Bug #4: explicit SAT / UNSAT / UNKNOWN branches, never collapses.
     Uses _solve_spec_worker_graph (Bug #1 safe).
     """
-    bin_schedule = [0]
+    bin_schedule = []
     b = 2
     while b <= len(scored_keys):
         bin_schedule.append(b)
         b *= 2
-    if scored_keys and bin_schedule[-1] < len(scored_keys):
+    if scored_keys and (not bin_schedule or bin_schedule[-1] < len(scored_keys)):
         bin_schedule.append(len(scored_keys))
 
+    levels = []
     opt_threads = max(1, n_cores - 1)
     for n_bins in bin_schedule:
         tl = time_left_fn()
@@ -981,45 +1035,45 @@ def _racing_escalation_graph_correct(impl, gg_ops, x_lo, x_hi, bounds_by_relu,
         pool = multiprocessing.Pool(2)
         async_feas = pool.apply_async(_solve_spec_worker_graph, (feas_args,))
         async_opt = pool.apply_async(_solve_spec_worker_graph, (opt_args,))
+        winner = None
         while True:
             if async_feas.ready():
-                feas_result, feas_dt, _ = async_feas.get()
+                feas_result, feas_dt, feas_info = async_feas.get()
                 pool.terminate(); pool.join()
+                rec = {'n_bins': n_bins, 'winner': 'feas',
+                       'result': feas_result, 'time': feas_dt,
+                       'info': feas_info}
+                levels.append(rec)
                 if feas_result == 'UNSAT':
                     if print_progress:
                         print(f'    Racing bins={n_bins}: '
                               f'feas UNSAT ({feas_dt:.1f}s) → verified')
-                    return True, n_bins
-                if feas_result == 'SAT':
-                    if print_progress:
-                        print(f'    Racing bins={n_bins}: '
-                              f'feas SAT ({feas_dt:.1f}s) → escalate')
-                    break
+                    return True, n_bins, levels
                 if print_progress:
                     print(f'    Racing bins={n_bins}: '
-                          f'feas UNKNOWN ({feas_dt:.1f}s) → escalate')
+                          f'feas {feas_result} ({feas_dt:.1f}s) → escalate')
                 break
             if async_opt.ready():
-                opt_result, opt_dt, opt_lb = async_opt.get()
+                opt_result, opt_dt, opt_info = async_opt.get()
                 pool.terminate(); pool.join()
+                opt_lb = opt_info.get('lb') if isinstance(opt_info, dict) else opt_info
                 lb_s = f'{opt_lb:.4f}' if opt_lb is not None else '?'
+                rec = {'n_bins': n_bins, 'winner': 'opt',
+                       'result': opt_result, 'time': opt_dt,
+                       'lb': opt_lb, 'info': opt_info}
+                levels.append(rec)
                 if opt_result == 'UNSAT':
                     if print_progress:
                         print(f'    Racing bins={n_bins}: '
                               f'opt lb={lb_s} ({opt_dt:.1f}s) → verified')
-                    return True, n_bins
-                if opt_result == 'SAT':
-                    if print_progress:
-                        print(f'    Racing bins={n_bins}: '
-                              f'opt lb={lb_s} ({opt_dt:.1f}s) → escalate')
-                    break
+                    return True, n_bins, levels
                 if print_progress:
                     print(f'    Racing bins={n_bins}: '
                           f'opt lb={lb_s} ({opt_dt:.1f}s) → escalate')
                 break
             time.sleep(0.05)
 
-    return False, bin_schedule[-1] if bin_schedule else 0
+    return False, bin_schedule[-1] if bin_schedule else 0, levels
 
 
 # ---------------------------------------------------------------------------
@@ -1637,7 +1691,7 @@ def _solve_sparse_neuron_graph_worker(args):
     m.setObjective(tv, first)
     m.setParam('BestBdStop',
                 1e-6 if first == grb.GRB.MINIMIZE else -1e-6)
-    m.optimize()
+    optimize_checked(m)
     if m.Status == grb.GRB.TIME_LIMIT:
         any_timeout = True
     try:
@@ -1650,7 +1704,7 @@ def _solve_sparse_neuron_graph_worker(args):
         m.setObjective(tv, second)
         m.setParam('BestBdStop',
                     1e-6 if second == grb.GRB.MINIMIZE else -1e-6)
-        m.optimize()
+        optimize_checked(m)
         if m.Status == grb.GRB.TIME_LIMIT:
             any_timeout = True
         try:
@@ -1683,7 +1737,7 @@ def _probe_sparse_neuron(gg_ops, x_lo, x_hi, bounds_by_relu, target_op_name,
     m.setObjective(tv, grb.GRB.MINIMIZE)
     m.setParam('TimeLimit', sample_timeout)
     t_probe0 = time.perf_counter()
-    m.optimize()
+    optimize_checked(m)
     dt_probe = time.perf_counter() - t_probe0
     status = m.Status
     m.dispose()
@@ -1922,7 +1976,8 @@ def _forward_zonotope_interleaved(
     # _milp_verify._milp_verify's tighten_mode. The per-neuron timeout
     # is `milp_sample_timeout` (default 5 s); there's no separate
     # cumulative budget — we trust the per-probe cap plus sticky mode.
-    tighten_mode = 'probe'
+    init_mode = str(getattr(settings, 'tighten_mode', 'probe'))
+    tighten_mode = init_mode if init_mode in ('probe', 'lp', 'skip') else 'probe'
     lp_per_worker = bool(getattr(settings, 'milp_lp_per_worker', True))
 
     last_use = {}
@@ -2003,8 +2058,10 @@ def _forward_zonotope_interleaved(
                 # back so the LP builder sees them at this layer.
                 bounds_by_relu[li] = (new_lo, new_hi)
 
+                max_layer = getattr(settings, 'max_tighten_layer', None)
                 if (len(after_adapt) > 0 and time_left() > 2
-                        and tighten_mode != 'skip'):
+                        and tighten_mode != 'skip'
+                        and (max_layer is None or li <= int(max_layer))):
                     if _has_merge_before(gg_ops_ser, li):
                         # Sparse per-target-neuron model: one small
                         # Gurobi model per unstable neuron, covering
@@ -2407,92 +2464,218 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         if not still_open_disj:
             return _finalize('verified', 'ld')
 
-    # --- Phase 7: score open queries via LP ---
+    # --- Phase 7: LP score+verify (replaces 7a feasibility + 7b CROWN) ---
+    # One LP solve per query in 'score' mode: minimizes spec objective,
+    # returns (status, lb, scores). If lb > 0 → verified. Otherwise use
+    # the fractional-a scores to seed MILP racing. Fallback to CROWN-based
+    # scoring (ew * frac) if LP times out / no solution.
     remaining_qids = set()
     for di in still_open_disj:
         for qi, _, _ in disj_queries[di]:
             if spec_lbs.get(qi, -1) <= 0:
                 remaining_qids.add(qi)
 
-    with torch.no_grad():
-        _, _, ew_at_relu = _spec_backward_graph(
-            sb, xl_g, xh_g, gg, spec_ew,
-            remaining_qids, nh, device, dtype, return_ew=True)
-
-    # --- Phase 7a: parallel LP feasibility pre-check (fast verify path) ---
-    # Run one worker per open query with feasibility mode. Queries that
-    # return UNSAT are verified immediately via LP; the rest fall through
-    # to scoring + MILP escalation.
     t0 = time.perf_counter()
+    per_query_scored = {}
     still_needs_milp = set()
+    lp_scores_by_query = {}
+    spec_impl = str(getattr(settings, 'spec_impl', 'gen_lp'))
+    gen_lp_device = ('cuda' if (spec_impl == 'gen_lp'
+                                 and torch.cuda.is_available())
+                     else 'cpu')
+    if spec_impl == 'gen_lp' and not torch.cuda.is_available():
+        # gen_lp on CPU works but is slow; fall back to monolithic
+        spec_impl = 'monolithic'
+    gen_lp_state = None
     if remaining_qids and time_left() > 2:
-        n_q = len(remaining_qids)
-        per_worker_threads = max(1, n_cores // max(1, n_q))
-        feas_tl = time_left() * 0.5
-        feas_tasks = []
-        for qi in sorted(remaining_qids):
-            _, q_w, q_bias = queries[qi]
-            feas_tasks.append((
-                'feasibility', impl, gg_ops_ser, x_lo_64, x_hi_64,
-                bounds_by_relu, q_w, q_bias, [], 0, per_worker_threads,
-                feas_tl, gg['input_name']))
-        pool_size = min(n_q, max(1, n_cores // max(1, per_worker_threads)))
-        with multiprocessing.Pool(pool_size) as pool:
-            results = pool.map(_solve_spec_worker_graph, feas_tasks)
-        for qi, (res, dt_feas, _) in zip(sorted(remaining_qids), results):
+        if spec_impl == 'gen_lp':
+            # Precompute the gen LP state once — G matrices and centers as
+            # numpy arrays — reused across all Phase 7 and Phase 8 solves.
+            # This avoids GPU non-determinism causing bit-different constraint
+            # coefficients between calls (the soundness bug source).
+            last_name = gg_ops_ser[-1]['name']
+            t_pre = time.perf_counter()
+            gen_lp_state = verify_gen_lp.precompute_gen_state(
+                gg_ops_ser, x_lo_64, x_hi_64, bounds_by_relu,
+                gg['input_name'], last_name,
+                device=gen_lp_device, dtype=torch.float64,
+                formulation=str(getattr(settings, 'gen_lp_formulation',
+                                          'dense')))
             if print_progress:
-                print(f'  Phase 7a query {qi}: feas={res} ({dt_feas:.1f}s)')
-            if res == 'UNSAT':
-                spec_lbs[qi] = 1.0
-            else:
+                print(f'  Gen LP state precomputed: n_gens={gen_lp_state["n_gens"]}, '
+                      f'unstable={len(gen_lp_state["unstable_list"])} '
+                      f'({time.perf_counter()-t_pre:.2f}s)')
+            # Serial gen_lp solves (GPU can't be shared across procs)
+            lp_tl = min(120.0, time_left() * 0.5)
+            for qi in sorted(remaining_qids):
+                _, q_w, q_bias = queries[qi]
+                res, dt_lp, info = verify_gen_lp.solve_spec(
+                    gg_ops_ser, x_lo_64, x_hi_64, bounds_by_relu,
+                    gg['input_name'], last_name, q_w, q_bias,
+                    milp_set=None, time_limit=lp_tl, n_threads=n_cores,
+                    device=gen_lp_device, state=gen_lp_state)
+                if print_progress:
+                    lb = info.get('lb')
+                    lb_s = f'{lb:+.4f}' if isinstance(lb, float) else 'n/a'
+                    print(f'  Phase 7 query {qi}: {res} ({dt_lp:.1f}s) '
+                          f'lb={lb_s} vars={info["n_vars"]}')
+                    details.setdefault('phase7', {})[qi] = {
+                        'result': res, 'time': dt_lp, 'info': info}
+                if res == 'UNSAT':
+                    spec_lbs[qi] = 1.0
+                    continue
                 still_needs_milp.add(qi)
+                if info.get('scores'):
+                    lp_scores_by_query[qi] = info['scores']
+        else:
+            # Monolithic (old behavior)
+            n_q = len(remaining_qids)
+            per_worker_threads = n_cores if n_q == 1 else 1
+            lp_tl = min(120.0, time_left() * 0.5)
+            tasks = []
+            for qi in sorted(remaining_qids):
+                _, q_w, q_bias = queries[qi]
+                tasks.append((
+                    'score', impl, gg_ops_ser, x_lo_64, x_hi_64,
+                    bounds_by_relu, q_w, q_bias, [], 0, per_worker_threads,
+                    lp_tl, gg['input_name']))
+            pool_size = min(n_q, n_cores)
+            with multiprocessing.Pool(pool_size) as pool:
+                results = pool.map(_solve_spec_worker_graph, tasks)
+            for qi, (res, dt_lp, info) in zip(sorted(remaining_qids), results):
+                if print_progress:
+                    lb = info.get('lb') if isinstance(info, dict) else None
+                    lb_s = f'{lb:+.4f}' if isinstance(lb, float) else 'n/a'
+                    st = info.get('status', '?') if isinstance(info, dict) else '?'
+                    print(f'  Phase 7 query {qi}: {res} ({dt_lp:.1f}s) '
+                          f'lb={lb_s} status={st}')
+                    details.setdefault('phase7', {})[qi] = {
+                        'result': res, 'time': dt_lp, 'info': info}
+                if res == 'UNSAT':
+                    spec_lbs[qi] = 1.0
+                    continue
+                still_needs_milp.add(qi)
+                if isinstance(info, dict) and info.get('scores'):
+                    lp_scores_by_query[qi] = info['scores']
     else:
         still_needs_milp = set(remaining_qids)
-    timing['phase7_feasibility'] = time.perf_counter() - t0
+    timing['phase7_lp_score'] = time.perf_counter() - t0
 
-    # --- Phase 7b: seed MILP scores from CROWN ew + zono width ---
-    # When the LP didn't finish in phase 7a (all 5 queries timed out), the
-    # scoring LP will also time out. Use the cheap CROWN-derived estimate
-    # directly; the true LP-fractional scoring can come back later once
-    # we have a tighter bound store.
-    per_query_scored = {}
-    t0 = time.perf_counter()
+    # Fallback CROWN ew*frac scoring for queries that didn't get LP scores
+    need_ew = [qi for qi in still_needs_milp if qi not in lp_scores_by_query]
+    if need_ew:
+        with torch.no_grad():
+            _, _, ew_at_relu = _spec_backward_graph(
+                sb, xl_g, xh_g, gg, spec_ew, set(need_ew), nh,
+                device, dtype, return_ew=True)
+    else:
+        ew_at_relu = {}
+
     for qi in sorted(still_needs_milp):
-        q_ew = ew_at_relu.get(qi, {})
-        q_scores = {}
-        for li in range(nh):
-            lo_l, hi_l = bounds_by_relu[li]
-            unstable = np.where((lo_l < 0) & (hi_l > 0))[0]
-            if li in q_ew:
-                ew = np.abs(q_ew[li])
-                for i in unstable:
-                    ew_i = float(ew[i]) if i < len(ew) else 1.0
-                    frac = float(hi_l[i]) * abs(float(lo_l[i])) / float(
-                        hi_l[i] - lo_l[i])
-                    q_scores[(li, int(i))] = ew_i * frac
-            else:
-                for i in unstable:
-                    q_scores[(li, int(i))] = float(hi_l[i]) * abs(float(lo_l[i])) / 2
+        if qi in lp_scores_by_query:
+            scores = lp_scores_by_query[qi]
+        else:
+            scores = {}
+            q_ew = ew_at_relu.get(qi, {})
+            for li in range(nh):
+                lo_l, hi_l = bounds_by_relu[li]
+                unstable = np.where((lo_l < 0) & (hi_l > 0))[0]
+                if li in q_ew:
+                    ew = np.abs(q_ew[li])
+                    for i in unstable:
+                        ew_i = float(ew[i]) if i < len(ew) else 1.0
+                        frac = float(hi_l[i]) * abs(float(lo_l[i])) / float(
+                            hi_l[i] - lo_l[i])
+                        scores[(li, int(i))] = ew_i * frac
+                else:
+                    for i in unstable:
+                        scores[(li, int(i))] = float(hi_l[i]) * abs(float(lo_l[i])) / 2
         per_query_scored[qi] = sorted(
-            q_scores.keys(), key=lambda k: q_scores[k], reverse=True)
-    timing['phase7_score'] = time.perf_counter() - t0
+            scores.keys(), key=lambda k: scores[k], reverse=True)
 
-    # --- Phase 8: MILP racing escalation (correct worker, Bug #1 safe) ---
+    # --- Phase 8: MILP racing escalation ---
     t_phase8 = time.perf_counter()
-    for qi in sorted(still_needs_milp):
-        if time_left() <= 0:
-            break
-        _, q_w, q_bias = queries[qi]
-        scored_keys = per_query_scored.get(qi, [])
-        if print_progress:
-            print(f'  MILP query {qi} (disjunct {queries[qi][0]}):')
-        verified, _ = _racing_escalation_graph_correct(
-            impl, gg_ops_ser, x_lo_64, x_hi_64, bounds_by_relu,
-            q_w, q_bias, scored_keys, n_cores, time_left,
-            gg['input_name'], print_progress)
-        if verified:
-            spec_lbs[qi] = 1.0
+    milp_witness = None
+    if spec_impl == 'gen_lp' and still_needs_milp:
+        # Parallel racing across open queries; within each query,
+        # sequential bin escalation with early termination on UNSAT.
+        query_specs = []
+        for qi in sorted(still_needs_milp):
+            _, q_w, q_bias = queries[qi]
+            scored_keys = per_query_scored.get(qi, [])
+            query_specs.append((qi, q_w, q_bias, scored_keys))
+        import os as _os
+        _dbg_save = _os.environ.get('GEN_LP_SAVE_STATE')
+        if _dbg_save:
+            import pickle
+            with open(_dbg_save, 'wb') as _f:
+                pickle.dump({'state': gen_lp_state,
+                             'query_specs': query_specs,
+                             'gg_ops_ser': gg_ops_ser,
+                             'x_lo_64': x_lo_64,
+                             'x_hi_64': x_hi_64,
+                             'bounds_by_relu': bounds_by_relu,
+                             'input_name': gg['input_name'],
+                             'last_name': gg_ops_ser[-1]['name']}, _f)
+            print(f'  [debug] saved gen_lp_state + query_specs to {_dbg_save}')
+        raw = verify_gen_lp.parallel_query_racing(
+            gen_lp_state, query_specs,
+            time_left_fn=time_left,
+            n_threads_total=n_cores,
+            print_progress=False)
+        for qi, verdict, race_levels, witness in raw:
+            if print_progress:
+                print(f'  MILP query {qi} (disjunct {queries[qi][0]}):')
+                for lv in race_levels:
+                    lb = lv.get('lb')
+                    lb_s = f'{lb:+.4f}' if isinstance(lb, float) else 'n/a'
+                    print(f'    Racing bins={lv["n_bins"]}: '
+                          f'{lv["result"]} lb={lb_s} ({lv["time"]:.1f}s)')
+                n_bins_used = (race_levels[-1]['n_bins']
+                               if race_levels else 0)
+                details.setdefault('racing', {})[qi] = {
+                    'verified': verdict == 'unsat', 'n_bins': n_bins_used,
+                    'levels': race_levels}
+            if verdict == 'unsat':
+                spec_lbs[qi] = 1.0
+            elif verdict == 'sat' and witness is not None \
+                    and milp_witness is None:
+                # Validate witness against the full spec.
+                y = verify_gen_lp.forward_point(
+                    gg_ops_ser, witness, gg['input_name'],
+                    gg_ops_ser[-1]['name'])
+                _, check_details = spec.check(y, y)
+                worst = check_details.get('worst_margin', 0.0)
+                if worst < 0:
+                    milp_witness = witness
+                    if print_progress:
+                        print(f'  MILP query {qi} found SAT witness '
+                              f'(worst margin {worst:+.6f})')
+    else:
+        for qi in sorted(still_needs_milp):
+            if time_left() <= 0:
+                break
+            _, q_w, q_bias = queries[qi]
+            scored_keys = per_query_scored.get(qi, [])
+            if print_progress:
+                print(f'  MILP query {qi} (disjunct {queries[qi][0]}):')
+            verified, n_bins_used, race_levels = \
+                _racing_escalation_graph_correct(
+                    impl, gg_ops_ser, x_lo_64, x_hi_64, bounds_by_relu,
+                    q_w, q_bias, scored_keys, n_cores, time_left,
+                    gg['input_name'], print_progress)
+            if print_progress:
+                details.setdefault('racing', {})[qi] = {
+                    'verified': verified, 'n_bins': n_bins_used,
+                    'levels': race_levels}
+            if verified:
+                spec_lbs[qi] = 1.0
     timing['phase8_milp'] = time.perf_counter() - t_phase8
+
+    # If the gen_lp path found a true counterexample from a MILP integer
+    # solution, short-circuit to SAT before running final PGD.
+    if milp_witness is not None:
+        return _finalize('sat', 'spec_milp', witness=milp_witness)
 
     verified_disj = {di for di, qlist in disj_queries.items()
                       if all(spec_lbs.get(qi, -1) > 0 for qi, _, _ in qlist)}

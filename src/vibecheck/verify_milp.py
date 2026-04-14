@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .settings import default_settings, resolve_torch
+from .gurobi_util import optimize_checked
 
 
 class VerifyStats:
@@ -831,7 +832,7 @@ def _solve_neuron(args):
         model.setObjective(target_var, grb.GRB.MAXIMIZE)
 
     t0 = time.perf_counter()
-    model.optimize()
+    optimize_checked(model)
     dt = time.perf_counter() - t0
 
     timed_out = model.status == 9
@@ -938,7 +939,7 @@ def _solve_neuron_both(args):
         model.setParam('BestBdStop', 1e-6)  # stop if lb > 0 (proven active)
     else:
         model.setParam('BestBdStop', -1e-6)  # stop if ub < 0 (proven dead)
-    model.optimize()
+    optimize_checked(model)
     if model.status == 9:
         any_timeout = True
     try:
@@ -964,7 +965,7 @@ def _solve_neuron_both(args):
         model.setParam('BestBdStop', 1e-6)
     else:
         model.setParam('BestBdStop', -1e-6)
-    model.optimize()
+    optimize_checked(model)
     if model.status == 9:
         any_timeout = True
     try:
@@ -1434,7 +1435,7 @@ def _solve_spec_worker(args):
     if mode == 'feasibility':
         m.addConstr(spec_expr + b_diff <= 0, 'spec_leq0')
         m.update()
-        m.optimize()
+        optimize_checked(m)
         dt = time.perf_counter() - t0
         if m.Status == 2:
             result = 'SAT'
@@ -1449,7 +1450,7 @@ def _solve_spec_worker(args):
         m.setParam('BestBdStop', 0.0)
         m.setObjective(spec_expr + b_diff, grb.GRB.MINIMIZE)
         m.update()
-        m.optimize()
+        optimize_checked(m)
         dt = time.perf_counter() - t0
         lb = None
         if m.Status in (2, 15):
@@ -1819,7 +1820,7 @@ def _tighten_neuron_graph(args):
         else:
             m.setObjective(tv, grb.GRB.MAXIMIZE)
             m.setParam('BestBdStop', -1e-6)
-        m.optimize()
+        optimize_checked(m)
         try:
             b = m.ObjBound
         except Exception:
@@ -1838,7 +1839,7 @@ def _tighten_neuron_graph(args):
             else:
                 m.setObjective(tv, grb.GRB.MINIMIZE)
                 m.setParam('BestBdStop', 1e-6)
-            m.optimize()
+            optimize_checked(m)
             try:
                 b = m.ObjBound
             except Exception:
@@ -2076,7 +2077,7 @@ def _solve_spec_graph_worker(args):
 
     if mode == 'feasibility':
         m.addConstr(spec_expr + float(query_bias) <= 0)
-        m.update(); m.optimize()
+        m.update(); optimize_checked(m)
         dt = time.perf_counter() - t0
         result = ('SAT' if m.Status == 2 else
                   'UNSAT' if m.Status == 3 else 'UNKNOWN')
@@ -2085,7 +2086,7 @@ def _solve_spec_graph_worker(args):
     elif mode == 'score':
         # Solve LP, extract fractional scores for scoring neurons
         m.setObjective(spec_expr + float(query_bias), grb.GRB.MINIMIZE)
-        m.update(); m.optimize()
+        m.update(); optimize_checked(m)
         dt = time.perf_counter() - t0
         scores = {}
         if m.Status == 2:
@@ -2113,7 +2114,7 @@ def _solve_spec_graph_worker(args):
     else:
         m.setParam('BestBdStop', 0.0)
         m.setObjective(spec_expr + float(query_bias), grb.GRB.MINIMIZE)
-        m.update(); m.optimize()
+        m.update(); optimize_checked(m)
         dt = time.perf_counter() - t0
         lb = None
         if m.Status in (2, 15):
@@ -2519,7 +2520,7 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
             cm.setObjective(cm.getVars()[tvars[probe_j].index], grb.GRB.MINIMIZE)
             cm.setParam('TimeLimit', sample_timeout)
             t_probe = time.perf_counter()
-            cm.optimize()
+            optimize_checked(cm)
             dt_probe = time.perf_counter() - t_probe
             timed_out = cm.Status == 9
             cm.dispose()
@@ -3029,7 +3030,7 @@ def milp_verify(graph, spec, settings=None):
                 layers_np, x_lo_64, x_hi_64, bounds_np, pred, comp,
                 milp_neurons=set(), n_threads=1)
             lp_m.setParam('TimeLimit', min(30, time_left()))
-            lp_m.optimize()
+            optimize_checked(lp_m)
             dt_lp = time.perf_counter() - t_lp0
 
             if lp_m.status == 2:

@@ -18,6 +18,7 @@ bound on the spec query.
 import numpy as np
 
 from .verify_milp import _conv_connections
+from .gurobi_util import optimize_checked
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +670,7 @@ def _solve_subproblem(refs, timeout):
 
     m = refs['model']
     m.setParam('TimeLimit', float(timeout))
-    m.optimize()
+    optimize_checked(m)
     status = m.Status
     assert status in (
         grb.GRB.OPTIMAL, grb.GRB.SUBOPTIMAL, grb.GRB.TIME_LIMIT,

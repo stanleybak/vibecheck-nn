@@ -50,6 +50,12 @@ The codebase uses **object-oriented dispatch**: each ONNX op type is a `GraphNod
 
 - **`main.py`** — CLI entry point. Exit code 0 = verified, 1 = unknown.
 
+- **`gurobi_util.py`** — `optimize_checked(model, user_callback=None)` wraps `model.optimize()` with a message callback that scans for numeric-trouble warnings (`Markowitz tolerance tightened`, `variables dropped from basis`, `switch to quad precision`, `max constraint violation`). Raises `GurobiNumericTrouble` if any are captured.
+
+## Gurobi solve convention
+
+**Never call `model.optimize()` directly.** Always use `optimize_checked(model)` from `gurobi_util.py` (or pass a callback via its `user_callback=` argument if the caller also needs MESSAGE/MIPNODE events). Rationale: on numerically fragile models (e.g., the dense gen-LP formulation on deep conv nets), Gurobi can silently certify wrong bounds — `NumericFocus=2` has been observed to return `ObjBound=+0.034` on a problem whose true bound is `-0.355`, with no queryable attribute flagging the issue. The log-stream warnings captured by `optimize_checked` are the only reliable signal, and raising on them turns silent soundness failures into loud errors. Callers that genuinely want to tolerate trouble (e.g., a tightening pass that will re-solve with sparser formulation on failure) should catch `GurobiNumericTrouble` explicitly.
+
 ## Testing
 
 Tests use pytest. Unit tests cover zonotope math and individual op propagation. Integration tests load real ONNX networks from vnncomp benchmarks (discovered via `instances.csv`), run point propagation, and validate against onnxruntime. On soundness failure, per-node comparison identifies the divergent op. External benchmark paths configured in `tests/paths.yaml` (gitignored, template at `tests/paths.yaml.template`).

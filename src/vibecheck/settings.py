@@ -27,7 +27,10 @@ def default_settings(**overrides):
         milp_tighten_parallel=True,     # parallel workers vs sequential
         milp_tighten_rebuild=False,     # rebuild model per worker vs copy shared
         milp_lp_encoding='compact',     # 'compact' (1 var, 2 constrs) or 'zas' (3 vars, 5 constrs)
-        graph_impl='optimized',         # 'reference' or 'optimized' for verify_graph builder
+        graph_impl='optimized',         # 'reference' or 'optimized' for verify_graph builder (Phase 1)
+        spec_impl='gen_lp',             # 'gen_lp' (generator-based GPU) or 'monolithic' for Phase 7/8
+        gen_lp_formulation='sparse',    # 'dense' or 'sparse' (applies when spec_impl='gen_lp'); sparse cuts at the last hidden ReLU to avoid numeric trouble
+        max_tighten_layer=None,         # if set, only Phase 1 tightens layers <= this idx
         # Callback: called at key points with (event, info) -> bool (False = stop)
         milp_callback=None,
         # Lagrangian-decomposition solver (off by default; gated path in _run_pipeline)
