@@ -21,9 +21,9 @@ def main():
     parser.add_argument('--spec', required=True, help='Path to VNNLIB specification')
     parser.add_argument('--dtype', default='float32', choices=list(_DTYPES),
                         help='Computation dtype (default: float32)')
-    parser.add_argument('--mode', default='zonotope',
+    parser.add_argument('--mode', default='graph',
                         choices=['zonotope', 'bnb', 'milp', 'graph'],
-                        help='Verification mode (default: zonotope)')
+                        help='Verification mode (default: graph)')
     parser.add_argument('--device', default='gpu', choices=['cpu', 'gpu'],
                         help='Device for BnB mode (default: gpu)')
     parser.add_argument('--bits', type=int, default=32, choices=[16, 32, 64],
@@ -61,6 +61,7 @@ def main():
             bnb_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        graph.optimize(settings)
         print(f'Running BnB verification (device={args.device}, '
               f'bits={args.bits}, order={args.bnb_order})...')
         result, details = zonotope_bnb_verify(graph, spec, settings)
@@ -73,6 +74,7 @@ def main():
             total_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        graph.optimize(settings)
         print(f'Running MILP verification (device={args.device}, '
               f'timeout={args.timeout}s)...')
         result, details = milp_verify(graph, spec, settings)
@@ -85,6 +87,7 @@ def main():
             total_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        graph.optimize(settings)
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, timeout={args.timeout}s)...')
         result, details = verify_graph(graph, spec, settings)
@@ -109,7 +112,8 @@ def main():
         if phase_timing:
             parts = [f'{k.replace("phase", "p").split("_", 1)[0]}={v:.2f}s'
                      if k.startswith('phase') else f'{k}={v:.2f}s'
-                     for k, v in phase_timing.items()]
+                     for k, v in phase_timing.items()
+                     if isinstance(v, (int, float))]
             print('  Timing: ' + '  '.join(parts))
         n_splits = details.get('n_splits', {})
         if n_splits:

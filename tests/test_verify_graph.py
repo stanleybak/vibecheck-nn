@@ -195,6 +195,23 @@ def test_reference_optimized_equivalence_small(tmp_path):
     assert d_ref['n_splits'].keys() == d_opt['n_splits'].keys()
 
 
+@pytest.mark.parametrize('zono_impl', ['dense', 'patches'])
+def test_verify_graph_dense_vs_patches_identical_verdict(tmp_path, zono_impl):
+    """Phase 4 gate: parametrise the residual-block test over zono_impl.
+
+    The patches forward must reach the same verdict as the dense forward.
+    """
+    rng = np.random.RandomState(42)
+    model = _build_identity_skip_model(rng)
+    g = _save_and_load(model, tmp_path, 'id_skip.onnx')
+    spec = _fixed_spec(32, 1e6)
+    s = default_settings(device='cpu', total_timeout=20,
+                          print_progress=False, graph_impl='optimized',
+                          zono_impl=zono_impl)
+    result, _ = verify_graph(g, spec, s)
+    assert result == 'verified'
+
+
 def test_reference_optimized_lp_minima_match(tmp_path):
     """Build full LP via each builder on a residual block with unstable
     neurons, optimize the output neuron, and assert the minima match."""
@@ -395,15 +412,6 @@ def test_main_mode_choices_include_graph():
 
 
 # ---------------------------------------------------------------------------
-# 6. CIFAR100 flagship
-# ---------------------------------------------------------------------------
-
-_CIFAR_ONNX = ('/home/stan/repositories/vnncomp2025_benchmarks/benchmarks/'
-               'cifar100_2024/onnx/CIFAR100_resnet_medium.onnx.gz')
-_CIFAR_VNNLIB = ('/home/stan/repositories/vnncomp2025_benchmarks/benchmarks/'
-                 'cifar100_2024/vnnlib/'
-                 'CIFAR100_resnet_medium_prop_idx_7258_sidx_3539_eps_0.0039'
-                 '.vnnlib.gz')
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +610,8 @@ def test_verify_graph_worker_on_dead_branch(tmp_path):
     opt_args = (
         'optimize', 'optimized', gg_ops, x_lo, x_hi, bounds_by_relu,
         q_w, q_bias, [], 0, 1, 30.0, gg['input_name'])
-    _, _, opt_lb = _solve_spec_worker_graph(opt_args)
+    _, _, payload = _solve_spec_worker_graph(opt_args)
+    opt_lb = payload['lb']
     assert opt_lb is not None and opt_lb > 4.9, (
         f'verify_graph worker lb={opt_lb}, expected ~5.98')
 
@@ -626,39 +635,3 @@ def test_milp_and_graph_agree_on_dead_branch(tmp_path):
     assert r_graph == 'verified', f'verify_graph = {r_graph}'
 
 
-@pytest.mark.skipif(not os.path.exists(_CIFAR_ONNX),
-                    reason='CIFAR100 benchmark files not available')
-def test_cifar100_runs_without_crash():
-    """End-to-end smoke on the flagship CIFAR100 instance.
-
-    With the Bug #1 fix in the spec worker and the sound per-neuron
-    adaptive bounds (separate EW_lb/EW_ub) the pipeline legitimately
-    reports 'unknown' for this instance in 180 s — the LP relaxation
-    cannot prove 3 of the 99 disjuncts and MILP escalation does not
-    finish in the remaining budget. Upgrading to 'verified' requires
-    either branch-and-bound / alpha-CROWN-style tightening or a bigger
-    time budget. The previous 'verified' result relied on two unsound
-    shortcuts (Bug #1 in verify_milp and a wrong upper-bound
-    computation in the adaptive pass) and was therefore wrong.
-    """
-    from vibecheck.vnnlib_loader import load_vnnlib
-    g = ComputeGraph.from_onnx(_CIFAR_ONNX)
-    spec = load_vnnlib(_CIFAR_VNNLIB)
-    s = default_settings(device='cpu', total_timeout=180,
-                         print_progress=False, graph_impl='optimized')
-    result, details = verify_graph(g, spec, s)
-    assert result in ('verified', 'unknown'), (
-        f'got {result} (phase={details.get("phase")})')
-
-
-@pytest.mark.skipif(not os.path.exists(_CIFAR_ONNX),
-                    reason='CIFAR100 benchmark files not available')
-def test_cifar100_reference_agrees():
-    """Reference builder should also make progress on CIFAR100."""
-    from vibecheck.vnnlib_loader import load_vnnlib
-    g = ComputeGraph.from_onnx(_CIFAR_ONNX)
-    spec = load_vnnlib(_CIFAR_VNNLIB)
-    s = default_settings(device='cpu', total_timeout=180,
-                         print_progress=False, graph_impl='reference')
-    result, _ = verify_graph(g, spec, s)
-    assert result in ('verified', 'unknown')

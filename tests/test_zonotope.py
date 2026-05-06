@@ -329,3 +329,367 @@ def test_f32_vs_f64_bounds_close():
     lo64, hi64 = z64.bounds()
     np.testing.assert_allclose(lo32, lo64, atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(hi32, hi64, atol=1e-5, rtol=1e-5)
+
+
+# -------------------------------------------------------------
+# TorchZonotope 4D-native representation tests
+# -------------------------------------------------------------
+
+import torch
+from vibecheck.zonotope import TorchZonotope
+
+
+def _build_pair(n, K, C, H, W, seed=0):
+    """Return (z_old_path, z_new_path) — both (n=C*H*W, K) generators.
+
+    z_old_path forces the 2D representation by touching `.generators`
+    after each op, whereas z_new_path keeps the native 4D form.
+    """
+    assert n == C * H * W
+    rng = torch.Generator().manual_seed(seed)
+    center = torch.randn(n, dtype=torch.float64, generator=rng)
+    gens = torch.randn(n, K, dtype=torch.float64, generator=rng)
+    return (TorchZonotope(center.clone(), gens.clone()),
+            TorchZonotope(center.clone(), gens.clone()))
+
+
+def test_torch_zono_4d_conv_matches_2d():
+    """After one conv, the 4D-native and 2D-forced paths produce the
+    same generators (mod float round-off)."""
+    C_in, H_in, W_in = 4, 8, 8
+    n = C_in * H_in * W_in
+    K = 6
+    z_new, z_force2d = _build_pair(n, K, C_in, H_in, W_in, seed=1)
+    kernel = torch.randn(3, C_in, 3, 3, dtype=torch.float64)
+    bias = torch.randn(3, dtype=torch.float64)
+    z_new.propagate_conv(kernel, bias, (C_in, H_in, W_in), (1, 1), (1, 1))
+    # 4D should be populated, 2D cache empty
+    assert z_new._gen_4d is not None
+    assert z_new._gen_2d is None
+
+    z_force2d.propagate_conv(kernel, bias, (C_in, H_in, W_in), (1, 1), (1, 1))
+    _ = z_force2d.generators  # force materialization to 2D
+
+    torch.testing.assert_close(z_new.generators, z_force2d.generators,
+                                atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(z_new.center, z_force2d.center)
+
+
+def test_torch_zono_4d_consecutive_convs_stay_in_4d():
+    """A conv→conv chain stays 4D internally and matches a 2D-forced
+    path bit-for-bit up to rounding."""
+    C, H, W = 4, 8, 8
+    n = C * H * W
+    K = 5
+    z_a, z_b = _build_pair(n, K, C, H, W, seed=2)
+    k1 = torch.randn(4, C, 3, 3, dtype=torch.float64)
+    k2 = torch.randn(4, 4, 3, 3, dtype=torch.float64)
+    b1 = torch.randn(4, dtype=torch.float64)
+    b2 = torch.randn(4, dtype=torch.float64)
+    # z_a: native 4D chain
+    z_a.propagate_conv(k1, b1, (C, H, W), (1, 1), (1, 1))
+    z_a.propagate_conv(k2, b2, (4, H, W), (1, 1), (1, 1))
+    assert z_a._gen_4d is not None  # stayed 4D throughout
+    # z_b: force 2D between convs by reading generators
+    z_b.propagate_conv(k1, b1, (C, H, W), (1, 1), (1, 1))
+    _ = z_b.generators
+    z_b.propagate_conv(k2, b2, (4, H, W), (1, 1), (1, 1))
+    torch.testing.assert_close(z_a.generators, z_b.generators,
+                                atol=1e-9, rtol=1e-9)
+
+
+def test_torch_zono_4d_relu_matches_2d():
+    """apply_relu in 4D mode matches the 2D path."""
+    C, H, W = 2, 4, 4
+    n = C * H * W
+    K = 4
+    z_4d, z_2d = _build_pair(n, K, C, H, W, seed=3)
+    kernel = torch.randn(C, C, 3, 3, dtype=torch.float64)
+    bias = torch.randn(C, dtype=torch.float64)
+    z_4d.propagate_conv(kernel, bias, (C, H, W), (1, 1), (1, 1))
+    z_2d.propagate_conv(kernel, bias, (C, H, W), (1, 1), (1, 1))
+    _ = z_2d.generators  # force 2D
+    lo_4d, hi_4d = z_4d.apply_relu()
+    lo_2d, hi_2d = z_2d.apply_relu()
+    torch.testing.assert_close(z_4d.generators, z_2d.generators,
+                                atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(z_4d.center, z_2d.center)
+    torch.testing.assert_close(lo_4d, lo_2d)
+    torch.testing.assert_close(hi_4d, hi_2d)
+
+
+def test_torch_zono_4d_bounds_matches_2d():
+    """bounds() in 4D mode matches the 2D path."""
+    C, H, W = 3, 6, 6
+    n = C * H * W
+    K = 7
+    z_4d, z_2d = _build_pair(n, K, C, H, W, seed=4)
+    kernel = torch.randn(C, C, 3, 3, dtype=torch.float64)
+    bias = torch.randn(C, dtype=torch.float64)
+    z_4d.propagate_conv(kernel, bias, (C, H, W), (1, 1), (1, 1))
+    z_2d.propagate_conv(kernel, bias, (C, H, W), (1, 1), (1, 1))
+    _ = z_2d.generators
+    lo_4d, hi_4d = z_4d.bounds()
+    lo_2d, hi_2d = z_2d.bounds()
+    torch.testing.assert_close(lo_4d, lo_2d)
+    torch.testing.assert_close(hi_4d, hi_2d)
+
+
+def test_torch_zono_4d_relu_appends_unstable_generators():
+    """apply_relu in 4D mode correctly appends new generators for
+    unstable neurons (matching 2D behavior)."""
+    C, H, W = 2, 3, 3
+    n = C * H * W
+    # Construct a zonotope where all neurons are unstable — center 0,
+    # generators are unit vectors — so ReLU will add 18 new generators.
+    center = torch.zeros(n, dtype=torch.float64)
+    gens = 0.5 * torch.eye(n, dtype=torch.float64)  # n×n
+    z_4d = TorchZonotope(center.clone(), gens.clone())
+    z_2d = TorchZonotope(center.clone(), gens.clone())
+    # Force z_4d into 4D form by running a passthrough conv (identity 1×1)
+    identity = torch.zeros(C, C, 1, 1, dtype=torch.float64)
+    for i in range(C):
+        identity[i, i, 0, 0] = 1.0
+    z_4d.propagate_conv(identity, torch.zeros(C, dtype=torch.float64),
+                         (C, H, W), (1, 1), (0, 0))
+    _ = z_4d.generators  # materialize to 2D for comparison later
+    # Rebuild 4D state so apply_relu uses the 4D path
+    z_4d._gen_4d = z_4d._gen_2d.t().contiguous().reshape(n, C, H, W)
+    z_4d._gen_2d = None
+    z_4d.apply_relu()
+    z_2d.apply_relu()
+    torch.testing.assert_close(z_4d.generators, z_2d.generators,
+                                atol=1e-9, rtol=1e-9)
+
+
+def test_torch_zono_copy_preserves_mode():
+    """copy() preserves whichever form (2D or 4D) is currently active."""
+    C, H, W = 2, 4, 4
+    n = C * H * W
+    z = TorchZonotope(
+        torch.randn(n, dtype=torch.float64),
+        torch.randn(n, 5, dtype=torch.float64))
+    kernel = torch.randn(C, C, 3, 3, dtype=torch.float64)
+    z.propagate_conv(kernel, torch.zeros(C, dtype=torch.float64),
+                     (C, H, W), (1, 1), (1, 1))
+    assert z._gen_4d is not None
+    z_copy = z.copy()
+    assert z_copy._gen_4d is not None
+    assert z_copy._gen_2d is None
+    torch.testing.assert_close(z_copy._gen_4d, z._gen_4d)
+    # Independence: mutating the copy does not affect the original.
+    z_copy._gen_4d.fill_(0.0)
+    assert not torch.allclose(z._gen_4d, torch.zeros_like(z._gen_4d))
+
+
+def test_torch_zono_4d_end_to_end_conv_relu_conv_matches_2d():
+    """Full conv→relu→conv chain. End result generators match."""
+    C, H, W = 3, 8, 8
+    n = C * H * W
+    K = 6
+    z_a, z_b = _build_pair(n, K, C, H, W, seed=7)
+    k1 = torch.randn(4, C, 3, 3, dtype=torch.float64)
+    k2 = torch.randn(4, 4, 3, 3, dtype=torch.float64)
+    b1 = torch.randn(4, dtype=torch.float64)
+    b2 = torch.randn(4, dtype=torch.float64)
+
+    # z_a: native 4D
+    z_a.propagate_conv(k1, b1, (C, H, W), (1, 1), (1, 1))
+    z_a.apply_relu()
+    z_a.propagate_conv(k2, b2, (4, H, W), (1, 1), (1, 1))
+
+    # z_b: force 2D between every op
+    z_b.propagate_conv(k1, b1, (C, H, W), (1, 1), (1, 1))
+    _ = z_b.generators
+    z_b.apply_relu()
+    _ = z_b.generators
+    z_b.propagate_conv(k2, b2, (4, H, W), (1, 1), (1, 1))
+
+    torch.testing.assert_close(z_a.generators, z_b.generators,
+                                atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(z_a.center, z_b.center)
+
+
+def test_torch_zono_get_gen_row_4d_no_materialization():
+    """`get_gen_row` on a 4D zonotope returns the correct row without
+    collapsing the 4D cache to 2D."""
+    C, H, W = 3, 4, 5
+    n = C * H * W
+    K = 6
+    rng = torch.Generator().manual_seed(7)
+    center = torch.randn(n, dtype=torch.float64, generator=rng)
+    gens = torch.randn(n, K, dtype=torch.float64, generator=rng)
+    z = TorchZonotope(center.clone(), gens.clone())
+    # Force 4D state via identity conv.
+    identity = torch.zeros(C, C, 1, 1, dtype=torch.float64)
+    for i in range(C):
+        identity[i, i, 0, 0] = 1.0
+    z.propagate_conv(identity, torch.zeros(C, dtype=torch.float64),
+                     (C, H, W), (1, 1), (0, 0))
+    assert z._gen_4d is not None
+    row = z.get_gen_row(7)  # arbitrary flat neuron
+    assert z._gen_4d is not None  # still 4D
+    assert z._gen_2d is None
+    # Cross-check against the 2D materialized form.
+    gens_2d = z.generators
+    torch.testing.assert_close(row, gens_2d[7, :], atol=0, rtol=0)
+
+
+def test_torch_zono_get_gen_row_2d():
+    """`get_gen_row` returns a row slice when generators are 2D."""
+    n, K = 5, 4
+    rng = torch.Generator().manual_seed(11)
+    center = torch.randn(n, dtype=torch.float64, generator=rng)
+    gens = torch.randn(n, K, dtype=torch.float64, generator=rng)
+    z = TorchZonotope(center, gens)
+    assert z._gen_4d is None
+    torch.testing.assert_close(z.get_gen_row(2), gens[2, :], atol=0, rtol=0)
+
+
+# -------------------------------------------------------------
+# TorchZonotope.add — fast (in-place, K_b==shared) vs slow (new alloc).
+# Verifies that the in-place fast path produces bit-identical output to
+# the slow path used when K_b > shared_gens.
+# -------------------------------------------------------------
+
+def _slow_add_reference(a_center, a_gens, b_center, b_gens, shared_gens):
+    """Reference implementation: always the slow/allocating path.
+    Used to check the fast in-place path agrees column-for-column.
+    """
+    n = a_gens.shape[0]
+    K_a, K_b = a_gens.shape[1], b_gens.shape[1]
+    K_out = K_a + K_b - shared_gens
+    out = torch.empty(n, K_out, dtype=a_gens.dtype)
+    out[:, :shared_gens] = a_gens[:, :shared_gens] + b_gens[:, :shared_gens]
+    if K_a > shared_gens:
+        out[:, shared_gens:K_a] = a_gens[:, shared_gens:]
+    if K_b > shared_gens:
+        out[:, K_a:] = b_gens[:, shared_gens:]
+    return a_center + b_center, out
+
+
+def test_torch_zonotope_add_fast_path_Kb_equals_shared():
+    """K_b == shared_gens — this triggers the fast in-place path.
+
+    The returned zonotope must match the slow-path reference column-for-column
+    AND must BE `self` (in-place mutation: `add` returned the z_a instance).
+    """
+    rng = torch.Generator().manual_seed(17)
+    n, shared = 50, 30
+    K_a_extra = 20
+    K_a = shared + K_a_extra
+    K_b = shared  # skip-branch has no extras — triggers fast path
+
+    c_a = torch.randn(n, dtype=torch.float64, generator=rng)
+    c_b = torch.randn(n, dtype=torch.float64, generator=rng)
+    G_shared_a = torch.randn(n, shared, dtype=torch.float64, generator=rng)
+    G_a_extra = torch.randn(n, K_a_extra, dtype=torch.float64, generator=rng)
+    G_a = torch.cat([G_shared_a, G_a_extra], dim=1)
+    # Branch B inherits the shared prefix from the fork — *different values*
+    # than A in those columns (because A went through convs too, but we
+    # simulate that by using arbitrary values), still aligned col-for-col.
+    G_shared_b = torch.randn(n, shared, dtype=torch.float64, generator=rng)
+    G_b = G_shared_b
+
+    # Reference (slow path).
+    ref_center, ref_gens = _slow_add_reference(c_a, G_a, c_b, G_b, shared)
+
+    # Fast path.
+    z_a = TorchZonotope(c_a.clone(), G_a.clone())
+    z_b = TorchZonotope(c_b.clone(), G_b.clone())
+    merged = z_a.add(z_b, shared)
+
+    # Bit-identical to reference.
+    torch.testing.assert_close(merged.center, ref_center, atol=0, rtol=0)
+    torch.testing.assert_close(merged.generators, ref_gens, atol=0, rtol=0)
+    # Output is the mutated self (in-place fast path).
+    assert merged is z_a
+    # b is untouched.
+    torch.testing.assert_close(z_b.generators, G_b, atol=0, rtol=0)
+
+
+def test_torch_zonotope_add_slow_path_both_branches_have_extras():
+    """K_a > shared AND K_b > shared — the slow path must run (new allocation).
+
+    The result must NOT be self (slow path returns a fresh TorchZonotope).
+    """
+    rng = torch.Generator().manual_seed(19)
+    n, shared = 50, 30
+    K_a_extra, K_b_extra = 20, 10
+    K_a, K_b = shared + K_a_extra, shared + K_b_extra
+
+    c_a = torch.randn(n, dtype=torch.float64, generator=rng)
+    c_b = torch.randn(n, dtype=torch.float64, generator=rng)
+    G_a = torch.randn(n, K_a, dtype=torch.float64, generator=rng)
+    G_b = torch.randn(n, K_b, dtype=torch.float64, generator=rng)
+
+    ref_center, ref_gens = _slow_add_reference(c_a, G_a, c_b, G_b, shared)
+
+    z_a = TorchZonotope(c_a.clone(), G_a.clone())
+    z_b = TorchZonotope(c_b.clone(), G_b.clone())
+    merged = z_a.add(z_b, shared)
+
+    torch.testing.assert_close(merged.center, ref_center, atol=0, rtol=0)
+    torch.testing.assert_close(merged.generators, ref_gens, atol=0, rtol=0)
+    # Slow path: result is a fresh object, not `self`.
+    assert merged is not z_a
+    # a and b unchanged.
+    torch.testing.assert_close(z_a.generators, G_a, atol=0, rtol=0)
+    torch.testing.assert_close(z_b.generators, G_b, atol=0, rtol=0)
+
+
+def test_torch_zonotope_add_shared_gens_zero():
+    """shared_gens == 0 — both branches are fully branch-specific (disjoint
+    noise symbols). K_b == 0 triggers the fast path (K_b == shared); K_b > 0
+    with shared=0 triggers slow path."""
+    rng = torch.Generator().manual_seed(23)
+    n, K_a = 40, 15
+
+    c_a = torch.randn(n, dtype=torch.float64, generator=rng)
+    c_b = torch.randn(n, dtype=torch.float64, generator=rng)
+    G_a = torch.randn(n, K_a, dtype=torch.float64, generator=rng)
+
+    # Case 1: K_b == 0 == shared (degenerate "empty skip" — fast path).
+    G_b = torch.zeros(n, 0, dtype=torch.float64)
+    z_a = TorchZonotope(c_a.clone(), G_a.clone())
+    z_b = TorchZonotope(c_b.clone(), G_b)
+    merged = z_a.add(z_b, 0)
+    torch.testing.assert_close(merged.center, c_a + c_b, atol=0, rtol=0)
+    torch.testing.assert_close(merged.generators, G_a, atol=0, rtol=0)
+    assert merged is z_a
+
+    # Case 2: K_b > 0 with shared==0 (no shared prefix — slow path).
+    K_b = 8
+    G_b = torch.randn(n, K_b, dtype=torch.float64, generator=rng)
+    z_a = TorchZonotope(c_a.clone(), G_a.clone())
+    z_b = TorchZonotope(c_b.clone(), G_b.clone())
+    merged = z_a.add(z_b, 0)
+    ref_center, ref_gens = _slow_add_reference(c_a, G_a, c_b, G_b, 0)
+    torch.testing.assert_close(merged.center, ref_center, atol=0, rtol=0)
+    torch.testing.assert_close(merged.generators, ref_gens, atol=0, rtol=0)
+    assert merged is not z_a
+
+
+def test_torch_zonotope_add_Ka_equals_shared_Kb_equals_shared():
+    """K_a == K_b == shared — both branches trivially match (no extras).
+
+    Fast path mutates a; result center = a+b, gens = a+b elementwise.
+    """
+    rng = torch.Generator().manual_seed(29)
+    n, K = 25, 12
+
+    c_a = torch.randn(n, dtype=torch.float64, generator=rng)
+    c_b = torch.randn(n, dtype=torch.float64, generator=rng)
+    G_a = torch.randn(n, K, dtype=torch.float64, generator=rng)
+    G_b = torch.randn(n, K, dtype=torch.float64, generator=rng)
+    expected_gens = G_a + G_b
+
+    z_a = TorchZonotope(c_a.clone(), G_a.clone())
+    z_b = TorchZonotope(c_b.clone(), G_b.clone())
+    merged = z_a.add(z_b, K)
+
+    torch.testing.assert_close(merged.center, c_a + c_b, atol=0, rtol=0)
+    torch.testing.assert_close(merged.generators, expected_gens, atol=0, rtol=0)
+    assert merged is z_a
+
+

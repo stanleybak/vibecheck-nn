@@ -48,14 +48,25 @@ class GurobiNumericTrouble(RuntimeError):
         return (type(self), (self.lines,))
 
 
-def optimize_checked(model, user_callback=None, *, tokens=TROUBLE_TOKENS):
+_NUM_TROUBLE_WARNED_ONCE = False
+
+
+def optimize_checked(model, user_callback=None, *, tokens=TROUBLE_TOKENS,
+                     tolerate_numeric_warnings=False):
     """Run `model.optimize()` with a message callback that scans for
     numeric-trouble warnings. Raises `GurobiNumericTrouble` if any are
-    captured.
+    captured — unless `tolerate_numeric_warnings=True`, in which case
+    trouble is logged (via a one-shot `print`) and recorded on the
+    model as `model._num_trouble_lines` without raising.
+
+    The caller can downstream-check `getattr(model, "_num_trouble", False)`
+    to see if this solve experienced trouble, and propagate that flag
+    up to any final return object / report to the user.
 
     If `user_callback(model, where)` is provided it is chained after
     the trouble scan, so both can observe MESSAGE events.
     """
+    global _NUM_TROUBLE_WARNED_ONCE
     trouble = []
 
     def cb(m, where):
@@ -70,4 +81,15 @@ def optimize_checked(model, user_callback=None, *, tokens=TROUBLE_TOKENS):
 
     model.optimize(cb)
     if trouble:
+        if tolerate_numeric_warnings:
+            model._num_trouble = True
+            model._num_trouble_lines = trouble
+            if not _NUM_TROUBLE_WARNED_ONCE:
+                print('[optimize_checked] numeric-trouble warnings '
+                      'encountered in at least one Gurobi solve; '
+                      'tolerating because tolerate_numeric_warnings=True. '
+                      'First trouble lines: ' + '; '.join(trouble[:3]))
+                _NUM_TROUBLE_WARNED_ONCE = True
+            return
         raise GurobiNumericTrouble(trouble)
+    model._num_trouble = False

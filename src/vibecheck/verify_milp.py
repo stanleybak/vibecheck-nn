@@ -90,64 +90,17 @@ from .verify_zono_bnb import (
 )
 
 
-def _pgd_attack_general(xl, xh, spec, gg, settings):
-    """PGD attack for any spec type. Checks actual spec margins.
+def _pgd_attack_general(xl, xh, spec, gg, settings,
+                         restrict_disj=None, time_budget=None):
+    """Thin wrapper over `vibecheck.pgd.pgd_attack_general`.
 
-    Returns (is_sat, witness_np).
+    Kept here so existing imports still work; all algorithmic logic lives
+    in `pgd.py` (α,β-CROWN-style AdamClipping + hinge + 10×100 schedule).
     """
-    DEV = xl.device
-    DT = xl.dtype
-    n_restarts = settings.pgd_restarts
-    n_iter = settings.pgd_iter
-    eps = (xh - xl) / 2
-    step_size = eps * 0.2
-
-    x_adv = xl + (xh - xl) * torch.rand(n_restarts, len(xl), dtype=DT,
-                                         device=DEV)
-    x_adv.requires_grad_(True)
-
-    for _ in range(n_iter):
-        out = _forward_batch_graph(x_adv, gg)
-        # Check spec: find any sample where all constraints of ANY disjunct hold
-        out_np = out.detach().cpu().numpy()
-        for b in range(n_restarts):
-            o_lo = o_hi = out_np[b]
-            result, _ = spec.check(o_lo, o_hi)
-            if result == 'unknown':
-                # Found a point in the unsafe region
-                return True, x_adv[b].detach().cpu().numpy()
-
-        # Loss: minimize worst margin across all disjuncts
-        # (try to make some disjunct's constraints all satisfied)
-        # Simple approach: minimize the output that has the most negative margin
-        margins = []
-        for conj in spec.disjuncts:
-            for c in conj.constraints:
-                if hasattr(c, 'pred'):
-                    m = out[:, c.pred] - out[:, c.comp]
-                elif c.op == '>=':
-                    m = c.value - out[:, c.index]
-                else:
-                    m = out[:, c.index] - c.value
-                margins.append(m)
-        # Stack and get worst (most positive = hardest to violate)
-        margins_t = torch.stack(margins, dim=1)
-        worst_margin = margins_t.max(dim=1).values  # per sample
-        loss = worst_margin.sum()
-        loss.backward()
-        with torch.no_grad():
-            x_new = x_adv - step_size * x_adv.grad.sign()
-            x_adv = torch.clamp(x_new, xl, xh).clone().requires_grad_(True)
-
-    # Final check
-    with torch.no_grad():
-        out = _forward_batch_graph(x_adv, gg)
-        out_np = out.cpu().numpy()
-        for b in range(n_restarts):
-            result, _ = spec.check(out_np[b], out_np[b])
-            if result == 'unknown':
-                return True, x_adv[b].cpu().numpy()
-    return False, None
+    from . import pgd as _pgd
+    return _pgd.pgd_attack_general(xl, xh, spec, gg, settings,
+                                     restrict_disj=restrict_disj,
+                                     time_budget=time_budget)
 
 # ---------------------------------------------------------------------------
 # Shared state for multiprocessing workers (COW via fork)
@@ -850,14 +803,71 @@ def _solve_neuron(args):
     return idx, direction, bound, dt, timed_out
 
 
+def _forward_witnesses_layered(layers_np, witnesses, target_layer):
+    """Forward witness inputs (n_w, n_in_flat) through the actual ReLU
+    network up to `target_layer` and return pre-activation z at that layer
+    of shape (n_w, n_neur_at_target). Used to pick MIN/MAX ordering: if all
+    witnesses give z ≥ 0 at neuron j, MAX cannot prove dead → MIN first.
+
+    Conv layers are evaluated via torch.nn.functional.conv2d at fp64 to
+    avoid precision drift (the LP/MILP runs at fp64 by default).
+    """
+    y = witnesses.astype(np.float64, copy=False)
+    for L in range(target_layer + 1):
+        layer = layers_np[L]
+        if layer['type'] == 'fc':
+            z = y @ layer['W'].T.astype(np.float64) + \
+                layer['bias'].astype(np.float64)
+        else:  # conv
+            kernel = layer['kernel'].astype(np.float64)
+            bias = layer['bias'].astype(np.float64)
+            stride = layer['stride']; padding = layer['padding']
+            in_shape = layer['in_shape']
+            n_w = y.shape[0]
+            y_4d = y.reshape(n_w, in_shape[0], in_shape[1], in_shape[2])
+            z_t = F.conv2d(
+                torch.from_numpy(y_4d), torch.from_numpy(kernel),
+                torch.from_numpy(bias), stride=stride, padding=padding)
+            z = z_t.numpy().reshape(n_w, -1)
+        if L == target_layer:
+            return z
+        y = np.maximum(z, 0.0)
+    return z   # unreachable
+
+
+def _pick_milp_direction(cur_lo, cur_hi, z_w_min, z_w_max):
+    """Return (first_obj, second_obj) — Gurobi sense for first/second MILP.
+    Witness rule: all witnesses ≥ 0 → MIN first (proving active is the only
+    chance). All ≤ 0 → MAX first (proving dead). Straddle / no witness →
+    fall back to |cur_lo|<|cur_hi| asymmetry heuristic.
+    """
+    import gurobipy as grb
+    if z_w_min is not None and z_w_max is not None:
+        if z_w_min >= -1e-9:
+            return grb.GRB.MINIMIZE, grb.GRB.MAXIMIZE
+        if z_w_max <= 1e-9:
+            return grb.GRB.MAXIMIZE, grb.GRB.MINIMIZE
+    if abs(cur_lo) < abs(cur_hi):
+        return grb.GRB.MINIMIZE, grb.GRB.MAXIMIZE
+    return grb.GRB.MAXIMIZE, grb.GRB.MINIMIZE
+
+
 def _solve_neuron_both(args):
     """Worker: solve BOTH min and max for a neuron on the same model.
 
     Returns (idx, lb, ub, total_time, any_timeout).
+
+    args is (idx, timeout, cur_lo, cur_hi) for the legacy bound-asymmetry
+    ordering, or (idx, timeout, cur_lo, cur_hi, z_w_min, z_w_max) for
+    witness-guided ordering (per `tighten_witness_ordering=True`).
     """
     import gurobipy as grb
 
-    idx, timeout, cur_lo, cur_hi = args
+    if len(args) == 6:
+        idx, timeout, cur_lo, cur_hi, z_w_min, z_w_max = args
+    else:
+        idx, timeout, cur_lo, cur_hi = args
+        z_w_min = z_w_max = None
 
     if _shared_sparse_args is not None:
         sparse_args = _shared_sparse_args
@@ -927,11 +937,9 @@ def _solve_neuron_both(args):
     any_timeout = False
     lb, ub = cur_lo, cur_hi
 
-    # Solve tighter direction first
-    if abs(cur_lo) < abs(cur_hi):
-        first, second = grb.GRB.MINIMIZE, grb.GRB.MAXIMIZE
-    else:
-        first, second = grb.GRB.MAXIMIZE, grb.GRB.MINIMIZE
+    # Solve "proving stable" direction first (witness-guided when available,
+    # else the |cur_lo|<|cur_hi| asymmetry heuristic).
+    first, second = _pick_milp_direction(cur_lo, cur_hi, z_w_min, z_w_max)
 
     # First direction with BestBdStop for early exit
     model.setObjective(target_var, first)
@@ -986,7 +994,8 @@ def _solve_neuron_both(args):
 
 def _tighten_layer_parallel(layers_np, x_lo, x_hi, bounds, l,
                              use_milp, timeout, n_cores,
-                             neuron_subset=None, lp_per_worker=False):
+                             neuron_subset=None, lp_per_worker=False,
+                             witness_n_random=8):
     """Tighten unstable neurons at layer l using parallel LP or MILP.
 
     For conv layers, uses sparse per-neuron models (much faster).
@@ -1037,10 +1046,32 @@ def _tighten_layer_parallel(layers_np, x_lo, x_hi, bounds, l,
     new_lo, new_hi = lo.copy(), hi.copy()
     any_timeout = False
 
-    # Single pass: each worker solves both min and max, with BestBdStop
-    # for early exit when neuron proven stable
-    tasks = [(int(idx), timeout, float(lo[idx]), float(hi[idx]))
-             for idx in unstable]
+    # Witness-guided ordering: forward `witness_n_random` random + 3 corner
+    # witnesses (x_lo, x_hi, midpoint) through the actual ReLU network up
+    # to layer l. For each unstable neuron j, pass z_w_min[j], z_w_max[j]
+    # so the worker can put the "proving stable" MILP direction first
+    # (the only direction that has a chance to fire BestBdStop early).
+    z_w_min = z_w_max = None
+    if witness_n_random > 0:
+        rng = np.random.default_rng(7)
+        rand = (x_lo[None, :] +
+                rng.random((witness_n_random, x_lo.size)) * (x_hi - x_lo))
+        witnesses = np.vstack([
+            rand,
+            x_lo[None, :],
+            x_hi[None, :],
+            ((x_lo + x_hi) / 2)[None, :],
+        ]).astype(np.float64)
+        z_w = _forward_witnesses_layered(layers_np, witnesses, l)
+        z_w_min = z_w.min(axis=0); z_w_max = z_w.max(axis=0)
+
+    if z_w_min is not None:
+        tasks = [(int(idx), timeout, float(lo[idx]), float(hi[idx]),
+                  float(z_w_min[idx]), float(z_w_max[idx]))
+                 for idx in unstable]
+    else:
+        tasks = [(int(idx), timeout, float(lo[idx]), float(hi[idx]))
+                 for idx in unstable]
     chunksize = max(1, len(tasks) // (n_cores * 4))
 
     with multiprocessing.Pool(n_cores) as pool:
@@ -2205,6 +2236,8 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
     """
     print_progress = settings.print_progress
     stats = VerifyStats()
+    _wnr = (int(getattr(settings, 'tighten_witness_n_random', 8))
+            if getattr(settings, 'tighten_witness_ordering', True) else 0)
 
     def time_left():
         return max(0, deadline - time.perf_counter())
@@ -2250,10 +2283,17 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
         with torch.no_grad():
             sb, z_final = _forward_zonotope_graph(
                 xl_g, xh_g, gg, device, dtype)
-    except (torch.cuda.OutOfMemoryError, RuntimeError):
-        if device.type != 'cpu':
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        # CPU fallback silently masks real regressions (a forward that
+        # used to fit suddenly doesn't). Require explicit opt-in via
+        # `allow_cpu_fallback` AND `raise_on_oom=False`; otherwise re-raise.
+        cpu_ok = (device.type != 'cpu'
+                  and getattr(settings, 'allow_cpu_fallback', False)
+                  and not getattr(settings, 'raise_on_oom', True))
+        if cpu_ok:
             if print_progress:
-                print('  GPU OOM, falling back to CPU')
+                print(f'  GPU OOM ({e!s:.60}); falling back to CPU '
+                      '(allow_cpu_fallback=True, raise_on_oom=False)')
             device = torch.device('cpu')
             gg = graph.gpu_graph(device, dtype)
             xl_g = xl_g.cpu()
@@ -2450,18 +2490,21 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 _, _, milp_to = _tighten_layer_parallel(
                     layers_np_seq, x_lo_64, x_hi_64, seq_bounds, seq_li,
                     use_milp=True, timeout=sample_timeout,
-                    n_cores=n_cores, neuron_subset=samp[:half])
+                    n_cores=n_cores, neuron_subset=samp[:half],
+                    witness_n_random=_wnr)
 
             if not milp_to and is_conv:
                 new_lo, new_hi, _ = _tighten_layer_parallel(
                     layers_np_seq, x_lo_64, x_hi_64, seq_bounds, seq_li,
-                    use_milp=True, timeout=sample_timeout, n_cores=n_cores)
+                    use_milp=True, timeout=sample_timeout, n_cores=n_cores,
+                    witness_n_random=_wnr)
                 method_label = 'MILP-sparse'
             else:
                 new_lo, new_hi, _ = _tighten_layer_parallel(
                     layers_np_seq, x_lo_64, x_hi_64, seq_bounds, seq_li,
                     use_milp=False, timeout=sample_timeout,
-                    n_cores=n_cores, lp_per_worker=lp_pw)
+                    n_cores=n_cores, lp_per_worker=lp_pw,
+                    witness_n_random=_wnr)
                 method_label = 'LP-seq'
 
             tightened = int(np.sum((new_lo >= 0) | (new_hi <= 0)))
@@ -2763,18 +2806,12 @@ def milp_verify(graph, spec, settings=None):
 
     sample_timeout = settings.milp_sample_timeout
     lp_per_worker = getattr(settings, 'milp_lp_per_worker', True)
+    _wnr = (int(getattr(settings, 'tighten_witness_n_random', 8))
+            if getattr(settings, 'tighten_witness_ordering', True) else 0)
     n_cores = multiprocessing.cpu_count()
 
     def time_left():
         return max(0, deadline - time.perf_counter())
-
-    # --- Graph optimizations ---
-    if settings.optimize_relu_relation:
-        from .onnx_optimizer import fold_relusplitter
-        fold_relusplitter(graph)
-    if settings.fuse_gemm_conv:
-        from .onnx_optimizer import fuse_gemm_reshape_conv
-        fuse_gemm_reshape_conv(graph)
 
     pw = spec.as_pairwise()
     assert pw is not None, "MILP verification requires pairwise constraints"
@@ -2909,7 +2946,8 @@ def milp_verify(graph, spec, settings=None):
                 _, _, milp_any_timeout = _tighten_layer_parallel(
                     layers_np, x_lo_64, x_hi_64, bounds_np, l,
                     use_milp=True, timeout=sample_timeout,
-                    n_cores=n_cores, neuron_subset=sample_idx[:half])
+                    n_cores=n_cores, neuron_subset=sample_idx[:half],
+                    witness_n_random=_wnr)
 
             # Sample LP on second half
             lp_any_timeout = False
@@ -2918,7 +2956,7 @@ def milp_verify(graph, spec, settings=None):
                     layers_np, x_lo_64, x_hi_64, bounds_np, l,
                     use_milp=False, timeout=sample_timeout,
                     n_cores=n_cores, neuron_subset=sample_idx[half:],
-                    lp_per_worker=lp_per_worker)
+                    lp_per_worker=lp_per_worker, witness_n_random=_wnr)
 
             if not milp_any_timeout:
                 if print_progress:
@@ -2927,7 +2965,7 @@ def milp_verify(graph, spec, settings=None):
                 new_lo, new_hi, _ = _tighten_layer_parallel(
                     layers_np, x_lo_64, x_hi_64, bounds_np, l,
                     use_milp=True, timeout=sample_timeout,
-                    n_cores=n_cores)
+                    n_cores=n_cores, witness_n_random=_wnr)
                 bounds_np[l] = (new_lo, new_hi)
             elif not lp_any_timeout:
                 if print_progress:
@@ -2936,7 +2974,8 @@ def milp_verify(graph, spec, settings=None):
                 new_lo, new_hi, _ = _tighten_layer_parallel(
                     layers_np, x_lo_64, x_hi_64, bounds_np, l,
                     use_milp=False, timeout=sample_timeout,
-                    n_cores=n_cores, lp_per_worker=lp_per_worker)
+                    n_cores=n_cores, lp_per_worker=lp_per_worker,
+                    witness_n_random=_wnr)
                 bounds_np[l] = (new_lo, new_hi)
                 tighten_mode = 'lp'
             else:
@@ -2951,7 +2990,8 @@ def milp_verify(graph, spec, settings=None):
             new_lo, new_hi, any_to = _tighten_layer_parallel(
                 layers_np, x_lo_64, x_hi_64, bounds_np, l,
                 use_milp=False, timeout=sample_timeout,
-                n_cores=n_cores, lp_per_worker=lp_per_worker)
+                n_cores=n_cores, lp_per_worker=lp_per_worker,
+                witness_n_random=_wnr)
             bounds_np[l] = (new_lo, new_hi)
             if any_to:
                 tighten_mode = 'zono'

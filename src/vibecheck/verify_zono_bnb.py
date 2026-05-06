@@ -294,7 +294,7 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype):
     """
     z_init = TorchZonotope.from_input_bounds(xl, xh, device, dtype)
     zono_state = {gg['input_name']: z_init}
-    gen_count = {gg['input_name']: z_init.generators.shape[1]}
+    gen_count = {gg['input_name']: z_init.n_gens}
     forks = gg['fork_points']
     sb = {}
 
@@ -361,7 +361,7 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype):
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
 
-        gen_count[name] = zono_state[name].generators.shape[1]
+        gen_count[name] = zono_state[name].n_gens
 
         # Free zonotopes that are no longer needed
         for inp in op['inputs']:
@@ -929,13 +929,6 @@ def zonotope_bnb_verify(graph, spec, settings=None):
     device, dtype = resolve_torch(settings)
 
     torch.set_num_threads(1)
-
-    if settings.optimize_relu_relation:
-        from .onnx_optimizer import fold_relusplitter
-        fold_relusplitter(graph)
-    if settings.fuse_gemm_conv:
-        from .onnx_optimizer import fuse_gemm_reshape_conv
-        fuse_gemm_reshape_conv(graph)
 
     pw = spec.as_pairwise()
     assert pw is not None, (
