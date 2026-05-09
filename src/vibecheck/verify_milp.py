@@ -2337,20 +2337,22 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
             'phase': 'crown_graph'}, stats)
 
     # --- PGD attack ---
-    t_pgd = time.perf_counter()
-    try:
-        pgd_sat, pgd_witness = _pgd_attack_general(
-            xl_g, xh_g, spec, gg, settings)
-    except RuntimeError:
-        pgd_sat, pgd_witness = False, None
-    dt_pgd = time.perf_counter() - t_pgd
-    stats.record_timing('pgd', dt_pgd)
-    if print_progress:
-        print(f'PGD attack (graph): {dt_pgd:.2f}s  sat={pgd_sat}')
-    if pgd_sat:
-        return _make_result('sat', {
-            'time': time.perf_counter() - (deadline - total_timeout),
-            'phase': 'pgd_graph', 'witness': pgd_witness}, stats)
+    _disable_sat = bool(getattr(settings, 'disable_sat_finding', False))
+    if not _disable_sat:
+        t_pgd = time.perf_counter()
+        try:
+            pgd_sat, pgd_witness = _pgd_attack_general(
+                xl_g, xh_g, spec, gg, settings)
+        except RuntimeError:
+            pgd_sat, pgd_witness = False, None
+        dt_pgd = time.perf_counter() - t_pgd
+        stats.record_timing('pgd', dt_pgd)
+        if print_progress:
+            print(f'PGD attack (graph): {dt_pgd:.2f}s  sat={pgd_sat}')
+        if pgd_sat:
+            return _make_result('sat', {
+                'time': time.perf_counter() - (deadline - total_timeout),
+                'phase': 'pgd_graph', 'witness': pgd_witness}, stats)
 
     if time_left() <= 0:
         return _make_result('unknown', {'time': total_timeout,
@@ -2849,15 +2851,18 @@ def milp_verify(graph, spec, settings=None):
         return 'unknown', {'time': total_timeout, 'phase': 'crown_timeout'}
 
     # --- PGD attack (GPU, fast) ---
-    t_pgd = time.perf_counter()
-    pgd_sat, pgd_witness, pgd_best = _pgd_attack(
-        xl_g, xh_g, still_open, pred, fwd_data, nh, settings)
-    if print_progress:
-        print(f'PGD attack: {time.perf_counter()-t_pgd:.2f}s  '
-              f'sat={pgd_sat}')
-    if pgd_sat:
-        return 'sat', {'time': time.perf_counter() - (deadline - total_timeout),
-                        'phase': 'pgd', 'witness': pgd_witness}
+    _disable_sat = bool(getattr(settings, 'disable_sat_finding', False))
+    pgd_sat, pgd_witness, pgd_best = False, None, None
+    if not _disable_sat:
+        t_pgd = time.perf_counter()
+        pgd_sat, pgd_witness, pgd_best = _pgd_attack(
+            xl_g, xh_g, still_open, pred, fwd_data, nh, settings)
+        if print_progress:
+            print(f'PGD attack: {time.perf_counter()-t_pgd:.2f}s  '
+                  f'sat={pgd_sat}')
+        if pgd_sat:
+            return 'sat', {'time': time.perf_counter() - (deadline - total_timeout),
+                            'phase': 'pgd', 'witness': pgd_witness}
 
     # --- Extract bounds to CPU numpy ---
     # Re-run zonotope forward to get sb bounds (Phase 1 of _evaluate_region)
@@ -2893,6 +2898,72 @@ def milp_verify(graph, spec, settings=None):
         hi_l = sb[l][1].cpu().numpy().astype(np.float64)
         bounds_np[l] = (lo_l, hi_l)
 
+    # --- Phase 1.5: α-CROWN intermediate-bound tightening ---
+    # Joint α optimization (Adam, ~10 iters on GPU) tightens every
+    # unstable layer's pre-ReLU bounds in 1-2s. On conv ResNets this
+    # closes more specs than the per-layer LP/MILP loop (Phase 2)
+    # despite running 10-20× faster, because:
+    #   1. It tightens deeper layers that LP per-neuron times out on.
+    #   2. It optimizes α slopes jointly across layers, preserving spec
+    #      direction sensitivity (per-neuron LP can degrade joint
+    #      consistency — observed worst-LB *worsening* on img3039 from
+    #      -3.97 to -5.17 after Phase 2).
+    # Phase 2 still runs after this on the tightened bbr to catch
+    # remaining unstables that α-CROWN didn't close.
+    alpha_tighten = bool(getattr(settings, 'milp_alpha_tighten', True))
+    if alpha_tighten and time_left() > 5.0:
+        t_at = time.perf_counter()
+        from . import alpha_crown as ac
+        gg = graph.gpu_graph(device, dtype)
+        xl_at = torch.as_tensor(spec.x_lo.flatten().astype(np.float64),
+                                 device=device, dtype=dtype)
+        xh_at = torch.as_tensor(spec.x_hi.flatten().astype(np.float64),
+                                 device=device, dtype=dtype)
+        # Build linear queries from spec
+        last_op = gg['ops'][-1]
+        n_out = int(np.prod(last_op.get('out_shape', (10,))))
+        queries_at = spec.as_linear_queries(n_out)
+        if queries_at:
+            w_qs_at = np.stack([q[1] for q in queries_at])
+            b_qs_at = np.array([q[2] for q in queries_at])
+            # Use the bbr from sb_init (zono forward) for α-CROWN.
+            # Note: gg uses ReLU layer_idx as keys; sb uses 0..nh-1.
+            # On non-fork networks these align (every linear layer
+            # produces a ReLU at the same index).
+            bbr_at = {l: bounds_np[l] for l in bounds_np}
+            start_nodes = [Lk for Lk in bbr_at if Lk > 0 and
+                            ((bbr_at[Lk][0] < 0)
+                             & (bbr_at[Lk][1] > 0)).any()]
+            un_idx = {Lk: np.where((bbr_at[Lk][0] < 0)
+                                     & (bbr_at[Lk][1] > 0))[0].tolist()
+                       for Lk in bbr_at}
+            if start_nodes:
+                n_iters_at = int(getattr(settings,
+                                          'milp_alpha_tighten_iters', 10))
+                _, _, best_bounds, _ = ac.run_alpha_crown_batched(
+                    gg, xl_at, xh_at, bbr_at, w_qs_at, b_qs_at,
+                    start_nodes, un_idx,
+                    device, dtype, n_iters=n_iters_at, lr=0.25,
+                    lr_decay=0.98, early_stop_on_positive=False)
+                # Merge tightened bounds (max lo, min hi)
+                n_tightened = 0
+                for Lk in best_bounds:
+                    lo_t, hi_t = best_bounds[Lk]
+                    lo_a = lo_t.detach().cpu().numpy().astype(np.float64)
+                    hi_a = hi_t.detach().cpu().numpy().astype(np.float64)
+                    if Lk in bounds_np:
+                        lo_g, hi_g = bounds_np[Lk]
+                        new_lo = np.maximum(lo_g, lo_a)
+                        new_hi = np.minimum(hi_g, hi_a)
+                        n_tightened += int(((lo_g < 0) & (hi_g > 0)
+                                             & ~((new_lo < 0)
+                                                 & (new_hi > 0))).sum())
+                        bounds_np[Lk] = (new_lo, new_hi)
+                if print_progress:
+                    print(f'Phase 1.5 (α-CROWN tighten, {n_iters_at} iters): '
+                          f'{time.perf_counter()-t_at:.2f}s  '
+                          f'closed {n_tightened} unstables')
+
     # Extract numpy layer weights
     layers_np = []
     for gl in gpu_layers_list:
@@ -2912,10 +2983,20 @@ def milp_verify(graph, spec, settings=None):
     x_hi_64 = spec.x_hi.astype(np.float64)
 
     # --- Phase 2: Per-layer tightening ---
+    # When milp_skip_phase2_after_alpha is set AND α-CROWN tightening
+    # already ran in Phase 1.5, skip the per-layer LP/MILP loop entirely.
+    # On conv ResNets the α-CROWN tightening already closes the easy
+    # unstables; Phase 2's per-neuron MILPs spend their budget on harder
+    # remaining neurons that don't pay off (closed 68 of remaining 1000+
+    # in 33s on oval21 img3039). Better to spend that time on racing.
+    skip_phase2 = (alpha_tighten and bool(getattr(
+        settings, 'milp_skip_phase2_after_alpha', False)))
     t_phase2_start = time.perf_counter()
     tighten_mode = 'sample'  # 'sample', 'lp', 'zono'
 
     for l in range(nh):
+        if skip_phase2:
+            break
         if time_left() <= 0:
             break
 
@@ -3040,7 +3121,7 @@ def milp_verify(graph, spec, settings=None):
             'phase': 'crown_tightened'}
 
     # --- PGD attack again (seeded with best adversarial from first PGD) ---
-    if time_left() > 0:
+    if time_left() > 0 and not _disable_sat:
         t_pgd2 = time.perf_counter()
         pgd_sat2, pgd_witness2, pgd_best2 = _pgd_attack(
             xl_g, xh_g, still_open, pred, fwd_data, nh, settings)

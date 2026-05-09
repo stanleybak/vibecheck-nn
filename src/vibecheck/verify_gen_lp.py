@@ -1933,6 +1933,26 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
                 if b > 0 and b not in out:
                     out.append(b)
             return out
+        if bin_mode == 'hybrid':
+            # Mix small (fast on easy specs) + large (closes hard specs)
+            # bin counts: [8, 16, 64, 128, 200] capped at n_workers.
+            # CAVEAT: empirically WORSE than 'octaves' + sequential
+            # fallback on img5988. The bins=64 tier without halfspace
+            # takes 20-50s per MILP and eats the time budget that the
+            # high-bin halfspace fallback needs (~50s for q1). Net:
+            # 8/9 closed (q1 stuck) vs 9/9 closed with octaves+fallback.
+            # Keep this mode available for benchmarking but DO NOT use
+            # in production — octaves+fallback is the proven combo.
+            base = [8, 16, 64, 128, 200]
+            k_max = max(1, n_threads_total)
+            sched = [b for b in base[:k_max] if b <= n_scored]
+            if n_scored > 0 and sched and sched[-1] < n_scored:
+                sched.append(n_scored)
+            out = []
+            for b in sched:
+                if b > 0 and b not in out:
+                    out.append(b)
+            return out
         # legacy geometric
         schedule = []
         b = min_bin
@@ -1964,11 +1984,22 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
     # workers and let each task pick its state by qi. Shared `state` is the
     # fallback for queries without a per-query override.
     init_state = (state, state_by_qi) if state_by_qi else (state, None)
-    with ctx.Pool(n_workers, initializer=_query_race_init,
-                   initargs=(init_state, gurobi_threads, deadline,
-                              unsafe_halfspace,
-                              int(triangle_top_k))) as pool:
+    pool = ctx.Pool(n_workers, initializer=_query_race_init,
+                     initargs=(init_state, gurobi_threads, deadline,
+                                unsafe_halfspace,
+                                int(triangle_top_k)))
+    try:
         for out in pool.imap_unordered(_query_race_one_bin, tasks):
+            # Hard wall-clock check: if past deadline, terminate the pool
+            # immediately and stop consuming results. Without this, the
+            # pool's context-manager exit waits for in-flight workers
+            # whose Gurobi solves were started with a long per-MILP
+            # `time_limit` (computed when the task was scheduled, not
+            # the residual time at exit), causing total wall time to
+            # overshoot `total_timeout` by many tens of seconds and
+            # eventually getting killed by the OS-level outer timeout.
+            if _t.perf_counter() >= deadline:
+                break
             qi, n_bins, verdict, level_info, witness = out
             r = results[qi]
             if qi in done_specs:
@@ -2005,6 +2036,14 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
                 found_sat = True
             if found_sat or len(done_specs) == len(query_specs):
                 break
+    finally:
+        # Force-terminate workers regardless of how we exit. Pool
+        # context-manager `__exit__` calls terminate() too, but doing
+        # it explicitly here ensures the SIGTERM is sent before the
+        # `finally` continues, and any blocked Gurobi solves are
+        # interrupted as fast as the OS allows.
+        pool.terminate()
+        pool.join()
 
     return [(qi, results[qi]['verdict'], results[qi]['levels'],
              results[qi]['witness'])

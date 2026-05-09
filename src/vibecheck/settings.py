@@ -47,6 +47,14 @@ def default_settings(**overrides):
         # found here, skip the entire cascade. Without this, SAT cases
         # waste 30-60s on cascade work before PGD (Phase 3.5) gets a
         # chance, while AB-CROWN finds them in 3-7s.
+        # Master disable for all SAT-finding paths (PGD phases 0, 3, 3.5,
+        # 9, MILP-seeded PGD, and integer-witness check inside Phase 8).
+        # Used for soundness testing: when True, the only legitimate
+        # outcomes are 'verified' (UNSAT proved) or 'unknown'. If a case
+        # AB-CROWN reports SAT comes back as 'verified' here, that's a
+        # soundness bug — the LP relaxation incorrectly claims UNSAT.
+        # Default False (production behavior).
+        disable_sat_finding=False,
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         pgd_lr_decay=0.99,               # step-size × this every iter
@@ -188,6 +196,18 @@ def default_settings(**overrides):
         # progressing on benchmarks that DO have low-impact tail
         # neurons (most cases).
         bab_refine_layer_budget=30.0,
+        # Phase 1 hard wall-time cap as a FRACTION of total_timeout.
+        # When > 0, the bab_refine cascade exits early once Phase 1 has
+        # used `phase1_time_fraction × total_timeout` seconds, returning
+        # with whatever bbr it has so far (incomplete cascade is sound;
+        # remaining layers stay at their pre-Phase-1 bounds). Also caps
+        # individual MILP timeouts dynamically — each per-layer MILP
+        # gets at most `(remaining_phase1_budget / n_layers_remaining)`
+        # seconds rather than the hard-coded `milp_sample_timeout`.
+        # 0.0 = disabled (production default behaviour). On img5988
+        # Phase 1 was 92s of a 180s budget (51%); setting 0.3 caps it
+        # at 54s, leaving 126s for Phase 2.5 + Phase 8.
+        phase1_time_fraction=0.0,
         # Topk filter — only the K most-impactful unstable neurons per
         # layer get an MILP-tightening pass; the rest stay at the
         # forward-zono / α-CROWN bound. 0 = no filter (default). With
@@ -280,6 +300,33 @@ def default_settings(**overrides):
         # (0.0 < lb < 0.05 and you want to push them positive without
         # paying the joint α cost).
         bab_refine_phase05_per_spec_alpha=False,
+        # Per-target α-CROWN in the bab_refine cascade (Phase 0.5 joint
+        # tightening + per-cascade-iter refresh). When True, each unstable
+        # neuron at each start_node S gets its OWN α tensor at every upstream
+        # layer L < S — α shape `(n_targets_at_S, n_neurons_L)`. Loss is
+        # `Σ_S Σ_target (ub_target - lb_target)` (width minimisation per
+        # target). Per-target α gradients are independent so a single
+        # batched Adam step is equivalent to per-target Adam, but at one
+        # forward/backward cost. Empirically (oval21 deep_kw img3039 layer
+        # M=4): matches LP-tight (V_LP_book) bounds within 0.003 in 104 ms
+        # for 61 targets vs ~6 ms shared-α (V_spec) baseline. Default OFF
+        # because the per-target tensors raise Adam state by `n_targets×`
+        # and shared-α is already enough on FC nets like mnist_fc. Worth
+        # turning ON for deep conv ResNets where the spec-direction α
+        # compromise is the main looseness source.
+        bab_refine_alpha_per_target=False,
+        # Phase 2.5: after the batched α-CROWN refresh inside zono_lift,
+        # ALSO run `run_alpha_crown_per_target_widths` to tighten each
+        # unstable neuron's bbr individually (per-target α + width loss),
+        # then merge into best_bounds_shared (max-lo, min-hi). Separate
+        # from `bab_refine_alpha_per_target` (Phase 1) so the two phases
+        # can be toggled independently. Default OFF — empirically the
+        # per-target halfspace LP doesn't beat the existing dir-adaptive
+        # zono on layer M=4 of img3039 (sum-w 233.94 vs 233.92), so the
+        # only place per-target α helps in Phase 2.5 is in the bbr feed
+        # to the next iteration's forward zono. Keep OFF unless running
+        # an exploratory comparison.
+        phase2p5_alpha_per_target=False,
         # Run MIP-tighten + α-CROWN refresh on L=1 INSIDE Phase 0.5
         # (between joint α and spec α). Spec α-CROWN then sees
         # post-MIP bounds, potentially closing more specs and
@@ -301,6 +348,24 @@ def default_settings(**overrides):
         # AND no fork points. Disable to force every case through
         # bab_refine (e.g. for benchmarking).
         auto_route_milp_for_conv=True,
+        # α-CROWN intermediate-bound tightening as Phase 1.5 in
+        # milp_verify, BEFORE the per-layer LP/MILP loop. On conv
+        # ResNets (oval21 deep_kw img3039: 1.4s α-CROWN closes 3/9
+        # specs vs 29s LP+MILP closing 1/9 with WORSE worst-LB). The
+        # joint α optimization tightens deep layers (L3-L5) that
+        # per-neuron LP times out on, and preserves spec-direction
+        # consistency. Phase 2 still runs after to catch remaining
+        # unstables. Default ON.
+        milp_alpha_tighten=True,
+        milp_alpha_tighten_iters=10,
+        # Skip the milp_verify Phase 2 per-layer LP/MILP loop entirely
+        # when Phase 1.5 α-CROWN tightening ran. On conv ResNets,
+        # α-CROWN closes the easy unstables; Phase 2's MILPs then spend
+        # 30s+ on the harder ones with low payoff (68 closed of 1000+
+        # remaining on oval21 img3039 — 4× cost per closure vs α-CROWN).
+        # Default OFF so the existing pipeline works unchanged; turn ON
+        # for conv-heavy nets where α-CROWN is the better tightener.
+        milp_skip_phase2_after_alpha=False,
         # Refresh `min_ew_per_layer` after each layer's MIP+α-CROWN
         # round in the bab_refine cascade (mirrors AB-CROWN's per-layer
         # `lA` rebuild between MIP layers). Costs one CROWN backward per
@@ -431,6 +496,22 @@ def default_settings(**overrides):
         # to push ObjBound > 0 on hard UNSAT cases — triangulating the
         # top neurons may close the gap without binarising them.
         phase8_alpha_zono_triangle_top_k=0,
+        # High-bin infeasibility fallback. After standard Phase 8 racing
+        # exhausts its octave/legacy schedule (capped at 8*n_workers bins
+        # for `octaves` mode), each still-open query gets ONE more shot:
+        # build the alpha_zono LP with the top-K most-impactful neurons as
+        # binaries AND `qw·y + qb ≤ 0` halfspace constraint, look for
+        # Gurobi `INFEASIBLE` (proves UNSAT). Empirically (oval21 deep_kw
+        # img3039 q8): standard racing maxes at bins=32 → lb≈−0.144;
+        # the fallback at bins=200 returns INFEASIBLE in ~30s → q8 closed,
+        # full instance verified in 73s (matches AB-CROWN's 70s solve).
+        # Sound: relaxation∩{qw·y+qb≤0}=∅ ⇔ relaxation min > 0, proves
+        # spec. The cross-check via `_resolve_standard_lb` rejects any
+        # numerical false-INFEASIBLE; if it can't confirm, we keep the
+        # query open. Default ON.
+        phase8_high_bin_fallback=True,
+        phase8_high_bin_count=200,
+        phase8_high_bin_time_limit=60.0,
         # ----- MILP-seeded PGD refinement -----
         # After every Phase 8 MILP worker that returns a feasible (but not
         # spec-violating) solution, take its e_in (the input-generator
@@ -485,6 +566,17 @@ def default_settings(**overrides):
         # still-open disjunct after Phase 2 CROWN, before Phase 7.
         zono_lift_enabled=True,
         zono_lift_max_passes=10,           # iterations per query (cascade)
+        # Dual-pass Phase 2.5: build TWO zonotopes (all-α "lb-tight"
+        # and all-up_s "ub-tight") and merge per-neuron bounds. Tested
+        # on oval21 img3039 — slightly WORSE than single-pass
+        # dir-adaptive (LBs less tight; same closure count). The
+        # all-α/all-up_s slope choice ignores spec ew sign per neuron,
+        # so each pass is suboptimal for the spec direction; merging
+        # two suboptimal results doesn't recover dir-adaptive's
+        # tightness. Kept as a setting for future per-neuron-target
+        # optimization (true "best zonotope for each neuron's
+        # ub/lb"); current implementation is preliminary.
+        zono_lift_dual_pass=False,
         zono_lift_tolerance=1e-4,          # stop when CROWN LB delta < this
         zono_lift_layers=None,             # None = all layers with unstable
         zono_lift_plateau_patience=2,      # stop after K no-bound-change passes
@@ -498,6 +590,13 @@ def default_settings(**overrides):
         input_split_max_dims=20,
         input_split_max_depth=8,
         input_split_node_timeout=8.0,
+        # Fast-leaf path for input-split BaB. When True, each leaf runs
+        # only forward zono + CROWN backward + α-CROWN(N iters) + spec
+        # check, bypassing the full _run_pipeline's PGD/multiprocess
+        # overhead (~60s per leaf). On cifar_biasfield_0 a leaf takes
+        # ~3.4s here vs ~65s via _run_pipeline. Default ON.
+        input_split_fast_leaf=True,
+        input_split_alpha_iters=3,  # α-CROWN iters per leaf
         # α-CROWN-driven variant D: run α-CROWN per query, reconstruct
         # direction-adaptive forward zonotope with the optimal α's, then
         # apply the halfspace LP on that tighter G. Much stronger than the

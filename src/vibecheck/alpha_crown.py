@@ -642,6 +642,115 @@ def run_alpha_crown_fixed_intermediate_batched(
     return best_lbs, {'spec': spec_alpha}, best_bounds, histories
 
 
+def run_alpha_crown_per_target_widths(
+        gg, xl, xh, bbr_init, intermediate_start_nodes, unstable_indices,
+        device, dtype, n_iters=10, lr=0.25, lr_decay=0.98):
+    """V_target_batched α-CROWN: per-target α + width-minimisation loss.
+
+    For each start_node S in `intermediate_start_nodes`:
+      - α at upstream layers L < S has shape `(n_targets_at_S, n_neurons_L)`.
+      - Each target gets its own independent α (per-target gradient).
+    Loss: sum over (S, target) of `(ub_target − lb_target)`. Per-target
+    α gradients are independent, so the joint Adam optim is equivalent
+    to per-target Adam — but in a single batched call.
+
+    On oval21 deep_kw img3039 layer 4: 104 ms for 61 targets; matches
+    LP-tight (V_LP_book) bounds within 0.003. Compared to:
+      - V_layer (shared α + width loss, 61 ms): only ~50% of the gain
+      - V_spec  (shared α + spec loss, ~6 ms per backward): baseline (looser)
+
+    Returns:
+      best_bounds: dict {L: (lo_tensor, hi_tensor)} — per-(S, target)-tightened
+                    bounds merged into bbr at each S (max lo, min hi).
+    """
+    from .alpha_crown import _make_slopes, _crown_backward_matrix
+    all_relu_layers = sorted(bbr_init.keys())
+    bbr_tensors_init = {
+        L: (torch.as_tensor(bbr_init[L][0], dtype=dtype, device=device),
+            torch.as_tensor(bbr_init[L][1], dtype=dtype, device=device))
+        for L in bbr_init}
+    # Per-S, per-L α with leading n_targets dim
+    alpha_per_S = {}
+    slopes_cache = {}
+    for L in all_relu_layers:
+        lo_t = bbr_tensors_init[L][0]; hi_t = bbr_tensors_init[L][1]
+        lo_s, _, _, active, dead, unstable = _make_slopes(lo_t, hi_t)
+        slopes_cache[L] = (active, dead, lo_s)
+    for S in sorted(intermediate_start_nodes):
+        un_S = unstable_indices.get(S, [])
+        n_targets = len(un_S)
+        if n_targets == 0: continue
+        alpha_per_S[S] = {}
+        for L in all_relu_layers:
+            if L >= S: continue
+            lo_t = bbr_tensors_init[L][0]
+            active, dead, lo_s = slopes_cache[L]
+            a = lo_s.unsqueeze(0).expand(n_targets, -1).contiguous()
+            a = a.clone()
+            a[:, active] = 1.0
+            a[:, dead] = 0.0
+            a = a.detach().requires_grad_(True)
+            alpha_per_S[S][L] = a
+    # Find pre-relu op for each start_node S
+    start_op_for_S = {}
+    for S in alpha_per_S:
+        for op in gg['ops']:
+            if op.get('type') == 'relu' and op.get('layer_idx') == S:
+                start_op_for_S[S] = op['inputs'][0]
+                break
+    all_params = [a for S_alpha in alpha_per_S.values()
+                   for a in S_alpha.values()]
+    if not all_params:
+        return {L: (lo, hi) for L, (lo, hi) in bbr_tensors_init.items()}
+    opt = torch.optim.Adam(all_params, lr=lr)
+    sched = (torch.optim.lr_scheduler.ExponentialLR(opt, lr_decay)
+             if lr_decay != 1.0 else None)
+    best_bounds = {L: (lo.clone(), hi.clone())
+                    for L, (lo, hi) in bbr_tensors_init.items()}
+    n_neurons_at = {L: bbr_init[L][0].size for L in bbr_init}
+    for it in range(n_iters):
+        opt.zero_grad()
+        total_loss = torch.zeros((), dtype=dtype, device=device)
+        for S, S_alpha in alpha_per_S.items():
+            un_S = unstable_indices[S]
+            n_targets = len(un_S)
+            n_S = n_neurons_at[S]
+            ew_init = torch.zeros(n_targets, n_S,
+                                    dtype=dtype, device=device)
+            for i, jj in enumerate(un_S):
+                ew_init[i, jj] = 1.0
+            lb_batch, _ = _crown_backward_matrix(
+                gg, xl, xh, S_alpha, bbr_tensors_init,
+                start_op_for_S[S], ew_init, device, dtype)
+            neg_ub_batch, _ = _crown_backward_matrix(
+                gg, xl, xh, S_alpha, bbr_tensors_init,
+                start_op_for_S[S], -ew_init, device, dtype)
+            ub_batch = -neg_ub_batch
+            total_loss = total_loss + (ub_batch - lb_batch).sum()
+            with torch.no_grad():
+                un_t = torch.as_tensor(un_S, device=device, dtype=torch.long)
+                lo_old, hi_old = best_bounds[S]
+                lo_new = torch.maximum(lo_old.scatter(
+                    0, un_t,
+                    torch.maximum(lo_old[un_t], lb_batch.detach())), lo_old)
+                hi_new = torch.minimum(hi_old.scatter(
+                    0, un_t,
+                    torch.minimum(hi_old[un_t], ub_batch.detach())), hi_old)
+                best_bounds[S] = (lo_new, hi_new)
+        total_loss.backward()
+        opt.step()
+        if sched is not None:
+            sched.step()
+        with torch.no_grad():
+            for S, S_alpha in alpha_per_S.items():
+                for L, a in S_alpha.items():
+                    a.clamp_(0.0, 1.0)
+                    active, dead, _ = slopes_cache[L]
+                    a[:, active] = 1.0
+                    a[:, dead] = 0.0
+    return best_bounds
+
+
 def run_alpha_crown_batched(
         gg, xl, xh, bbr_init, w_qs, b_qs,
         intermediate_start_nodes, unstable_indices,
@@ -993,6 +1102,63 @@ def build_dir_adaptive_alpha(alpha_spec, ew_at_relu, bbr, device, dtype):
         else:
             # Fall back to up_s (min-area) for layers without α.
             lam[unstable] = up_s[unstable]
+        alpha_per_layer[L] = lam
+    return alpha_per_layer
+
+
+def build_lb_tight_alpha(alpha_spec, bbr, device, dtype):
+    """Per-neuron λ for a 'lower-bound-tight' zonotope: every unstable neuron
+    uses the α-CROWN-optimised α (the lower-edge ReLU relaxation slope
+    y ≥ α·z). The parallelogram leans to maximise the LB on z_k along
+    the spec direction; combined with the spec halfspace LP, gives a
+    tight LB on each unstable z_k. Pair with `build_ub_tight_alpha`
+    for a dual-pass that gets a tight UB from the same forward
+    machinery (different parallelogram orientation).
+
+    Stable-on: λ=1. Dead: λ=0. Returns dict {L: tensor (n_neurons,)}.
+    """
+    alpha_per_layer = {}
+    for L, (lo, hi) in bbr.items():
+        lo_t = torch.as_tensor(lo, dtype=dtype, device=device)
+        hi_t = torch.as_tensor(hi, dtype=dtype, device=device)
+        lo_s, _, _, active, dead, unstable = _make_slopes(lo_t, hi_t)
+        lam = torch.zeros_like(lo_t)
+        lam[active] = 1.0
+        if L in alpha_spec:
+            alpha = alpha_spec[L]
+            if alpha.numel() == lo_t.numel():
+                lam[unstable] = alpha[unstable]
+            else:
+                # Sparse α: shape (n_unstable,) → densify
+                un_idx = torch.nonzero(
+                    unstable, as_tuple=False).flatten()
+                alpha_full = torch.zeros_like(lo_t)
+                alpha_full[un_idx] = alpha
+                lam[unstable] = alpha_full[unstable]
+        else:
+            # No α for this layer — fall back to lo_s (min-area lower-edge).
+            lam[unstable] = lo_s[unstable]
+        alpha_per_layer[L] = lam
+    return alpha_per_layer
+
+
+def build_ub_tight_alpha(bbr, device, dtype):
+    """Per-neuron λ for an 'upper-bound-tight' zonotope: every unstable
+    neuron uses up_s = hi/(hi-lo) (the upper-edge ReLU relaxation slope
+    y ≤ up_s·z + up_t). The parallelogram leans to minimise the UB on
+    z_k. Pair with `build_lb_tight_alpha` for a dual-pass that produces
+    tight per-neuron `[lo, hi]` (LB from lb-tight pass, UB from ub-tight).
+
+    Stable-on: λ=1. Dead: λ=0. Returns dict {L: tensor (n_neurons,)}.
+    """
+    alpha_per_layer = {}
+    for L, (lo, hi) in bbr.items():
+        lo_t = torch.as_tensor(lo, dtype=dtype, device=device)
+        hi_t = torch.as_tensor(hi, dtype=dtype, device=device)
+        _, up_s, _, active, dead, unstable = _make_slopes(lo_t, hi_t)
+        lam = torch.zeros_like(lo_t)
+        lam[active] = 1.0
+        lam[unstable] = up_s[unstable]
         alpha_per_layer[L] = lam
     return alpha_per_layer
 
