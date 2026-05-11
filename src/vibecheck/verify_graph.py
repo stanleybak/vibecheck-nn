@@ -3389,27 +3389,18 @@ def _phase1_bab_refine(
     score_mode = str(getattr(settings, 'bab_refine_score', 'center_width'))
     short_circuit = bool(getattr(settings, 'bab_refine_short_circuit', True))
     n_passes = max(1, int(getattr(settings, 'bab_refine_passes', 1)))
-    remove_unstable = bool(
-        getattr(settings, 'bab_refine_remove_unstable', True))
     phase05_alpha_iters = int(
         getattr(settings, 'bab_refine_phase05_alpha_iters', 10))
     phase05_spec_iters = int(
         getattr(settings, 'bab_refine_phase05_spec_iters', 20))
-    alpha_per_target = bool(
-        getattr(settings, 'bab_refine_alpha_per_target', False))
 
     def _alpha_refresh_best_bounds(bbr_now, S_nodes, un_idx, n_iters):
         """Dispatch α-CROWN intermediate-bound refresh.
 
-        Returns `best_bounds: dict {L: (lo_t, hi_t)}` regardless of which
-        backend ran. With per-target α, each (S, target) gets independent
-        slopes; otherwise α is shared across queries with a spec-LB loss.
+        Returns `best_bounds: dict {L: (lo_t, hi_t)}` from
+        `run_alpha_crown_batched` (shared α across queries with a
+        spec-LB loss).
         """
-        if alpha_per_target:
-            return ac.run_alpha_crown_per_target_widths(
-                gg, xl, xh, bbr_now, S_nodes, un_idx,
-                device, dtype, n_iters=n_iters, lr=alpha_lr,
-                lr_decay=0.98)
         _, _, best_bounds, _ = ac.run_alpha_crown_batched(
             gg, xl, xh, bbr_now, w_qs, b_qs, S_nodes, un_idx,
             device, dtype, n_iters=n_iters, lr=alpha_lr,
@@ -3418,7 +3409,7 @@ def _phase1_bab_refine(
 
     ew_score_per_layer = None
     min_ew_per_layer = None
-    need_ew = (score_mode == 'ew_frac' and topk > 0) or remove_unstable
+    need_ew = score_mode == 'ew_frac' and topk > 0
     spec_ew_local = {
         qi: (torch.as_tensor(np.asarray(queries_flat[qi][1],
                                           dtype=np.float64),
@@ -3456,61 +3447,12 @@ def _phase1_bab_refine(
                 np.minimum(hi_g, hi_a))
         tb['phase1_alpha_total'] += time.perf_counter() - t_a
 
-    # Optional Phase 0.5 step 1.5: MIP-tighten L=1 BEFORE spec α-CROWN.
-    # Idea: feeding spec α-CROWN tighter L=1 bounds can close more specs
-    # in Phase 0.5, triggering the all-closed short-circuit on cases the
-    # cascade would otherwise have to chew through. The L=1 cascade
-    # iteration is then skipped (start_layer=2) since its work is done.
-    phase05_milp_l1 = bool(
-        getattr(settings, 'bab_refine_phase05_milp_l1', False))
     cascade_start_layer = 1
-    if phase05_milp_l1 and queries_flat and 1 in bounds_by_relu:
-        lo_1, hi_1 = bounds_by_relu[1]
-        unstable_1 = np.where((lo_1 < 0) & (hi_1 > 0))[0]
-        if len(unstable_1) > 0:
-            t_m = time.perf_counter()
-            new_lo, new_hi, _meth, _db, _dp, _ds = _tighten_layer_gen_cone(
-                gg_ops_ser, x_lo_64, x_hi_64, bounds_by_relu, 1,
-                unstable_1, gg['input_name'],
-                sample_timeout=sample_timeout, n_cores=n_cores,
-                time_left=time_left, mode='gen_cone_milp',
-                device=device, dtype=dtype, use_milp=True, precomputed=None)
-            bounds_by_relu[1] = (np.maximum(lo_1, new_lo),
-                                  np.minimum(hi_1, new_hi))
-            tb['phase1_milp_total'] += time.perf_counter() - t_m
-            # α-CROWN refresh on the tightened L=1 bounds — propagates
-            # the tightening to L=2, L=3, etc. before spec α-CROWN runs.
-            t_a = time.perf_counter()
-            intermediate_start_nodes_p15 = [
-                Lk for Lk in bounds_by_relu if Lk > 0 and
-                ((bounds_by_relu[Lk][0] < 0)
-                 & (bounds_by_relu[Lk][1] > 0)).any()]
-            unstable_indices_p15 = {
-                Lk: np.where((bounds_by_relu[Lk][0] < 0)
-                              & (bounds_by_relu[Lk][1] > 0))[0].tolist()
-                for Lk in bounds_by_relu}
-            if intermediate_start_nodes_p15:
-                best_bounds = _alpha_refresh_best_bounds(
-                    bounds_by_relu, intermediate_start_nodes_p15,
-                    unstable_indices_p15, phase05_alpha_iters)
-                for Lk in best_bounds:
-                    lo_t, hi_t = best_bounds[Lk]
-                    lo_a = lo_t.detach().cpu().numpy().astype(np.float64)
-                    hi_a = hi_t.detach().cpu().numpy().astype(np.float64)
-                    lo_g, hi_g = bounds_by_relu[Lk]
-                    bounds_by_relu[Lk] = (
-                        np.maximum(lo_g, lo_a),
-                        np.minimum(hi_g, hi_a))
-            tb['phase1_alpha_total'] += time.perf_counter() - t_a
-        # Skip L=1 in the cascade since we just did its MIP.
-        cascade_start_layer = 2
 
     # Spec α-CROWN with frozen (just-tightened) intermediate bounds.
     open_qis = list(range(len(queries_flat)))
     spec_lbs_phase05 = None
     spec_alpha_phase05 = None  # captured for downstream ew sweep
-    per_spec_alpha = bool(
-        getattr(settings, 'bab_refine_phase05_per_spec_alpha', True))
     if queries_flat:
         t_a = time.perf_counter()
         spec_lbs_phase05, alpha_dict_p05, _, _ = (
@@ -3518,13 +3460,8 @@ def _phase1_bab_refine(
                 gg, xl, xh, bounds_by_relu, w_qs, b_qs,
                 device, dtype, n_iters=phase05_spec_iters, lr=alpha_lr,
                 lr_decay=0.98, early_stop_on_positive=True,
-                per_spec_alpha=per_spec_alpha))
-        # Capture spec α only when shared (dense per-layer tensors of
-        # shape (n_neurons_at_L,)). Per-spec α has shape (n_q, n_L);
-        # `capture_ew_per_relu` expects (n_neurons,) so fall back to
-        # trivial α in that case.
-        if not per_spec_alpha:
-            spec_alpha_phase05 = alpha_dict_p05.get('spec')
+                per_spec_alpha=False))
+        spec_alpha_phase05 = alpha_dict_p05.get('spec')
         open_qis = [qi for qi in range(len(queries_flat))
                     if float(spec_lbs_phase05[qi]) <= 0]
         tb['phase1_alpha_total'] += time.perf_counter() - t_a
@@ -3594,26 +3531,8 @@ def _phase1_bab_refine(
                 min_ew_per_layer[L] = np.minimum(
                     min_ew_per_layer[L], ew_np)
 
-    # Phase 1 hard budget — cap as a fraction of total_timeout. Once
-    # elapsed Phase 1 time exceeds budget, exit the cascade early
-    # leaving remaining layers at their pre-cascade bbr (sound).
-    _p1_frac = float(getattr(settings, 'phase1_time_fraction', 0.0))
-    _phase1_budget = (_p1_frac * float(getattr(settings,
-                                                  'total_timeout', 120.0))
-                      if _p1_frac > 0.0 else None)
-
-    def _phase1_over_budget():
-        if _phase1_budget is None:
-            return False
-        return (time.perf_counter() - t_total) > _phase1_budget
-
     for pass_idx in range(n_passes):
         if time_left() <= 1:
-            break
-        if _phase1_over_budget():
-            if print_progress:
-                print(f'  [bab_refine] phase1 budget exhausted, exiting',
-                      flush=True)
             break
         if print_progress and n_passes > 1:
             print(f'  [bab_refine] pass {pass_idx+1}/{n_passes}', flush=True)
@@ -3625,11 +3544,6 @@ def _phase1_bab_refine(
         # `if relu_idx >= 1` guard at lp_mip_solver.py:1849.
         for L in range(cascade_start_layer, max_layer + 1):
             if time_left() <= 1:
-                break
-            if _phase1_over_budget():
-                if print_progress:
-                    print(f'  [bab_refine L{L}] phase1 budget exhausted, '
-                          f'skipping remaining layers', flush=True)
                 break
             lo_l, hi_l = bounds_by_relu[L]
             unstable = np.where((lo_l < 0) & (hi_l > 0))[0]
@@ -3657,26 +3571,6 @@ def _phase1_bab_refine(
                 unstable_for_milp = unstable_sorted[:topk]
             else:
                 unstable_for_milp = unstable_sorted
-            # AB-CROWN's `remove_unstable_neurons` filter — skip per-neuron
-            # MILP for neurons whose spec-direction ew is positive on every
-            # open spec row (refining can't help spec_LB). Applied at L>=2
-            # to match AB's "Start on the third linear layer" guard
-            # (lp_mip_solver.py:1858); L=1's ew is computed on the initial
-            # bbr before any upstream MIP refinement, so AB skips the
-            # filter there.
-            if (remove_unstable and L >= 2
-                    and min_ew_per_layer is not None
-                    and L in min_ew_per_layer):
-                me = min_ew_per_layer[L]
-                keep_mask = me[unstable_for_milp] <= 0
-                n_skipped = int((~keep_mask).sum())
-                if n_skipped > 0:
-                    unstable_for_milp = unstable_for_milp[keep_mask]
-                    if (os.environ.get('VC_LOG_MILP_TIMEOUTS', '') == '1'
-                            or print_progress):
-                        print(f'    [tighten L{L}] remove_unstable: '
-                              f'{n_skipped} neurons skipped (all-positive ew), '
-                              f'{len(unstable_for_milp)} remain', flush=True)
             # MILP-tighten z_L (sliding window applied via env var).
             t_m = time.perf_counter()
             # Cap total time for this layer's MILP — wraps the time_left
@@ -3685,18 +3579,7 @@ def _phase1_bab_refine(
             # remaining time.
             layer_start = time.perf_counter()
             gtl = time_left
-            # When phase1_time_fraction is set, derive per-layer budget
-            # from the REMAINING phase1 budget divided across layers
-            # still to process. This gives the deeper layers more time
-            # if early ones finished fast, and less if they didn't.
-            if _phase1_budget is not None:
-                p1_used = time.perf_counter() - t_total
-                p1_remain = max(0.0, _phase1_budget - p1_used)
-                layers_remain = max(1, max_layer - L + 1)
-                # Reserve ~30% for the per-layer α-CROWN refresh.
-                _layer_lb = (p1_remain / layers_remain) * 0.7
-            else:
-                _layer_lb = layer_budget
+            _layer_lb = layer_budget
             def _layer_time_left(start=layer_start, lb=_layer_lb,
                                   gtl=gtl):
                 return min(gtl(), lb - (time.perf_counter() - start))
@@ -3756,51 +3639,6 @@ def _phase1_bab_refine(
                         print(f'  [bab_refine L{L}] all specs closed (short-circuit)',
                               flush=True)
                     break
-                # Refresh open_qis and min_ew_per_layer for the next layer's
-                # filter. AB-CROWN does this between MIP layers
-                # (lp_mip_solver.py:1979-1986). Cost: one CROWN backward per
-                # still-open spec (~10ms each on mnist_fc); narrows the filter
-                # when bbr has tightened materially. Off by default — see
-                # `bab_refine_refresh_filter_per_layer` for caveats.
-                if (need_ew and remove_unstable
-                        and bool(getattr(settings,
-                                          'bab_refine_refresh_filter_per_layer',
-                                          False))
-                        and L + 1 <= max_layer
-                        and L + 1 in bounds_by_relu):
-                    open_qis = [qi for qi, lb in spec_lbs_now.items()
-                                if lb <= 0]
-                    if open_qis:
-                        from .alpha_crown import _make_slopes
-                        alpha_for_ew = {}
-                        for Lk in bounds_by_relu:
-                            lo_t = torch.as_tensor(bounds_by_relu[Lk][0],
-                                                    dtype=dtype, device=device)
-                            hi_t = torch.as_tensor(bounds_by_relu[Lk][1],
-                                                    dtype=dtype, device=device)
-                            lo_s, _, _, active, dead, _u = _make_slopes(
-                                lo_t, hi_t)
-                            a = torch.zeros_like(lo_t)
-                            a[active] = 1.0
-                            unst_lk = ((bounds_by_relu[Lk][0] < 0)
-                                        & (bounds_by_relu[Lk][1] > 0))
-                            unst_lk_t = torch.as_tensor(unst_lk, device=device)
-                            a[unst_lk_t] = lo_s[unst_lk_t]
-                            alpha_for_ew[Lk] = a
-                        for Lk in bounds_by_relu:
-                            min_ew_per_layer[Lk] = np.full(
-                                bounds_by_relu[Lk][0].size, np.inf,
-                                dtype=np.float64)
-                        for qi in open_qis:
-                            _, ew_at = ac.capture_ew_per_relu(
-                                gg, xl, xh, alpha_for_ew, bounds_by_relu,
-                                w_qs[qi], float(b_qs[qi]), device, dtype)
-                            for Lk, ew_t in ew_at.items():
-                                ew_np = ew_t.detach().cpu().numpy().astype(
-                                    np.float64)
-                                min_ew_per_layer[Lk] = np.minimum(
-                                    min_ew_per_layer[Lk], ew_np)
-
     # Materialise sb (torch tensors) from updated bounds_by_relu.
     sb = {L: (torch.tensor(lo, dtype=dtype, device=device),
               torch.tensor(hi, dtype=dtype, device=device))
@@ -3955,249 +3793,6 @@ def _forward_keep_pre_gpu(xl, xh, gg, device, dtype, override_tight=None,
     return zono_state[last_name], pre_relu_gpu
 
 
-def _phase2p5_bab_split(
-        gg, xl_g, xh_g, w_np, b_q, current_bounds, ew_per_relu,
-        z_final, pre_relu_gpu_in, alpha_per_layer, unstable_per_layer_q,
-        bab_iters, rebuild_zono, settings, device, dtype):
-    """Iterative box+halfspace splits on top of the spec-adaptive zonotope.
-
-    For each of `bab_iters` candidate split neurons (ranked by |ew|×frac):
-      - Build the two halfspaces: child A (N ≥ 0) → −g_N·e ≤ c_N;
-                                  child B (N ≤ 0) →  g_N·e ≤ −c_N.
-      - Apply box+halfspace LP at every layer to get tightened bounds for
-        each child.
-      - Compute spec_lb under each child via the same closed-form LP.
-      - 3 outcomes per split: (i) both verify → CLOSED; (ii) one verifies →
-        commit other side's tightened bounds (split neuron auto-flips
-        stable); (iii) neither verifies → take the union (sound).
-      - Optionally rebuild the spec-adaptive zonotope from the new bounds.
-
-    Returns (closed, final_lb, final_bounds, info).
-    """
-    from . import box_halfspace
-    from . import alpha_crown as ac
-    import time as _t
-
-    info = {'iters': [], 'rebuild': bool(rebuild_zono),
-            'closed_at_iter': None, 't_total': 0.0}
-    _t0 = _t.perf_counter()
-
-    # State holders that may be rebuilt
-    pre_relu_gpu = pre_relu_gpu_in
-    c_out = z_final.center.detach().cpu().numpy().astype(np.float64)
-    G_out = z_final.generators.detach().cpu().numpy().astype(np.float64)
-    n_gens = G_out.shape[1]
-    d_spec = G_out.T @ w_np  # (n_gens,)
-    c0_spec = float(w_np @ c_out + b_q)
-
-    # Running bounds (sound, monotonically tightening)
-    bounds = {L: (np.asarray(lo, dtype=np.float64).copy(),
-                   np.asarray(hi, dtype=np.float64).copy())
-              for L, (lo, hi) in current_bounds.items()}
-
-    # Pre-extract pre_relu_gpu into per-layer full-size numpy arrays. The
-    # slim form (only original-unstable rows) breaks once bounds tighten and
-    # the unstable set shrinks (tighten_all_layers_with_halfspace's slim
-    # check fails and silently mis-indexes). Full-form is N×K float64 — fine
-    # for one query at a time.
-    pre_relu_full = {}
-    for L, (c_gpu, G_gpu) in pre_relu_gpu.items():
-        n_full = bounds[L][0].shape[0]
-        smap = (None if L not in unstable_per_layer_q
-                or unstable_per_layer_q[L].numel() == 0
-                else {int(unstable_per_layer_q[L][i].item()): i
-                       for i in range(unstable_per_layer_q[L].shape[0])})
-        c_slim = c_gpu.detach().cpu().numpy().astype(np.float64)
-        G_slim = G_gpu.detach().cpu().numpy().astype(np.float64)
-        if smap is not None and c_slim.shape[0] == len(smap):
-            # Slim → full
-            c_full = np.zeros(n_full, dtype=np.float64)
-            G_full = np.zeros((n_full, G_slim.shape[1]), dtype=np.float64)
-            for global_k, slim_i in smap.items():
-                c_full[global_k] = c_slim[slim_i]
-                G_full[global_k] = G_slim[slim_i]
-            pre_relu_full[L] = (c_full, G_full)
-        elif c_slim.shape[0] == n_full:
-            pre_relu_full[L] = (c_slim, G_slim)
-        else:
-            # Unexpected size — skip this layer
-            continue
-
-    # Build candidate ranking from ew_per_relu (q_info_ew):
-    # score(L, k) = |ew[L][k]| × (hi · |lo|) / (hi - lo) for unstable (L, k).
-    candidates = []
-    for L, (lo_L, hi_L) in bounds.items():
-        if L not in ew_per_relu:
-            continue
-        ew_L = np.abs(np.asarray(ew_per_relu[L], dtype=np.float64))
-        for k in np.where((lo_L < 0) & (hi_L > 0))[0]:
-            k = int(k)
-            ew_i = float(ew_L[k]) if k < len(ew_L) else 1.0
-            denom = float(hi_L[k] - lo_L[k])
-            if denom <= 0:
-                continue
-            frac = float(hi_L[k]) * abs(float(lo_L[k])) / denom
-            candidates.append((ew_i * frac, L, k))
-    candidates.sort(reverse=True)
-    candidates = [(L, k) for _, L, k in candidates]
-    if not candidates:
-        info['t_total'] = _t.perf_counter() - _t0
-        return False, None, bounds, info
-
-    layers_with_unstable = sorted(L for L, (lo, hi) in bounds.items()
-                                    if ((lo < 0) & (hi > 0)).any())
-
-    closed = False
-    final_lb = None
-
-    for it in range(min(bab_iters, len(candidates))):
-        L_pick, k_pick = candidates[it]
-        # Skip if neuron already stable (committed earlier or by union).
-        lo_pk = bounds[L_pick][0][k_pick]
-        hi_pk = bounds[L_pick][1][k_pick]
-        if lo_pk >= -1e-9 or hi_pk <= 1e-9:
-            info['iters'].append({'i': it, 'L': L_pick, 'k': k_pick,
-                                   'skip': 'already_stable'})
-            continue
-
-        # Locate (c_N, g_N) in pre_relu_full (full-form numpy).
-        if L_pick not in pre_relu_full:
-            info['iters'].append({'i': it, 'L': L_pick, 'k': k_pick,
-                                   'skip': 'no_pre_relu'})
-            continue
-        c_full, G_full = pre_relu_full[L_pick]
-        if k_pick >= c_full.shape[0]:
-            info['iters'].append({'i': it, 'L': L_pick, 'k': k_pick,
-                                   'skip': 'k_out_of_range'})
-            continue
-        c_N = float(c_full[k_pick])
-        g_N = G_full[k_pick].copy()
-        # Pad g_N to current n_gens
-        if g_N.shape[0] < n_gens:
-            g_N = np.concatenate([g_N, np.zeros(n_gens - g_N.shape[0],
-                                                  dtype=np.float64)])
-        elif g_N.shape[0] > n_gens:
-            g_N = g_N[:n_gens]
-
-        # Halfspaces
-        a_A = -g_N
-        beta_A = c_N
-        a_B = g_N
-        beta_B = -c_N
-
-        # Tighten per-layer bounds for each child using pre_relu_full
-        # (full-form numpy), avoiding the slim/full mismatch in
-        # tighten_all_layers_with_halfspace once unstable sets shrink.
-        def _tighten_layers(a_hs, beta_hs):
-            res = {}
-            for L in layers_with_unstable:
-                if L not in pre_relu_full:
-                    res[L] = (bounds[L][0].copy(), bounds[L][1].copy())
-                    continue
-                c_L, G_L = pre_relu_full[L]
-                lo_new, hi_new = box_halfspace.tighten_layer(
-                    c_L, G_L, bounds[L][0], bounds[L][1], a_hs, beta_hs,
-                    n_gens=n_gens)
-                res[L] = (lo_new, hi_new)
-            return res
-
-        bounds_A_res = _tighten_layers(a_A, beta_A)
-        bounds_B_res = _tighten_layers(a_B, beta_B)
-
-        # Spec LB per child (single halfspace + box).
-        spec_lb_A = float(box_halfspace.lagrangian_min(
-            d_spec, c0_spec, a_A, beta_A))
-        spec_lb_B = float(box_halfspace.lagrangian_min(
-            d_spec, c0_spec, a_B, beta_B))
-
-        decision = None
-        if spec_lb_A > 0 and spec_lb_B > 0:
-            decision = 'both_verified'
-            closed = True
-            final_lb = min(spec_lb_A, spec_lb_B)
-        elif spec_lb_A > 0:
-            decision = 'commit_dead'  # surviving = child B (N ≤ 0)
-            for L in bounds_B_res:
-                bounds[L] = (np.maximum(bounds[L][0], bounds_B_res[L][0]),
-                             np.minimum(bounds[L][1], bounds_B_res[L][1]))
-        elif spec_lb_B > 0:
-            decision = 'commit_active'  # surviving = child A (N ≥ 0)
-            for L in bounds_A_res:
-                bounds[L] = (np.maximum(bounds[L][0], bounds_A_res[L][0]),
-                             np.minimum(bounds[L][1], bounds_A_res[L][1]))
-        else:
-            decision = 'union'
-            # Sound union: lo_union = min(lo_A, lo_B); hi_union = max(hi_A, hi_B)
-            for L in bounds_A_res:
-                lo_u = np.minimum(bounds_A_res[L][0], bounds_B_res[L][0])
-                hi_u = np.maximum(bounds_A_res[L][1], bounds_B_res[L][1])
-                # Intersect with running tightening
-                bounds[L] = (np.maximum(bounds[L][0], lo_u),
-                             np.minimum(bounds[L][1], hi_u))
-
-        # Count flips this iter
-        n_flipped_iter = 0
-        for L in bounds_A_res:
-            lo_n = bounds[L][0]
-            hi_n = bounds[L][1]
-            n_flipped_iter += int(((lo_n >= -1e-9) | (hi_n <= 1e-9)).sum())
-
-        info['iters'].append({
-            'i': it, 'L': L_pick, 'k': k_pick,
-            'spec_lb_A': spec_lb_A, 'spec_lb_B': spec_lb_B,
-            'decision': decision, 'n_stable_total': n_flipped_iter,
-        })
-
-        if closed:
-            info['closed_at_iter'] = it
-            break
-
-        # Optional rebuild: refresh the spec-adaptive zonotope on tighter
-        # bounds. Fires on every iteration when enabled (commits AND unions
-        # both shrink bounds, both benefit from a refreshed c, G).
-        if rebuild_zono:
-            try:
-                z_new, pre_relu_gpu_new = ac.forward_zono_dir_adaptive(
-                    xl_g, xh_g, gg, alpha_per_layer, bounds, device, dtype,
-                    settings=settings, unstable_per_layer=unstable_per_layer_q)
-                z_final = z_new
-                pre_relu_gpu = pre_relu_gpu_new
-                c_out = z_final.center.detach().cpu().numpy().astype(np.float64)
-                G_out = z_final.generators.detach().cpu().numpy().astype(
-                    np.float64)
-                n_gens = G_out.shape[1]
-                d_spec = G_out.T @ w_np
-                c0_spec = float(w_np @ c_out + b_q)
-                # Re-extract per-layer full-form pre-ReLU. The new zonotope
-                # may have new slim indices (the new unstable_per_layer might
-                # be a subset of the old one due to flips during rebuild).
-                pre_relu_full = {}
-                for L_re, (c_re, G_re) in pre_relu_gpu.items():
-                    n_full = bounds[L_re][0].shape[0]
-                    smap_re = (None if L_re not in unstable_per_layer_q
-                               or unstable_per_layer_q[L_re].numel() == 0
-                               else {int(unstable_per_layer_q[L_re][i].item()): i
-                                      for i in range(unstable_per_layer_q[L_re].shape[0])})
-                    c_slim_re = c_re.detach().cpu().numpy().astype(np.float64)
-                    G_slim_re = G_re.detach().cpu().numpy().astype(np.float64)
-                    if smap_re is not None and c_slim_re.shape[0] == len(smap_re):
-                        c_full = np.zeros(n_full, dtype=np.float64)
-                        G_full = np.zeros((n_full, G_slim_re.shape[1]),
-                                            dtype=np.float64)
-                        for global_k, slim_i in smap_re.items():
-                            c_full[global_k] = c_slim_re[slim_i]
-                            G_full[global_k] = G_slim_re[slim_i]
-                        pre_relu_full[L_re] = (c_full, G_full)
-                    elif c_slim_re.shape[0] == n_full:
-                        pre_relu_full[L_re] = (c_slim_re, G_slim_re)
-            except (RuntimeError, MemoryError):
-                # OOM or other failure: keep old zono and continue
-                pass
-
-    info['t_total'] = _t.perf_counter() - _t0
-    return closed, final_lb, bounds, info
-
-
 def _phase2p5_zono_lift(
         gg, xl_g, xh_g, bounds_by_relu, disj_queries, spec_ew, spec_lbs,
         still_open_disj, device, dtype, settings, print_progress,
@@ -4349,9 +3944,7 @@ def _phase2p5_zono_lift(
             # tightened by α-CROWN globally. Mirrors α,β-CROWN's
             # bab-refine pattern of "tighten K layers with MILP, then
             # re-run α-CROWN to refresh deeper layers."
-            if (best_bounds_shared is not None
-                    and bool(getattr(
-                        settings, 'merge_alpha_bounds_globally', False))):
+            if best_bounds_shared is not None:
                 for L in best_bounds_shared:
                     lo_t, hi_t = best_bounds_shared[L]
                     lo_a = lo_t.detach().cpu().numpy().astype(np.float64)
@@ -4360,36 +3953,6 @@ def _phase2p5_zono_lift(
                     bounds_by_relu[L] = (
                         np.maximum(lo_g, lo_a),
                         np.minimum(hi_g, hi_a))
-
-            # Optional per-target α-CROWN to further tighten bbr inside
-            # Phase 2.5. Per-target α gives strictly-or-equal tighter
-            # bounds than shared α — merge by max(lo)/min(hi) so the
-            # next forward zono builds on tighter intermediates.
-            if (best_bounds_shared is not None
-                    and bool(getattr(
-                        settings, 'phase2p5_alpha_per_target', False))):
-                bbr_for_pt = {
-                    L: (lo_t.detach().cpu().numpy().astype(np.float64),
-                         hi_t.detach().cpu().numpy().astype(np.float64))
-                    for L, (lo_t, hi_t) in best_bounds_shared.items()}
-                pt_isn = [Lk for Lk in bbr_for_pt if Lk > 0 and
-                          ((bbr_for_pt[Lk][0] < 0)
-                           & (bbr_for_pt[Lk][1] > 0)).any()]
-                pt_un = {Lk: np.where(
-                            (bbr_for_pt[Lk][0] < 0)
-                            & (bbr_for_pt[Lk][1] > 0))[0].tolist()
-                         for Lk in bbr_for_pt}
-                if pt_isn:
-                    pt_bounds = ac.run_alpha_crown_per_target_widths(
-                        gg, xl_g, xh_g, bbr_for_pt, pt_isn, pt_un,
-                        device, dtype, n_iters=alpha_iters, lr=alpha_lr,
-                        lr_decay=alpha_lr_decay)
-                    for L in pt_bounds:
-                        lo_pt, hi_pt = pt_bounds[L]
-                        lo_old, hi_old = best_bounds_shared[L]
-                        best_bounds_shared[L] = (
-                            torch.maximum(lo_old, lo_pt),
-                            torch.minimum(hi_old, hi_pt))
 
     for di in list(still_open):
         q_list = [(qi, w, b) for qi, w, b in disj_queries[di]
@@ -4562,46 +4125,17 @@ def _phase2p5_zono_lift(
                         np.minimum(bbr_alpha[L][1], override[L][1]))
                     if L in override else bbr_alpha[L]
                     for L in bbr_alpha}
-                _dual_pass = bool(getattr(
-                    settings, 'zono_lift_dual_pass', False))
-                if (alpha_per_layer is not None and _dual_pass
-                        and alpha_spec is not None):
-                    # Dual-pass: build TWO zonotopes — one with all unstables
-                    # using α-CROWN's lower-edge slope (tight LB on z_k via
-                    # halfspace LP) and one with all unstables using up_s
-                    # (tight UB on z_k). Each forward + halfspace LP gives
-                    # the corresponding-direction-tight bound; merge by
-                    # taking max(lo) and min(hi) per neuron.
-                    alpha_lb = ac.build_lb_tight_alpha(
-                        alpha_spec, _bbr_for_fwd, device, dtype)
-                    alpha_ub = ac.build_ub_tight_alpha(
-                        _bbr_for_fwd, device, dtype)
-                    z_lb, pre_relu_lb = ac.forward_zono_dir_adaptive(
-                        xl_g, xh_g, gg, alpha_lb, _bbr_for_fwd,
-                        device, dtype, settings=settings,
-                        unstable_per_layer=unstable_per_layer_q)
-                    z_ub, pre_relu_ub = ac.forward_zono_dir_adaptive(
-                        xl_g, xh_g, gg, alpha_ub, _bbr_for_fwd,
-                        device, dtype, settings=settings,
-                        unstable_per_layer=unstable_per_layer_q)
-                    # Use lb-tight zono as primary (for lb_zono the
-                    # halfspace-direction). Dual-pass tightening below.
-                    z_final = z_lb
-                    pre_relu_gpu = pre_relu_lb
-                    pre_relu_gpu_alt = pre_relu_ub
-                elif alpha_per_layer is not None:
+                if alpha_per_layer is not None:
                     z_final, pre_relu_gpu = ac.forward_zono_dir_adaptive(
                         xl_g, xh_g, gg, alpha_per_layer, _bbr_for_fwd,
                         device, dtype, settings=settings,
                         unstable_per_layer=unstable_per_layer_q)
-                    pre_relu_gpu_alt = None
                 else:
                     z_final, pre_relu_gpu = _forward_keep_pre_gpu(
                         xl_g, xh_g, gg, device, dtype,
                         override_tight=(override if override else None),
                         settings=settings,
                         unstable_per_layer=unstable_per_layer_q)
-                    pre_relu_gpu_alt = None
                 c_out = z_final.center.detach().cpu().numpy().astype(np.float64)
                 G_out = z_final.generators.detach().cpu().numpy().astype(np.float64)
                 lb_zono = float(
@@ -4630,28 +4164,6 @@ def _phase2p5_zono_lift(
                 result, stats = box_halfspace.tighten_all_layers(
                     pre_relu_gpu, c_out, G_out, w_np, b_q, working_bbr,
                     layers, device, dtype)
-                # Dual-pass: also tighten via the ub-tight zonotope.
-                # Per-neuron: lo from lb-tight (max), hi from ub-tight (min).
-                if pre_relu_gpu_alt is not None:
-                    c_alt = z_ub.center.detach().cpu().numpy().astype(
-                        np.float64)
-                    G_alt = z_ub.generators.detach().cpu().numpy().astype(
-                        np.float64)
-                    result_alt, stats_alt = box_halfspace.tighten_all_layers(
-                        pre_relu_gpu_alt, c_alt, G_alt, w_np, b_q,
-                        working_bbr, layers, device, dtype)
-                    merged = {}
-                    for L in set(result) | set(result_alt):
-                        lo_a, hi_a = result.get(L, working_bbr[L])
-                        lo_b, hi_b = result_alt.get(L, working_bbr[L])
-                        merged[L] = (np.maximum(lo_a, lo_b),
-                                      np.minimum(hi_a, hi_b))
-                    result = merged
-                    stats['n_flipped'] = (stats.get('n_flipped', 0)
-                                           + stats_alt.get('n_flipped', 0))
-                    stats['total_shrink'] = (stats.get('total_shrink', 0.0)
-                                              + stats_alt.get('total_shrink',
-                                                              0.0))
                 for L, (lo_n, hi_n) in result.items():
                     if L in override:
                         ol, oh = override[L]
@@ -4719,52 +4231,9 @@ def _phase2p5_zono_lift(
                         hi_f = np.minimum(hi_f, override[L][1])
                     tightened[L] = (lo_f, hi_f)
 
-            # ----- Phase 2.5 BaB-style split iterations (NEW) -----
-            bab_iters_set = int(getattr(settings, 'phase2p5_bab_iters', 0))
-            bab_rebuild = bool(getattr(
-                settings, 'phase2p5_bab_rebuild_zono', False))
-            bab_info = None
-            if (not closed_here and bab_iters_set > 0
-                    and tightened is not None
-                    and q_info_ew is not None
-                    and 'z_final' in dir() and 'pre_relu_gpu' in dir()):
-                from . import box_halfspace as _bh  # noqa: F401
-                try:
-                    bab_closed, bab_lb, bab_bounds, bab_info = (
-                        _phase2p5_bab_split(
-                            gg, xl_g, xh_g, w_np, b_q,
-                            tightened, q_info_ew,
-                            z_final, pre_relu_gpu, alpha_per_layer,
-                            unstable_per_layer_q,
-                            bab_iters_set, bab_rebuild,
-                            settings, device, dtype))
-                    if bab_closed:
-                        spec_lbs[qi] = max(spec_lbs.get(qi, -1e30),
-                                            float(bab_lb))
-                        closed_here = True
-                    tightened = bab_bounds
-                    if print_progress:
-                        n_iters = len(bab_info.get('iters', []))
-                        n_commit = sum(
-                            1 for r in bab_info['iters']
-                            if r.get('decision') in (
-                                'commit_active', 'commit_dead'))
-                        n_union = sum(
-                            1 for r in bab_info['iters']
-                            if r.get('decision') == 'union')
-                        print(f'  q{qi} BaB: iters={n_iters} '
-                              f'commits={n_commit} unions={n_union} '
-                              f'closed={bab_closed} '
-                              f'wall={bab_info["t_total"]*1000:.0f}ms')
-                except (RuntimeError, MemoryError) as _e:
-                    if print_progress:
-                        print(f'  q{qi} BaB skipped ({type(_e).__name__})')
-
             q_info[qi] = {'passes': pass_records, 'closed': closed_here}
             _dt_q = time.perf_counter() - _t_qstart
             q_info[qi]['t_total'] = _dt_q
-            if bab_info is not None:
-                q_info[qi]['bab'] = bab_info
             # Stash α-CROWN ew per-query for Phase 8 scoring (only if it
             # wasn't closed here — closed queries don't need MILP).
             if not closed_here and q_info_ew is not None:
@@ -4836,91 +4305,6 @@ def _compute_avg_layer_width(gg, bounds_by_relu):
         mask = (lo_np < 0) & (hi_np > 0)
         out[name] = float((hi_np - lo_np)[mask].mean()) if mask.any() else 0.0
     return out
-
-
-def _deferred_milp_tighten_layer(
-        L, gg_ops, x_lo, x_hi, bounds_by_relu,
-        n_cores, probe_timeout, probe_neurons, budget_frac,
-        time_left, skip_probe=False):
-    """Parallel per-neuron MILP tighten at layer L, with probe + budget guard.
-
-    Designed to run AFTER α-CROWN (Phase 2.5) fails to close every disjunct.
-    The idea: α-CROWN is fast and closes easy cases without the expensive
-    Phase 1 MILP tightening; only if it fails do we pay for L1 tightening,
-    and even then we first probe a handful of neurons to make sure the
-    per-neuron MILP is solvable (not all hitting `probe_timeout`) and the
-    extrapolated full-layer wall fits within `budget_frac × time_left`.
-
-    Returns (new_lo, new_hi, info_dict). `info_dict['method']` is one of
-    'milp' (succeeded), 'probe_timeout' (all sampled neurons hit timeout
-    → full tighten would too), 'over_budget' (extrapolated full-tighten
-    wall exceeds budget), or 'no_unstable' (nothing to tighten).
-    """
-    lo, hi = bounds_by_relu[L]
-    lo = np.asarray(lo, dtype=np.float64)
-    hi = np.asarray(hi, dtype=np.float64)
-    unstable = np.where((lo < 0) & (hi > 0))[0]
-    if len(unstable) == 0:
-        return lo.copy(), hi.copy(), {'method': 'no_unstable'}
-
-    n_sample = int(probe_neurons) if probe_neurons else n_cores
-    n_sample = min(n_sample, len(unstable))
-    rng = np.random.RandomState(int(L))
-    sample_idx = rng.choice(unstable, n_sample, replace=False)
-
-    layers_np, seq_bounds, seq_li = _build_sequential_subgraph(
-        gg_ops, L, bounds_by_relu)
-
-    # Probe: full-timeout MILP on `n_sample` neurons. When `skip_probe=True`
-    # (bab-refine cascade), don't probe-and-bail — α,β-CROWN's MIP-refine
-    # accepts partial progress on per-neuron timeouts (e.g. 16/97 timed out
-    # at L3 in their prop_5 run, they still kept the partial-progress bound
-    # for those and the converged bound for the rest).
-    dt_probe = 0.0
-    if not skip_probe:
-        t0 = time.perf_counter()
-        _, _, any_timeout = _tighten_layer_parallel(
-            layers_np, x_lo, x_hi, seq_bounds, seq_li,
-            use_milp=True, timeout=probe_timeout,
-            n_cores=n_cores, neuron_subset=sample_idx)
-        dt_probe = time.perf_counter() - t0
-        if any_timeout:
-            return lo.copy(), hi.copy(), {
-                'method': 'probe_timeout', 'dt_probe': dt_probe,
-                'n_unstable': len(unstable)}
-
-        # Extrapolate full-layer wall. `dt_probe` is the wall of the parallel
-        # probe over `n_sample` neurons using `n_cores` workers (effectively
-        # one "batch" since n_sample <= n_cores). The full tighten has
-        # `len(unstable) / n_cores` such batches, each ~dt_probe wide.
-        n_batches_est = max(1.0, len(unstable) / max(1, n_cores))
-        est_full = dt_probe * n_batches_est
-        budget = budget_frac * time_left()
-        if est_full > budget:
-            return lo.copy(), hi.copy(), {
-                'method': 'over_budget', 'dt_probe': dt_probe,
-                'est_full': est_full, 'budget': budget,
-                'n_unstable': len(unstable)}
-    else:
-        # Cap full-layer wall by remaining budget — divide budget across
-        # remaining neurons evenly, so a slow layer doesn't burn the whole
-        # timeout.
-        budget = budget_frac * time_left()
-        est_full = budget
-
-    # Full parallel tighten.
-    t_solve = time.perf_counter()
-    new_lo, new_hi, _ = _tighten_layer_parallel(
-        layers_np, x_lo, x_hi, seq_bounds, seq_li,
-        use_milp=True, timeout=probe_timeout,
-        n_cores=n_cores, neuron_subset=unstable)
-    dt_solve = time.perf_counter() - t_solve
-    new_lo = np.maximum(new_lo, lo)
-    new_hi = np.minimum(new_hi, hi)
-    return new_lo, new_hi, {
-        'method': 'milp', 'dt_probe': dt_probe,
-        'dt_solve': dt_solve, 'est_full': est_full, 'budget': budget,
-        'n_unstable': len(unstable)}
 
 
 def _run_pipeline(graph, spec, settings, build_fn, impl):
@@ -5116,23 +4500,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     _tf = str(getattr(settings, 'tighten_formulation', 'weight_walk'))
     rec_zono = {} if _tf == 'gen_cone' else None
 
-    # Deferred MILP tightening: skip L1+ MILP in Phase 1; come back after
-    # α-CROWN if it fails. We lower `max_tighten_layer` to one below the
-    # smallest deferred layer so Phase 1 still tightens everything before it.
-    _deferred_milp = bool(getattr(settings, 'deferred_milp_tighten', False))
-    _deferred_milp_layers = sorted(int(x) for x in getattr(
-        settings, 'deferred_milp_layers', ()) or ())
-    _saved_max_tighten_layer = getattr(settings, 'max_tighten_layer', None)
-    if _deferred_milp and _deferred_milp_layers:
-        _new_cap = _deferred_milp_layers[0] - 1
-        if (_saved_max_tighten_layer is None
-                or int(_saved_max_tighten_layer) > _new_cap):
-            settings.max_tighten_layer = _new_cap
-            if print_progress:
-                print(f'Phase 1 deferred-MILP: tightening capped at '
-                      f'L{_new_cap} (layers {_deferred_milp_layers} '
-                      f'will be tightened after α-CROWN if needed)')
-
     t0 = time.perf_counter()
     _phase1_method = str(getattr(settings, 'phase1_method', 'legacy'))
     try:
@@ -5188,12 +4555,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     timing['phase1_zono_tighten'] = time.perf_counter() - t0
     timing['phase1_breakdown'] = phase1_tb
     _mem_audit('after phase1')
-
-    # Restore user's max_tighten_layer (we only overrode for Phase 1 when
-    # deferred-MILP is enabled; the deferred block below uses the full list
-    # of deferred layers directly).
-    if _deferred_milp and _deferred_milp_layers:
-        settings.max_tighten_layer = _saved_max_tighten_layer
 
     # --- Phase 2: CROWN backward ---
     t0 = time.perf_counter()
@@ -5312,99 +4673,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         details['phase2p5'] = phase25_info
         if not still_open_disj:
             return _finalize('verified', 'zono_lift')
-
-    # --- Phase 2.7: deferred MILP tightening / bab-refine cascade ---
-    # If α-CROWN didn't close every disjunct, come back and do the parallel
-    # per-neuron MILP tightening we skipped at Phase 1. Probe+budget guard
-    # prevents spending the whole timeout on a layer where individual neuron
-    # MILPs don't converge.
-    #
-    # When `bab_refine_cascade=True` (default-on for small networks where
-    # input split doesn't apply), this matches α,β-CROWN's `bab-refine`
-    # flow: between each layer's MILP tightening, re-run Phase 2.5
-    # (α-CROWN + halfspace-LP cascade) so the new layer's bounds propagate
-    # downstream via α-CROWN — that propagation is what closes hard cases
-    # like mnist_fc 256x6 prop_5_0.05 (ABC: −1924 → −71 → −0.24 → +0.09).
-    _bab_refine = bool(getattr(settings, 'bab_refine_cascade', True))
-    if (_deferred_milp and _deferred_milp_layers and still_open_disj
-            and time_left() > 2.0):
-        t0 = time.perf_counter()
-        probe_timeout = float(getattr(
-            settings, 'deferred_milp_probe_timeout', 5.0))
-        probe_neurons = getattr(settings, 'deferred_milp_probe_neurons', None)
-        budget_frac = float(getattr(
-            settings, 'deferred_milp_budget_frac', 0.2))
-        deferred_info = {'layers': {}, 'cascade_phase25': []}
-        bounds_changed_total = False
-        for L in _deferred_milp_layers:
-            if L not in bounds_by_relu:
-                continue
-            if not still_open_disj:
-                break
-            if time_left() <= 1.0:
-                break
-            new_lo, new_hi, info = _deferred_milp_tighten_layer(
-                L, gg_ops_ser, x_lo_64, x_hi_64, bounds_by_relu,
-                n_cores, probe_timeout, probe_neurons, budget_frac,
-                time_left, skip_probe=_bab_refine)
-            deferred_info['layers'][L] = info
-            this_layer_changed = (info['method'] == 'milp')
-            if this_layer_changed:
-                bounds_by_relu[L] = (new_lo, new_hi)
-                bounds_changed_total = True
-            if print_progress:
-                if info['method'] == 'milp':
-                    print(f'Phase 2.7 deferred-MILP L{L}: '
-                          f'n_unstable={info["n_unstable"]}  '
-                          f'probe={info["dt_probe"]:.2f}s  '
-                          f'solve={info["dt_solve"]:.2f}s')
-                elif info['method'] == 'probe_timeout':
-                    print(f'Phase 2.7 deferred-MILP L{L}: SKIPPED '
-                          f'(probe hit timeout; n_unstable='
-                          f'{info["n_unstable"]})')
-                elif info['method'] == 'over_budget':
-                    print(f'Phase 2.7 deferred-MILP L{L}: SKIPPED '
-                          f'(est_full={info["est_full"]:.1f}s > '
-                          f'budget={info["budget"]:.1f}s)')
-            # Cascade: re-run Phase 2.5 (α-CROWN + halfspace LP) after
-            # this layer's tightening so the new bounds propagate to deeper
-            # layers + spec direction. Match ABC's bab-refine layer-by-layer
-            # cascade.
-            if (_bab_refine and this_layer_changed and still_open_disj
-                    and time_left() > 1.0):
-                t25 = time.perf_counter()
-                still_open_disj, p25_info = _phase2p5_zono_lift(
-                    gg, xl_g, xh_g, bounds_by_relu, disj_queries, spec_ew,
-                    spec_lbs, still_open_disj, device, dtype, settings,
-                    print_progress=print_progress,
-                    mem_audit=_mem_audit if verbose else None)
-                deferred_info['cascade_phase25'].append({
-                    'after_L': L, 'wall': time.perf_counter() - t25,
-                    'still_open': len(still_open_disj),
-                    'worst_lb': (min(spec_lbs.values())
-                                  if spec_lbs else 0.0)})
-                if print_progress and spec_lbs:
-                    print(f'Phase 2.7 cascade α-CROWN after L{L}: '
-                          f'still_open={len(still_open_disj)}/'
-                          f'{len(disj_queries)}  '
-                          f'worst={min(spec_lbs.values()):.4f}')
-        timing['phase2p7_deferred_milp'] = time.perf_counter() - t0
-        details['phase2p7_deferred_milp'] = deferred_info
-
-        # If cascade was OFF and bounds changed, re-run Phase 2.5 once at end
-        # (legacy non-cascading behaviour).
-        if (not _bab_refine and bounds_changed_total and still_open_disj
-                and time_left() > 0):
-            t0 = time.perf_counter()
-            still_open_disj, phase25b_info = _phase2p5_zono_lift(
-                gg, xl_g, xh_g, bounds_by_relu, disj_queries, spec_ew,
-                spec_lbs, still_open_disj, device, dtype, settings,
-                print_progress=print_progress,
-                mem_audit=_mem_audit if verbose else None)
-            timing['phase2p5b_zono_lift'] = time.perf_counter() - t0
-            details['phase2p5b'] = phase25b_info
-            if not still_open_disj:
-                return _finalize('verified', 'zono_lift_after_deferred_milp')
 
     # --- Phase 7: LP score+verify (replaces 7a feasibility + 7b CROWN) ---
     # One LP solve per query in 'score' mode: minimizes spec objective,
@@ -5681,9 +4949,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         _parallel_race = bool(getattr(settings, 'gen_lp_parallel_racing',
                                        True))
         _grb_threads = int(getattr(settings, 'gen_lp_gurobi_threads', 1))
-        _min_bin = int(getattr(settings, 'gen_lp_min_bin', 4))
-        _bin_mult = int(getattr(settings, 'gen_lp_bin_mult', 4))
-        _bin_mode = str(getattr(settings, 'phase8_bin_mode', 'octaves'))
         _leave_open = int(getattr(settings, 'phase8_leave_cores_open', 1))
         _n_workers = max(1, n_cores - _leave_open)
         # Per-query rebuild: if Phase 2.5 tightened the intermediate bounds
@@ -5897,8 +5162,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 n_threads_total=_n_workers,
                 print_progress=False,
                 gurobi_threads=_grb_threads,
-                min_bin=_min_bin, bin_mult=_bin_mult,
-                bin_mode=_bin_mode,
                 state_by_qi=state_by_qi if state_by_qi else None,
                 unsafe_halfspace=_milp_hs,
                 triangle_top_k=_triangle_top_k,
@@ -6090,21 +5353,30 @@ def verify_graph(graph, spec, settings):
 
     Returns (result_str, details_dict).
     """
-    # Route conv-heavy nets (e.g. oval21 cifar_base/deep/wide_kw,
-    # cifar_biasfield) to the historical milp_verify pipeline. The
-    # bab_refine cascade + alpha-zono Phase 8 are tuned for FC nets like
-    # mnist_fc and underperform on conv ResNets where the alpha-zono LP
-    # relaxation is too loose at the spec layer. milp_verify uses a
-    # per-neuron layer-wise MILP encoding + Phase 5 racing escalation
-    # which empirically closes oval21 medium-eps cases (e.g. img1204
+    # Route conv-heavy nets (e.g. oval21 cifar_base/deep/wide_kw) to
+    # the historical milp_verify pipeline. The bab_refine cascade +
+    # alpha-zono Phase 8 are tuned for FC nets like mnist_fc and
+    # underperform on conv ResNets where the alpha-zono LP relaxation
+    # is too loose at the spec layer. milp_verify uses a per-neuron
+    # layer-wise MILP encoding + Phase 5 racing escalation which
+    # empirically closes oval21 medium-eps cases (e.g. img1204
     # eps=0.025: milp_verify 36s vs bab_refine 181s timeout).
     #
-    # Trigger condition (all three must hold):
+    # Trigger condition (all four must hold):
     #   1. settings.auto_route_milp_for_conv is True
     #   2. graph has at least one Conv node (not a pure FC net)
-    #   3. no fork points (milp_verify's non-graph path requires this;
-    #      with forks it would call _milp_verify_graph anyway)
-    if bool(getattr(settings, 'auto_route_milp_for_conv', True)):
+    #   3. no fork points (milp_verify's non-graph path requires this)
+    #   4. input dimension > `input_split_max_dims` (without this guard
+    #      cifar_biasfield (input_dim=16) was misrouted to milp_verify
+    #      where the joint α-CROWN tightening OOMs the 10 GB GPU; with
+    #      it the input-split BaB / fast-leaf path takes over and
+    #      verifies the same case in ~55 s)
+    n_in = (int(np.prod(spec.x_lo.shape))
+            if hasattr(spec, 'x_lo') else 10**9)
+    _split_max = int(getattr(settings, 'input_split_max_dims', 20))
+    if (bool(getattr(settings, 'auto_route_milp_for_conv', True))
+            and bool(getattr(settings, 'input_split_enabled', True))
+            and n_in > _split_max):
         has_conv = any(getattr(n, 'op_type', '') == 'Conv'
                        for n in graph.nodes.values())
         if has_conv and not graph.fork_points():
@@ -6125,7 +5397,7 @@ def verify_graph(graph, spec, settings):
     return _run_pipeline(graph, spec, settings, build_fn, impl)
 
 
-def _score_input_axes(graph, spec):
+def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):
     """Score each input axis by its contribution to the worst spec margin.
 
     Runs a single fast zono forward pass through the network from the
@@ -6136,11 +5408,19 @@ def _score_input_axes(graph, spec):
 
     Returns ``(scores, axis_for_col)`` where ``scores[i]`` is the score
     for original input axis ``i``, and axes with zero radius get score 0.
+
+    `gg` / `device` / `dtype`: when provided, the cached GPU graph is
+    reused. Without these, the function rebuilds `gpu_graph(...)` from
+    scratch which is hundreds of milliseconds per call on
+    cifar_biasfield-class networks. Passing the cached `fast_gg` from
+    `_input_split_verify` cut per-BaB-node cost from ~1 s to ~580 ms in
+    profiling.
     """
     import torch
-    device = 'cuda' if (str(getattr(graph, 'device', 'gpu')) == 'gpu'
-                         and torch.cuda.is_available()) else 'cpu'
-    dtype = torch.float32
+    if device is None or dtype is None:
+        device = 'cuda' if (str(getattr(graph, 'device', 'gpu')) == 'gpu'
+                             and torch.cuda.is_available()) else 'cpu'
+        dtype = torch.float32
     x_lo = torch.tensor(spec.x_lo.flatten(), dtype=dtype, device=device)
     x_hi = torch.tensor(spec.x_hi.flatten(), dtype=dtype, device=device)
     radii = (x_hi - x_lo) / 2
@@ -6148,7 +5428,8 @@ def _score_input_axes(graph, spec):
     if nz.numel() == 0:
         return np.zeros(x_lo.numel()), np.array([], dtype=np.int64)
 
-    gg = graph.gpu_graph(device=device, dtype=dtype)
+    if gg is None:
+        gg = graph.gpu_graph(device=device, dtype=dtype)
     _, z_final = _forward_zonotope_graph(x_lo, x_hi, gg, device, dtype)
     G = z_final.generators  # (n_out, n_gens)
     K_in = nz.numel()
@@ -6189,7 +5470,12 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
     from . import alpha_crown as ac
     xl = torch.tensor(spec.x_lo.flatten(), device=device, dtype=dtype)
     xh = torch.tensor(spec.x_hi.flatten(), device=device, dtype=dtype)
-    sb, _ = _forward_zonotope_graph(xl, xh, gg, device, dtype)
+    # Capture z_final too — caller can reuse it for the BaB axis-score
+    # forward pass instead of doing a third redundant forward zono per
+    # node. On cifar_biasfield_70 the per-leaf forward zono is ~250 ms;
+    # `_score_input_axes` was doing an identical pass per BaB node so
+    # ~25 s of every 60 s budget went to redundant kernel launches.
+    sb, z_final_leaf = _forward_zonotope_graph(xl, xh, gg, device, dtype)
     bbr = {L: (lo.cpu().numpy().astype(np.float64),
                 hi.cpu().numpy().astype(np.float64))
            for L, (lo, hi) in sb.items()}
@@ -6234,7 +5520,23 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
         return 'verified', {'phase': 'fast_leaf_crown',
                             'spec_lbs': dict(spec_lbs)}
 
-    # α-CROWN tightening — only run if needed
+    # α-CROWN tightening — only run if it can fit in memory.
+    #
+    # joint α-CROWN (`run_alpha_crown_batched`) keeps a backward graph
+    # per (start_node, layer) pair × per Adam iter. On cifar_biasfield
+    # leaves with ~7000 unstable across 7 hidden layers, the peak
+    # working set exceeds the 10 GB RTX 3080. Pre-2026-05-10 we ran α
+    # speculatively and caught the resulting OOM with `pass` — that
+    # masked real memory regressions and burned ~3 s per leaf on
+    # quickly-swallowed errors.
+    #
+    # New strategy: count total_unstable upfront. If it exceeds
+    # `alpha_crown_impl_auto_switch_threshold`, the joint path can't
+    # fit. Fall back to `run_alpha_crown_fixed_intermediate_batched`
+    # (sparse_alpha=True), which only optimises spec α (no per-(S, L)
+    # tensors) and has no compounding backward-graph cost. If even
+    # the lightweight variant fails, the OOM propagates so the user
+    # sees the regression.
     isn = [Lk for Lk in bbr if Lk > 0 and
             ((bbr[Lk][0] < 0) & (bbr[Lk][1] > 0)).any()]
     un = {Lk: np.where((bbr[Lk][0] < 0) & (bbr[Lk][1] > 0))[0].tolist()
@@ -6242,30 +5544,92 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
     if isn and any(un.values()):
         n_iters = int(getattr(settings,
                                 'input_split_alpha_iters', 3))
-        try:
+        # `... or 10**9` would WRONGLY treat 0 as "no cap" because
+        # `0 or 10**9 == 10**9` — explicit `is None` check instead.
+        _thr_raw = getattr(
+            settings, 'alpha_crown_impl_auto_switch_threshold', 5000)
+        switch_thr = 10**9 if _thr_raw is None else int(_thr_raw)
+        total_unstable = sum(len(un[L]) for L in un)
+        if total_unstable <= switch_thr:
+            # Truncate `intermediate_start_nodes` to the deepest
+            # `input_split_alpha_max_start_nodes` layers. The joint
+            # α-CROWN cost grows roughly linearly in `len(isn)` because
+            # each start node spawns a backward chain through every
+            # earlier layer (per-iter conv-transpose count is
+            # ~Σ|chunks(S)|). Profiling cifar_biasfield_70: full isn
+            # (6 layers) takes 800 ms and closes 4/9 specs; last 2
+            # layers take 491 ms and close 3/9. The split itself is
+            # already shrinking the input box per BaB iter, so we
+            # don't actually need joint α to RE-tighten every
+            # intermediate — only the deepest few layers (which
+            # accumulate the most spec-direction error) materially
+            # help. Default 0 = use ALL start nodes (legacy
+            # behaviour). Setting e.g. 2 gives ~40 % per-leaf
+            # speedup on cifar_biasfield at the cost of
+            # marginally looser bounds; the BaB compensates by
+            # splitting one more level deeper.
+            _max_isn = int(getattr(
+                settings, 'input_split_alpha_max_start_nodes', 0))
+            if _max_isn > 0 and len(isn) > _max_isn:
+                isn = isn[-_max_isn:]
             best_lbs, _, _, _ = ac.run_alpha_crown_batched(
                 gg, xl, xh, bbr, w_qs, b_qs, isn, un,
                 device, dtype, n_iters=n_iters, lr=0.25, lr_decay=0.98,
                 early_stop_on_positive=True)
             for qi, lb in enumerate(best_lbs):
                 spec_lbs[qi] = max(spec_lbs.get(qi, -1e9), float(lb))
-        except torch.cuda.OutOfMemoryError:
-            pass  # fall through with whatever bounds we have
-        except Exception:
-            pass
+        else:
+            # Lightweight fallback: spec-only α, fixed intermediate
+            # bounds, sparse α tensors. Doesn't tighten intermediates,
+            # so the leaf often returns 'unknown' and BaB splits
+            # further — but it costs ~100 ms instead of ~3 s of
+            # OOM-attempt-and-discard.
+            best_lbs, _, _, _ = ac.run_alpha_crown_fixed_intermediate_batched(
+                gg, xl, xh, bbr, w_qs, b_qs,
+                device, dtype, n_iters=n_iters, lr=0.25, lr_decay=0.98,
+                early_stop_on_positive=True, sparse_alpha=True)
+            for qi, lb in enumerate(best_lbs):
+                spec_lbs[qi] = max(spec_lbs.get(qi, -1e9), float(lb))
+
+    if _all_verified():
+        del sb, spec_ew
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return 'verified', {'phase': 'fast_leaf_alpha',
+                            'spec_lbs': dict(spec_lbs)}
+
+    # Compute the axis-score from z_final_leaf BEFORE releasing GPU
+    # tensors. This is the same quantity `_score_input_axes` would
+    # compute via a *third* forward zono in `_bab` — by stashing it in
+    # the details dict the caller can reuse our forward pass and avoid
+    # ~250 ms of redundant work per BaB node on cifar_biasfield-class
+    # graphs (~25 s saved across the 60 s budget).
+    score_per_axis = None
+    try:
+        radii = (xh - xl) / 2
+        nz = torch.nonzero(radii).squeeze(1)
+        if nz.numel() > 0:
+            G = z_final_leaf.generators  # (n_out, n_gens)
+            K_in = nz.numel()
+            G_in = G[:, :K_in]
+            score_per_col = torch.zeros(K_in, dtype=dtype, device=device)
+            for w, _ in spec_ew.values():
+                score_per_col = score_per_col + (w @ G_in).abs()
+            score_per_axis = np.zeros(xl.numel())
+            score_per_axis[nz.cpu().numpy()] = score_per_col.cpu().numpy()
+    except Exception:
+        score_per_axis = None  # caller falls back to width-based score
 
     # Release GPU tensors held by sb / spec_ew before next leaf.
     # On deep BaB trees (15+ leaves on cifar_biasfield) the cached
     # allocator fills up if we don't drop refs explicitly.
-    del sb, spec_ew
+    del sb, spec_ew, z_final_leaf
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if _all_verified():
-        return 'verified', {'phase': 'fast_leaf_alpha',
-                            'spec_lbs': dict(spec_lbs)}
     return 'unknown', {'phase': 'fast_leaf_open',
-                       'spec_lbs': dict(spec_lbs)}
+                       'spec_lbs': dict(spec_lbs),
+                       'axis_scores': score_per_axis}
 
 
 def _input_split_verify(graph, spec, settings, build_fn, impl):
@@ -6379,11 +5743,21 @@ def _input_split_verify(graph, spec, settings, build_fn, impl):
         if time.perf_counter() - t_start > total_budget - 0.5:
             return 'unknown', d
         # Pick split axis by spec sensitivity (ew × current radius — radius
-        # is folded into G column magnitude).
-        try:
-            scores, _ = _score_input_axes(graph, s)
-        except Exception:
-            scores = (s.x_hi - s.x_lo).astype(float).flatten()
+        # is folded into G column magnitude). Prefer the score the leaf
+        # already computed (saves a redundant forward zono per BaB
+        # node — ~250 ms each on cifar_biasfield); fall back to a fresh
+        # `_score_input_axes` only if the leaf didn't stash one (e.g.
+        # because it returned `verified` and we're in the rare case
+        # of needing to refine after).
+        leaf_scores = d.get('axis_scores') if isinstance(d, dict) else None
+        if leaf_scores is not None:
+            scores = leaf_scores
+        else:
+            try:
+                scores, _ = _score_input_axes(
+                    graph, s, gg=fast_gg, device=fast_device, dtype=fast_dtype)
+            except Exception:
+                scores = (s.x_hi - s.x_lo).astype(float).flatten()
         widths = (s.x_hi - s.x_lo).astype(float).flatten()
         # Don't split an axis that has effectively zero width (avoids
         # infinite recursion on degenerate dims).

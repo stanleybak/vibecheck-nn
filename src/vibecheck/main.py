@@ -79,9 +79,10 @@ def main():
               f'timeout={args.timeout}s)...')
         result, details = milp_verify(graph, spec, settings)
     elif args.mode == 'graph':
-        from .settings import default_settings
+        from .config_profiles import default_settings_for
         from .verify_graph import verify_graph
-        settings = default_settings(
+        settings = default_settings_for(
+            graph, spec,
             device=args.device,
             bits=args.bits,
             total_timeout=args.timeout,
@@ -89,7 +90,8 @@ def main():
         )
         graph.optimize(settings)
         print(f'Running graph verification (device={args.device}, '
-              f'impl={settings.graph_impl}, timeout={args.timeout}s)...')
+              f'impl={settings.graph_impl}, profile={settings._profile}, '
+              f'timeout={args.timeout}s)...')
         result, details = verify_graph(graph, spec, settings)
     else:
         print('Running zonotope analysis...')

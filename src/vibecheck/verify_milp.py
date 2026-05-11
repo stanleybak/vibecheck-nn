@@ -349,13 +349,49 @@ def _compute_crown_layer_weights(bounds_np, layers_np, spec_ew, pred, comp, nh):
     """
     ew_at_layer = {}
 
-    # Start from spec weight at output
+    # Start from spec weight at output. Two output-layer shapes:
+    #   FC : `final['W'][pred] - final['W'][comp]` is the spec direction
+    #        already in (n_in,) shape, ready to walk backward.
+    #   Conv (e.g. cifar_biasfield's last layer is Conv(in=128, out=10)
+    #        with output spatial 1×1, then Flatten → (10,)): treat the
+    #        spec direction as a one-hot vector in output shape
+    #        (out_channels, H_out, W_out), then conv-transpose it back
+    #        to (in_channels, H_in, W_in) flattened — same as how the
+    #        hidden Conv branch below propagates ew through earlier
+    #        Convs. This recovers 15 cifar_biasfield cases that
+    #        otherwise hit `NotImplementedError` here and report
+    #        `error` in the harness.
     final = layers_np[nh]
     if final['type'] == 'fc':
         ew = final['W'][pred] - final['W'][comp]
         acc = float(final['bias'][pred]) - float(final['bias'][comp])
     else:
-        raise NotImplementedError("Conv final layer not supported for CROWN scoring")
+        kernel = final['kernel']
+        in_shape = final['in_shape']
+        stride = final['stride']
+        padding = final['padding']
+        C_out = kernel.shape[0]
+        H_out = (in_shape[1] + 2*padding[0] - kernel.shape[2]) // stride[0] + 1
+        W_out = (in_shape[2] + 2*padding[1] - kernel.shape[3]) // stride[1] + 1
+        # Spec direction in flattened output space = pred-row minus comp-row
+        # of the one-hot identity matrix. Reshape to (out_c, H_out, W_out)
+        # — for the cifar_biasfield case H_out=W_out=1 so this is a
+        # one-hot at (pred, 0, 0) minus one-hot at (comp, 0, 0).
+        spec_dir = np.zeros(C_out * H_out * W_out, dtype=np.float64)
+        spec_dir[pred * H_out * W_out:(pred + 1) * H_out * W_out] = 1.0
+        spec_dir[comp * H_out * W_out:(comp + 1) * H_out * W_out] -= 1.0
+        bias_arr = final['bias']
+        acc = float(bias_arr[pred]) - float(bias_arr[comp])
+        ew_t = torch.tensor(spec_dir, dtype=torch.float64).reshape(
+            1, C_out, H_out, W_out)
+        k_t = torch.tensor(kernel, dtype=torch.float64)
+        oph = in_shape[1] - ((H_out - 1)*stride[0] - 2*padding[0]
+                              + kernel.shape[2])
+        opw = in_shape[2] - ((W_out - 1)*stride[1] - 2*padding[1]
+                              + kernel.shape[3])
+        ew = F.conv_transpose2d(
+            ew_t, k_t, stride=stride, padding=padding,
+            output_padding=(oph, opw)).flatten().numpy()
 
     for k in range(nh - 1, -1, -1):
         lo, hi = bounds_np[k]
@@ -2940,7 +2976,16 @@ def milp_verify(graph, spec, settings=None):
             if start_nodes:
                 n_iters_at = int(getattr(settings,
                                           'milp_alpha_tighten_iters', 10))
-                _, _, best_bounds, _ = ac.run_alpha_crown_batched(
+                # `best_lbs_joint` is the joint α-CROWN's spec-direction
+                # lower bounds — Phase 1.5 always optimised them as part
+                # of the joint pass (the 'spec' start_node is appended
+                # inside run_alpha_crown_batched), pre-2026-05-11 the
+                # caller silently dropped them via `_, _, best_bounds, _`.
+                # On oval21 deep_kw img3782 those joint-spec lbs close
+                # 7/9 OR specs in ~5 s (matching AB-CROWN's
+                # `prune_after_crown` flow), saving the per-layer LP/MILP
+                # work that was previously the entire 60 s budget.
+                best_lbs_joint, _, best_bounds, _ = ac.run_alpha_crown_batched(
                     gg, xl_at, xh_at, bbr_at, w_qs_at, b_qs_at,
                     start_nodes, un_idx,
                     device, dtype, n_iters=n_iters_at, lr=0.25,
@@ -2964,6 +3009,37 @@ def milp_verify(graph, spec, settings=None):
                           f'{time.perf_counter()-t_at:.2f}s  '
                           f'closed {n_tightened} unstables')
 
+                # Short-circuit + still_open prune: joint α-CROWN's
+                # spec lbs let us mark verified queries early so Phase 2
+                # only works on the remainder. The query order from
+                # `as_linear_queries` is the same `comps` order milp_verify
+                # tracks (`spec_ew` is built from `comps` in order).
+                worst_lb_joint = float(best_lbs_joint.min()) if len(
+                    best_lbs_joint) > 0 else -1e30
+                n_closed_joint = int((best_lbs_joint > 0).sum()) if len(
+                    best_lbs_joint) > 0 else 0
+                # Only safe to prune if query count matches comp count
+                # AND the order is the per-comp scan; on more elaborate
+                # multi-disjunct specs the mapping differs and we just
+                # skip the prune (still get the short-circuit when ALL
+                # close).
+                if len(best_lbs_joint) == len(comps):
+                    comps_list = sorted(comps)
+                    for qi, lb_q in enumerate(best_lbs_joint):
+                        if float(lb_q) > 0:
+                            still_open.discard(comps_list[qi])
+                if print_progress:
+                    print(f'  joint-α spec lbs: closed '
+                          f'{n_closed_joint}/{len(best_lbs_joint)} queries '
+                          f'worst={worst_lb_joint:.4f}  '
+                          f'still_open now={len(still_open)}')
+                if worst_lb_joint > 0:
+                    return 'verified', {
+                        'time': time.perf_counter() - (deadline
+                                                         - total_timeout),
+                        'phase': 'alpha_crown_joint',
+                    }
+
     # Extract numpy layer weights
     layers_np = []
     for gl in gpu_layers_list:
@@ -2983,20 +3059,31 @@ def milp_verify(graph, spec, settings=None):
     x_hi_64 = spec.x_hi.astype(np.float64)
 
     # --- Phase 2: Per-layer tightening ---
-    # When milp_skip_phase2_after_alpha is set AND α-CROWN tightening
-    # already ran in Phase 1.5, skip the per-layer LP/MILP loop entirely.
-    # On conv ResNets the α-CROWN tightening already closes the easy
-    # unstables; Phase 2's per-neuron MILPs spend their budget on harder
-    # remaining neurons that don't pay off (closed 68 of remaining 1000+
-    # in 33s on oval21 img3039). Better to spend that time on racing.
-    skip_phase2 = (alpha_tighten and bool(getattr(
-        settings, 'milp_skip_phase2_after_alpha', False)))
+    # Skip Phase 2 entirely when Phase 1.5's joint α-CROWN already
+    # closed most specs. Phase 2 tightens unstable neurons across ALL
+    # layers regardless of which spec needs them — wasted work when
+    # only 1-2 specs remain open. Going straight to Phase 5/8 spec MILP
+    # racing on the few remaining queries is much faster.
+    # Threshold: skip if ≤ 33 % of comps still open. On oval21 deep_kw
+    # img3782 the joint-α leaves 2/9 open (22 %), the per-layer LP/MILP
+    # would burn the entire 60 s budget; with the skip Phase 5 racing
+    # closes the remainder in seconds.
+    _skip_phase2_thr_frac = 0.33
+    if (len(still_open) <= int(_skip_phase2_thr_frac * len(comps))
+            and len(still_open) > 0):
+        if print_progress:
+            print(f'Phase 2 SKIPPED: {len(still_open)}/{len(comps)} '
+                  f'still open after Phase 1.5 — going straight to '
+                  f'Phase 5 spec MILP')
+        # Jump to Phase 5 by leaving bounds_np as-is (still tightened by
+        # Phase 1.5). The for-loop below is a no-op via the early break.
+        nh_iter = 0
+    else:
+        nh_iter = nh
     t_phase2_start = time.perf_counter()
     tighten_mode = 'sample'  # 'sample', 'lp', 'zono'
 
-    for l in range(nh):
-        if skip_phase2:
-            break
+    for l in range(nh_iter):
         if time_left() <= 0:
             break
 

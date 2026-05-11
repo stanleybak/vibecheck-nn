@@ -83,3 +83,5 @@ When running a verify experiment for the user, pickle the returned `details` dic
 ## Active investigations — keep iterating
 
 When the user says "keep going" or "implement it": keep going until the goal is reached or a structural impossibility is documented with evidence. Don't stop after one negative result to ask whether to proceed — run the next reasonable experiment. Multi-iteration / multi-pass refinement is fine even when slower than the reference; correctness first, then optimize. Before each big implementation, write a small toy-problem test to validate correctness before scaling.
+
+When implementing a multi-phase plan, **push through every phase in sequence**. Treat each phase's stated gate as the only stopping condition (regression → revert that single ablation, then continue). Do not pause between phases to ask "should I keep going?" — only pause if a gate genuinely fails after a sensible revert, or if a destructive irreversible action requires explicit authorization. Tasks (TaskCreate) are good for tracking phases but resolving them is not a checkpoint to stop at.

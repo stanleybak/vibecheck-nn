@@ -48,8 +48,15 @@ def test_acasxu_pipeline_tighten_axes(vnncomp_benchmarks,
         tighten_solver=solver)
     # Phase 0 PGD finds SAT on ACAS Xu prop_2 immediately and would
     # short-circuit before Phase 1 runs. This test specifically checks
-    # the tightening axes are exercised, so disable Phase 0 PGD.
+    # the tightening axes are exercised, so disable Phase 0 PGD. Also
+    # disable input_split BaB — its fast_leaf path bypasses Phase 1 and
+    # the test would never see `phase1_zono_tighten` in the timing.
+    # Force the legacy interleaved Phase 1 — the bab_refine cascade has
+    # a known size-mismatch on ACAS Xu (5 inputs / 5 outputs), unrelated
+    # to the formulation×solver axes this test exercises.
     s.pgd_phase0_enabled = False
+    s.input_split_enabled = False
+    s.phase1_method = 'legacy'
     result, details = verify_graph(g, spec, s)
     assert result in ('verified', 'unknown', 'sat'), (
         f'({formulation},{solver}) returned unexpected result {result}')

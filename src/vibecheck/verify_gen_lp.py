@@ -1880,8 +1880,7 @@ def sequential_query_racing(state, query_specs, *, time_left_fn,
 
 def parallel_query_racing(state, query_specs, *, time_left_fn,
                            n_threads_total=4, print_progress=False,
-                           gurobi_threads=1, min_bin=4, bin_mult=4,
-                           bin_mode='legacy', state_by_qi=None,
+                           gurobi_threads=1, state_by_qi=None,
                            unsafe_halfspace='none',
                            triangle_top_k=0,
                            witness_refine_fn=None):
@@ -1894,11 +1893,12 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
     spec still execute but their results are ignored; the pool exits on
     first SAT witness (global) or when every spec is resolved.
 
-    bin_mode:
-      - 'legacy'  : geometric schedule [min_bin, *bin_mult, ...] + n_scored
-      - 'octaves' : additive schedule  [8, 16, 24, ..., 8k] with
-                    8k ≤ n_threads_total (launch all levels concurrently;
-                    BestBdStop=0 on each worker produces first-to-prove racing)
+    Bin schedule is the additive 'octaves' schedule [8, 16, 24, ..., 8k]
+    with 8k ≤ n_threads_total — all levels launch concurrently and
+    BestBdStop=0 on each worker produces first-to-prove racing. Low-bin
+    workers finish fast but may not prove tightness; high-bin workers
+    are stronger but slower. Saturating the pool with distinct bin
+    counts maximises the chance some level proves UNSAT.
 
     query_specs: list of (qi, qw, qb, scored_keys) tuples.
     Returns: list of (qi, verdict, levels, witness) in submission order,
@@ -1914,53 +1914,20 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
     deadline = _t.perf_counter() + tl
 
     def _build_schedule(n_scored):
-        """Bin counts for one spec given len(scored_keys) = n_scored."""
-        if bin_mode == 'octaves':
-            # [8, 16, 24, ..., 8*k] with k = n_threads_total (one bin level
-            # per worker). Pool runs all levels concurrently; BestBdStop=0
-            # on each worker makes the first-to-prove UNSAT win the race.
-            # Low-bin workers finish fast but may not prove tightness; high-
-            # bin workers are stronger but slower. Saturating the pool with
-            # distinct bin counts maximises the chance some level proves it.
-            k_max = max(1, n_threads_total)
-            sched = [8 * k for k in range(1, k_max + 1)]
-            # Cap at n_scored (can't binarize more neurons than we scored).
-            sched = [min(b, n_scored) for b in sched]
-            # Deduplicate while preserving order (n_scored ≤ 8k collapses
-            # to n_scored; subsequent 8*(k+1) would exceed → same value).
-            out = []
-            for b in sched:
-                if b > 0 and b not in out:
-                    out.append(b)
-            return out
-        if bin_mode == 'hybrid':
-            # Mix small (fast on easy specs) + large (closes hard specs)
-            # bin counts: [8, 16, 64, 128, 200] capped at n_workers.
-            # CAVEAT: empirically WORSE than 'octaves' + sequential
-            # fallback on img5988. The bins=64 tier without halfspace
-            # takes 20-50s per MILP and eats the time budget that the
-            # high-bin halfspace fallback needs (~50s for q1). Net:
-            # 8/9 closed (q1 stuck) vs 9/9 closed with octaves+fallback.
-            # Keep this mode available for benchmarking but DO NOT use
-            # in production — octaves+fallback is the proven combo.
-            base = [8, 16, 64, 128, 200]
-            k_max = max(1, n_threads_total)
-            sched = [b for b in base[:k_max] if b <= n_scored]
-            if n_scored > 0 and sched and sched[-1] < n_scored:
-                sched.append(n_scored)
-            out = []
-            for b in sched:
-                if b > 0 and b not in out:
-                    out.append(b)
-            return out
-        # legacy geometric
-        schedule = []
-        b = min_bin
-        while b <= n_scored:
-            schedule.append(b); b *= bin_mult
-        if n_scored > 0 and (not schedule or schedule[-1] < n_scored):
-            schedule.append(n_scored)
-        return schedule
+        """Bin counts for one spec: [8, 16, 24, ..., 8*n_threads_total].
+
+        One bin level per worker so the pool runs all levels concurrently;
+        BestBdStop=0 on each worker makes the first-to-prove UNSAT win
+        the race. Capped at `n_scored` (can't binarize more neurons than
+        we scored), with duplicates removed to preserve order.
+        """
+        k_max = max(1, n_threads_total)
+        sched = [min(8 * k, n_scored) for k in range(1, k_max + 1)]
+        out = []
+        for b in sched:
+            if b > 0 and b not in out:
+                out.append(b)
+        return out
 
     per_spec_schedule = []
     for qi, qw, qb, scored_keys in query_specs:

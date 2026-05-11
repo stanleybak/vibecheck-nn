@@ -121,7 +121,8 @@ def test_phase2p5_disabled_skips_setting(tmp_path):
     g = _tiny_fc(tmp_path, 'skip.onnx')
     spec = _easy_verifiable_spec(2)
     s = default_settings(device='cpu', bits=64, total_timeout=30,
-                         print_progress=False, zono_lift_enabled=False)
+                         print_progress=False, zono_lift_enabled=False,
+                         input_split_enabled=False)
     result, details = verify_graph(g, spec, s)
     # Spec is trivially verified by CROWN; Phase 2.5 shouldn't have run.
     assert result == 'verified'
@@ -155,7 +156,8 @@ def test_phase2p5_runs_when_crown_leaves_queries_open(monkeypatch, tmp_path):
 
     s = default_settings(device='cpu', bits=64, total_timeout=30,
                          print_progress=False, zono_lift_enabled=True,
-                         zono_lift_max_passes=2)
+                         zono_lift_max_passes=2,
+                         input_split_enabled=False)
     result, details = verify_graph(g, spec, s)
     # Phase 2.5 should have run.
     assert 'phase2p5_zono_lift' in details['timing']
@@ -197,7 +199,8 @@ def test_phase2p5_converges_without_verify(monkeypatch, tmp_path):
     s = default_settings(device='cpu', bits=64, total_timeout=30,
                          print_progress=False, zono_lift_enabled=True,
                          zono_lift_max_passes=2,
-                         zono_lift_alpha_crown=False)
+                         zono_lift_alpha_crown=False,
+                         input_split_enabled=False)
     result, details = verify_graph(g, spec, s)
     # Phase 2.5 ran but didn't close the query (stayed at CROWN LB = -1.0).
     assert 'phase2p5_zono_lift' in details['timing']
@@ -256,7 +259,8 @@ def test_alpha_crown_v2_fixed_intermediate_runs(monkeypatch, tmp_path):
                          zono_lift_max_passes=2,
                          alpha_crown_impl='v2_fixed_intermediate',
                          alpha_crown_lr_decay=0.98,
-                         zono_lift_alpha_iters=5)
+                         zono_lift_alpha_iters=5,
+                         input_split_enabled=False)
     result, details = verify_graph(g, spec, s)
     assert 'phase2p5_zono_lift' in details['timing']
     # v2 path must have been called at least once (single or batched).
@@ -418,7 +422,8 @@ def test_phase2p5_layers_override(monkeypatch, tmp_path):
 
     s = default_settings(device='cpu', bits=64, total_timeout=30,
                          print_progress=False, zono_lift_enabled=True,
-                         zono_lift_max_passes=1, zono_lift_layers=[0])
+                         zono_lift_max_passes=1, zono_lift_layers=[0],
+                         input_split_enabled=False)
     result, details = verify_graph(g, spec, s)
     # Phase 2.5 ran and only touched layer 0. The test passes so long as
     # the code runs without crashing and records per-query info.
