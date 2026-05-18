@@ -53,6 +53,170 @@ _FEAS_TOL = 1e-5
 _ROWS_PER_SPLIT = 2  # OFF: z≤0, z≥-2μ/λ.  ON: z≥0, z≤2μ/(1-λ).
 
 
+def _precompute_state_geometry(state, device, dtype):
+    """Precompute QUERY-INDEPENDENT pieces of the substitution-form LP.
+
+    Most of `_build_substitution_caches` only depends on the *state* (box
+    bounds, per-unstable `lam`/`mu`/`c_in`/`row_*`/`e_new_col`), not on the
+    spec direction `(qw, qb)`. On CIFAR100 we call dual-ascent BaB once per
+    disjunct query (up to 99 queries per spec), so the original code was
+    repeating ~50–200 s of geometric work per case. Cache it on the state
+    dict and gather per query.
+
+    Cached fields (all keyed by global unstable index = position in
+    `state['unstable_list']`):
+      - n_gens, n_input, device, dtype                  (sanity)
+      - e_lb, e_hi, width                               box bounds (torch)
+      - lam_pu, mu_pu, c_in_pu                          [n_u] numpy float64
+      - e_new_col_pu                                    [n_u] numpy int64
+      - a_pu_np                                         [n_u, n_gens] np float64,
+                                                          e_new_col zeroed
+      - a_pu_t                                          [n_u, n_gens] torch
+      - z_lo_pu, z_hi_pu                                [n_u] np float64
+      - obj_G_out_np, obj_c_out_np                      cached float64
+    """
+    n_gens = int(state['n_gens'])
+    n_input = int(state['n_input'])
+    unstable_list = state['unstable_list']
+    n_u = len(unstable_list)
+
+    # Box bounds
+    e_lb_np = np.zeros(n_gens, dtype=np.float64)
+    e_hi_np = np.zeros(n_gens, dtype=np.float64)
+    e_lb_np[:n_input] = -1.0
+    e_hi_np[:n_input] = 1.0
+    for u in unstable_list:
+        c = int(u['e_new_col'])
+        e_lb_np[c] = -1.0
+        e_hi_np[c] = 1.0
+    width_np = e_hi_np - e_lb_np
+
+    # Per-unstable scalar arrays
+    lam_pu = np.empty(n_u, dtype=np.float64)
+    mu_pu = np.empty(n_u, dtype=np.float64)
+    c_in_pu = np.empty(n_u, dtype=np.float64)
+    e_new_col_pu = np.empty(n_u, dtype=np.int64)
+    a_pu_np = np.zeros((n_u, n_gens), dtype=np.float64)
+    for j, u in enumerate(unstable_list):
+        lam_pu[j] = float(u['lam'])
+        mu_pu[j] = float(u['mu'])
+        c_in_pu[j] = float(u['c_in'])
+        e_new_col_pu[j] = int(u['e_new_col'])
+        row_idx = np.asarray(u['row_indices'], dtype=np.int64)
+        row_val = np.asarray(u['row_values'], dtype=np.float64)
+        # Safety: e_new_col must not collide with a row coefficient, or our
+        # optimization (zeroing a_pu[e_new_col] before forming d_corr) would
+        # drop the term that the legacy code's `d_corr[row_idx] = ...; d_corr[e_new_col] -= ...`
+        # pair set then decremented. Assert disjointness.
+        assert e_new_col_pu[j] not in row_idx, (
+            f'unstable {(u["layer_idx"], u["neuron_idx"])}: e_new_col '
+            f'{e_new_col_pu[j]} overlaps with row_indices — geometric cache '
+            f'would be incorrect.')
+        a_pu_np[j, row_idx] = row_val
+        a_pu_np[j, e_new_col_pu[j]] = 0.0  # explicit; original sets h1[e_new_col]=0
+
+    # z_lo, z_hi (scalar per unstable)
+    safe_mu = mu_pu > 1e-12
+    safe_lam = lam_pu > 1e-12
+    safe_1ml = (1.0 - lam_pu) > 1e-12
+    z_lo_pu = np.where(safe_mu & safe_lam,
+                        2.0 * mu_pu / np.maximum(lam_pu, 1e-30) + c_in_pu,
+                        1e9)
+    z_hi_pu = np.where(safe_mu & safe_1ml,
+                        2.0 * mu_pu / np.maximum(1.0 - lam_pu, 1e-30) - c_in_pu,
+                        1e9)
+
+    geo = {
+        'n_gens': n_gens, 'n_input': n_input,
+        'device': device, 'dtype': dtype,
+        'e_lb_t': torch.tensor(e_lb_np, device=device, dtype=dtype),
+        'e_hi_t': torch.tensor(e_hi_np, device=device, dtype=dtype),
+        'width_t': torch.tensor(width_np, device=device, dtype=dtype),
+        'lam_pu': lam_pu, 'mu_pu': mu_pu, 'c_in_pu': c_in_pu,
+        'safe_mu': safe_mu,
+        'e_new_col_pu': e_new_col_pu,
+        'a_pu_np': a_pu_np,
+        'a_pu_t': torch.tensor(a_pu_np, device=device, dtype=dtype),
+        'z_lo_pu': z_lo_pu, 'z_hi_pu': z_hi_pu,
+        'obj_G_out_np': state['obj_G_out_csr'].toarray().astype(np.float64),
+        'obj_c_out_np': np.asarray(state['obj_c_out'], dtype=np.float64),
+        'unstable_idx_by_key': {(u['layer_idx'], u['neuron_idx']): j
+                                  for j, u in enumerate(unstable_list)},
+    }
+    return geo
+
+
+def _compute_query_caches(geo, scored_keys, qw, qb, device, dtype):
+    """Per-query: gather geometry and apply qw-dependent corrections.
+
+    Bit-equivalent to the legacy `_build_substitution_caches` (within
+    float32 conversion). All heavy ops happen on GPU using the cached
+    `a_pu_t` to avoid a CPU→GPU transfer of the per-query hs_A.
+    """
+    n_gens = geo['n_gens']
+    # Map scored_keys -> global unstable indices.
+    idx_by_key = geo['unstable_idx_by_key']
+    scored_idx = np.fromiter(
+        (idx_by_key[k] for k in scored_keys),
+        dtype=np.int64, count=len(scored_keys))
+    n_splits = scored_idx.shape[0]
+
+    # Per-query objective on host (cheap dense matvec).
+    qw_np = np.asarray(qw, dtype=np.float64)
+    d_np = qw_np @ geo['obj_G_out_np']
+    c0 = float(qw_np @ geo['obj_c_out_np'] + qb)
+
+    # Gather per-split scalar fields from precomputed numpy.
+    lam = geo['lam_pu'][scored_idx]
+    mu = geo['mu_pu'][scored_idx]
+    c_in = geo['c_in_pu'][scored_idx]
+    e_new_col = geo['e_new_col_pu'][scored_idx]
+    z_lo = geo['z_lo_pu'][scored_idx]
+    z_hi = geo['z_hi_pu'][scored_idx]
+    safe_mu = geo['safe_mu'][scored_idx]
+    d_at_e_new = d_np[e_new_col]                       # [n_splits]
+
+    inv_mu_safe = 1.0 / np.where(safe_mu, mu, 1.0)
+    ratio_off_np = np.where(safe_mu, -(lam * inv_mu_safe) * d_at_e_new, 0.0)
+    ratio_on_np = np.where(safe_mu, ((1.0 - lam) * inv_mu_safe) * d_at_e_new, 0.0)
+    c0_off_np = np.where(safe_mu,
+                          -(1.0 + lam * c_in * inv_mu_safe) * d_at_e_new,
+                          -d_at_e_new)
+    c0_on_np = np.where(safe_mu,
+                         ((1.0 - lam) * c_in * inv_mu_safe - 1.0) * d_at_e_new,
+                         -d_at_e_new)
+
+    # GPU side: gather a_pu and form hs_A / d_corr without CPU temps.
+    scored_idx_t = torch.as_tensor(scored_idx, device=device, dtype=torch.long)
+    e_new_col_t = torch.as_tensor(e_new_col, device=device, dtype=torch.long)
+    a_gathered = geo['a_pu_t'].index_select(0, scored_idx_t)  # [n_splits, n_gens]
+    # signs: OFF=(+a, -a), ON=(-a, +a)
+    signs = torch.tensor([[+1.0, -1.0], [-1.0, +1.0]], device=device, dtype=dtype)
+    hs_A = signs.view(1, 2, 2, 1) * a_gathered.view(n_splits, 1, 1, n_gens)
+    hs_b = torch.empty(n_splits, 2, 2, device=device, dtype=dtype)
+    hs_b[:, 0, 0] = torch.as_tensor(-c_in, device=device, dtype=dtype)
+    hs_b[:, 0, 1] = torch.as_tensor(z_lo, device=device, dtype=dtype)
+    hs_b[:, 1, 0] = torch.as_tensor(c_in, device=device, dtype=dtype)
+    hs_b[:, 1, 1] = torch.as_tensor(z_hi, device=device, dtype=dtype)
+
+    ratio_off_t = torch.as_tensor(ratio_off_np, device=device, dtype=dtype)
+    ratio_on_t = torch.as_tensor(ratio_on_np, device=device, dtype=dtype)
+    d_at_e_new_t = torch.as_tensor(d_at_e_new, device=device, dtype=dtype)
+    d_corr_off = ratio_off_t.view(n_splits, 1) * a_gathered    # a has e_new col=0
+    d_corr_on = ratio_on_t.view(n_splits, 1) * a_gathered
+    rows = torch.arange(n_splits, device=device, dtype=torch.long)
+    d_corr_off[rows, e_new_col_t] = -d_at_e_new_t
+    d_corr_on[rows, e_new_col_t] = -d_at_e_new_t
+    d_corr = torch.stack([d_corr_off, d_corr_on], dim=1)  # [n_splits, 2, n_gens]
+    c0_corr = torch.stack([
+        torch.as_tensor(c0_off_np, device=device, dtype=dtype),
+        torch.as_tensor(c0_on_np, device=device, dtype=dtype),
+    ], dim=1)
+    d_t = torch.as_tensor(d_np, device=device, dtype=dtype)
+    return (n_gens, geo['e_lb_t'], geo['e_hi_t'], geo['width_t'],
+            d_t, c0, hs_A, hs_b, d_corr, c0_corr)
+
+
 def _build_substitution_caches(
     state, qw, qb, scored_keys, device, dtype,
 ):
@@ -354,6 +518,16 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
     else:
         _left = time_left_fn
 
+    # Early exit if the deadline has already passed — skip per-query setup
+    # (which costs ~0.5–2 s on cifar100 even when BaB itself would bail).
+    if _left() <= 0:
+        return 'unknown', {'wall': time.perf_counter() - t_start,
+                            'nodes': 0, 'max_depth_seen': 0,
+                            'exit_counts': {'dual_safe': 0, 'primal_unsafe': 0,
+                                            'safety_cap': 0, 'no_progress': 0},
+                            'final_open': 0, 'root_g': float('nan'),
+                            'reason': 'deadline-on-entry'}
+
     # Filter scored_keys to those actually present in the per-query state's
     # unstable list. (per-query rebuilds with tightened bounds can drop
     # neurons that became stable; original ranking may include them.)
@@ -386,10 +560,17 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
                          'root_g': g_root}
 
     n_input = int(state['n_input'])
-    # Build substitution caches (one-time per query).
+    # Build / fetch state-level geometric cache (LRU-1 keyed by id(state)
+    # to bound GPU memory when state_by_qi populates many distinct states).
+    geo = state.get('_dab_geom')
+    if (geo is None
+            or geo['device'] != device
+            or geo['dtype'] != dtype
+            or geo['n_gens'] != int(state['n_gens'])):
+        geo = _precompute_state_geometry(state, device, dtype)
+        state['_dab_geom'] = geo
     (n_gens, e_lb, e_hi, width, d_t, c0, hs_A, hs_b, d_corr, c0_corr) = \
-        _build_substitution_caches(state, qw, qb, scored_keys,
-                                    device, dtype)
+        _compute_query_caches(geo, scored_keys, qw, qb, device, dtype)
 
     # Root LP (no halfspaces): box minimum gives root g.
     x_star_root = torch.where(d_t < 0, e_hi, e_lb)
