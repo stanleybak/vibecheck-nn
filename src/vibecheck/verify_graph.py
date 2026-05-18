@@ -5012,9 +5012,15 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             return _finalize('verified', 'zono_lift')
 
     # --- Phase 2.6: per-spec targeted PGD on still-open disjuncts. ---
-    # Phase 3.5 attacks the UNION of open disjuncts (one shared loss);
-    # this iterates per-disjunct so each spec's margin gradient is
-    # isolated. Total wall hard-capped by `phase26_pgd_per_spec_time_budget`.
+    # Iterates per-disjunct so each spec's margin gradient is isolated.
+    # Each open spec is guaranteed at least `phase26_pgd_per_spec_min_per_spec`
+    # seconds (default 0.5s) — the total budget cap is honored only when
+    # the per-spec quota fits inside it. When `phase26_pgd_per_spec_strict_min`
+    # is True (default), the min wins even at the cost of overrunning the
+    # total budget — useful on many-open-spec cases (e.g. tinyimagenet's 30
+    # open disjuncts at 0.2s each was too little to find SAT).
+    # Order: most-likely-SAT first (lowest spec_lb across the disjunct's
+    # queries) so the budget is spent where SAT is most plausible.
     if (still_open_disj and not _disable_sat
             and getattr(settings, 'phase26_pgd_per_spec_enabled', True)
             and time_left() > 0):
@@ -5022,13 +5028,25 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         _p26_total = float(getattr(
             settings, 'phase26_pgd_per_spec_time_budget', 3.0))
         _p26_min = float(getattr(
-            settings, 'phase26_pgd_per_spec_min_per_spec', 0.2))
+            settings, 'phase26_pgd_per_spec_min_per_spec', 0.5))
+        _p26_strict = bool(getattr(
+            settings, 'phase26_pgd_per_spec_strict_min', True))
         _n_open = len(still_open_disj)
-        _per = max(_p26_min, _p26_total / max(_n_open, 1))
-        _p26_remaining = _p26_total
+        if _p26_strict:
+            _per = _p26_min   # ignore total budget; each spec gets min
+            _p26_remaining = float('inf')
+        else:
+            _per = max(_p26_min, _p26_total / max(_n_open, 1))
+            _p26_remaining = _p26_total
         _p26_n_attacked = 0
         _p26_sat = False
-        for _di in sorted(still_open_disj):
+        # Sort by closeness to SAT: lowest spec_lb first.
+        def _disj_score(di):
+            qids = [qi for qi, _, _ in disj_queries.get(di, [])]
+            if not qids: return float('inf')
+            return min(spec_lbs.get(qi, 0.0) for qi in qids)
+        _ordered_disj = sorted(still_open_disj, key=_disj_score)
+        for _di in _ordered_disj:
             if _p26_remaining <= 0 or time_left() <= 0:
                 break
             _budget = min(_per, _p26_remaining, max(time_left() - 0.5, 0.1))
