@@ -422,8 +422,6 @@ def default_settings(**overrides):
         phase8_use_dual_ascent_gpu=False,
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         phase8_dual_ascent_repair_steps=5,
-        phase8_dual_ascent_max_depth=200,  # was 40 — too tight; some hard cases need depth 50+. time_limit is the natural cap
-        phase8_dual_ascent_frontier_cap=16384,
         gen_lp_skip_phase7_lp=True,     # skip per-query LP scoring; use α-CROWN/CROWN ew*frac fallback (saves Phase 7 LP wall — was ~4s/query on hard CIFAR100)
         gen_lp_score_method='lp_ew_frac',  # 'lp_ew_frac', 'lp_fractional', 'lp_dual'. lp_dual ranks by |tri_lo|+|tri_up| duals — identifies the actual LP-binding triangles (on CIFAR100_resnet_medium_prop_idx_2477 the duals concentrate in L5 where kfsb/ew_frac promotes L9). lp_dual adds ~1-2s/query Phase-8 overhead to re-solve gen-LP with dual extraction; beneficial on hard queries where the wrong layer is being branched on, neutral-to-slow otherwise. Opt-in via settings.
         skip_phase8_milp=False,         # if True, Phase 8 is skipped and queries Phase 7 LP can't prove UNSAT are returned as 'unknown'

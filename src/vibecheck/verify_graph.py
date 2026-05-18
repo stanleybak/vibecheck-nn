@@ -5580,10 +5580,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             _da_K = int(getattr(settings, 'phase8_dual_ascent_max_iter', 1))
             _da_rep = int(getattr(
                 settings, 'phase8_dual_ascent_repair_steps', 5))
-            _da_md = int(getattr(
-                settings, 'phase8_dual_ascent_max_depth', 40))
-            _da_fc = int(getattr(
-                settings, 'phase8_dual_ascent_frontier_cap', 16384))
             raw = []
             # Witness-attack callback: maps each LP-relaxation primal witness
             # (e ∈ [-1,1]^n_input) back to real input space and runs the NN
@@ -5673,7 +5669,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     [k for k in scored_keys_q],
                     time_limit=time_left(),
                     max_iter=_da_K, repair_steps=_da_rep,
-                    max_depth=_da_md, frontier_cap=_da_fc,
                     print_progress=False, time_left_fn=time_left,
                     witness_check_fn=_da_witness_check)
                 if print_progress:

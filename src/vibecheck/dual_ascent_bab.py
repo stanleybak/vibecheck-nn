@@ -44,8 +44,6 @@ import torch
 # ---------------------------------------------------------------------------
 _DEFAULT_K = 1
 _DEFAULT_REPAIR_STEPS = 5
-_DEFAULT_MAX_DEPTH = 200  # let time_limit be the primary cap; 200 covers any realistic case
-_DEFAULT_FRONTIER_CAP = 16384
 # Chunk a layer's frontier into sub-batches sized so A_batch + d_path fits.
 # Conservative target: 1 GB per chunk for A + d (bytes_per_elem * B * m * n
 # + B * n). Auto-adjust below.
@@ -56,11 +54,11 @@ _ROWS_PER_SPLIT = 2  # OFF: z≤0, z≥-2μ/λ.  ON: z≥0, z≤2μ/(1-λ).
 
 
 def _build_substitution_caches(
-    state, qw, qb, scored_keys, device, dtype, max_depth: int,
+    state, qw, qb, scored_keys, device, dtype,
 ):
     """Pre-compute per-split caches for the substitution-form LP.
 
-    For each of the first `max_depth` splits in `scored_keys`, populate:
+    For each split in `scored_keys`, populate:
       - hs_A[i, side, row, :n_gens]   halfspace coefficients
       - hs_b[i, side, row]            rhs values
       - d_corr[i, side, :n_gens]      additive d-correction from substitution
@@ -291,8 +289,6 @@ def verify_query_dual_ascent_bab(
     time_limit: float = 60.0,
     max_iter: int = _DEFAULT_K,
     repair_steps: int = _DEFAULT_REPAIR_STEPS,
-    max_depth: int = _DEFAULT_MAX_DEPTH,
-    frontier_cap: int = _DEFAULT_FRONTIER_CAP,
     feas_tol: float = _FEAS_TOL,
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
@@ -306,13 +302,12 @@ def verify_query_dual_ascent_bab(
         state: gen-LP state dict from `verify_gen_lp.state_from_alpha_zono`.
         qw, qb: spec direction (qw·output ≤ qb means counterexample).
         scored_keys: list of (layer_idx, neuron_idx) tuples in branching order
-            (highest priority first). Length cap: max_depth.
-        time_limit: wall clock budget in seconds (default 60).
+            (highest priority first). Depth is naturally capped at the length
+            of this list.
+        time_limit: wall clock budget in seconds (default 60). Sole exit
+            criterion alongside frontier exhaustion — no depth/frontier cap.
         max_iter: hard iteration cap per BaB node (default 1 — fastest).
         repair_steps: greedy primal-repair steps per dual iter (default 5).
-        max_depth: max BaB depth before declaring INCONCLUSIVE (default 40).
-        frontier_cap: cap on layer-frontier size (default 16384). If exceeded,
-            returns 'unknown' early.
         feas_tol: feasibility tolerance for primal repair (default 1e-5).
         device: torch device (default 'cuda' if available else 'cpu').
         dtype: torch dtype (default float32 — sound; bfloat16 needs threshold).
@@ -341,14 +336,14 @@ def verify_query_dual_ascent_bab(
     try:
         return _verify_dab_impl(
             state, qw, qb, scored_keys, time_limit, max_iter, repair_steps,
-            max_depth, frontier_cap, feas_tol, device, dtype,
+            feas_tol, device, dtype,
             print_progress, time_left_fn, witness_check_fn)
     finally:
         torch.set_grad_enabled(_grad_was)
 
 
 def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
-                      repair_steps, max_depth, frontier_cap, feas_tol,
+                      repair_steps, feas_tol,
                       device, dtype, print_progress, time_left_fn,
                       witness_check_fn):
     t_start = time.perf_counter()
@@ -364,7 +359,6 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
     # neurons that became stable; original ranking may include them.)
     _state_keys = {(u['layer_idx'], u['neuron_idx']) for u in state['unstable_list']}
     scored_keys = [k for k in scored_keys if k in _state_keys]
-    # max_depth removed in favor of time_limit. Use full scored_keys length.
     n_splits = len(scored_keys)
     if n_splits == 0:
         # No splits available — just evaluate root LP.
@@ -395,7 +389,7 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
     # Build substitution caches (one-time per query).
     (n_gens, e_lb, e_hi, width, d_t, c0, hs_A, hs_b, d_corr, c0_corr) = \
         _build_substitution_caches(state, qw, qb, scored_keys,
-                                    device, dtype, max_depth)
+                                    device, dtype)
 
     # Root LP (no halfspaces): box minimum gives root g.
     x_star_root = torch.where(d_t < 0, e_hi, e_lb)
@@ -423,10 +417,6 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
         max_depth_seen = max(max_depth_seen, depth)
         B = open_paths.shape[0]
         n_total += B
-        if B > frontier_cap:
-            info_extra['reason'] = (f'frontier cap {frontier_cap} '
-                                     f'exceeded at depth {depth}')
-            break
 
         m_dim = depth * _ROWS_PER_SPLIT
         if open_lam.shape[1] < m_dim:
@@ -445,7 +435,13 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
         pl_full = open_paths.long()
         reason_all = torch.empty(B, dtype=torch.int8, device=device)
         lam_out_all = torch.empty(B, m_dim, device=device, dtype=dtype)
+        timed_out_mid_layer = False
         for chunk_start in range(0, B, chunk_size):
+            if _left() <= 0:
+                info_extra['reason'] = (f'TIMEOUT mid-layer at depth {depth} '
+                                         f'(chunk {chunk_start}/{B})')
+                timed_out_mid_layer = True
+                break
             chunk_end = min(chunk_start + chunk_size, B)
             cs = chunk_end - chunk_start
             pl = pl_full[chunk_start:chunk_end]
@@ -488,6 +484,8 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
                     info_extra['witness_inputs'].append(w)
                     info_extra['witness_p'].append(p)
             del A_batch, b_batch, d_path, c0_path
+        if timed_out_mid_layer:
+            break
         reason = reason_all
         lam_out = lam_out_all
         if device.type == 'cuda':
@@ -558,7 +556,7 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
         verdict = 'unknown'
         if 'reason' not in info_extra:
             if depth >= n_splits:
-                info_extra['reason'] = (f'reached max_depth={n_splits} '
+                info_extra['reason'] = (f'exhausted all {n_splits} splits '
                                          f'with {final_open} open nodes')
             else:
                 info_extra['reason'] = f'aborted at depth {depth}'
