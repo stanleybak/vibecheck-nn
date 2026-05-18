@@ -3615,6 +3615,12 @@ def _phase1_bab_refine(
         open_qis = [qi for qi in range(len(queries_flat))
                     if float(spec_lbs_phase05[qi]) <= 0]
         tb['phase1_alpha_total'] += time.perf_counter() - t_a
+        # Stash spec lbs (keyed by spec qi) so Phase 2 CROWN can be skipped
+        # when phase2_crown_enabled=False — α-CROWN already gave tighter lbs.
+        tb['spec_lbs_phase05'] = {
+            queries_flat[i][0]: float(spec_lbs_phase05[i])
+            for i in range(len(queries_flat))
+        }
         if print_progress:
             n_closed = len(queries_flat) - len(open_qis)
             print(f'  [phase0.5] α-CROWN closed {n_closed}/'
@@ -4760,12 +4766,29 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         t0 = time.perf_counter()
         _pgd_budget_phase0 = float(
             getattr(settings, 'pgd_time_budget_phase0', 10.0))
+        # Phase 0 can use a lighter PGD config (fewer restarts/iter) than
+        # Phase 2.6 (per-spec). Swap settings in place around the call so
+        # subsequent _pgd_attack_general invocations (Phase 2.6, Phase 3.5)
+        # see the default pgd_iter/pgd_restarts.
+        _p0_iter = (int(settings.pgd_phase0_iter)
+                     if 'pgd_phase0_iter' in settings else None)
+        _p0_restarts = (int(settings.pgd_phase0_restarts)
+                         if 'pgd_phase0_restarts' in settings else None)
+        _orig_iter = settings.pgd_iter
+        _orig_restarts = settings.pgd_restarts
+        if _p0_iter is not None:
+            settings.pgd_iter = _p0_iter
+        if _p0_restarts is not None:
+            settings.pgd_restarts = _p0_restarts
         try:
             pgd_sat, pgd_witness = _pgd_attack_general(
                 xl_pgd, xh_pgd, spec, gg_pgd, settings,
                 time_budget=_pgd_budget_phase0)
         except RuntimeError:
             pgd_sat, pgd_witness = False, None
+        finally:
+            settings.pgd_iter = _orig_iter
+            settings.pgd_restarts = _orig_restarts
         timing['phase0_pgd'] = time.perf_counter() - t0
         if print_progress:
             print(f'Phase 0 (PGD before cascade): '
@@ -4847,11 +4870,20 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     _mem_audit('after phase1')
 
     # --- Phase 2: CROWN backward ---
+    # Skippable when Phase 1 already produced tighter α-CROWN spec lbs
+    # (Phase 0.5 step 2). Setting `phase2_crown_enabled=False` reuses those
+    # lbs instead of recomputing a (looser) plain-CROWN backward.
     t0 = time.perf_counter()
     all_qids = set(spec_ew.keys())
-    with torch.no_grad():
-        spec_lbs, _ = _spec_backward_graph(
-            sb, xl_g, xh_g, gg, spec_ew, all_qids, nh, device, dtype)
+    _phase2_crown = bool(getattr(settings, 'phase2_crown_enabled', True))
+    _ph1_spec_lbs = phase1_tb.get('spec_lbs_phase05') if isinstance(phase1_tb, dict) else None
+    if _phase2_crown or not _ph1_spec_lbs:
+        with torch.no_grad():
+            spec_lbs, _ = _spec_backward_graph(
+                sb, xl_g, xh_g, gg, spec_ew, all_qids, nh, device, dtype)
+    else:
+        # Reuse Phase 0.5 α-CROWN spec lbs (already tighter than plain CROWN).
+        spec_lbs = {qi: _ph1_spec_lbs.get(qi, -1.0) for qi in all_qids}
     timing['phase2_crown'] = time.perf_counter() - t0
     stats.record_bounds(sb)
 
