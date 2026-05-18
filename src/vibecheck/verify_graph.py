@@ -5687,6 +5687,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 race_levels = [{'n_bins': 0, 'result': vd,
                                 'lb': 1.0 if vd == 'unsat' else 0.0,
                                 'time': info['wall'],
+                                'source': 'dual_ascent',
+                                'nodes': info.get('nodes', 0),
                                 'witness_source': 'dual_ascent_bab' if vd == 'sat' else None}]
                 raw.append((qi, vd, race_levels, _da_witness))
         elif _parallel_race:
@@ -5709,15 +5711,27 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 print_progress=print_progress)
         for qi, verdict, race_levels, witness in raw:
             if print_progress:
-                print(f'  MILP query {qi} (disjunct {queries[qi][0]}):')
-                for lv in race_levels:
-                    lb = lv.get('lb')
-                    lb_s = f'{lb:+.4f}' if isinstance(lb, float) else 'n/a'
-                    src = lv.get('witness_source')
-                    src_s = f' witness={src}' if src else ''
-                    print(f'    Racing bins={lv["n_bins"]}: '
-                          f'{lv["result"]} lb={lb_s} '
-                          f'({lv["time"]:.1f}s){src_s}')
+                # Dual-ascent reuses the race_levels container with a single
+                # synthetic entry — print a dual-ascent-friendly summary
+                # instead of the MILP/racing template.
+                src = race_levels[0].get('source') if race_levels else None
+                if src == 'dual_ascent':
+                    lv = race_levels[0]
+                    nd = lv.get('nodes', 0)
+                    print(f'  [dual-ascent] query {qi} '
+                          f'(disjunct {queries[qi][0]}): '
+                          f'{lv["result"]}  nodes={nd}  '
+                          f'({lv["time"]:.3f}s)')
+                else:
+                    print(f'  MILP query {qi} (disjunct {queries[qi][0]}):')
+                    for lv in race_levels:
+                        lb = lv.get('lb')
+                        lb_s = f'{lb:+.4f}' if isinstance(lb, float) else 'n/a'
+                        wsrc = lv.get('witness_source')
+                        src_s = f' witness={wsrc}' if wsrc else ''
+                        print(f'    Racing bins={lv["n_bins"]}: '
+                              f'{lv["result"]} lb={lb_s} '
+                              f'({lv["time"]:.1f}s){src_s}')
                 n_bins_used = (race_levels[-1]['n_bins']
                                if race_levels else 0)
                 details.setdefault('racing', {})[qi] = {
