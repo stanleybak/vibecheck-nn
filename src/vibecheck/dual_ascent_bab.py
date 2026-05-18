@@ -749,4 +749,350 @@ def _verify_dab_impl(state, qw, qb, scored_keys, time_limit, max_iter,
     return verdict, info
 
 
-__all__ = ['verify_query_dual_ascent_bab']
+def verify_queries_batched(
+    state, query_specs, *,
+    time_limit: float = 60.0,
+    max_iter: int = _DEFAULT_K,
+    repair_steps: int = _DEFAULT_REPAIR_STEPS,
+    feas_tol: float = _FEAS_TOL,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    print_progress: bool = False,
+    time_left_fn: Optional[Callable[[], float]] = None,
+    witness_check_fn: Optional[Callable[[np.ndarray], Optional[np.ndarray]]] = None,
+):
+    """Verify multiple (qw, qb) queries simultaneously via cross-query
+    batching of the dual-ascent BaB kernel.
+
+    `query_specs` is a list of `(qw, qb, scored_keys)` tuples. All queries
+    share the same `state`. Returns a list `[(verdict, info), ...]` in the
+    same order.
+
+    Per-layer: each active query has its own frontier and scored_keys; we
+    pad halfspace counts to `max(m_dim)` across active queries and run
+    ONE `_batched_dual_ascent` call on the concatenated frontier. This
+    amortizes kernel-launch + scheduling overhead across queries.
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    _grad_was = torch.is_grad_enabled()
+    torch.set_grad_enabled(False)
+    try:
+        return _verify_queries_batched_impl(
+            state, query_specs, time_limit, max_iter, repair_steps,
+            feas_tol, device, dtype, print_progress, time_left_fn,
+            witness_check_fn)
+    finally:
+        torch.set_grad_enabled(_grad_was)
+
+
+def _root_lp_only(state, geo, qw, qb, e_lb, e_hi, device, dtype, t_start):
+    """Evaluate root LP (no halfspaces) for a query — used when scored_keys
+    is empty (no splits possible). Same semantics as the n_splits==0 branch
+    in _verify_dab_impl."""
+    qw_np = np.asarray(qw, dtype=np.float64)
+    d_np = qw_np @ geo['obj_G_out_np']
+    c0_val = float(qw_np @ geo['obj_c_out_np'] + qb)
+    d_t_q = torch.as_tensor(d_np, device=device, dtype=dtype)
+    x_star = torch.where(d_t_q < 0, e_hi, e_lb)
+    g_root = c0_val + (d_t_q * x_star).sum().item()
+    verdict = 'unsat' if g_root > 0 else 'unknown'
+    info = {'wall': time.perf_counter() - t_start, 'nodes': 1,
+            'max_depth_seen': 0,
+            'exit_counts': {'dual_safe': 1 if g_root > 0 else 0,
+                             'primal_unsafe': 0, 'safety_cap': 0, 'no_progress': 0},
+            'final_open': 0, 'root_g': g_root}
+    return verdict, info
+
+
+def _verify_queries_batched_impl(
+    state, query_specs, time_limit, max_iter, repair_steps,
+    feas_tol, device, dtype, print_progress, time_left_fn,
+    witness_check_fn,
+):
+    t_start = time.perf_counter()
+    if time_left_fn is None:
+        deadline = t_start + time_limit
+        def _left():
+            return deadline - time.perf_counter()
+    else:
+        _left = time_left_fn
+
+    Q = len(query_specs)
+    if _left() <= 0 or Q == 0:
+        return [('unknown', {'wall': 0.0, 'nodes': 0, 'max_depth_seen': 0,
+                              'exit_counts': {'dual_safe': 0, 'primal_unsafe': 0,
+                                              'safety_cap': 0, 'no_progress': 0},
+                              'final_open': 0, 'root_g': float('nan'),
+                              'reason': 'deadline-on-entry'}) for _ in range(Q)]
+
+    # Shared state geometry (LRU-1 on state).
+    geo = state.get('_dab_geom')
+    if (geo is None or geo['device'] != device or geo['dtype'] != dtype
+            or geo['n_gens'] != int(state['n_gens'])):
+        geo = _precompute_state_geometry(state, device, dtype)
+        state['_dab_geom'] = geo
+    n_gens = geo['n_gens']
+    n_input = int(state['n_input'])
+    e_lb, e_hi, width = geo['e_lb_t'], geo['e_hi_t'], geo['width_t']
+    _state_keys = {(u['layer_idx'], u['neuron_idx']) for u in state['unstable_list']}
+
+    # Per-query state. `verdict=None` => still active.
+    Q_state = [None] * Q
+    for qi in range(Q):
+        qw, qb, scored_keys = query_specs[qi]
+        sk = [k for k in scored_keys if k in _state_keys]
+        if len(sk) == 0:
+            v, info = _root_lp_only(state, geo, qw, qb, e_lb, e_hi, device, dtype, t_start)
+            Q_state[qi] = {'verdict': v, 'info': info, 'open_paths': None}
+            continue
+        cache = _compute_query_caches(geo, sk, qw, qb, device, dtype)
+        _, _, _, _, d_t_q, c0_q, hs_A_q, hs_b_q, d_corr_q, c0_corr_q = cache
+        # Root LP first.
+        x_star_root = torch.where(d_t_q < 0, e_hi, e_lb)
+        g_root = c0_q + (d_t_q * x_star_root).sum().item()
+        if g_root > 0:
+            Q_state[qi] = {'verdict': 'unsat',
+                            'info': {'wall': time.perf_counter() - t_start,
+                                      'nodes': 1, 'max_depth_seen': 0,
+                                      'exit_counts': {'dual_safe': 1, 'primal_unsafe': 0,
+                                                      'safety_cap': 0, 'no_progress': 0},
+                                      'final_open': 0, 'root_g': g_root},
+                            'open_paths': None}
+            continue
+        Q_state[qi] = {
+            'verdict': None,
+            'd_t': d_t_q, 'c0': c0_q,
+            'hs_A': hs_A_q, 'hs_b': hs_b_q,
+            'd_corr': d_corr_q, 'c0_corr': c0_corr_q,
+            'n_splits': hs_A_q.shape[0],
+            'open_paths': torch.tensor([[0], [1]], device=device, dtype=torch.int8),
+            'open_lam': torch.zeros(2, _ROWS_PER_SPLIT, device=device, dtype=dtype),
+            'depth': 1, 'n_total': 1, 'max_depth_seen': 0,
+            'exit_counts': {'dual_safe': 0, 'primal_unsafe': 0,
+                             'safety_cap': 0, 'no_progress': 0},
+            'witness_inputs': [], 'witness_p': [],
+            'root_g': g_root, 'reason': None,
+            'sat_witness': None, 'sat_witness_depth': None,
+        }
+
+    # Layered BFS — synchronized across active queries, padded m_dim.
+    while True:
+        if _left() <= 0:
+            break
+        active = [qi for qi in range(Q)
+                   if Q_state[qi]['verdict'] is None
+                   and Q_state[qi]['open_paths'] is not None
+                   and Q_state[qi]['open_paths'].shape[0] > 0]
+        if not active:
+            break
+        max_m = max(Q_state[qi]['depth'] * _ROWS_PER_SPLIT for qi in active)
+
+        # Build per-query (A, b, d, c0, lam) padded to max_m, then concat
+        # across queries along the node dim. Chunk along the COMBINED node
+        # dim using the same memory budget.
+        # Pre-compute total_B and per-query slices.
+        slices = []  # list of (qi, start, end, depth_q, m_q, B_q)
+        cursor = 0
+        for qi in active:
+            qs = Q_state[qi]
+            B_q = qs['open_paths'].shape[0]
+            slices.append((qi, cursor, cursor + B_q, qs['depth'],
+                            qs['depth'] * _ROWS_PER_SPLIT, B_q))
+            cursor += B_q
+        total_B = cursor
+
+        # Chunk size based on max_m (worst case per node).
+        bytes_per_elem = 4 if dtype == torch.float32 else 2
+        per_node_bytes = bytes_per_elem * (max_m * n_gens + n_gens) * 8
+        chunk_size = max(1, min(total_B, int(_DEFAULT_CHUNK_BYTES_BUDGET
+                                              / max(1, per_node_bytes))))
+
+        reason_all = torch.empty(total_B, dtype=torch.int8, device=device)
+        lam_out_all = torch.zeros(total_B, max_m, device=device, dtype=dtype)
+        # NOTE: no full-batch `witness_all` tensor — would be total_B × n_gens
+        # (~6 GB at total_B=1M, n_gens=11414) and isn't needed since witness
+        # stashing happens INSIDE the chunk loop below.
+        # Per-query witness inputs/primals captured INSIDE the chunk loop,
+        # since we no longer materialize the per-query A_q ahead of time.
+        layer_witness_per_q = {qi: ([], []) for qi, *_ in slices}
+
+        # Build an index helping us map combined positions -> per-query.
+        # slices is already ordered by combined cursor.
+        slice_starts = np.array([s[1] for s in slices], dtype=np.int64)
+        slice_ends = np.array([s[2] for s in slices], dtype=np.int64)
+
+        timed_out_mid = False
+        for chunk_start in range(0, total_B, chunk_size):
+            if _left() <= 0:
+                timed_out_mid = True; break
+            chunk_end = min(chunk_start + chunk_size, total_B)
+            cs = chunk_end - chunk_start
+            # Build the chunk's (A, b, d, c0, lam) by walking the slices
+            # that intersect [chunk_start, chunk_end). Per-query segment
+            # rows of A get the gathered hs_A; other rows stay zero (which
+            # are inactive constraints since b=0 ≥ 0·e is trivially feasible
+            # and lam=0 contributes nothing to rc or g).
+            A_chunk = torch.zeros(cs, max_m, n_gens, device=device, dtype=dtype)
+            b_chunk = torch.zeros(cs, max_m, device=device, dtype=dtype)
+            d_chunk = torch.zeros(cs, n_gens, device=device, dtype=dtype)
+            c0_chunk = torch.zeros(cs, device=device, dtype=dtype)
+            lam_chunk = torch.zeros(cs, max_m, device=device, dtype=dtype)
+            # Track which slice indices contributed to this chunk (for the
+            # witness-stashing pass below).
+            contributing = []
+            for sidx, (qi, qs_st, qs_en, depth_q, m_q, B_q) in enumerate(slices):
+                seg_st = max(chunk_start, qs_st)
+                seg_en = min(chunk_end, qs_en)
+                if seg_st >= seg_en:
+                    continue
+                local_st = seg_st - qs_st
+                local_en = seg_en - qs_st
+                cl_st = seg_st - chunk_start
+                cl_en = seg_en - chunk_start
+                qs = Q_state[qi]
+                pl = qs['open_paths'][local_st:local_en].long()
+                d_chunk[cl_st:cl_en] = qs['d_t']
+                c0_chunk[cl_st:cl_en] = qs['c0']
+                for j in range(depth_q):
+                    sides_j = pl[:, j]
+                    A_chunk[cl_st:cl_en,
+                             j*_ROWS_PER_SPLIT:(j+1)*_ROWS_PER_SPLIT, :] = qs['hs_A'][j, sides_j]
+                    b_chunk[cl_st:cl_en,
+                             j*_ROWS_PER_SPLIT:(j+1)*_ROWS_PER_SPLIT] = qs['hs_b'][j, sides_j]
+                    d_chunk[cl_st:cl_en] += qs['d_corr'][j, sides_j]
+                    c0_chunk[cl_st:cl_en] += qs['c0_corr'][j, sides_j]
+                lam_chunk[cl_st:cl_en, :m_q] = qs['open_lam'][local_st:local_en]
+                contributing.append((qi, cl_st, cl_en))
+
+            alive = torch.ones(cs, dtype=torch.bool, device=device)
+            _, lam_chunk_out, reason_chunk, witness_chunk = _batched_dual_ascent(
+                d_chunk, c0_chunk, A_chunk, b_chunk, lam_chunk, alive,
+                e_lb, e_hi, width,
+                max_iter=max_iter, repair_steps=repair_steps,
+                feas_tol=feas_tol, tol=_TOL, dtype=dtype, device=device)
+            reason_all[chunk_start:chunk_end] = reason_chunk
+            lam_out_all[chunk_start:chunk_end] = lam_chunk_out
+
+            # Capture primal_unsafe witnesses per query within this chunk.
+            if witness_check_fn is not None:
+                for qi, cl_st, cl_en in contributing:
+                    seg_reason = reason_chunk[cl_st:cl_en]
+                    w_mask = (seg_reason == 1)
+                    if not w_mask.any():
+                        continue
+                    seg_witness = witness_chunk[cl_st:cl_en][w_mask][:, :n_input].cpu().numpy()
+                    seg_d = d_chunk[cl_st:cl_en][w_mask].float()
+                    seg_c0 = c0_chunk[cl_st:cl_en][w_mask].float()
+                    seg_w_full = witness_chunk[cl_st:cl_en][w_mask].float()
+                    seg_p = (seg_c0 + (seg_d * seg_w_full).sum(-1)).cpu().numpy()
+                    ws, ps = layer_witness_per_q[qi]
+                    ws.append(seg_witness)
+                    ps.append(seg_p)
+
+            del A_chunk, b_chunk, d_chunk, c0_chunk, lam_chunk
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        if timed_out_mid:
+            break
+
+        # Split back per query and expand frontier.
+        for qi, st, en, depth_q, m_q, B_q in slices:
+            qs = Q_state[qi]
+            reason_q = reason_all[st:en]
+            lam_out_q = lam_out_all[st:en, :m_q]
+            r_np = reason_q.cpu().numpy()
+            qs['exit_counts']['dual_safe'] += int((r_np == 0).sum())
+            qs['exit_counts']['primal_unsafe'] += int((r_np == 1).sum())
+            qs['exit_counts']['no_progress'] += int((r_np == 2).sum())
+            qs['exit_counts']['safety_cap'] += int((r_np == 3).sum())
+            qs['n_total'] += B_q
+            qs['max_depth_seen'] = max(qs['max_depth_seen'], depth_q)
+
+            if witness_check_fn is not None:
+                ws, ps = layer_witness_per_q[qi]
+                if ws:
+                    qs['witness_inputs'].extend(ws)
+                    qs['witness_p'].extend(ps)
+
+            # Frontier expansion for non-closed survivors.
+            must_split = (reason_q != 0) & (reason_q != -1)
+            survivors_idx = must_split.nonzero(as_tuple=True)[0]
+            ns = int(survivors_idx.shape[0])
+            survivor_paths = qs['open_paths'][survivors_idx]
+            survivor_lams = lam_out_q[survivors_idx]
+            new_paths = torch.zeros(ns * 2, depth_q + 1, device=device, dtype=torch.int8)
+            new_paths[0::2, :depth_q] = survivor_paths; new_paths[0::2, depth_q] = 0
+            new_paths[1::2, :depth_q] = survivor_paths; new_paths[1::2, depth_q] = 1
+            new_lams = torch.zeros(ns * 2, m_q + _ROWS_PER_SPLIT,
+                                    device=device, dtype=dtype)
+            new_lams[0::2, :m_q] = survivor_lams
+            new_lams[1::2, :m_q] = survivor_lams
+            qs['open_paths'] = new_paths
+            qs['open_lam'] = new_lams
+            qs['depth'] += 1
+
+        # Witness attack check (per-query, after the layer).
+        if witness_check_fn is not None:
+            for qi in active:
+                qs = Q_state[qi]
+                if qs['verdict'] is not None:
+                    continue
+                ws = qs.pop('witness_inputs')
+                ps = qs.pop('witness_p')
+                qs['witness_inputs'] = []
+                qs['witness_p'] = []
+                if ws:
+                    w_all = np.concatenate(ws, axis=0)
+                    K_WITNESS = 5
+                    if ps and len(w_all) > K_WITNESS:
+                        p_all = np.concatenate(ps, axis=0)
+                        top_idx = np.argpartition(p_all, K_WITNESS)[:K_WITNESS]
+                        w_all = w_all[top_idx]
+                    cex = witness_check_fn(w_all)
+                    if cex is not None:
+                        qs['verdict'] = 'sat'
+                        qs['sat_witness'] = cex
+                        qs['sat_witness_depth'] = qs['depth'] - 1
+                        qs['open_paths'] = None
+
+        # Close queries whose frontier emptied or whose depth exhausted splits.
+        for qi in active:
+            qs = Q_state[qi]
+            if qs['verdict'] is not None:
+                continue
+            if qs['open_paths'] is None or qs['open_paths'].shape[0] == 0:
+                qs['verdict'] = 'unsat'
+            elif qs['depth'] >= qs['n_splits']:
+                qs['verdict'] = 'unknown'
+                qs['reason'] = (f'exhausted all {qs["n_splits"]} splits '
+                                 f'with {qs["open_paths"].shape[0]} open nodes')
+
+    # Build results (any still-active query becomes unknown with TIMEOUT).
+    elapsed = time.perf_counter() - t_start
+    results = []
+    for qi in range(Q):
+        qs = Q_state[qi]
+        if 'd_t' not in qs:
+            # Pure root-LP path: info already complete.
+            results.append((qs['verdict'], qs['info']))
+            continue
+        v = qs['verdict'] or 'unknown'
+        final_open = (int(qs['open_paths'].shape[0])
+                       if qs['open_paths'] is not None else 0)
+        info = {'wall': elapsed, 'nodes': qs['n_total'],
+                'max_depth_seen': qs['max_depth_seen'],
+                'exit_counts': qs['exit_counts'],
+                'final_open': final_open, 'root_g': qs['root_g']}
+        if v == 'unknown':
+            info['reason'] = qs.get('reason') or f'TIMEOUT at depth {qs["depth"]}'
+        if qs.get('sat_witness') is not None:
+            info['sat_witness'] = qs['sat_witness']
+            info['sat_witness_depth'] = qs['sat_witness_depth']
+        results.append((v, info))
+    return results
+
+
+__all__ = ['verify_query_dual_ascent_bab', 'verify_queries_batched']
