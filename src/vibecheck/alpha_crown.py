@@ -382,7 +382,7 @@ def run_alpha_crown(gg, xl, xh, bbr_init, w_q, b_q,
 def run_alpha_crown_fixed_intermediate(
         gg, xl, xh, bbr_init, w_q, b_q,
         device, dtype, n_iters=20, lr=0.25, lr_decay=0.98,
-        early_stop_on_positive=True):
+        early_stop_on_positive=True, time_left_fn=None):
     """α-CROWN with fixed intermediate bounds and spec-only α.
 
     Matches α,β-CROWN's effective `fix_intermediate_bounds=True` config: the
@@ -450,6 +450,8 @@ def run_alpha_crown_fixed_intermediate(
     history = []
 
     for it in range(n_iters):
+        if time_left_fn is not None and time_left_fn() <= 0:
+            break
         opt.zero_grad()
         lb_batch, _ = _crown_backward_matrix(
             gg, xl, xh, spec_alpha, bbr_tensors_fixed,
@@ -488,7 +490,7 @@ def run_alpha_crown_fixed_intermediate_batched(
         device, dtype, n_iters=20, lr=0.25, lr_decay=0.98,
         early_stop_on_positive=True, sparse_alpha=False,
         hopeless_lb=None, hopeless_delta=0.5,
-        per_spec_alpha=False):
+        per_spec_alpha=False, time_left_fn=None):
     """Batched version of `run_alpha_crown_fixed_intermediate`: shared spec α
     across multiple queries, spec backward batched over `ew_init` of shape
     `(n_q, n_out)`. Closed queries are excluded from the loss sum so α
@@ -578,6 +580,8 @@ def run_alpha_crown_fixed_intermediate_batched(
     sparse_at = unstable_idx_per_layer if sparse_alpha else None
 
     for it in range(n_iters):
+        if time_left_fn is not None and time_left_fn() <= 0:
+            break
         opt.zero_grad()
         lb_batch, _ = _crown_backward_matrix(
             gg, xl, xh, spec_alpha, bbr_tensors_fixed,
@@ -648,7 +652,7 @@ def run_alpha_crown_batched(
         device, dtype, n_iters=20, lr=0.25, lr_decay=1.0,
         early_stop_on_positive=False, sparse_alpha=False,
         hopeless_lb=None, hopeless_delta=0.5,
-        dir_mode='auto', s_split_n=1):
+        dir_mode='auto', s_split_n=1, time_left_fn=None):
     """Batched α-CROWN across multiple spec directions (w_qs, b_qs).
 
     α is shared across queries (one (n_L,) tensor per (start_node, layer)
@@ -862,6 +866,11 @@ def run_alpha_crown_batched(
 
     import gc as _gc
     for it in range(n_iters):
+        # Honor caller-supplied deadline so the Adam loop stops cleanly
+        # at the global time_left boundary (e.g. cascade refresh on a
+        # resnet_large with little budget left).
+        if time_left_fn is not None and time_left_fn() <= 0:
+            break
         opt.zero_grad()
         spec_lb_batch = None
         bbr_tensors_for_best = None

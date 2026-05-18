@@ -3554,7 +3554,8 @@ def _phase1_bab_refine(
             gg, xl, xh, bbr_now, w_qs, b_qs, S_nodes, un_idx,
             device, dtype, n_iters=n_iters, lr=alpha_lr,
             lr_decay=0.98, early_stop_on_positive=False,
-            dir_mode=_dir_mode, s_split_n=_s_split)
+            dir_mode=_dir_mode, s_split_n=_s_split,
+            time_left_fn=time_left)
         return best_bounds
 
     ew_score_per_layer = None
@@ -3610,7 +3611,7 @@ def _phase1_bab_refine(
                 gg, xl, xh, bounds_by_relu, w_qs, b_qs,
                 device, dtype, n_iters=phase05_spec_iters, lr=alpha_lr,
                 lr_decay=0.98, early_stop_on_positive=True,
-                per_spec_alpha=False))
+                per_spec_alpha=False, time_left_fn=time_left))
         spec_alpha_phase05 = alpha_dict_p05.get('spec')
         open_qis = [qi for qi in range(len(queries_flat))
                     if float(spec_lbs_phase05[qi]) <= 0]
@@ -4618,9 +4619,22 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
 
     t_start = time.perf_counter()
     deadline = t_start + total_timeout
+    # Optional guarantee: Phase 8 gets at least this fraction of total_timeout.
+    # Pre-Phase-8 phases see a wrapped time_left that returns
+    # min(remaining, phase8_min_deadline - now). When `_phase8_started` flips
+    # True (right before Phase 8 BaB dispatch), time_left returns the full
+    # remaining budget.
+    _phase8_min_frac = float(getattr(settings, 'phase8_min_budget_frac', 0.0))
+    _phase8_min_deadline = (t_start + total_timeout * (1.0 - _phase8_min_frac)
+                             if _phase8_min_frac > 0 else deadline)
+    _phase8_started = [False]
 
     def time_left():
-        return max(0.0, deadline - time.perf_counter())
+        now = time.perf_counter()
+        full = max(0.0, deadline - now)
+        if not _phase8_started[0] and _phase8_min_frac > 0:
+            return max(0.0, min(full, _phase8_min_deadline - now))
+        return full
 
     stats = VerifyStats()
     timing = {}
@@ -5376,6 +5390,10 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         # classifications reflect those tighter bounds. New λ slopes fall
         # out automatically from the ReLU (lo, hi) → triangle reconstruction
         # inside `precompute_gen_state`.
+        # Flip time_left to "Phase 8" mode — drops the pre-Phase-8 cap so
+        # Phase 8 BaB and its per-query α-zono setup see the full remaining
+        # budget (deadline - now), not min(.., phase8_min_deadline - now).
+        _phase8_started[0] = True
         state_by_qi = {}
         _per_qi_rebuild = bool(getattr(
             settings, 'phase8_per_query_tightened_bounds', True))
