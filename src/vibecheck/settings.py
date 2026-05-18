@@ -395,6 +395,35 @@ def default_settings(**overrides):
         phase8_pgd_seed_iters=20,
         phase8_pgd_seed_perts=8,
         phase8_pgd_seed_noise=0.01,    # fraction of input-box width
+        # ----- Phase 8 split scoring -----
+        # Use box+halfspace per-neuron delta_LB scoring to rank BaB splits
+        # (replaces the older `lp_ew_frac = |ew_k| * triangle_area`).
+        # Bug 2026-05-14: DotMap's missing-attr returns DotMap() not True,
+        # so `bool(getattr(settings, '...', True))` was always False and
+        # this rerank was silently disabled. Now an explicit setting.
+        phase8_score_box_halfspace=True,
+        # Also a separate fix in score_box_halfspace_delta_lb: derive
+        # ew_k = d[e_new_col]/μ from state instead of using the α-CROWN
+        # capture_ew_per_relu output. They differ by ~1e-8 (FP32 noise),
+        # but for neurons with lam=0 (degenerate parallelogram), the
+        # off-side substitution's only adjustment is `d[e_new_col] -= ew*μ`.
+        # Using state-derived ew exactly zeros this; α-CROWN-derived ew
+        # leaves a tiny residual that gets amplified into wildly different
+        # rankings across runs (with the same input).
+        #
+        # ----- GPU dual-ascent BaB (drop-in for Phase 8 MILP racing) -----
+        # When True, replace `parallel_query_racing` with the substitution-
+        # form GPU BaB in `dual_ascent_bab.verify_query_dual_ascent_bab`.
+        # Each query is solved in ~0.3-1s on RTX 3080 (vs ~70s for the
+        # MILP racing default on hard tinyimagenet cases). Sound: any λ ≥ 0
+        # yields g(λ) ≤ LP_min by weak duality; only certifies when
+        # computed best_g > 0. Sanity-checked vs Gurobi on prop_4260
+        # (250 nodes, 100% decision match, 0 unsoundness). FP32 by default.
+        phase8_use_dual_ascent_gpu=False,
+        phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
+        phase8_dual_ascent_repair_steps=5,
+        phase8_dual_ascent_max_depth=200,  # was 40 — too tight; some hard cases need depth 50+. time_limit is the natural cap
+        phase8_dual_ascent_frontier_cap=16384,
         gen_lp_skip_phase7_lp=True,     # skip per-query LP scoring; use α-CROWN/CROWN ew*frac fallback (saves Phase 7 LP wall — was ~4s/query on hard CIFAR100)
         gen_lp_score_method='lp_ew_frac',  # 'lp_ew_frac', 'lp_fractional', 'lp_dual'. lp_dual ranks by |tri_lo|+|tri_up| duals — identifies the actual LP-binding triangles (on CIFAR100_resnet_medium_prop_idx_2477 the duals concentrate in L5 where kfsb/ew_frac promotes L9). lp_dual adds ~1-2s/query Phase-8 overhead to re-solve gen-LP with dual extraction; beneficial on hard queries where the wrong layer is being branched on, neutral-to-slow otherwise. Opt-in via settings.
         skip_phase8_milp=False,         # if True, Phase 8 is skipped and queries Phase 7 LP can't prove UNSAT are returned as 'unknown'
@@ -534,6 +563,82 @@ def default_settings(**overrides):
         # few passes where single-α zono-lift stalls. Fast queries close on
         # pass 0 before cascade engages.
         zono_lift_cascade_alpha=True,      # re-run α-CROWN per pass on new bbr
+        # Hard wall-time budget for the entire Phase 2.5 cascade across all
+        # disjuncts. None = unlimited (legacy). When set, the per-disjunct
+        # outer loop checks elapsed before starting each disjunct and the
+        # per-query inner loop checks before each query; once exceeded,
+        # remaining queries are left open and Phase 2.5 returns. Bound is
+        # soundness-preserving: every query starts from `bounds_by_relu`
+        # and only tightens, so an aborted query is no worse than skipped.
+        zono_lift_time_budget=None,
+        # Disjunct-level early abort. After the batched pass-0 α-CROWN, if
+        # the worst (most-negative) `lb_alpha` over all queries in a
+        # disjunct is below this threshold, skip the per-query cascade for
+        # the entire disjunct — it cannot close in 2.5 (a disjunct only
+        # closes when ALL its queries close). None = disabled (legacy).
+        # Negative value typical (e.g. -0.3); the smaller (more negative)
+        # the threshold, the more aggressive the skip.
+        zono_lift_disjunct_hopeless_lb=None,
+        # Promising-first ordering across disjuncts and within a disjunct.
+        # When True (default once enabled), disjuncts are processed in
+        # descending order of their min-query lb_alpha (most likely to
+        # fully close first), and queries within a disjunct in ASCENDING
+        # order of lb_alpha (bottleneck first — if it cannot close, the
+        # disjunct cannot either, so we detect hopeless cases earliest).
+        # Requires batched pass-0 results (`zono_lift_batch_queries=True`).
+        zono_lift_promising_first=True,
+        # Phase 2.6: per-spec targeted PGD after Phase 2.5 closes easy
+        # disjuncts. For each still-open disjunct, run a small focused
+        # PGD with `restrict_disj={di}` so the loss landscape isolates
+        # ONE spec's margins (vs Phase 3.5's union-of-margins PGD which
+        # can dilute the gradient when many disjuncts are open). Total
+        # wall is hard-capped by `phase26_pgd_per_spec_time_budget`;
+        # per-disjunct time is `total / n_open`, floored at 0.2s. Stops
+        # on first SAT witness.
+        phase26_pgd_per_spec_enabled=True,
+        phase26_pgd_per_spec_time_budget=3.0,
+        phase26_pgd_per_spec_min_per_spec=0.2,
+        # Phase 1 gen-LP conv chunking. Default 256 = chunked with safe
+        # block size + OOM-halve-retry fallback. The chunk loop itself
+        # is ~0.3% overhead vs un-chunked; OOM halving costs ~0.2% per
+        # event. Set to None to force the un-chunked legacy path.
+        # Read via env var VC_GEN_LP_CONV_CHUNK inside _gen_cone_state.
+        gen_lp_conv_chunk=256,
+        # Storage form for gen-LP `G_out` allocations in precompute_gen_state.
+        # 'dense' = legacy (n × n_gens) torch.zeros.
+        # 'sparse' = `_StructuredSparseG` (dense rows for stable passthrough +
+        #   identity-entry lists for unstable/stable-new). Identical results
+        #   (materialize-equivalent), ~0% overhead on cases that fit, ~4×
+        #   memory savings on big nets (cifar100_resnet_large L1: 1.55 GB →
+        #   ~400 MB).  Default 'sparse' since it's strictly equal or better.
+        # Read via env var VC_GEN_LP_G_STORAGE inside _gen_cone_state.
+        gen_lp_g_storage='sparse',
+        # α-CROWN backward direction-batching mode for run_alpha_crown_batched
+        # in `_alpha_refresh_best_bounds`.
+        #   'joint' — compute LB and UB backwards per chunk together; both
+        #             autograd graphs live until loss.backward(). Tightest
+        #             per-iter, highest memory.
+        #   'split' — separate spec-loss passes for LB-only and UB-only;
+        #             each pass's autograd graph dies at its loss.backward().
+        #             ~half memory peak, ~1.5-2× wall per iter.
+        #   'auto'  — start in 'joint', sticky-downgrade to 'split' on OOM.
+        # Default 'split' (not 'auto'): the joint-mode OOM-then-fallback
+        # path leaves ~2 GB of joint-attempt autograd state behind that
+        # gc.collect can't reclaim, causing the split fallback to fail
+        # on big nets that split alone would handle (cifar100_resnet_large
+        # prop_2461 etc.). Split is ~5% slower than joint on cases that
+        # fit in either; we accept that for the robustness.
+        alpha_crown_dir_mode='split',
+        # When >1, split sorted(intermediate_start_nodes) into N groups in
+        # `run_alpha_crown_batched._do_pass`. Each group runs its own
+        # spec backward + loss.backward(), freeing autograd between groups.
+        # Cuts peak autograd retention to ~1/N at cost of N× spec backwards
+        # (and N-times-looser per-group gradient signal since spec backward
+        # sees partial bbr updates). Default 2 since the s_split=1→2 OOM
+        # fallback ladder is unreliable (partial OOM state leaks across
+        # retry); ~7% wall overhead on cases that fit either, recovers
+        # cifar100_resnet_large cases that need s_split≥2.
+        alpha_crown_s_split_n=2,
         # OOM-handling policy. True (default) = re-raise any CUDA/CPU OOM
         # so the user sees the real failure. False = callers that have an
         # explicit fallback path (e.g. benchmarking loops recording "OOM"

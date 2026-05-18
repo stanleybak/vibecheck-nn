@@ -647,7 +647,8 @@ def run_alpha_crown_batched(
         intermediate_start_nodes, unstable_indices,
         device, dtype, n_iters=20, lr=0.25, lr_decay=1.0,
         early_stop_on_positive=False, sparse_alpha=False,
-        hopeless_lb=None, hopeless_delta=0.5):
+        hopeless_lb=None, hopeless_delta=0.5,
+        dir_mode='auto', s_split_n=1):
     """Batched α-CROWN across multiple spec directions (w_qs, b_qs).
 
     α is shared across queries (one (n_L,) tensor per (start_node, layer)
@@ -731,80 +732,184 @@ def run_alpha_crown_batched(
 
     sparse_at = unstable_idx_per_layer if sparse_alpha else None
     base_chunk = 128
-    for it in range(n_iters):
-        opt.zero_grad()
+
+    def _do_pass(direction, s_split_n=1):
+        """One Adam-iter pass, optionally split into `s_split_n` S-groups.
+
+        direction ∈ {'both','lb','ub'} — see earlier docstring.
+
+        `s_split_n`: split sorted(intermediate_start_nodes) into N groups.
+        Each group: process its S's (with autograd), spec backward, loss,
+        `.backward()` to free the group's graph. Cuts peak autograd
+        retention to ~1/N at the cost of N spec backwards + a looser
+        spec_lb per group (uses partial bbr updates).
+
+        Returns (spec_lb_batch_values, bbr_tensors_with_combined_updates).
+        Calls `.backward()` internally per group; caller invokes opt.step().
+        """
         bbr_tensors = {L: (
             torch.as_tensor(bbr_init[L][0], dtype=dtype, device=device).clone(),
             torch.as_tensor(bbr_init[L][1], dtype=dtype, device=device).clone(),
         ) for L in bbr_init}
-        for S in sorted(intermediate_start_nodes):
-            alpha_for_S = alpha_params[S]
-            start_op = _find_op_producing_relu_input(gg, S)
-            un_S = unstable_indices[S]
-            if not un_S or start_op is None: continue
-            n_S = bbr_init[S][0].size
-            n_un = len(un_S)
-            chunk = min(n_un, base_chunk)
-            lb_parts = []; ub_parts = []
-            un_idx_all = torch.as_tensor(un_S, device=device)
-            for start in range(0, n_un, chunk):
-                end = min(start + chunk, n_un)
-                kc = end - start
-                ew_init_lb = torch.zeros(
-                    kc, n_S, dtype=dtype, device=device)
-                ew_init_lb[torch.arange(kc, device=device),
-                           un_idx_all[start:end]] = 1.0
-                lb_part, _ = _crown_backward_matrix(
-                    gg, xl, xh, alpha_for_S, bbr_tensors,
-                    start_op, ew_init_lb, device, dtype,
-                    unstable_at_layer=sparse_at)
-                neg_ub_part, _ = _crown_backward_matrix(
-                    gg, xl, xh, alpha_for_S, bbr_tensors,
-                    start_op, -ew_init_lb, device, dtype,
-                    unstable_at_layer=sparse_at)
-                lb_parts.append(lb_part); ub_parts.append(-neg_ub_part)
-            lb_batch = torch.cat(lb_parts, dim=0)
-            ub_batch = torch.cat(ub_parts, dim=0)
-            un_t = torch.as_tensor(un_S, device=device, dtype=torch.long)
-            # MAX(init, recomputed) for LB, MIN(init, recomputed) for UB.
-            # Trade-off measured empirically:
-            #   • MAX: prop_5 256x6 in pipeline (tight Phase-1-init bounds)
-            #     reaches spec_lb = −265 after 10 joint α-CROWN iters.
-            #     REPLACE (let bounds drift) regresses this to −995 because
-            #     with tight init, recomputed bound is almost always looser
-            #     → drift makes spec_lb worse → Adam can't recover.
-            #   • REPLACE: matches ABC's α-CROWN to within 2% on ABC's
-            #     plain-CROWN-loose init bounds (−1843 vs −1810). MAX caps
-            #     us at −4132 there because gradient stops flowing when
-            #     the init wins.
-            # MAX is right for our pipeline because Phase 1 always tightens
-            # before Phase 2.5; we never start from loose plain-CROWN bounds.
-            # Tracked across iters via `best_bounds` (per-neuron, max/min).
-            lo_new = bbr_tensors[S][0].scatter(
-                0, un_t, torch.maximum(bbr_tensors[S][0][un_t], lb_batch))
-            hi_new = bbr_tensors[S][1].scatter(
-                0, un_t, torch.minimum(bbr_tensors[S][1][un_t], ub_batch))
-            bbr_tensors[S] = (lo_new, hi_new)
+        sorted_S = sorted(intermediate_start_nodes)
+        # Round-robin grouping so layer depths are distributed across groups.
+        s_groups = [sorted_S[i::s_split_n] for i in range(s_split_n)] \
+                    if s_split_n > 1 else [sorted_S]
+        un_idx_t_cache = {S: torch.as_tensor(unstable_indices[S], device=device)
+                           for S in sorted_S if unstable_indices[S]}
 
-        # Spec backward batched across queries: ew_init shape (n_q, n_out).
-        spec_alpha = alpha_params['spec']
-        lb_batch, _ = _crown_backward_matrix(
-            gg, xl, xh, spec_alpha, bbr_tensors,
-            last_op['name'], w_ts, device, dtype,
-            unstable_at_layer=sparse_at)
-        spec_lb_batch = lb_batch + b_ts  # (n_q,)
+        per_group_spec_lb = []
+        for group in s_groups:
+            for S in group:
+                alpha_for_S = alpha_params[S]
+                start_op = _find_op_producing_relu_input(gg, S)
+                un_S = unstable_indices[S]
+                if not un_S or start_op is None:
+                    continue
+                n_S = bbr_init[S][0].size
+                n_un = len(un_S)
+                chunk = min(n_un, base_chunk)
+                lb_parts = []; ub_parts = []
+                un_idx_all = un_idx_t_cache[S]
+                for start in range(0, n_un, chunk):
+                    end = min(start + chunk, n_un)
+                    kc = end - start
+                    ew_init_lb = torch.zeros(
+                        kc, n_S, dtype=dtype, device=device)
+                    ew_init_lb[torch.arange(kc, device=device),
+                               un_idx_all[start:end]] = 1.0
+                    if direction in ('both', 'lb'):
+                        lb_part, _ = _crown_backward_matrix(
+                            gg, xl, xh, alpha_for_S, bbr_tensors,
+                            start_op, ew_init_lb, device, dtype,
+                            unstable_at_layer=sparse_at)
+                        lb_parts.append(lb_part)
+                    if direction in ('both', 'ub'):
+                        neg_ub_part, _ = _crown_backward_matrix(
+                            gg, xl, xh, alpha_for_S, bbr_tensors,
+                            start_op, -ew_init_lb, device, dtype,
+                            unstable_at_layer=sparse_at)
+                        ub_parts.append(-neg_ub_part)
+                un_t = torch.as_tensor(un_S, device=device, dtype=torch.long)
+                if lb_parts:
+                    lb_batch = torch.cat(lb_parts, dim=0)
+                    lo_new = bbr_tensors[S][0].scatter(
+                        0, un_t,
+                        torch.maximum(bbr_tensors[S][0][un_t], lb_batch))
+                    bbr_tensors[S] = (lo_new, bbr_tensors[S][1])
+                if ub_parts:
+                    ub_batch = torch.cat(ub_parts, dim=0)
+                    hi_new = bbr_tensors[S][1].scatter(
+                        0, un_t,
+                        torch.minimum(bbr_tensors[S][1][un_t], ub_batch))
+                    bbr_tensors[S] = (bbr_tensors[S][0], hi_new)
 
-        # Loss drops closed queries so α doesn't over-fit to them.
+            # Group complete: spec backward with current bbr_tensors.
+            spec_alpha = alpha_params['spec']
+            lb_b, _ = _crown_backward_matrix(
+                gg, xl, xh, spec_alpha, bbr_tensors,
+                last_op['name'], w_ts, device, dtype,
+                unstable_at_layer=sparse_at)
+            spec_lb_batch_g = lb_b + b_ts
+            with torch.no_grad():
+                closed_mask = torch.as_tensor(
+                    best_lbs > 0, device=device, dtype=torch.bool)
+            active = ~closed_mask
+            if active.any():
+                loss_g = -spec_lb_batch_g[active].sum()
+                loss_g.backward()
+            per_group_spec_lb.append(spec_lb_batch_g.detach())
+            # Detach this group's bbr updates so the next group sees them
+            # as constants (no autograd retention across groups).
+            if s_split_n > 1:
+                for S in group:
+                    if S in bbr_tensors:
+                        bbr_tensors[S] = (bbr_tensors[S][0].detach(),
+                                            bbr_tensors[S][1].detach())
+
+        # Best (= max) spec_lb across groups; sound since each group's
+        # spec backward uses correct (per-group-tightened) bbr.
+        if len(per_group_spec_lb) == 1:
+            spec_lb_batch = per_group_spec_lb[0]
+        else:
+            spec_lb_batch = per_group_spec_lb[0]
+            for x in per_group_spec_lb[1:]:
+                spec_lb_batch = torch.maximum(spec_lb_batch, x)
+        return spec_lb_batch, bbr_tensors
+
+    assert dir_mode in ('joint', 'split', 'auto'), dir_mode
+    # Sticky downgrade ladder when dir_mode='auto':
+    #   joint            (lowest wall, highest memory)
+    #   split LB/UB      (~2× memory cut, ~1.5× wall)
+    #   split + s_split=2 (~4× cut, ~3× wall — one half of S's per group)
+    #   split + s_split=4 (~8× cut)
+    #   ...
+    _mode_active = ('joint' if dir_mode in ('joint', 'auto') else 'split')
+    _s_split_n = int(s_split_n) if s_split_n is not None else 1
+
+    def _run_split_pair(s_split):
+        spec_lb_a, bbr_a = _do_pass('lb', s_split_n=s_split)
+        spec_lb_b, bbr_b = _do_pass('ub', s_split_n=s_split)
+        bbr_tensors_for_best = {}
+        for L in bbr_a:
+            lo_a, _hi_a = bbr_a[L]
+            _lo_b, hi_b = bbr_b[L]
+            bbr_tensors_for_best[L] = (lo_a, hi_b)
         with torch.no_grad():
-            closed_mask = torch.as_tensor(
-                best_lbs > 0, device=device, dtype=torch.bool)
-        active = ~closed_mask
-        if active.any():
-            loss = -spec_lb_batch[active].sum()
-            loss.backward()
-            opt.step()
-            if scheduler is not None:
-                scheduler.step()
+            spec_lb_batch = torch.maximum(
+                spec_lb_a.detach(), spec_lb_b.detach())
+        return spec_lb_batch, bbr_tensors_for_best
+
+    import gc as _gc
+    for it in range(n_iters):
+        opt.zero_grad()
+        spec_lb_batch = None
+        bbr_tensors_for_best = None
+        if _mode_active == 'joint':
+            try:
+                spec_lb_batch, bbr_tensors_for_best = _do_pass(
+                    'both', s_split_n=_s_split_n)
+            except torch.cuda.OutOfMemoryError:
+                if dir_mode != 'auto':
+                    raise
+                # Aggressive release: gc.collect() forces Python to drop
+                # references in the popped exception frame so CUDA blocks
+                # can actually be reclaimed by empty_cache. Without this,
+                # split-mode retries inherit ~2GB of leaked state and the
+                # fallback fails even though split alone would fit.
+                _gc.collect()
+                torch.cuda.empty_cache()
+                opt.zero_grad()
+                _mode_active = 'split'  # sticky downgrade
+        if _mode_active == 'split':
+            while True:
+                try:
+                    spec_lb_batch, bbr_tensors_for_best = _run_split_pair(
+                        _s_split_n)
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    # s_split halving fires for BOTH 'split' and 'auto' modes
+                    # — only 'joint' suppresses all fallback. Halving the
+                    # number of S-groups is algorithmically inert (same α
+                    # updates accumulated, just looser per-group spec_lb),
+                    # so it's safe to enable whenever we're already in
+                    # split-mode rather than forcing the user to opt-in via
+                    # 'auto'.
+                    if dir_mode == 'joint':
+                        raise
+                    if _s_split_n >= max(1, len(intermediate_start_nodes)):
+                        raise
+                    _gc.collect()
+                    torch.cuda.empty_cache()
+                    opt.zero_grad()
+                    _s_split_n = min(
+                        _s_split_n * 2,
+                        max(1, len(intermediate_start_nodes)))
+        # Single opt.step() with accumulated grads from joint or split passes.
+        opt.step()
+        if scheduler is not None:
+            scheduler.step()
+        bbr_tensors = bbr_tensors_for_best
 
         with torch.no_grad():
             for S in start_nodes:

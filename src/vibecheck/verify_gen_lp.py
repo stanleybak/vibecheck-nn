@@ -73,10 +73,244 @@ def forward_point(gg_ops_ser, x, input_name, output_op_name):
     return vals[output_op_name]
 
 
+class _StructuredSparseG:
+    """Custom storage for precompute_gen_state's per-ReLU G output.
+
+    Exploits the fact that G_out has a very specific structure:
+      - `stable_idx` rows passthrough rows from G_in (dense in the first
+        `n_gens_old` cols, zero in the new cols);
+      - `unstable_idx` rows have a single 1.0 entry in a new col (identity);
+      - optionally `stable_new_idx` rows have a single 1.0 entry in a later
+        new col (sparse mode);
+      - all other rows are zero.
+
+    Rather than allocating an `(n × n_total)` dense tensor with ~92% zeros,
+    we keep:
+      - `stable_g`: a dense tensor of just the stable-passthrough rows,
+        shape `(len(stable_idx), n_gens_old)`;
+      - `stable_idx`, `unstable_idx`, optional `stable_new_idx` and their
+        new-col starts;
+      - method `materialize_cols(c_lo, c_hi)` reconstructs an `(n × chunk)`
+        dense slice on the fly — for use by chunked conv/fc consumers.
+
+    Memory: stable_g is `len(stable) × n_gens_old × 4 B`. For cifar100_
+    resnet_large L1: stable=8117, n_gens_old=4050 → 132 MB vs the dense
+    65536×6350 = 1.55 GB → ~12× smaller.
+    """
+    def __init__(self, n_rows, n_total_cols, n_gens_old,
+                  stable_idx, stable_g, unstable_idx,
+                  unstable_new_col_start,
+                  stable_new_idx=None, stable_new_col_start=None,
+                  device=None, dtype=None):
+        self.n_rows = int(n_rows)
+        self.n_total_cols = int(n_total_cols)
+        self.n_gens_old = int(n_gens_old)
+        self.stable_idx = stable_idx                   # 1-d long tensor (device)
+        self.stable_g = stable_g                       # dense (n_stable, n_gens_old)
+        self.unstable_idx = unstable_idx               # 1-d long tensor
+        self.unstable_new_col_start = int(unstable_new_col_start)
+        self.stable_new_idx = stable_new_idx
+        self.stable_new_col_start = (int(stable_new_col_start)
+                                       if stable_new_col_start is not None else None)
+        self.device = device if device is not None else stable_g.device
+        self.dtype = dtype if dtype is not None else stable_g.dtype
+
+    @property
+    def shape(self):
+        return (self.n_rows, self.n_total_cols)
+
+    def materialize(self):
+        """Return the full dense `(n_rows, n_total_cols)` tensor."""
+        out = torch.zeros(self.n_rows, self.n_total_cols,
+                           dtype=self.dtype, device=self.device)
+        if self.stable_g.shape[0] > 0 and self.n_gens_old > 0:
+            out[self.stable_idx, :self.n_gens_old] = self.stable_g
+        if self.unstable_idx is not None and self.unstable_idx.numel() > 0:
+            cols = torch.arange(
+                self.unstable_new_col_start,
+                self.unstable_new_col_start + self.unstable_idx.numel(),
+                device=self.device, dtype=torch.long)
+            out[self.unstable_idx, cols] = 1.0
+        if (self.stable_new_idx is not None
+                and self.stable_new_idx.numel() > 0):
+            cols = torch.arange(
+                self.stable_new_col_start,
+                self.stable_new_col_start + self.stable_new_idx.numel(),
+                device=self.device, dtype=torch.long)
+            out[self.stable_new_idx, cols] = 1.0
+        return out
+
+    def materialize_cols(self, c_lo, c_hi):
+        """Return dense `(n_rows, c_hi-c_lo)` slice of columns."""
+        chunk = c_hi - c_lo
+        out = torch.zeros(self.n_rows, chunk,
+                           dtype=self.dtype, device=self.device)
+        # Stable passthrough rows occupy cols [0, n_gens_old)
+        lo_p = max(c_lo, 0); hi_p = min(c_hi, self.n_gens_old)
+        if hi_p > lo_p and self.stable_g.shape[0] > 0:
+            out[self.stable_idx, : (hi_p - lo_p)] = (
+                self.stable_g[:, lo_p:hi_p])
+            # If chunk slice starts beyond col 0 in the chunk, shift dst:
+            if lo_p > c_lo:
+                # The passthrough section is at chunk offset (lo_p - c_lo)
+                # but we wrote to indices [0, hi_p-lo_p) above. Need to
+                # re-do correctly. Fall back to clearer logic:
+                out[self.stable_idx, : (hi_p - lo_p)] = 0.0
+                out[self.stable_idx,
+                    (lo_p - c_lo):(lo_p - c_lo + hi_p - lo_p)] = (
+                    self.stable_g[:, lo_p:hi_p])
+        # Unstable identity entries at col [unstable_new_col_start, +n_un)
+        if self.unstable_idx is not None and self.unstable_idx.numel() > 0:
+            un_lo = self.unstable_new_col_start
+            un_hi = un_lo + self.unstable_idx.numel()
+            lo_u = max(c_lo, un_lo); hi_u = min(c_hi, un_hi)
+            if hi_u > lo_u:
+                # Rows for those cols
+                un_offset_lo = lo_u - un_lo
+                un_offset_hi = hi_u - un_lo
+                rows = self.unstable_idx[un_offset_lo:un_offset_hi]
+                cols = torch.arange(lo_u - c_lo, hi_u - c_lo,
+                                      device=self.device, dtype=torch.long)
+                out[rows, cols] = 1.0
+        # Stable-new identity entries
+        if (self.stable_new_idx is not None
+                and self.stable_new_idx.numel() > 0):
+            sn_lo = self.stable_new_col_start
+            sn_hi = sn_lo + self.stable_new_idx.numel()
+            lo_s = max(c_lo, sn_lo); hi_s = min(c_hi, sn_hi)
+            if hi_s > lo_s:
+                sn_offset_lo = lo_s - sn_lo
+                sn_offset_hi = hi_s - sn_lo
+                rows = self.stable_new_idx[sn_offset_lo:sn_offset_hi]
+                cols = torch.arange(lo_s - c_lo, hi_s - c_lo,
+                                      device=self.device, dtype=torch.long)
+                out[rows, cols] = 1.0
+        return out
+
+    def __getitem__(self, key):
+        """Support prev_G[idx] indexing (used in conv/fc passthrough)."""
+        # Tolerate the materialize-then-index pattern as a fallback;
+        # if someone wants raw indexed slicing we just materialize the
+        # required rows. Cheap because we go row-wise.
+        if isinstance(key, (tuple, list)) and len(key) == 2:
+            row_idx, col_slice = key
+            full = self.materialize()
+            return full[row_idx, col_slice]
+        if isinstance(key, torch.Tensor):
+            # row indexing: materialize and select
+            full = self.materialize()
+            return full[key]
+        return self.materialize()[key]
+
+
+def _materialize_g(g):
+    """Return a dense torch tensor regardless of storage type."""
+    if isinstance(g, _StructuredSparseG):
+        return g.materialize()
+    return g
+
+
+def _conv2d_chunked_with_oom_halving(prev_G, n_gens, C_in, H_in, W_in,
+                                       kernel, stride, padding,
+                                       chunk_size, min_chunk=1,
+                                       oom_log=None):
+    """Compute F.conv2d(prev_G.t().reshape(n_gens,C,H,W), kernel) chunked.
+
+    `prev_G` is shape (C_in*H_in*W_in, n_gens) — the un-transposed gen
+    matrix. We slice columns then transpose+contiguous PER CHUNK so we
+    never materialize the full (n_gens, C*H*W) tensor (that's the 1.4 GB
+    allocation that OOMs on resnet_large for un-chunked).
+
+    Output is PRE-ALLOCATED and chunks are scatter-copied into it — avoids
+    the torch.cat-induced peak (which would double-buffer the output).
+
+    On per-chunk OOM, halve chunk_size and retry the SAME slice.
+
+    Returns (g_out_4d, final_chunk_size, oom_count).
+    """
+    sH, sW = stride
+    pH, pW = padding
+    C_out, _, kH, kW = kernel.shape
+    H_out = (H_in + 2 * pH - kH) // sH + 1
+    W_out = (W_in + 2 * pW - kW) // sW + 1
+    g_out = torch.empty(n_gens, C_out, H_out, W_out,
+                         dtype=kernel.dtype, device=kernel.device)
+    i = 0
+    oom_count = 0
+    _is_sparse = isinstance(prev_G, _StructuredSparseG)
+    while i < n_gens:
+        actual = min(chunk_size, n_gens - i)
+        try:
+            if _is_sparse:
+                # Materialize just this column slice (n_rows × chunk)
+                slab = prev_G.materialize_cols(i, i + actual)  # (n_rows, chunk)
+                g_chunk = slab.t().contiguous().reshape(
+                    actual, C_in, H_in, W_in)
+                del slab
+            else:
+                g_chunk = prev_G[:, i:i + actual].t().contiguous().reshape(
+                    actual, C_in, H_in, W_in)
+            out_chunk = F.conv2d(g_chunk, kernel, bias=None,
+                                  stride=stride, padding=padding)
+            g_out[i:i + actual].copy_(out_chunk)
+            del g_chunk, out_chunk
+            i += actual
+        except torch.cuda.OutOfMemoryError:
+            oom_count += 1
+            if chunk_size <= min_chunk:
+                raise
+            chunk_size = max(min_chunk, chunk_size // 2)
+            torch.cuda.empty_cache()
+            if oom_log is not None:
+                oom_log.append({'at_index': i,
+                                 'new_chunk_size': chunk_size})
+    return g_out, chunk_size, oom_count
+
+
+def _matmul_chunked_with_oom_halving(W, prev_G, chunk_size, min_chunk=1,
+                                       oom_log=None):
+    """Compute W @ prev_G col-chunked along the n_gens dim.
+
+    prev_G shape: (n_in_features, n_gens). Output: (n_out_features, n_gens).
+    Pre-allocated output (no torch.cat doubling). OOM-halve-retry per chunk.
+    """
+    n_gens = prev_G.shape[1]
+    n_out = W.shape[0]
+    out = torch.empty(n_out, n_gens, dtype=W.dtype, device=W.device)
+    _is_sparse = isinstance(prev_G, _StructuredSparseG)
+    j = 0
+    oom_count = 0
+    while j < n_gens:
+        actual = min(chunk_size, n_gens - j)
+        try:
+            if _is_sparse:
+                slab = prev_G.materialize_cols(j, j + actual)
+                chunk_out = W @ slab
+                del slab
+            else:
+                chunk_out = W @ prev_G[:, j:j + actual]
+            out[:, j:j + actual].copy_(chunk_out)
+            del chunk_out
+            j += actual
+        except torch.cuda.OutOfMemoryError:
+            oom_count += 1
+            if chunk_size <= min_chunk:
+                raise
+            chunk_size = max(min_chunk, chunk_size // 2)
+            torch.cuda.empty_cache()
+            if oom_log is not None:
+                oom_log.append({'at_index': j,
+                                 'new_chunk_size': chunk_size})
+    return out, chunk_size, oom_count
+
+
 def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
                          output_op_name, *,
                          device='cuda', dtype=torch.float64,
-                         formulation='sparse'):
+                         formulation='sparse',
+                         conv_chunk_size=None,
+                         g_storage='dense',
+                         _oom_log=None):
     """Compute G/center arrays on GPU, return numpy-only state.
 
     The returned state is query-independent (no qw/qb) and milp_set-independent.
@@ -132,6 +366,13 @@ def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
     stable_list = []  # used only if formulation == 'sparse'
 
     def pad_cols(G):
+        # For sparse storage: bump the recorded total cols (cheap update;
+        # additional cols are implicitly zero). Materialize will produce
+        # the right shape downstream.
+        if isinstance(G, _StructuredSparseG):
+            if G.n_total_cols < n_gens:
+                G.n_total_cols = int(n_gens)
+            return G
         if G.shape[1] < n_gens:
             return torch.cat([G, torch.zeros(
                 G.shape[0], n_gens - G.shape[1], dtype=dtype, device=gpu)],
@@ -153,9 +394,23 @@ def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
             c_img = prev_c.reshape(1, C_in, H_in, W_in)
             c_out = F.conv2d(c_img, kernel, bias=bias,
                              stride=(sH, sW), padding=(pH, pW)).flatten()
-            g_img = prev_G.t().contiguous().reshape(n_gens, C_in, H_in, W_in)
-            g_out = F.conv2d(g_img, kernel, bias=None,
-                             stride=(sH, sW), padding=(pH, pW))
+            if conv_chunk_size is None:
+                # Default un-chunked path — preserves legacy behavior.
+                # For sparse storage, materialize first.
+                _prev_G_dense = _materialize_g(prev_G)
+                g_img = _prev_G_dense.t().contiguous().reshape(
+                    n_gens, C_in, H_in, W_in)
+                g_out = F.conv2d(g_img, kernel, bias=None,
+                                  stride=(sH, sW), padding=(pH, pW))
+            else:
+                # Chunk over n_gens — slice prev_G columns then transpose
+                # PER CHUNK to avoid materializing the full (n_gens,C*H*W)
+                # tensor (1.4 GB at L3 resnet_large). With OOM-halve-retry.
+                g_out, _, _ = _conv2d_chunked_with_oom_halving(
+                    prev_G, n_gens, C_in, H_in, W_in, kernel,
+                    (sH, sW), (pH, pW),
+                    chunk_size=int(conv_chunk_size),
+                    oom_log=_oom_log)
             g_out = g_out.reshape(n_gens, -1).t()
             center[nm] = c_out
             G_by_op[nm] = g_out
@@ -166,7 +421,14 @@ def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
             W = torch.tensor(op['W_np'], dtype=dtype, device=gpu)
             bias = torch.tensor(op['bias_np'], dtype=dtype, device=gpu)
             center[nm] = W @ prev_c + bias
-            G_by_op[nm] = W @ prev_G
+            if conv_chunk_size is None:
+                G_by_op[nm] = W @ _materialize_g(prev_G)
+            else:
+                # Same OOM-halve pattern for fc.
+                g_out, _, _ = _matmul_chunked_with_oom_halving(
+                    W, prev_G, chunk_size=int(conv_chunk_size),
+                    oom_log=_oom_log)
+                G_by_op[nm] = g_out
 
         elif t == 'relu':
             if 'layer_idx' not in op:
@@ -194,12 +456,24 @@ def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
                 (formulation == 'sparse' and li == last_relu_idx)
                 or formulation == 'all_sparse')
             c_in_cpu = c_in.detach().cpu().numpy()
+            # Materialize only the needed rows from sparse G if applicable.
             if len(unstable_idx) > 0:
                 uidx_t = torch.tensor(unstable_idx, device=gpu, dtype=torch.long)
-                G_unstable = G_in[uidx_t].detach().cpu().numpy()
+                if isinstance(G_in, _StructuredSparseG):
+                    # Materialize just unstable rows
+                    _full = G_in.materialize()  # for now, materialize all
+                    G_unstable = _full[uidx_t].detach().cpu().numpy()
+                    del _full
+                else:
+                    G_unstable = G_in[uidx_t].detach().cpu().numpy()
             if do_sparse and len(stable_idx) > 0:
                 sidx_t_cpu = torch.tensor(stable_idx, device=gpu, dtype=torch.long)
-                G_stable = G_in[sidx_t_cpu].detach().cpu().numpy()
+                if isinstance(G_in, _StructuredSparseG):
+                    _full = G_in.materialize()
+                    G_stable = _full[sidx_t_cpu].detach().cpu().numpy()
+                    del _full
+                else:
+                    G_stable = G_in[sidx_t_cpu].detach().cpu().numpy()
 
             # Unstable neurons always get a new gen
             for local_idx, j in enumerate(unstable_idx):
@@ -246,39 +520,79 @@ def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
             n_new = n_unstable + n_stable_new
 
             # Build output G on GPU
-            G_out = torch.zeros(n, n_gens + n_new, dtype=dtype, device=gpu)
-            if not do_sparse and len(stable_idx) > 0:
-                # Dense: stable-on rows pass through the prior G row
-                sidx_t = torch.tensor(stable_idx, device=gpu, dtype=torch.long)
-                G_out[sidx_t, :n_gens] = G_in[sidx_t]
-            if len(unstable_idx) > 0:
-                uidx_t = torch.tensor(unstable_idx, device=gpu, dtype=torch.long)
-                new_col_idx = torch.arange(n_gens, n_gens + n_unstable,
-                                            device=gpu, dtype=torch.long)
-                G_out[uidx_t, new_col_idx] = 1.0
-            if do_sparse and len(stable_idx) > 0:
-                # Sparse: stable-on row becomes a single 1.0 at its new col
-                sidx_t = torch.tensor(stable_idx, device=gpu, dtype=torch.long)
-                stable_cols = torch.arange(
-                    n_gens + n_unstable, n_gens + n_new,
-                    device=gpu, dtype=torch.long)
-                G_out[sidx_t, stable_cols] = 1.0
+            import os as _os
+            if _os.environ.get('VC_TRACE_GEN_STATE'):
+                _bytes = n * (n_gens + n_new) * (8 if dtype == torch.float64 else 4)
+                print(f'[gen_state] li={li:2d} n_layer={n:6d} n_gens_in={n_gens:6d} '
+                      f'n_unstable={n_unstable:5d} n_stable={len(stable_idx):6d} '
+                      f'n_gens_out={n_gens + n_new:6d}  '
+                      f'G_out=({n}×{n_gens + n_new})  '
+                      f'alloc={_bytes/1024/1024:.0f} MB')
+            sidx_t = (torch.tensor(stable_idx, device=gpu, dtype=torch.long)
+                       if len(stable_idx) > 0 else None)
+            uidx_t = (torch.tensor(unstable_idx, device=gpu, dtype=torch.long)
+                       if len(unstable_idx) > 0 else None)
+            # Compute c_out (independent of G storage choice)
             c_out = torch.zeros(n, dtype=dtype, device=gpu)
             if not do_sparse and len(stable_idx) > 0:
-                # Dense: stable-on center passes through
                 c_out[sidx_t] = c_in[sidx_t]
             # Sparse: stable-on center is absorbed into the equality constraint
             # (v == c + G@e), so c_out[j] stays 0 and the var carries the full value
             center[nm] = c_out
-            G_by_op[nm] = G_out
+
+            if g_storage == 'sparse':
+                # Structured sparse storage. Stable-passthrough rows kept as
+                # a thin (n_stable × n_gens_old) dense buffer; unstable +
+                # stable_new identities stored as index lists.
+                if not do_sparse and sidx_t is not None:
+                    if isinstance(G_in, _StructuredSparseG):
+                        _full = G_in.materialize()
+                        stable_g = _full[sidx_t].contiguous()
+                        del _full
+                    else:
+                        stable_g = G_in[sidx_t].contiguous()
+                else:
+                    # In do_sparse mode the stable rows become identity new
+                    # cols, no passthrough dense block.
+                    stable_g = torch.zeros(0, n_gens, dtype=dtype, device=gpu)
+                G_out = _StructuredSparseG(
+                    n_rows=n, n_total_cols=n_gens + n_new,
+                    n_gens_old=(n_gens if not do_sparse else 0),
+                    stable_idx=(sidx_t if not do_sparse else
+                                 torch.tensor([], dtype=torch.long, device=gpu)),
+                    stable_g=stable_g,
+                    unstable_idx=(uidx_t if uidx_t is not None
+                                    else torch.tensor([], dtype=torch.long, device=gpu)),
+                    unstable_new_col_start=n_gens,
+                    stable_new_idx=(sidx_t if do_sparse else None),
+                    stable_new_col_start=(n_gens + n_unstable if do_sparse else None),
+                    device=gpu, dtype=dtype)
+                G_by_op[nm] = G_out
+            else:
+                G_out = torch.zeros(n, n_gens + n_new, dtype=dtype, device=gpu)
+                if not do_sparse and sidx_t is not None:
+                    G_out[sidx_t, :n_gens] = _materialize_g(G_in)[sidx_t]
+                if uidx_t is not None:
+                    new_col_idx = torch.arange(n_gens, n_gens + n_unstable,
+                                                device=gpu, dtype=torch.long)
+                    G_out[uidx_t, new_col_idx] = 1.0
+                if do_sparse and sidx_t is not None:
+                    stable_cols = torch.arange(
+                        n_gens + n_unstable, n_gens + n_new,
+                        device=gpu, dtype=torch.long)
+                    G_out[sidx_t, stable_cols] = 1.0
+                G_by_op[nm] = G_out
             n_gens += n_new
 
         elif t == 'add':
             if op.get('is_merge'):
                 ca = center[op['inputs'][0]]
                 cb = center[op['inputs'][1]]
-                Ga = pad_cols(G_by_op[op['inputs'][0]])
-                Gb = pad_cols(G_by_op[op['inputs'][1]])
+                # Residual add: any sparse operand must be materialized
+                # before the elementwise add (sparse + sparse fast path
+                # not implemented).
+                Ga = _materialize_g(pad_cols(G_by_op[op['inputs'][0]]))
+                Gb = _materialize_g(pad_cols(G_by_op[op['inputs'][1]]))
                 center[nm] = ca + cb
                 G_by_op[nm] = Ga + Gb
             else:
@@ -318,6 +632,8 @@ def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
 
     c_out = center[output_op_name]
     G_out = G_by_op[output_op_name]
+    # Materialize sparse storage before the final dense conversion below.
+    G_out = _materialize_g(G_out)
     if G_out.shape[1] < n_gens:
         G_out = torch.cat([G_out, torch.zeros(
             G_out.shape[0], n_gens - G_out.shape[1],
@@ -634,14 +950,43 @@ def _build_alpha_zono_lp(state, qw, qb, milp_set, n_threads,
 
     n_input = state['n_input']
     n_gens = state['n_gens']
-    e_vars = [m.addVar(lb=-1.0, ub=1.0, name=f'e_in_{i}')
-              for i in range(n_input)]
-    m.update()
-
-    unstable_info = []
     combined = sorted(state.get('unstable_list', []),
                       key=lambda e: e['e_new_col'])
 
+    # ---- Batched variable creation ----
+    # Old loop did 1 addVar per e_in + 1 addVar + m.update() per unstable
+    # (~10K addVar calls + ~1300 update() syncs ⇒ ~2.4s build on
+    # tinyimagenet). addVars + a single update() drops it to ~0.3s.
+    # Pre-build the FULL n_gens-length e_vars array. Slots that don't
+    # correspond to a real e_in or e_new (gaps from skipped unstables)
+    # get fixed to 0 via lb=ub=0; those slots have no objective weight.
+    e_lb = np.zeros(n_gens, dtype=np.float64)
+    e_ub = np.zeros(n_gens, dtype=np.float64)
+    # Input noise symbols: e_in_i ∈ [-1, 1].
+    e_lb[:n_input] = -1.0
+    e_ub[:n_input] = 1.0
+    # New noise symbols (one per unstable): e_new ∈ [-1, 1] at e_new_col.
+    e_new_cols = np.array([int(ul['e_new_col']) for ul in combined],
+                          dtype=np.int64)
+    if len(e_new_cols) > 0:
+        e_lb[e_new_cols] = -1.0
+        e_ub[e_new_cols] = 1.0
+    e_vars_arr = m.addMVar(n_gens, lb=e_lb, ub=e_ub, name='e')
+    e_vars = list(e_vars_arr.tolist())
+    # Binary vars in one batch (one per milp_set member).
+    milp_keys_in_unstable = [(ul['layer_idx'], ul['neuron_idx'])
+                              for ul in combined
+                              if (ul['layer_idx'], ul['neuron_idx']) in milp_set]
+    if milp_keys_in_unstable:
+        s_arr = m.addMVar(len(milp_keys_in_unstable),
+                          vtype=grb.GRB.BINARY, name='s')
+        s_by_key = {k: s_arr[i].tolist()
+                    for i, k in enumerate(milp_keys_in_unstable)}
+    else:
+        s_by_key = {}
+    m.update()
+
+    unstable_info = []
     for ul in combined:
         li = ul['layer_idx']
         j = ul['neuron_idx']
@@ -654,14 +999,7 @@ def _build_alpha_zono_lp(state, qw, qb, milp_set, n_threads,
         lam = ul['lam']
         mu = ul['mu']
 
-        while len(e_vars) < e_new_col:
-            e_vars.append(m.addVar(lb=0.0, ub=0.0,
-                                    name=f'_unused_{len(e_vars)}'))
-
-        e_new = m.addVar(lb=-1.0, ub=1.0, name=f'a_L{li}_{j}')
-        e_vars.append(e_new)
-        m.update()
-
+        e_new = e_vars[int(e_new_col)]
         expr_vars = [e_vars[int(k)] for k in row_idx]
         expr_coefs = [float(v) for v in row_val]
 
@@ -689,8 +1027,7 @@ def _build_alpha_zono_lp(state, qw, qb, milp_set, n_threads,
 
         # Big-M binary (tier A only): adds the upper edge constraints.
         if is_milp:
-            s = m.addVar(vtype=grb.GRB.BINARY, name=f's_L{li}_{j}')
-            m.update()
+            s = s_by_key[(li, j)]
 
             # y ≤ hi·s:  Σ (λ·row)·e + μ·e_new - hi·s ≤ -μ - λ·c_in
             lin_hi = grb.LinExpr(
@@ -726,10 +1063,8 @@ def _build_alpha_zono_lp(state, qw, qb, milp_set, n_threads,
             'formulation': 'alpha_zono',
         })
 
-    # Pad e_vars to n_gens.
-    while len(e_vars) < n_gens:
-        e_vars.append(m.addVar(lb=0.0, ub=0.0,
-                                name=f'_unused_{len(e_vars)}'))
+    # (e_vars already padded to n_gens by the batched addMVar above —
+    # gap slots are fixed at 0 via lb=ub=0 and contribute nothing.)
 
     # Objective: qw·c_α + (qw·G_α)·e + qb. The α-zono output zonotope
     # ALREADY encodes the full network with the α relaxation, so this
@@ -1113,6 +1448,105 @@ def build_gen_lp(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
         output_op_name, device=device, dtype=dtype)
     return build_gen_lp_from_state(state, qw, qb,
                                     milp_set=milp_set, n_threads=n_threads)
+
+
+def score_box_halfspace_delta_lb(state, qw, qb, ew_per_relu):
+    """Per-neuron BaB worst-child delta_LB via closed-form box+halfspace LP.
+
+    For each unstable k in the alpha_zono state, computes:
+        delta_LB(k) = min(LB_off(k), LB_on(k)) - LB_baseline
+    where LB_off forces y_k=0 (off-side binarisation) and LB_on forces
+    y_k=z_k (on-side). Both sub-LPs are box + 1 halfspace + linear
+    objective — solved exactly by `box_halfspace.lagrangian_min`.
+
+    The trick: forcing y_k to its binarised value rewrites the spec
+    objective by removing y_k's parallelogram contribution (substitute
+    y_k=0 or y_k=z_k into qw·y_out). The resulting objective is still
+    linear in `e`, just with adjusted coefficients on row_k and on the
+    e_new_k column. Then add the corresponding halfspace `z_k ≤ 0`
+    (off) or `z_k ≥ 0` (on) and solve.
+
+    Args:
+        state: alpha_zono state dict (state_from_alpha_zono output).
+        qw, qb: spec direction (np.float64 array, scalar).
+        ew_per_relu: dict {layer_idx: np.ndarray(n_layer,)} — the spec's
+            effective weight at each ReLU layer (from
+            `alpha_crown.capture_ew_per_relu`). ew[L][k] = ∂(qw·y_out)/∂y_k.
+
+    Returns:
+        scores: dict {(layer_idx, neuron_idx): delta_LB} where higher
+            score = better candidate for binarisation. Comparable to
+            kfsb in selection quality, ~10ms/1000 neurons via O(n log n)
+            Lagrangian.
+    """
+    from .box_halfspace import lagrangian_min
+    obj_c_out = np.asarray(state['obj_c_out'], dtype=np.float64)
+    obj_G_out = state['obj_G_out_csr'].toarray().astype(np.float64)
+    n_gens = state['n_gens']
+    qw = np.asarray(qw, dtype=np.float64)
+    qb = float(qb)
+    d_obj_base = qw @ obj_G_out
+    c0_obj_base = float(qw @ obj_c_out + qb)
+    baseline_lb = c0_obj_base - float(np.sum(np.abs(d_obj_base)))
+
+    scores = {}
+    for u in state.get('unstable_list', []):
+        li = u['layer_idx']
+        j = u['neuron_idx']
+        c_in_k = float(u['c_in'])
+        row_idx = np.asarray(u['row_indices'], dtype=np.int64)
+        row_val = np.asarray(u['row_values'], dtype=np.float64)
+        e_new_col = int(u['e_new_col'])
+        # Some state forms (phase1) don't have lam/mu — recompute from (lo,hi)
+        lo_k = float(u['lo']); hi_k = float(u['hi'])
+        if 'lam' in u and 'mu' in u:
+            lam = float(u['lam'])
+            mu = float(u['mu'])
+        else:
+            if hi_k <= lo_k or hi_k <= 0 or lo_k >= 0:
+                scores[(li, j)] = 0.0
+                continue
+            lam = hi_k / (hi_k - lo_k)
+            mu = -hi_k * lo_k / (2.0 * (hi_k - lo_k))
+        # ew_k = ∂(qw·y_out)/∂y_k. Two equivalent forms:
+        #   ew_α  := ew_per_relu[li][j]      (from α-CROWN backward)
+        #   ew_st := d_obj_base[e_new_col]/μ (from state's e_new_col coefficient)
+        # In theory ew_α == ew_st (same gradient). In practice they differ
+        # by ~1e-8 (FP32 noise in α-CROWN backward vs forward state build).
+        # For neurons with lam=0 (degenerate parallelogram), the off-side
+        # substitution's only nonzero d_off adjustment is `d[e_new_col] -= ew*mu`.
+        # Using ew_st makes this EXACTLY zero out d[e_new_col] regardless
+        # of small bbr drift; using ew_α leaves a tiny residual that gets
+        # amplified by the LP solve into wildly different ranking. Use ew_st
+        # for stability (deterministic given state, no α-CROWN dep).
+        if mu > 1e-12:
+            ew_k = float(d_obj_base[e_new_col]) / mu
+        else:
+            ew_l = ew_per_relu.get(li)
+            if ew_l is None or j >= len(ew_l):
+                scores[(li, j)] = 0.0
+                continue
+            ew_k = float(ew_l[j])
+
+        row_full = np.zeros(n_gens, dtype=np.float64)
+        row_full[row_idx] = row_val
+
+        # Off-side: y_k = 0 → subtract ew_k·y_k from objective; halfspace z_k ≤ 0
+        d_off = d_obj_base - ew_k * lam * row_full
+        d_off[e_new_col] -= ew_k * mu
+        c0_off = c0_obj_base - ew_k * (lam * c_in_k + mu)
+        lb_off = lagrangian_min(d_off, c0_off, row_full, -c_in_k)
+
+        # On-side: y_k = z_k → add ew_k·(z_k - y_k); halfspace z_k ≥ 0
+        d_on = d_obj_base + ew_k * (1.0 - lam) * row_full
+        d_on[e_new_col] -= ew_k * mu
+        c0_on = c0_obj_base + ew_k * ((1.0 - lam) * c_in_k - mu)
+        lb_on = lagrangian_min(d_on, c0_on, -row_full, c_in_k)
+
+        # BaB takes the worse child. Higher delta = harder to verify
+        # without binarising = better candidate.
+        scores[(li, j)] = float(min(lb_off, lb_on)) - baseline_lb
+    return scores
 
 
 def compute_scores(m, unstable_info, obj_coef, method='lp_ew_frac'):
@@ -1626,8 +2060,11 @@ def tighten_bounds(gg_ops_ser, x_lo, x_hi, initial_bounds, input_name, *,
             if op.get('is_merge'):
                 ca = center[op['inputs'][0]]
                 cb = center[op['inputs'][1]]
-                Ga = pad_cols(G_by_op[op['inputs'][0]])
-                Gb = pad_cols(G_by_op[op['inputs'][1]])
+                # Residual add: any sparse operand must be materialized
+                # before the elementwise add (sparse + sparse fast path
+                # not implemented).
+                Ga = _materialize_g(pad_cols(G_by_op[op['inputs'][0]]))
+                Gb = _materialize_g(pad_cols(G_by_op[op['inputs'][1]]))
                 center[nm] = ca + cb
                 G_by_op[nm] = Ga + Gb
             else:
@@ -1883,7 +2320,8 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
                            gurobi_threads=1, state_by_qi=None,
                            unsafe_halfspace='none',
                            triangle_top_k=0,
-                           witness_refine_fn=None):
+                           witness_refine_fn=None,
+                           bin_schedule_override=None):
     """Run MILP racing across open queries with idle-core-filling.
 
     Submits one task per (spec, bin_level). Tasks are ordered so every
@@ -1914,13 +2352,21 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
     deadline = _t.perf_counter() + tl
 
     def _build_schedule(n_scored):
-        """Bin counts for one spec: [8, 16, 24, ..., 8*n_threads_total].
+        """Bin counts for one spec.
 
-        One bin level per worker so the pool runs all levels concurrently;
-        BestBdStop=0 on each worker makes the first-to-prove UNSAT win
-        the race. Capped at `n_scored` (can't binarize more neurons than
-        we scored), with duplicates removed to preserve order.
+        Default: [8, 16, 24, ..., 8*n_threads_total]. ``bin_schedule_override``
+        (per-call) replaces this with a fixed list — useful when you've
+        empirically measured that intermediate K's catch real cases the
+        stride-8 schedule skips (e.g., on TinyImageNet K=18, 22, 30 close
+        cases that K=16/24/32 miss with our box+halfspace scoring).
         """
+        if bin_schedule_override is not None:
+            out = []
+            for b in bin_schedule_override:
+                b = min(int(b), n_scored)
+                if b > 0 and b not in out:
+                    out.append(b)
+            return out
         k_max = max(1, n_threads_total)
         sched = [min(8 * k, n_scored) for k in range(1, k_max + 1)]
         out = []

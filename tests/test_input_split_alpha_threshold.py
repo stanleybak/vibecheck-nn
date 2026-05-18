@@ -95,8 +95,8 @@ def _force_open_specs(monkeypatch):
     from vibecheck.verify_zono_bnb import _forward_zonotope_graph as orig_fwd
     from vibecheck.verify_zono_bnb import _spec_backward_graph as orig_bw
 
-    def fake_fwd(xl, xh, gg, device, dtype):
-        sb, x = orig_fwd(xl, xh, gg, device, dtype)
+    def fake_fwd(xl, xh, gg, device, dtype, settings=None):
+        sb, x = orig_fwd(xl, xh, gg, device, dtype, settings=settings)
         # Force unstable: rewrite each layer's bounds so lo<0 and hi>0.
         for L, (lo, hi) in list(sb.items()):
             sb[L] = (-_torch.ones_like(lo), _torch.ones_like(hi))

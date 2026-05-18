@@ -921,3 +921,45 @@ def test_add_from_dense_side_promotes():
     ld, hd = sum_d.bounds()
     torch.testing.assert_close(lp, ld, atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(hp, hd, atol=1e-9, rtol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Conv chunking: chunked path matches un-chunked for both stride==1 and >1.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('stride,padding', [(1, 1), (2, 1)])
+def test_propagate_conv_chunked_matches_unchunked(monkeypatch, stride, padding):
+    """Forcing a tiny chunk budget must not change the output.
+
+    Builds a PatchesZonotope big enough that several K-chunks are needed
+    when ``_conv_chunk_bytes`` is dropped to 1 KB, then compares against
+    the default (un-chunked) result.
+    """
+    in_shape = (3, 8, 8)
+    xl, xh = _rand_input_bounds(in_shape, seed=200)
+    z_unchunked = PatchesZonotope.from_input_bounds(
+        xl, xh, in_shape, DEV, DTYPE)
+    z_chunked = z_unchunked.copy()
+
+    kernel, bias = _rand_kernel(8, 3, 3, 3, seed=201)
+
+    z_unchunked.propagate_conv(
+        kernel, bias, in_shape, stride, padding)
+
+    monkeypatch.setattr(PatchesZonotope, '_conv_chunk_bytes', 1024)
+    z_chunked.propagate_conv(
+        kernel, bias, in_shape, stride, padding)
+
+    torch.testing.assert_close(
+        z_unchunked.center, z_chunked.center, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(
+        z_unchunked._patches, z_chunked._patches, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(
+        z_unchunked._offsets, z_chunked._offsets, atol=0, rtol=0)
+
+    # Bounds must also match.
+    lo_u, hi_u = z_unchunked.bounds()
+    lo_c, hi_c = z_chunked.bounds()
+    torch.testing.assert_close(lo_u, lo_c, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(hi_u, hi_c, atol=1e-12, rtol=1e-12)

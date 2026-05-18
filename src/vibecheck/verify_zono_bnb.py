@@ -281,22 +281,60 @@ def _build_spec_ew_graph(gg, pred, comps, device, dtype):
 
 
 @torch.no_grad()
-def _forward_zonotope_graph(xl, xh, gg, device, dtype):
+def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
+                             rec_zono=None, tight_bounds=None):
     """Graph-aware zonotope forward pass (supports skip connections).
 
     Args:
         xl, xh: input bounds (flat torch tensors)
         gg: gpu_graph dict from ComputeGraph.gpu_graph()
+        settings: optional settings DotMap. When provided AND
+            `settings.zono_impl == 'patches'` AND the input shape is
+            image-like (C, H, W), the initial zonotope is built as a
+            `PatchesZonotope` instead of a `TorchZonotope`. On
+            TinyImageNet ResNet (3×56×56 = 9 408 input pixels) the
+            dense path needs ~700 MB just for the input zonotope's
+            generator-identity matrix and OOMs the RTX 3080 inside the
+            first conv; the patches path uses ~0.6 MB for the same
+            input. Defaults to dense when `settings is None` for
+            backward compatibility with callers that don't carry the
+            settings (e.g. unit tests, BaB-leaf shortcuts).
+        rec_zono: optional dict to populate with ``{gen_rows_by_layer,
+            col_origin, n_input}`` harvested at each layer's pre-ReLU.
+            Same protocol as ``_forward_zonotope_interleaved`` —
+            downstream Phase 7 (`state_from_phase1`) consumes this to
+            avoid the multi-GB ``precompute_gen_state`` allocation.
+            When None, behaves as before.
+        tight_bounds: optional ``{layer_idx: (lo_np, hi_np)}`` dict of
+            externally-computed (e.g. cascade-tightened) pre-activation
+            bounds. When provided, ``apply_relu`` uses the intersection
+            of ``z.bounds()`` with these tight bounds for the relaxation
+            (sound). ``rec_zono`` entries also record the intersected
+            (lo, hi), keeping the parametrization consistent so
+            ``state_from_phase1``'s LP triangle constraints use the
+            same (lo, hi) as the recorded μ, λ.
 
     Returns:
         sb: dict mapping layer_idx -> (lo, hi) bounds at each ReLU
-        z_final: final TorchZonotope (after last op, before output)
+        z_final: final zonotope (after last op, before output)
     """
-    z_init = TorchZonotope.from_input_bounds(xl, xh, device, dtype)
+    if settings is not None and str(getattr(
+            settings, 'zono_impl', 'dense')) == 'patches':
+        from .zonotope import make_input_zonotope
+        in_shape = getattr(gg, 'input_shape', None) or gg.get('input_shape')
+        z_init = make_input_zonotope(
+            settings, xl, xh, device, dtype, in_shape=in_shape)
+    else:
+        z_init = TorchZonotope.from_input_bounds(xl, xh, device, dtype)
     zono_state = {gg['input_name']: z_init}
     gen_count = {gg['input_name']: z_init.n_gens}
     forks = gg['fork_points']
     sb = {}
+
+    if rec_zono is not None:
+        rec_zono.setdefault('gen_rows_by_layer', {})
+        rec_zono.setdefault('col_origin', {})
+        rec_zono['n_input'] = z_init.n_gens
 
     # Precompute last consumer index for each op name → free memory eagerly
     last_use = {}
@@ -326,9 +364,35 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype):
 
         elif t == 'relu':
             z = _get(op['inputs'][0])
-            lo, hi = z.apply_relu()
-            if 'layer_idx' in op:
-                sb[op['layer_idx']] = (lo.clone(), hi.clone())
+            layer_idx = op.get('layer_idx')
+            # Build the (lo, hi) the relaxation will use: intersect z's
+            # own bounds with any externally-supplied tight bounds. We
+            # record this same (lo, hi) into rec_zono so the LP triangle
+            # constraints in state_from_phase1 match the parametrization.
+            need_pre_bounds = (
+                rec_zono is not None and layer_idx is not None
+            ) or (tight_bounds is not None and layer_idx in (tight_bounds or {}))
+            if need_pre_bounds:
+                pre_lo_z, pre_hi_z = z.bounds()
+                if tight_bounds is not None and layer_idx in tight_bounds:
+                    tlo_np, thi_np = tight_bounds[layer_idx]
+                    tlo = torch.as_tensor(tlo_np, dtype=dtype, device=device)
+                    thi = torch.as_tensor(thi_np, dtype=dtype, device=device)
+                    pre_lo = torch.maximum(pre_lo_z, tlo)
+                    pre_hi = torch.minimum(pre_hi_z, thi)
+                else:
+                    pre_lo, pre_hi = pre_lo_z, pre_hi_z
+                if rec_zono is not None and layer_idx is not None:
+                    from .verify_graph import _record_zono_pre_relu_rows
+                    _record_zono_pre_relu_rows(
+                        z, layer_idx,
+                        (pre_lo.cpu().numpy(), pre_hi.cpu().numpy()),
+                        rec_zono)
+                lo, hi = z.apply_relu(tight_lo=pre_lo, tight_hi=pre_hi)
+            else:
+                lo, hi = z.apply_relu()
+            if layer_idx is not None:
+                sb[layer_idx] = (lo.clone(), hi.clone())
             zono_state[name] = z
 
         elif t == 'add':

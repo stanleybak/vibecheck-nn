@@ -42,6 +42,18 @@ def _flat_to_chw(flat_idx, in_shape):
 class PatchesZonotope:
     """Forward-mode zonotope with per-generator localised patches."""
 
+    # Per-chunk byte budget for the conv intermediate tensor in
+    # ``propagate_conv``. Class attribute so tests can monkeypatch it
+    # to small values to exercise the chunked path on tiny inputs.
+    _conv_chunk_bytes = 256 * 1024 * 1024
+
+    # Materialise-to-dense trigger threshold: when patch area exceeds
+    # `_materialize_factor` × feature-map area, flip to dense. Default
+    # 4× tolerates the 14×14 stage of TinyImageNet_resnet_medium where
+    # patches grow past 14×14 within one or two convs but the dense form
+    # would OOM the next stride-2 conv.
+    _materialize_factor = 4
+
     def __init__(self, center, patches, offsets, out_shape,
                  _mode='patches', _dense=None):
         """
@@ -258,9 +270,14 @@ class PatchesZonotope:
     def propagate_conv(self, kernel, bias, in_shape, stride, padding):
         """Propagate through a Conv2d layer.
 
-        Stride-1 keeps the patches representation. Stride > 1 falls back
-        to dense (the alignment math gets fiddly and the memory benefit
-        diminishes at strided / downsampled feature maps anyway).
+        Stride-1 keeps the patches representation. Stride > 1 subsamples
+        per-gen back to the stride-s alignment grid (handled below).
+
+        Memory: the conv2d is run in K-chunks so the intermediate
+        ``(chunk, C_out, kH_pre, kW_pre)`` tensor stays bounded
+        regardless of K. On TinyImageNet ResNet (K ≈ 10K and growing
+        through the residual blocks) the un-chunked conv can allocate
+        2 GB+ inside cuDNN; the chunked path caps it at ~256 MB.
         """
         sH, sW = stride if isinstance(stride, tuple) else (stride, stride)
         pH, pW = padding if isinstance(padding, tuple) else (padding, padding)
@@ -299,13 +316,12 @@ class PatchesZonotope:
             self.out_shape = new_out_shape
             return
 
-        # Stride-1 patches conv with padding=(kH_new-1, kW_new-1) so the
-        # output covers every position where the new kernel touches the old
-        # patch. Output shape: (K, C_out, kH_p + kH_new - 1, kW_p + kW_new - 1).
-        pre = F.conv2d(
-            self._patches, kernel, stride=(1, 1),
-            padding=(kH_new - 1, kW_new - 1))
-        kH_pre, kW_pre = pre.shape[2], pre.shape[3]
+        # Stride-1 patches conv would produce shape
+        # (K, C_out, kH_p + kH_new - 1, kW_p + kW_new - 1). We don't
+        # materialise it whole — chunk over K below.
+        kH_p, kW_p = self._patches.shape[2], self._patches.shape[3]
+        kH_pre = kH_p + kH_new - 1
+        kW_pre = kW_p + kW_new - 1
 
         # Stride-1 offset shift: the smallest position oy in the stride-1
         # virtual output is oy_k + pH - (kH_new - 1) (derived from
@@ -313,22 +329,36 @@ class PatchesZonotope:
         s1_off_y = self._offsets[:, 0] + (pH - kH_new + 1)
         s1_off_x = self._offsets[:, 1] + (pW - kW_new + 1)
 
+        device = self._patches.device
+        dtype_pre = self._patches.dtype
+
+        # Chunk size: cap the per-chunk pre tensor at the budget below.
+        # cuDNN workspace adds a small constant on top. Tests monkeypatch
+        # ``_conv_chunk_bytes`` to force chunking with small K.
+        elem_bytes = self._patches.element_size()
+        bytes_per_gen = elem_bytes * C_out * kH_pre * kW_pre
+        chunk = max(
+            1, min(K, self._conv_chunk_bytes // max(1, bytes_per_gen)))
+
         if sH == 1 and sW == 1:
-            # Stride-1: no subsampling needed.
-            new_patches = pre
+            # Stride-1: output patch == pre patch. Pre-allocate final and
+            # write conv result chunk-by-chunk.
+            new_patches = torch.empty(
+                K, C_out, kH_pre, kW_pre,
+                dtype=dtype_pre, device=device)
+            for start in range(0, K, chunk):
+                end = min(start + chunk, K)
+                new_patches[start:end] = F.conv2d(
+                    self._patches[start:end], kernel, stride=(1, 1),
+                    padding=(kH_new - 1, kW_new - 1))
             new_offsets = torch.stack([s1_off_y, s1_off_x], dim=1)
         else:
             # Stride > 1: per-gen subsample to keep only stride-s aligned
             # output positions. Different gens have different alignment
             # (depending on s1_off mod s); we gather a uniform shape with
             # zero-padding for misaligned positions.
-            device = pre.device
-            dtype_pre = pre.dtype
-            # First valid stride-s output position dy_min in stride-1 frame:
-            # need (s1_off_y + dy_min) divisible by sH and >= 0.
             dy_min = (-s1_off_y) % sH  # (K,)
             dx_min = (-s1_off_x) % sW
-            # Max number of stride-s positions across all alignments.
             max_num_y = (kH_pre + sH - 1) // sH
             max_num_x = (kW_pre + sW - 1) // sW
             js_y = torch.arange(max_num_y, device=device)
@@ -339,31 +369,29 @@ class PatchesZonotope:
             x_valid = x_idx < kW_pre
             y_safe = y_idx.clamp(0, kH_pre - 1)
             x_safe = x_idx.clamp(0, kW_pre - 1)
-            # Chunked gather over K: advanced indexing into the full pre
-            # tensor would create a (K, C_out, max_num_y, max_num_x) +
-            # broadcast intermediate that can exceed GPU memory on wide
-            # nets. Chunking keeps the intermediate bounded while still
-            # using torch advanced indexing for speed.
             new_patches = torch.empty(
                 K, C_out, max_num_y, max_num_x,
                 dtype=dtype_pre, device=device)
-            chunk = 1024
             c_ar = torch.arange(C_out, device=device).view(1, C_out, 1, 1)
             for start in range(0, K, chunk):
                 end = min(start + chunk, K)
                 kc = end - start
+                # Conv only this chunk so the (chunk, C_out, kH_pre, kW_pre)
+                # intermediate is bounded.
+                pre_chunk = F.conv2d(
+                    self._patches[start:end], kernel, stride=(1, 1),
+                    padding=(kH_new - 1, kW_new - 1))
                 k_ar_c = torch.arange(
                     kc, device=device).view(kc, 1, 1, 1)
-                # y_safe[start:end] shape (kc, max_num_y).
                 y_idx_c = y_safe[start:end, None, :, None]
                 x_idx_c = x_safe[start:end, None, None, :]
-                new_patches[start:end] = pre[start:end][
+                new_patches[start:end] = pre_chunk[
                     k_ar_c.expand(kc, C_out, max_num_y, max_num_x),
                     c_ar.expand(kc, C_out, max_num_y, max_num_x),
                     y_idx_c.expand(kc, C_out, max_num_y, max_num_x),
                     x_idx_c.expand(kc, C_out, max_num_y, max_num_x),
                 ]
-            del pre
+                del pre_chunk
             mask = (y_valid[:, None, :, None] & x_valid[:, None, None, :])
             new_patches.mul_(mask.to(dtype_pre))
             # New offsets in the stride-s output frame.
@@ -380,9 +408,15 @@ class PatchesZonotope:
         # feature-map content).
         self._zero_phantoms()
 
-        # Materialise once patches are no longer smaller than dense.
+        # Materialise only when patches grow well past dense size — at the
+        # break-even point dense and patches use the same memory, but
+        # downstream convs are cheaper in dense form (chunked over K).
+        # The factor `_materialize_factor` defaults to 4× the feature-map
+        # area so we tolerate a 4× memory hit before flipping; tinyimagenet
+        # ResNet (TinyImageNet_resnet_medium) needs this delay to traverse
+        # the 14×14 stage without dense-conv OOM at K ≈ 10K.
         kH_p, kW_p = self._patches.shape[2], self._patches.shape[3]
-        if kH_p * kW_p >= H_out * W_out:
+        if kH_p * kW_p >= self._materialize_factor * H_out * W_out:
             self._materialize_to_dense()
 
     def propagate_fc(self, W, bias):

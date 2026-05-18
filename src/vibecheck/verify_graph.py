@@ -2152,7 +2152,8 @@ def _tighten_sequential_with_probe(
 # ---------------------------------------------------------------------------
 
 def _gen_cone_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
-                    pre_relu_op_name, *, device, dtype):
+                    pre_relu_op_name, *, device, dtype, conv_chunk_size=None,
+                    g_storage='dense', oom_log=None):
     """Run gen-LP-style forward propagation up to `pre_relu_op_name`.
 
     Returns the state dict from `verify_gen_lp.precompute_gen_state` whose
@@ -2160,6 +2161,11 @@ def _gen_cone_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
     at the target layer. Uses formulation='dense' so stable-on neurons
     pass their full pre-relu G rows through — exactly the recursion the
     cone walker depends on.
+
+    `conv_chunk_size`: optional row-chunk for the conv/fc gen-image
+    propagation. None = legacy un-chunked path (no overhead). When set,
+    the conv2d/matmul over the n_gens dim is chunked with OOM-halve-retry
+    — see `_conv2d_chunked_with_oom_halving` in verify_gen_lp.
     """
     truncated = []
     for op in gg_ops_ser:
@@ -2169,7 +2175,8 @@ def _gen_cone_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
     return verify_gen_lp.precompute_gen_state(
         truncated, x_lo, x_hi, bounds_by_relu, input_name,
         pre_relu_op_name, device=device, dtype=dtype,
-        formulation='dense')
+        formulation='dense', conv_chunk_size=conv_chunk_size,
+        g_storage=g_storage, _oom_log=oom_log)
 
 
 def _build_gen_rows_reverse_map(state):
@@ -2573,6 +2580,38 @@ def _solve_gen_cone_neuron_worker(task):
                     except ValueError:
                         m.setParam(k.strip(), val)
         dt_build += time.perf_counter() - t_b
+        # MILP dump hook — writes .lp + sidecar .pkl per (layer, neuron, sense)
+        # when VC_DUMP_MILP_DIR is set. Optional VC_DUMP_MILP_LAYERS=1,2 (CSV
+        # of target_li values) restricts which layers get dumped (default:
+        # all). Used to capture phase-1 bound-tightening MILPs for
+        # standalone Gurobi profiling and dual-BnB experiments.
+        _dump_dir = os.environ.get('VC_DUMP_MILP_DIR', '')
+        if _dump_dir and use_milp:
+            _dump_layers = os.environ.get('VC_DUMP_MILP_LAYERS', '')
+            if _dump_layers:
+                _allowed = {int(s) for s in _dump_layers.split(',') if s}
+                _do_dump = int(target_li) in _allowed
+            else:
+                _do_dump = True
+            if _do_dump:
+                import pickle as _pkl
+                os.makedirs(_dump_dir, exist_ok=True)
+                _stem = f'L{int(target_li)}_n{int(j)}_{sense}'
+                m.write(f'{_dump_dir}/{_stem}.lp')
+                _meta = {
+                    'form': form, 'c_in': float(c_in),
+                    'nz': list(nz), 'vals': list(vals),
+                    'input_cols': list(input_cols),
+                    'upstream_topo': list(upstream_topo),
+                    'milp_neurons': list(milp_set),
+                    'sense': sense, 'timeout': float(timeout),
+                    'best_bd_stop': (1e-5 if sense == 'min' else -1e-5),
+                    'target_li': int(target_li), 'neuron_j': int(j),
+                    'lo_init': float(lo_init), 'hi_init': float(hi_init),
+                    'tune_env': _tune,
+                }
+                with open(f'{_dump_dir}/{_stem}.pkl', 'wb') as _f:
+                    _pkl.dump(_meta, _f)
         t_s = time.perf_counter()
         try:
             optimize_checked(m)
@@ -2614,6 +2653,43 @@ def _solve_gen_cone_neuron_worker(task):
                 pass
             if status == grb.GRB.TIME_LIMIT:
                 any_timeout = True
+        # Append solve result to dumped sidecar (if dump hook fired above).
+        if _dump_dir and use_milp:
+            _dump_layers2 = os.environ.get('VC_DUMP_MILP_LAYERS', '')
+            if _dump_layers2:
+                _allowed2 = {int(s) for s in _dump_layers2.split(',') if s}
+                _do_dump2 = int(target_li) in _allowed2
+            else:
+                _do_dump2 = True
+            if _do_dump2:
+                import pickle as _pkl2
+                _stem2 = f'L{int(target_li)}_n{int(j)}_{sense}'
+                _pp = f'{_dump_dir}/{_stem2}.pkl'
+                try:
+                    with open(_pp, 'rb') as _rf:
+                        _meta2 = _pkl2.load(_rf)
+                except FileNotFoundError:
+                    _meta2 = {}
+                _obj_bound = None; _obj_val = None
+                try:
+                    _obj_bound = float(m.ObjBound)
+                except (AttributeError, grb.GurobiError):
+                    pass
+                try:
+                    _obj_val = float(m.ObjVal)
+                except (AttributeError, grb.GurobiError):
+                    pass
+                _meta2['result'] = {
+                    'status': int(status),
+                    'obj_bound': _obj_bound,
+                    'obj_val': _obj_val,
+                    'solve_time_s': time.perf_counter() - t_s,
+                    'build_time_s': dt_build,
+                    'mip_gap': float(getattr(m, 'MIPGap', float('nan'))),
+                    'node_count': int(getattr(m, 'NodeCount', 0)),
+                }
+                with open(_pp, 'wb') as _wf:
+                    _pkl2.dump(_meta2, _wf)
         m.dispose()
         env.dispose()
     return int(j), lb, ub, any_timeout, dt_build, dt_solve
@@ -2663,9 +2739,26 @@ def _tighten_layer_gen_cone(gg_ops_ser, x_lo, x_hi, bounds_by_relu,
                 break
         assert target_relu_op_name is not None, \
             f'no relu op for layer_idx={target_layer_idx}'
+        # Per-call chunking of the gen-LP conv2d propagation. Defaults to
+        # 256 (chunked + OOM-halve-retry); set env VC_GEN_LP_CONV_CHUNK=0
+        # to force the un-chunked legacy path. Settings-aware callers can
+        # also override via the env var.
+        _conv_chunk = 256
+        try:
+            import os as _os_local
+            _env = _os_local.environ.get('VC_GEN_LP_CONV_CHUNK', '')
+            if _env:
+                _v = int(_env)
+                _conv_chunk = _v if _v > 0 else None
+        except (ValueError, TypeError):
+            _conv_chunk = 256
+        _g_storage = os.environ.get('VC_GEN_LP_G_STORAGE', 'sparse')
+        if _g_storage not in ('dense', 'sparse'):
+            _g_storage = 'sparse'
         state = _gen_cone_state(
             gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
-            target_relu_op_name, device=device, dtype=dtype)
+            target_relu_op_name, device=device, dtype=dtype,
+            conv_chunk_size=_conv_chunk, g_storage=_g_storage)
         gen_rows_by_layer, col_origin = \
             _build_gen_rows_reverse_map(state)
         n_input = state['n_input']
@@ -3299,7 +3392,8 @@ def _phase1_bab_refine(
         xl, xh, gg, gg_ops_ser, x_lo_64, x_hi_64,
         sample_timeout, n_cores, time_left,
         device, dtype, settings, spec=None,
-        print_progress=False, verbose_cb=None):
+        print_progress=False, verbose_cb=None,
+        rec_zono=None):
     """α,β-CROWN-style bab-refine cascade Phase 1.
 
     Algorithm:
@@ -3314,10 +3408,12 @@ def _phase1_bab_refine(
               (element-wise max on lo, min on hi).
 
     Returns (sb, bounds_by_relu, z_final, tb) — same signature as
-    `_forward_zonotope_interleaved`. `z_final` is None (the cascade
-    doesn't propagate the live zonotope through tightenings); the
-    downstream Phase 7 path falls back to `precompute_gen_state` when
-    `z_final` is None.
+    `_forward_zonotope_interleaved`. When ``rec_zono`` is provided, the
+    initial forward populates it AND ``z_final`` is captured from that
+    same forward, so the downstream ``state_from_phase1`` path can
+    skip the multi-GB ``precompute_gen_state`` allocation. When
+    ``rec_zono is None`` (legacy), ``z_final`` is None and Phase 7
+    falls back to the dense precompute.
     """
     from . import alpha_crown as ac
     tb = {'phase1_bab_refine': 0.0, 'phase1_alpha_total': 0.0,
@@ -3325,12 +3421,59 @@ def _phase1_bab_refine(
     t_total = time.perf_counter()
 
     # 1. Initial forward zono (no grad — pure tensor math).
+    # When rec_zono is provided, also harvest pre-ReLU gen rows here
+    # so Phase 7 can reuse them via state_from_phase1 (avoids the
+    # dense precompute that OOMs on TinyImageNet).
     with torch.no_grad():
-        sb_init, _ = _forward_zonotope_graph(xl, xh, gg, device, dtype)
+        sb_init, z_final_initial = _forward_zonotope_graph(
+            xl, xh, gg, device, dtype, settings=settings, rec_zono=rec_zono)
     bounds_by_relu = {
         L: (lo.cpu().numpy().astype(np.float64),
             hi.cpu().numpy().astype(np.float64))
         for L, (lo, hi) in sb_init.items()}
+
+    # 1b. Per-neuron adaptive CROWN backward at every (non-L0) ReLU.
+    # The legacy `_forward_zonotope_interleaved` did this interleaved
+    # with the forward at each ReLU; bab_refine silently dropped it.
+    # That cost us ~50% extra unstable at the deepest ReLU layer (L9
+    # on TinyImageNet ResNet: forward-zono 58 vs CROWN-backward 37) —
+    # which directly translated to needing ~2× more Phase 8 binaries.
+    # L0 is exact under forward zono (pre-act = affine of input box),
+    # so skip it. Use `bab_refine_adapt_enabled` knob to disable.
+    _adapt_enabled = bool(getattr(
+        settings, 'bab_refine_adapt_enabled', True))
+    if _adapt_enabled:
+        _adapt_chunk = getattr(settings, 'adapt_chunk_size', 256)
+        _adapt_topk = getattr(settings, 'phase1_adapt_topk', None)
+        t_adapt = time.perf_counter()
+        for L in sorted(bounds_by_relu.keys()):
+            if L == 0:
+                continue
+            lo_np, hi_np = bounds_by_relu[L]
+            unstable = np.where((lo_np < 0) & (hi_np > 0))[0]
+            if len(unstable) == 0:
+                continue
+            if (_adapt_topk is not None
+                    and len(unstable) > int(_adapt_topk)):
+                un = unstable
+                score = (np.abs((lo_np[un] + hi_np[un]) / 2.0)
+                         * (hi_np[un] - lo_np[un]))
+                top = un[np.argsort(-score)[:int(_adapt_topk)]]
+                neuron_subset = np.sort(top)
+            else:
+                neuron_subset = unstable
+            try:
+                adapt_lo, adapt_hi = _per_neuron_adaptive_bounds_chunked(
+                    gg, xl, xh, bounds_by_relu, L, device, dtype,
+                    neuron_subset=neuron_subset, chunk_size=_adapt_chunk)
+                new_lo = np.maximum(lo_np, adapt_lo)
+                new_hi = np.minimum(hi_np, adapt_hi)
+                bounds_by_relu[L] = (new_lo, new_hi)
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                # Skip this layer if backward CROWN OOMs; downstream
+                # cascade still uses whatever we have.
+                pass
+        tb['phase1_per_neuron_adapt'] = time.perf_counter() - t_adapt
 
     # 2. Build query directions from spec for α-CROWN refresh.
     # gg_ops_ser is the *serialized* op list — fc uses 'W_np', conv
@@ -3401,10 +3544,17 @@ def _phase1_bab_refine(
         `run_alpha_crown_batched` (shared α across queries with a
         spec-LB loss).
         """
+        _dir_mode = str(settings.alpha_crown_dir_mode
+                         if 'alpha_crown_dir_mode' in settings
+                         else 'auto')
+        _s_split = int(settings.alpha_crown_s_split_n
+                        if 'alpha_crown_s_split_n' in settings
+                        else 1)
         _, _, best_bounds, _ = ac.run_alpha_crown_batched(
             gg, xl, xh, bbr_now, w_qs, b_qs, S_nodes, un_idx,
             device, dtype, n_iters=n_iters, lr=alpha_lr,
-            lr_decay=0.98, early_stop_on_positive=False)
+            lr_decay=0.98, early_stop_on_positive=False,
+            dir_mode=_dir_mode, s_split_n=_s_split)
         return best_bounds
 
     ew_score_per_layer = None
@@ -3476,7 +3626,7 @@ def _phase1_bab_refine(
                   torch.tensor(hi, dtype=dtype, device=device))
               for L, (lo, hi) in bounds_by_relu.items()}
         tb['phase1_bab_refine'] = time.perf_counter() - t_total
-        return sb, bounds_by_relu, None, tb
+        return sb, bounds_by_relu, z_final_initial, tb
 
     # ---------- ew sweep restricted to OPEN queries ----------
     # min_ew_per_layer[L][j] = min over open specs of ew[i, j]. The
@@ -3593,6 +3743,22 @@ def _phase1_bab_refine(
             bounds_by_relu[L] = (np.maximum(lo_l, new_lo),
                                   np.minimum(hi_l, new_hi))
             tb['phase1_milp_total'] += time.perf_counter() - t_m
+            # Hard early-exit hook: terminate the whole verifier process
+            # after a specific layer's MILPs are done. Used by the
+            # MILP-dump scratch script to capture L1+L2 problems without
+            # paying for L3+ work or the full verify pipeline.
+            _stop_after = os.environ.get('VC_STOP_AFTER_LAYER', '')
+            if _stop_after:
+                try:
+                    if L >= int(_stop_after):
+                        if print_progress:
+                            print(f'  [bab_refine] stopping after L{L} '
+                                  f'(VC_STOP_AFTER_LAYER={_stop_after}) — '
+                                  f'terminating process for MILP dump',
+                                  flush=True)
+                        os._exit(0)
+                except ValueError:
+                    pass
             # α-CROWN refresh.
             if time_left() <= 1:
                 break
@@ -3643,8 +3809,24 @@ def _phase1_bab_refine(
     sb = {L: (torch.tensor(lo, dtype=dtype, device=device),
               torch.tensor(hi, dtype=dtype, device=device))
           for L, (lo, hi) in bounds_by_relu.items()}
+    # If rec_zono was requested, redo the forward with the cascade-
+    # tightened bounds_by_relu fed into apply_relu via tight_lo/tight_hi.
+    # This recomputes (μ, λ) from the tighter (lo, hi) so that
+    # state_from_phase1's LP triangle constraints reflect the cascade
+    # gain. Without this we'd ship Phase 1's looser bounds into the LP
+    # and pay multi-second Phase 8 MILP escalation that the cascade
+    # already obviated. One extra forward cost (small relative to the
+    # cascade itself).
+    if rec_zono is not None:
+        rec_zono.clear()
+        rec_zono.setdefault('gen_rows_by_layer', {})
+        rec_zono.setdefault('col_origin', {})
+        with torch.no_grad():
+            _, z_final_initial = _forward_zonotope_graph(
+                xl, xh, gg, device, dtype, settings=settings,
+                rec_zono=rec_zono, tight_bounds=bounds_by_relu)
     tb['phase1_bab_refine'] = time.perf_counter() - t_total
-    return sb, bounds_by_relu, None, tb
+    return sb, bounds_by_relu, z_final_initial, tb
 
 
 # ---------------------------------------------------------------------------
@@ -3869,6 +4051,28 @@ def _phase2p5_zono_lift(
     still_open = set(still_open_disj)
     verified_here = set()
 
+    # Time-budget for the whole Phase 2.5 cascade. None = unlimited.
+    time_budget = getattr(settings, 'zono_lift_time_budget', None)
+    time_budget = float(time_budget) if time_budget is not None else None
+    _t_phase25_start = time.perf_counter()
+    info['time_budget'] = time_budget
+    info['time_budget_hit'] = False
+    info['disjuncts_skipped_hopeless'] = 0
+    info['disjuncts_skipped_time'] = 0
+    info['queries_skipped_time'] = 0
+
+    # Disjunct-level early-abort threshold (after batched pass-0 α-CROWN).
+    # If the worst lb_alpha across queries in a disjunct is below this,
+    # the disjunct cannot close in 2.5 (closure requires ALL queries to
+    # close); skip the per-query cascade entirely.
+    hopeless_disjunct_lb = getattr(
+        settings, 'zono_lift_disjunct_hopeless_lb', None)
+    hopeless_disjunct_lb = (float(hopeless_disjunct_lb)
+                            if hopeless_disjunct_lb is not None else None)
+
+    promising_first = bool(
+        getattr(settings, 'zono_lift_promising_first', True))
+
     # Identify unstable neurons per layer for α-CROWN start_node selection.
     unstable_indices = {
         L: np.where(
@@ -3954,15 +4158,74 @@ def _phase2p5_zono_lift(
                         np.maximum(lo_g, lo_a),
                         np.minimum(hi_g, hi_a))
 
-    for di in list(still_open):
-        q_list = [(qi, w, b) for qi, w, b in disj_queries[di]
-                   if spec_lbs.get(qi, -1.0) <= 0]
-        if not q_list:
+    # Per-disjunct min(lb_alpha) over still-open queries — used for both
+    # disjunct ordering (most-promising first) and hopeless skip.
+    disjunct_min_lb = {}
+    if best_lbs_batch is not None:
+        for di in list(still_open):
+            lbs = []
+            for qi, _, _ in disj_queries[di]:
+                if spec_lbs.get(qi, -1.0) > 0:
+                    continue
+                if qi in global_qi_to_batched_idx:
+                    lbs.append(float(
+                        best_lbs_batch[global_qi_to_batched_idx[qi]]))
+            if lbs:
+                disjunct_min_lb[di] = min(lbs)
+
+    # Hopeless skip: disjuncts whose worst pass-0 lb_alpha is too negative
+    # cannot close in Phase 2.5 (closure requires ALL queries to close).
+    skip_hopeless = set()
+    if hopeless_disjunct_lb is not None:
+        for di, mlb in disjunct_min_lb.items():
+            if mlb < hopeless_disjunct_lb:
+                skip_hopeless.add(di)
+        info['disjuncts_skipped_hopeless'] = len(skip_hopeless)
+
+    # Most-promising-first ordering across disjuncts.
+    if promising_first and disjunct_min_lb:
+        disjunct_order = sorted(
+            list(still_open),
+            key=lambda d: -disjunct_min_lb.get(d, -float('inf')))
+    else:
+        disjunct_order = list(still_open)
+
+    for di in disjunct_order:
+        # Time-budget check at the disjunct boundary.
+        if (time_budget is not None
+                and (time.perf_counter() - _t_phase25_start) >= time_budget):
+            info['time_budget_hit'] = True
+            info['disjuncts_skipped_time'] += 1
             continue
+        if di in skip_hopeless:
+            continue
+        q_list_full = [(qi, w, b) for qi, w, b in disj_queries[di]
+                        if spec_lbs.get(qi, -1.0) <= 0]
+        if not q_list_full:
+            continue
+        # Within-disjunct order: bottleneck (lowest lb_alpha) first so a
+        # hopeless query is detected before time is spent on the rest.
+        if promising_first and best_lbs_batch is not None:
+            def _qlb(t):
+                qi = t[0]
+                if qi in global_qi_to_batched_idx:
+                    return float(best_lbs_batch[global_qi_to_batched_idx[qi]])
+                return -float('inf')
+            q_list = sorted(q_list_full, key=_qlb)
+        else:
+            q_list = q_list_full
         q_info = {}
         any_open_after = False
 
         for qi_idx, (qi, w_np, b_q) in enumerate(q_list):
+            # Per-query time-budget check at the inner loop boundary.
+            if (time_budget is not None
+                    and (time.perf_counter() - _t_phase25_start)
+                    >= time_budget):
+                info['time_budget_hit'] = True
+                info['queries_skipped_time'] += 1
+                any_open_after = True
+                continue
             _t_qstart = time.perf_counter()
             w_np = np.asarray(w_np, dtype=np.float64)
             b_q = float(b_q)
@@ -3996,13 +4259,25 @@ def _phase2p5_zono_lift(
                             lr_decay=alpha_lr_decay,
                             early_stop_on_positive=early_stop_on_positive))
                 else:
-                    lb_alpha, alpha_params, best_bounds, _hist = (
-                        ac.run_alpha_crown(
-                            gg, xl_g, xh_g, bounds_by_relu, w_np, b_q,
+                    # Route through the batched α-CROWN with n_q=1 so the
+                    # dir_mode/s_split_n OOM fallback ladder applies (the
+                    # legacy single-query `run_alpha_crown` has no such
+                    # ladder and OOMs on cifar100_resnet_large prop_7866).
+                    _dm = str(settings.alpha_crown_dir_mode
+                               if 'alpha_crown_dir_mode' in settings else 'split')
+                    _ss = int(settings.alpha_crown_s_split_n
+                               if 'alpha_crown_s_split_n' in settings else 2)
+                    _w_qs = np.asarray(w_np, dtype=np.float64).reshape(1, -1)
+                    _b_qs = np.asarray([float(b_q)], dtype=np.float64)
+                    _lbs, alpha_params, best_bounds, _hist = (
+                        ac.run_alpha_crown_batched(
+                            gg, xl_g, xh_g, bounds_by_relu, _w_qs, _b_qs,
                             intermediate_start_nodes, unstable_indices,
                             device, dtype, n_iters=alpha_iters, lr=alpha_lr,
                             lr_decay=alpha_lr_decay,
-                            early_stop_on_positive=early_stop_on_positive))
+                            early_stop_on_positive=early_stop_on_positive,
+                            dir_mode=_dm, s_split_n=_ss))
+                    lb_alpha = float(_lbs[0])
                 # If α-CROWN already verifies (common for easy cases that
                 # α,β-CROWN closes via "verified with init bound!"), record
                 # and skip Phase 2.5 entirely for this query. Skipping the
@@ -4071,14 +4346,27 @@ def _phase2p5_zono_lift(
                                     lr=alpha_lr, lr_decay=alpha_lr_decay,
                                     early_stop_on_positive=early_stop_on_positive))
                         else:
-                            lb_ac_it, alpha_params_it, best_bounds_it, _ = (
-                                ac.run_alpha_crown(
-                                    gg, xl_g, xh_g, bbr_for_ac, w_np, b_q,
+                            # Route through batched α-CROWN with n_q=1 for the
+                            # OOM-fallback ladder (see comment in Phase 2.5
+                            # initial α-CROWN call).
+                            _dm_c = str(settings.alpha_crown_dir_mode
+                                         if 'alpha_crown_dir_mode' in settings
+                                         else 'split')
+                            _ss_c = int(settings.alpha_crown_s_split_n
+                                         if 'alpha_crown_s_split_n' in settings
+                                         else 2)
+                            _w_qs_c = np.asarray(w_np, dtype=np.float64).reshape(1, -1)
+                            _b_qs_c = np.asarray([float(b_q)], dtype=np.float64)
+                            _lbs_c, alpha_params_it, best_bounds_it, _ = (
+                                ac.run_alpha_crown_batched(
+                                    gg, xl_g, xh_g, bbr_for_ac, _w_qs_c, _b_qs_c,
                                     isn_cur, un_idx_cur,
                                     device, dtype,
                                     n_iters=alpha_iters, lr=alpha_lr,
                                     lr_decay=alpha_lr_decay,
-                                    early_stop_on_positive=early_stop_on_positive))
+                                    early_stop_on_positive=early_stop_on_positive,
+                                    dir_mode=_dm_c, s_split_n=_ss_c))
+                            lb_ac_it = float(_lbs_c[0])
                         bbr_alpha = {
                             L: (lo_t.detach().cpu().numpy().astype(np.float64),
                                 hi_t.detach().cpu().numpy().astype(np.float64))
@@ -4504,16 +4792,18 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     _phase1_method = str(getattr(settings, 'phase1_method', 'legacy'))
     try:
         if _phase1_method == 'bab_refine':
+            # Pass rec_zono into bab_refine so its initial forward
+            # populates the per-layer pre-ReLU rows. Phase 7 then takes
+            # the state_from_phase1 fast path and avoids the dense
+            # precompute_gen_state allocation (which OOMs the RTX 3080
+            # on TinyImageNet's 14×14 stage).
             sb, bounds_by_relu, z_final_phase1, phase1_tb = \
                 _phase1_bab_refine(
                     xl_g, xh_g, gg, gg_ops_ser, x_lo_64, x_hi_64,
                     sample_timeout, n_cores, time_left, device, dtype,
                     settings, spec=spec,
-                    print_progress=print_progress, verbose_cb=_verbose_cb)
-            # bab_refine doesn't populate rec_zono. Phase 7 falls back
-            # to precompute_gen_state when z_final_phase1 is None — see
-            # the dispatch in `state_from_phase1` callsite.
-            rec_zono = None
+                    print_progress=print_progress, verbose_cb=_verbose_cb,
+                    rec_zono=rec_zono)
         else:
             sb, bounds_by_relu, z_final_phase1, phase1_tb = \
                 _forward_zonotope_interleaved(
@@ -4671,8 +4961,56 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             mem_audit=_mem_audit if verbose else None)
         timing['phase2p5_zono_lift'] = time.perf_counter() - t0
         details['phase2p5'] = phase25_info
+
         if not still_open_disj:
             return _finalize('verified', 'zono_lift')
+
+    # --- Phase 2.6: per-spec targeted PGD on still-open disjuncts. ---
+    # Phase 3.5 attacks the UNION of open disjuncts (one shared loss);
+    # this iterates per-disjunct so each spec's margin gradient is
+    # isolated. Total wall hard-capped by `phase26_pgd_per_spec_time_budget`.
+    if (still_open_disj and not _disable_sat
+            and getattr(settings, 'phase26_pgd_per_spec_enabled', True)
+            and time_left() > 0):
+        t0 = time.perf_counter()
+        _p26_total = float(getattr(
+            settings, 'phase26_pgd_per_spec_time_budget', 3.0))
+        _p26_min = float(getattr(
+            settings, 'phase26_pgd_per_spec_min_per_spec', 0.2))
+        _n_open = len(still_open_disj)
+        _per = max(_p26_min, _p26_total / max(_n_open, 1))
+        _p26_remaining = _p26_total
+        _p26_n_attacked = 0
+        _p26_sat = False
+        for _di in sorted(still_open_disj):
+            if _p26_remaining <= 0 or time_left() <= 0:
+                break
+            _budget = min(_per, _p26_remaining, max(time_left() - 0.5, 0.1))
+            try:
+                _ok, _w = _pgd_attack_general(
+                    xl_pgd, xh_pgd, spec, gg_pgd, settings,
+                    restrict_disj={_di}, time_budget=_budget)
+            except RuntimeError:
+                _ok, _w = False, None
+            _p26_n_attacked += 1
+            _p26_remaining -= _budget
+            if _ok:
+                _p26_sat = True
+                pgd_witness = _w
+                break
+        timing['phase2p6_pgd_per_spec'] = time.perf_counter() - t0
+        details['phase2p6'] = {
+            'n_attacked': _p26_n_attacked,
+            'n_open': _n_open,
+            'sat': _p26_sat,
+            'per_spec_budget': _per}
+        if print_progress:
+            print(f'Phase 2.6 (per-spec PGD, {_p26_n_attacked}/{_n_open} '
+                  f'attacked, {_per:.2f}s each): '
+                  f'{timing["phase2p6_pgd_per_spec"]:.2f}s  '
+                  f'sat={_p26_sat}', flush=True)
+        if _p26_sat:
+            return _finalize('sat', 'pgd_per_spec', witness=pgd_witness)
 
     # --- Phase 7: LP score+verify (replaces 7a feasibility + 7b CROWN) ---
     # One LP solve per query in 'score' mode: minimizes spec objective,
@@ -4772,13 +5110,62 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 # drive neuron ranking.
                 _phase7_score_method = ('lp_dual' if _hs_mode != 'none'
                                          else 'lp_ew_frac')
+                # Per-spec state_from_phase1 with that spec's Phase 2.5
+                # tightened bounds. Mirrors the existing Phase 8
+                # `phase8_per_query_tightened_bounds` path but for the
+                # Phase 7 LP triangle constraints. Same soundness story:
+                # rebuild rec_zono via a fresh forward with the spec's
+                # bounds (apply_relu intersects), so the (μ, λ) inside
+                # rec_zono and the (lo, hi) used in triangle constraints
+                # are consistent.
+                # Default OFF: per-spec rebuild uses state_from_phase1's
+                # closed-form min-area (μ, λ). When Phase 2.5 narrows
+                # (hi - lo) on already-near-stable neurons, μ = -hi·lo /
+                # (2·(hi-lo)) blows up — Gurobi simplex hits "drop
+                # variables from basis / switch to quad precision" and
+                # `optimize_checked` raises GurobiNumericTrouble (a real
+                # soundness signal we MUST NOT swallow). Phase 8's
+                # alpha_zono path uses α-CROWN-optimized (μ, λ) which
+                # doesn't have this pathology and already incorporates
+                # per-spec Phase 2.5 bounds (`merged_bbr` at the
+                # alpha_zono builder). So this knob is only useful on
+                # nets where state_from_phase1 stays well-conditioned.
+                _per_q_p7 = bool(getattr(
+                    settings, 'phase7_per_query_tightened_bounds', False))
+                _p25_per_q = (details.get('phase2p5', {})
+                              .get('per_query', {}))
+                # Cache per-qi tightened bounds for fast lookup
+                _tb_for_qi = {}
+                for _di, _qmap in _p25_per_q.items():
+                    for _qi_p, _qinfo_p in _qmap.items():
+                        _tb_p = _qinfo_p.get('tightened_bounds')
+                        if _tb_p is not None:
+                            _tb_for_qi[_qi_p] = _tb_p
                 for qi in sorted(remaining_qids):
                     _, q_w, q_bias = queries[qi]
+                    _state_for_qi = gen_lp_state
+                    if _per_q_p7 and qi in _tb_for_qi:
+                        _tb_q = _tb_for_qi[qi]
+                        _rec_q = {}
+                        with torch.no_grad():
+                            _, _zf_q = _forward_zonotope_graph(
+                                xl_g, xh_g, gg, device, dtype,
+                                settings=settings,
+                                rec_zono=_rec_q,
+                                tight_bounds=_tb_q)
+                        _state_for_qi = (
+                            verify_gen_lp.state_from_phase1(
+                                _zf_q, _rec_q, x_lo_64, x_hi_64,
+                                gg_ops_ser, gg['input_name'],
+                                last_name))
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                     res, dt_lp, info = verify_gen_lp.solve_spec(
                         gg_ops_ser, x_lo_64, x_hi_64, bounds_by_relu,
                         gg['input_name'], last_name, q_w, q_bias,
-                        milp_set=None, time_limit=lp_tl, n_threads=n_cores,
-                        device=gen_lp_device, state=gen_lp_state,
+                        milp_set=None, time_limit=lp_tl,
+                        n_threads=n_cores, device=gen_lp_device,
+                        state=_state_for_qi,
                         score_method=_phase7_score_method,
                         unsafe_halfspace=_hs_mode)
                     details.setdefault('phase7', {})[qi] = {
@@ -5030,6 +5417,26 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     gg_ops_ser, gg['input_name'],
                     gg_ops_ser[-1]['name'],
                     unstable_per_layer=unstable_per_layer_q)
+                # Box+halfspace per-neuron delta_LB scoring — closed-form
+                # Lagrangian, ~10ms/1k neurons. Picks kfsb-quality
+                # binarisation candidates by simulating off-side
+                # (y_k=0) and on-side (y_k=z_k) substitutions and
+                # taking BaB worst-child LB. Overrides ew*frac for
+                # this query — measured 24/30 overlap with AB-CROWN's
+                # actual splits on tinyimagenet prop_7575 (vs 19/30
+                # for ew*frac). Gated by `phase8_score_box_halfspace`.
+                if bool(getattr(
+                        settings, 'phase8_score_box_halfspace', True)):
+                    ew_np = {
+                        L: (t.detach().cpu().numpy().astype(np.float64)
+                            if hasattr(t, 'detach')
+                            else np.asarray(t, dtype=np.float64))
+                        for L, t in ew_at_relu_q.items()}
+                    bh_scores = verify_gen_lp.score_box_halfspace_delta_lb(
+                        state_by_qi[qi], qw_q, float(qb_q), ew_np)
+                    per_query_scored[qi] = sorted(
+                        bh_scores.keys(),
+                        key=lambda k: bh_scores[k], reverse=True)
                 if print_progress:
                     print(f'  Per-query α-zono state q{qi}: '
                           f'n_gens={state_by_qi[qi]["n_gens"]}, '
@@ -5155,7 +5562,139 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             settings, 'phase8_alpha_zono_triangle_top_k', 0))
         if _milp_mode not in ('alpha_zono_bnb', 'alpha_zono_infeasibility'):
             _triangle_top_k = 0
-        if _parallel_race:
+        # Per-setting bin schedule override. Default schedule is
+        # [8, 16, 24, ..., 8*n_workers]. For tinyimagenet our
+        # box+halfspace scoring close cases at K=18/22/30 that the
+        # stride-8 schedule skips between 16 and 32; supplying a
+        # custom list catches those.
+        _bin_sched = getattr(settings, 'phase8_bin_schedule', None)
+        if _bin_sched is not None:
+            try:
+                _bin_sched = [int(x) for x in _bin_sched]
+            except (TypeError, ValueError):
+                _bin_sched = None
+        _use_dual_gpu = bool(getattr(
+            settings, 'phase8_use_dual_ascent_gpu', False))
+        if _use_dual_gpu:
+            from .dual_ascent_bab import verify_query_dual_ascent_bab
+            _da_K = int(getattr(settings, 'phase8_dual_ascent_max_iter', 1))
+            _da_rep = int(getattr(
+                settings, 'phase8_dual_ascent_repair_steps', 5))
+            _da_md = int(getattr(
+                settings, 'phase8_dual_ascent_max_depth', 40))
+            _da_fc = int(getattr(
+                settings, 'phase8_dual_ascent_frontier_cap', 16384))
+            raw = []
+            # Witness-attack callback: maps each LP-relaxation primal witness
+            # (e ∈ [-1,1]^n_input) back to real input space and runs the NN
+            # forward to test if it actually falsifies the spec. Real
+            # counterexamples found this way short-circuit BaB with 'sat'.
+            x_lo_t = torch.as_tensor(x_lo_64, device=device, dtype=dtype)
+            x_hi_t = torch.as_tensor(x_hi_64, device=device, dtype=dtype)
+            _disable_sat_local = bool(getattr(settings, 'disable_sat_finding', False))
+            def _da_witness_check(w_e_input):
+                """w_e_input: [N, n_input] in [-1,1] (top-K worst LP witnesses).
+                For each: map to real input space, batch-forward, then PGD-refine
+                from any near-boundary witnesses. Returns counterexample np array
+                or None.
+                """
+                if _disable_sat_local: return None
+                w_t = torch.as_tensor(w_e_input, device=device, dtype=dtype)
+                center = (x_lo_t + x_hi_t) * 0.5
+                halfwidth = (x_hi_t - x_lo_t) * 0.5
+                x_real = center.unsqueeze(0) + w_t * halfwidth.unsqueeze(0)
+                x_real = x_real.reshape(w_t.shape[0], *spec.x_lo.shape)
+                # First: cheap point-forward check (most LP witnesses ARE
+                # already adversarial since we sort by primal value).
+                x_np_batch = x_real.cpu().numpy()
+                for bi in range(x_np_batch.shape[0]):
+                    y_np = verify_gen_lp.forward_point(
+                        gg_ops_ser, x_np_batch[bi],
+                        gg['input_name'], gg_ops_ser[-1]['name'])
+                    _, ck = spec.check(y_np, y_np)
+                    if ck.get('worst_margin', 0.0) < 0:
+                        return x_np_batch[bi]
+                # If raw witnesses don't falsify, run a SHORT PGD from them.
+                # The LP witness is near the spec boundary; PGD nudges it
+                # toward a real adversarial. Cheap: ~20 iter on B=5 batch ~ms.
+                try:
+                    from .pgd import pgd_attack_from_init
+                    _xl = xl_pgd.to(device) if xl_pgd.device != device else xl_pgd
+                    _xh = xh_pgd.to(device) if xh_pgd.device != device else xh_pgd
+                    is_sat, w = pgd_attack_from_init(
+                        x_real, _xl, _xh, spec, gg_pgd, settings,
+                        n_iter=20)
+                    if is_sat: return w
+                except Exception:
+                    pass
+                return None
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            for (qi, qw_q, qb_q, scored_keys_q) in query_specs:
+                if time_left() <= 0:
+                    raw.append((qi, 'unknown', [], None))
+                    continue
+                state_q = (state_by_qi.get(qi, gen_lp_state)
+                           if state_by_qi else gen_lp_state)
+                # BUGFIX: query_specs was built with lp_ew_frac scoring at
+                # phase 8 start; bh_scores reranking later updates
+                # per_query_scored but query_specs holds stale reference.
+                # Re-fetch the latest per_query_scored (which IS bh_scores
+                # if `phase8_score_box_halfspace=True`).
+                _latest_keys = per_query_scored.get(qi, scored_keys_q)
+                if list(_latest_keys) != list(scored_keys_q):
+                    scored_keys_q = _latest_keys
+                # DEBUG: dump state passed to dual-ascent BaB if env var set
+                import os as _os
+                _dump = _os.environ.get('DA_BAB_DUMP_DIR')
+                if _dump:
+                    _os.makedirs(_dump, exist_ok=True)
+                    import pickle as _pkl
+                    _path = f'{_dump}/dump_q{qi}.pkl'
+                    # Also extract ew_per_relu if available in scope
+                    try:
+                        _ew = ew_at_relu_q
+                        _ew_dump = {L: (t.detach().cpu().numpy().astype(np.float64)
+                                        if hasattr(t, 'detach')
+                                        else np.asarray(t, dtype=np.float64))
+                                    for L, t in _ew.items()}
+                    except (NameError, AttributeError):
+                        _ew_dump = None
+                    with open(_path, 'wb') as _f:
+                        _pkl.dump({'state': state_q,
+                                    'qw': np.asarray(qw_q),
+                                    'qb': float(qb_q),
+                                    'scored_keys': list(scored_keys_q),
+                                    'ew_at_relu': _ew_dump}, _f)
+                    print(f'  [DA-DUMP] q{qi} → {_path}')
+                vd, info = verify_query_dual_ascent_bab(
+                    state_q, qw_q, qb_q,
+                    [k for k in scored_keys_q],
+                    time_limit=time_left(),
+                    max_iter=_da_K, repair_steps=_da_rep,
+                    max_depth=_da_md, frontier_cap=_da_fc,
+                    print_progress=False, time_left_fn=time_left,
+                    witness_check_fn=_da_witness_check)
+                if print_progress:
+                    print(f'  [dual-ascent-gpu] query {qi}: {vd} '
+                          f'nodes={info["nodes"]} '
+                          f'wall={info["wall"]:.3f}s '
+                          f'(safe={info["exit_counts"]["dual_safe"]} '
+                          f'uns={info["exit_counts"]["primal_unsafe"]} '
+                          f'cap={info["exit_counts"]["safety_cap"]})')
+                # CRITICAL: when DA-BaB finds SAT via witness-attack,
+                # info['sat_witness'] is the real-input counterexample.
+                # Bug 2026-05-15: was passing witness=None, dropping all
+                # SAT discoveries from BaB. 8 missed AB-SAT cases on
+                # tinyimagenet were almost all caused by this.
+                _da_witness = info.get('sat_witness') if vd == 'sat' else None
+                race_levels = [{'n_bins': 0, 'result': vd,
+                                'lb': 1.0 if vd == 'unsat' else 0.0,
+                                'time': info['wall'],
+                                'witness_source': 'dual_ascent_bab' if vd == 'sat' else None}]
+                raw.append((qi, vd, race_levels, _da_witness))
+        elif _parallel_race:
             raw = verify_gen_lp.parallel_query_racing(
                 gen_lp_state, query_specs,
                 time_left_fn=time_left,
@@ -5165,7 +5704,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 state_by_qi=state_by_qi if state_by_qi else None,
                 unsafe_halfspace=_milp_hs,
                 triangle_top_k=_triangle_top_k,
-                witness_refine_fn=_refine_arg)
+                witness_refine_fn=_refine_arg,
+                bin_schedule_override=_bin_sched)
         else:
             raw = verify_gen_lp.sequential_query_racing(
                 gen_lp_state, query_specs,
@@ -5475,7 +6015,8 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
     # node. On cifar_biasfield_70 the per-leaf forward zono is ~250 ms;
     # `_score_input_axes` was doing an identical pass per BaB node so
     # ~25 s of every 60 s budget went to redundant kernel launches.
-    sb, z_final_leaf = _forward_zonotope_graph(xl, xh, gg, device, dtype)
+    sb, z_final_leaf = _forward_zonotope_graph(
+        xl, xh, gg, device, dtype, settings=settings)
     bbr = {L: (lo.cpu().numpy().astype(np.float64),
                 hi.cpu().numpy().astype(np.float64))
            for L, (lo, hi) in sb.items()}

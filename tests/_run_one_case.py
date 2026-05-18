@@ -59,14 +59,31 @@ def main() -> int:
     args = p.parse_args()
 
     # Defer heavy imports until after argparse so --help is fast.
-    from vibecheck.settings import default_settings
+    import numpy as np
+    from vibecheck.config_profiles import default_settings_for
     from vibecheck.onnx_loader import load_onnx
     from vibecheck.vnnlib_loader import load_vnnlib
     from vibecheck.verify_graph import verify_graph
 
     overrides = json.loads(args.override_json)
-    settings = default_settings()
-    settings.total_timeout = float(args.timeout)
+    # Mirror src/vibecheck/main.py's `--mode graph` flow byte-for-byte:
+    #   - dtype=np.float32 (main's --dtype default)
+    #   - default_settings_for picks the per-instance profile
+    #     (input_split_small / conv_deep / fc_shallow / default)
+    #   - bits=32, device=gpu, pgd_restarts=100 (main's CLI defaults)
+    # Earlier the harness ran with bare default_settings() at bits=64
+    # without profile selection — biasfield_70 verified via main in 22 s
+    # but the harness timed out at 60 s on the same case because
+    # bits=64 halved per-leaf throughput, fewer leaves explored.
+    graph = load_onnx(args.net, dtype=np.float32)
+    spec = load_vnnlib(args.spec)
+    settings = default_settings_for(
+        graph, spec,
+        device='gpu',
+        bits=32,
+        total_timeout=float(args.timeout),
+        pgd_restarts=100,
+    )
     settings.print_progress = False
     settings.verbose = False
     for k, v in overrides.items():
@@ -90,9 +107,7 @@ def main() -> int:
 
     t0 = time.perf_counter()
     try:
-        graph = load_onnx(args.net)
         graph.optimize(settings)
-        spec = load_vnnlib(args.spec)
         result, details = verify_graph(graph, spec, settings)
         wall = time.perf_counter() - t0
 
