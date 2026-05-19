@@ -3393,7 +3393,7 @@ def _phase1_bab_refine(
         sample_timeout, n_cores, time_left,
         device, dtype, settings, spec=None,
         print_progress=False, verbose_cb=None,
-        rec_zono=None):
+        rec_zono=None, pre_cascade_hook=None):
     """α,β-CROWN-style bab-refine cascade Phase 1.
 
     Algorithm:
@@ -3634,6 +3634,24 @@ def _phase1_bab_refine(
               for L, (lo, hi) in bounds_by_relu.items()}
         tb['phase1_bab_refine'] = time.perf_counter() - t_total
         return sb, bounds_by_relu, z_final_initial, tb
+
+    # Pre-cascade hook: try cheap per-spec PGD on still-open specs BEFORE
+    # spending the cascade budget on intermediate-bound tightening. If the
+    # hook returns a SAT witness, we abort Phase 1 and bubble the witness
+    # up to the caller via `tb['pre_cascade_sat']`. The hook receives the
+    # current spec lbs (so it can sort specs by closeness-to-SAT) and the
+    # current bounds_by_relu.
+    if pre_cascade_hook is not None:
+        spec_lbs_dict = {queries_flat[i][0]: float(spec_lbs_phase05[i])
+                          for i in range(len(queries_flat))}
+        sat_witness = pre_cascade_hook(spec_lbs_dict, bounds_by_relu, open_qis)
+        if sat_witness is not None:
+            sb = {L: (torch.tensor(lo, dtype=dtype, device=device),
+                      torch.tensor(hi, dtype=dtype, device=device))
+                  for L, (lo, hi) in bounds_by_relu.items()}
+            tb['phase1_bab_refine'] = time.perf_counter() - t_total
+            tb['pre_cascade_sat'] = sat_witness
+            return sb, bounds_by_relu, z_final_initial, tb
 
     # ---------- ew sweep restricted to OPEN queries ----------
     # min_ew_per_layer[L][j] = min over open specs of ew[i, j]. The
@@ -4827,6 +4845,54 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
 
     t0 = time.perf_counter()
     _phase1_method = str(getattr(settings, 'phase1_method', 'legacy'))
+    # Pre-cascade per-spec PGD hook (run right after Phase 0.5 spec α-CROWN,
+    # before the expensive MILP cascade). Catches SAT cheaply on cases the
+    # cascade-then-Phase-8-witness path would only catch after a full
+    # cascade burn. Sorted by spec_lb ascending (most-likely-SAT first).
+    def _pre_cascade_pgd_hook(spec_lbs_dict, _bbr, _open_qis):
+        # DotMap returns empty DotMap (not the default!) for missing keys,
+        # so use `in` check explicitly.
+        _enabled = (settings.phase26_pre_cascade_enabled
+                     if 'phase26_pre_cascade_enabled' in settings else True)
+        if _disable_sat or not bool(_enabled):
+            return None
+        t_hook = time.perf_counter()
+        # Build sorted disjunct list by spec_lb (lowest first).
+        disj_lb = {}
+        for di, qlist in disj_queries.items():
+            lbs = [spec_lbs_dict.get(qi, 0.0) for qi, _, _ in qlist]
+            if lbs:
+                disj_lb[di] = min(lbs)
+        # Restrict to OPEN disjuncts (spec_lb ≤ 0).
+        ordered = sorted([d for d in disj_lb if disj_lb[d] <= 0],
+                          key=lambda d: disj_lb[d])
+        _per = float(getattr(settings, 'phase26_pgd_per_spec_min_per_spec', 0.5))
+        if print_progress:
+            print(f'  [pre-cascade PGD] {len(ordered)} open disjuncts, '
+                  f'{_per}s each (sorted by spec_lb asc)', flush=True)
+        n_attacked = 0
+        for di in ordered:
+            if time_left() <= 0.5: break
+            _budget = min(_per, max(time_left() - 0.5, 0.1))
+            try:
+                _ok, _w = _pgd_attack_general(
+                    xl_pgd, xh_pgd, spec, gg_pgd, settings,
+                    restrict_disj={di}, time_budget=_budget)
+            except RuntimeError:
+                _ok, _w = False, None
+            n_attacked += 1
+            if _ok:
+                if print_progress:
+                    print(f'  [pre-cascade PGD] SAT on disjunct {di} '
+                          f'(attacked {n_attacked}/{len(ordered)}; '
+                          f'{time.perf_counter()-t_hook:.2f}s)', flush=True)
+                return _w
+        if print_progress:
+            print(f'  [pre-cascade PGD] no SAT, '
+                  f'attacked {n_attacked}/{len(ordered)} '
+                  f'({time.perf_counter()-t_hook:.2f}s)', flush=True)
+        return None
+
     try:
         if _phase1_method == 'bab_refine':
             # Pass rec_zono into bab_refine so its initial forward
@@ -4840,7 +4906,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     sample_timeout, n_cores, time_left, device, dtype,
                     settings, spec=spec,
                     print_progress=print_progress, verbose_cb=_verbose_cb,
-                    rec_zono=rec_zono)
+                    rec_zono=rec_zono,
+                    pre_cascade_hook=_pre_cascade_pgd_hook)
         else:
             sb, bounds_by_relu, z_final_phase1, phase1_tb = \
                 _forward_zonotope_interleaved(
@@ -4887,6 +4954,16 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     # the cascade from eating Phase 8's budget; once the cascade has
     # returned, everything downstream should use the real deadline.
     _phase8_started[0] = True
+
+    # Pre-cascade hook may have caught SAT before the cascade ran.
+    _pre_cascade_witness = (phase1_tb.get('pre_cascade_sat')
+                              if isinstance(phase1_tb, dict) else None)
+    if _pre_cascade_witness is not None:
+        if print_progress:
+            print(f'Phase 1 pre-cascade PGD found SAT — skipping cascade',
+                  flush=True)
+        return _finalize('sat', 'pgd_pre_cascade',
+                          witness=_pre_cascade_witness)
 
     # --- Phase 2: CROWN backward ---
     # Skippable when Phase 1 already produced tighter α-CROWN spec lbs
