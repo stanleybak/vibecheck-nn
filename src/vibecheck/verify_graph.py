@@ -4882,6 +4882,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     timing['phase1_zono_tighten'] = time.perf_counter() - t0
     timing['phase1_breakdown'] = phase1_tb
     _mem_audit('after phase1')
+    # Phase 1 done — drop the pre-Phase-8 budget cap so Phase 2/2.5/2.6/7/8
+    # all see the full remaining time_left. The cap's purpose is to stop
+    # the cascade from eating Phase 8's budget; once the cascade has
+    # returned, everything downstream should use the real deadline.
+    _phase8_started[0] = True
 
     # --- Phase 2: CROWN backward ---
     # Skippable when Phase 1 already produced tighter α-CROWN spec lbs
@@ -5408,9 +5413,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         # classifications reflect those tighter bounds. New λ slopes fall
         # out automatically from the ReLU (lo, hi) → triangle reconstruction
         # inside `precompute_gen_state`.
-        # Flip time_left to "Phase 8" mode — drops the pre-Phase-8 cap so
-        # Phase 8 BaB and its per-query α-zono setup see the full remaining
-        # budget (deadline - now), not min(.., phase8_min_deadline - now).
+        # (Flag was already flipped right after Phase 1; this is redundant.)
         _phase8_started[0] = True
         state_by_qi = {}
         _per_qi_rebuild = bool(getattr(
