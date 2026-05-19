@@ -54,17 +54,22 @@ The systems are NOT interchangeable. Mixing them gives a sound but materially lo
 
 ## Testing
 
-Unit tests cover zonotope math and individual op propagation. Integration tests load ONNX from vnncomp benchmarks (paths in `tests/paths.yaml`, gitignored), run point propagation, validate against onnxruntime.
+Three test categories:
+
+1. **Unit tests** — zonotope math + individual op propagation. Synthetic ONNX (`onnx.helper`) + inline VNNLIB strings. Must remain 100% line coverage. **No `# pragma: no cover`**, **no defensive `try/except`** (assert so the passing path gets coverage), **remove dead code** rather than testing unreachable branches.
+2. **VNNCOMP point-propagation tests** — load ONNX from vnncomp benchmarks (paths in `tests/paths.yaml`, gitignored), run point propagation, validate against onnxruntime.
+3. **Per-benchmark verdict regressions** — live in `tests/integration/<benchmark>.py`, pytest-marked `@pytest.mark.integration`. Each merged benchmark contributes ~3 cases (1 SAT if cracked + 2 hard UNSAT). Every benchmark merge re-runs *all* prior integration cases — catches cross-benchmark regressions.
 
 ```bash
 # Unit tests only — fast (~2s); must remain 100% line coverage
-.venv/bin/python -m pytest tests/ -k "not vnncomp" --cov=src/vibecheck --cov-report=term
+.venv/bin/python -m pytest tests/ -k "not vnncomp" -m "not integration" --cov=src/vibecheck --cov-report=term
+
+# Per-benchmark verdict regressions
+.venv/bin/python -m pytest tests/integration -m integration
 
 # Full correctness check (unit + vnncomp regular)
 .venv/bin/python -m pytest tests/ -k "not extended"
 ```
-
-100% line coverage from unit tests alone is the goal. **No `# pragma: no cover`** — write the test instead. **No defensive `try/except`** — assert so the passing path gets coverage. **Remove dead code** rather than testing unreachable branches. Use synthetic ONNX (`onnx.helper`) for op-parsing tests and inline VNNLIB strings for parser tests.
 
 ## Experiment runs — cache `details` to /tmp
 
@@ -85,3 +90,31 @@ When running a verify experiment for the user, pickle the returned `details` dic
 When the user says "keep going" or "implement it": keep going until the goal is reached or a structural impossibility is documented with evidence. Don't stop after one negative result to ask whether to proceed — run the next reasonable experiment. Multi-iteration / multi-pass refinement is fine even when slower than the reference; correctness first, then optimize. Before each big implementation, write a small toy-problem test to validate correctness before scaling.
 
 When implementing a multi-phase plan, **push through every phase in sequence**. Treat each phase's stated gate as the only stopping condition (regression → revert that single ablation, then continue). Do not pause between phases to ask "should I keep going?" — only pause if a gate genuinely fails after a sensible revert, or if a destructive irreversible action requires explicit authorization. Tasks (TaskCreate) are good for tracking phases but resolving them is not a checkpoint to stop at.
+
+## Benchmark optimization workflow
+
+Each VNNCOMP **regular-track** benchmark is optimized on its own branch, then squash-merged to `main`. Goal: beat AB-CROWN on every regular-track benchmark.
+
+1. **Branch**: `git checkout -b bench/<benchmark>` from `main`.
+2. **Config**: create `configs/<benchmark>.yaml` containing ONLY the overrides on top of `configs/default.yaml`. Keys map 1:1 to `Settings` attrs (no hidden mapping). Loaded explicitly with `--config configs/<benchmark>.yaml`; if no `--config`, fall back to `default_settings_for(graph, spec)`.
+3. **Optimize on the remote GPU**: run vibecheck + AB-CROWN live side-by-side; cross-check against the published `~/repositories/vnncomp2025_results/alpha_beta_crown/2025_<benchmark>/results.csv`. Fix any obvious misses.
+4. **Stuck-case rule**: if a case won't crack after 1-2 attack angles, surface a diag (timing breakdown, open-spec count, phase outcome) back to the user rather than spinning indefinitely.
+5. **Integration tests**: add `tests/integration/test_<benchmark>.py` with ~3 cases (1 SAT if cracked + 2 hard UNSAT we verified). `@pytest.mark.integration`. Every merge re-runs *all* prior benchmarks' integration cases.
+6. **Pre-merge gap report**: before squash-merging, present (a) cases still unsolved, (b) any visible AB-CROWN wins, (c) score delta vs published AB-CROWN results — to the user for feedback. Do not merge until they approve.
+7. **Squash-merge** to `main`; delete branch.
+
+Allowed references: read auto_LiRPA / AB-CROWN source (`~/Desktop/temp/abcrown/alpha-beta-CROWN_vnncomp2025` on remote) or run them with debug prints — especially for non-ReLU activations (tanh, sigmoid, GELU, MHA) — then re-implement.
+
+### Track split (authoritative: `~/repositories/vnncomp2025_results/SCORING-SMALL-TOL/settings.py:30-59`)
+
+**Regular track (16) — what we score on**: acasxu_2023, cersyve, cgan_2023, cifar100_2024, collins_rul_cnn_2022, cora_2024, dist_shift_2023, linearizenn_2024, malbeware, metaroom_2023, nn4sys, safenlp_2024, sat_relu, soundnessbench, tinyimagenet_2024, tllverifybench_2023.
+
+**Extended track (10) — out of scope for scoring**: cctsdb_yolo_2023, collins_aerospace_benchmark, lsnc_relu, ml4acopf_2023, ml4acopf_2024, **relusplitter**, traffic_signs_recognition_2023, vggnet16_2022, vit_2023, yolo_2023.
+
+### Already optimized
+
+cifar100_2024 · mnist_fc (historical, regression-only) · tinyimagenet_2024 · relusplitter (extended; kept as deliverable).
+
+### Queue (alphabetical, regular track only)
+
+acasxu_2023 · cersyve · cgan_2023 · collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · linearizenn_2024 · malbeware · metaroom_2023 · nn4sys · safenlp_2024 · sat_relu · soundnessbench · tllverifybench_2023.

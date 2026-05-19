@@ -22,3 +22,8 @@ vibecheck = "vibecheck.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: per-benchmark verdict regression tests (slow; require GPU + vnncomp benchmarks)",
+]

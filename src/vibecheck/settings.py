@@ -421,6 +421,15 @@ def default_settings(**overrides):
         # (250 nodes, 100% decision match, 0 unsoundness). FP32 by default.
         phase8_use_dual_ascent_gpu=False,
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
+        # Phase 8 minimum-budget floor as fraction of total_timeout. The
+        # pipeline rebudgets so Phase 8 always gets at least this fraction
+        # of the wall, trimming earlier phases if they overran. 0.0 = off.
+        phase8_min_budget_frac=0.0,
+        # Phase 2 (CROWN spec direction). When False, reuses the spec_lbs
+        # already produced by Phase 0.5's batched α-CROWN — strictly tighter
+        # than basic CROWN, so skipping is sound and saves ~1-3s/case on
+        # cifar100/tinyimagenet ResNets.
+        phase2_crown_enabled=True,
         phase8_dual_ascent_repair_steps=5,
         gen_lp_skip_phase7_lp=True,     # skip per-query LP scoring; use α-CROWN/CROWN ew*frac fallback (saves Phase 7 LP wall — was ~4s/query on hard CIFAR100)
         gen_lp_score_method='lp_ew_frac',  # 'lp_ew_frac', 'lp_fractional', 'lp_dual'. lp_dual ranks by |tri_lo|+|tri_up| duals — identifies the actual LP-binding triangles (on CIFAR100_resnet_medium_prop_idx_2477 the duals concentrate in L5 where kfsb/ew_frac promotes L9). lp_dual adds ~1-2s/query Phase-8 overhead to re-solve gen-LP with dual extraction; beneficial on hard queries where the wrong layer is being branched on, neutral-to-slow otherwise. Opt-in via settings.
@@ -596,6 +605,17 @@ def default_settings(**overrides):
         phase26_pgd_per_spec_enabled=True,
         phase26_pgd_per_spec_time_budget=3.0,
         phase26_pgd_per_spec_min_per_spec=0.2,
+        # `strict_min=True`: each open spec gets at least min_per_spec
+        # regardless of total budget. False = stop when total exhausted.
+        phase26_pgd_per_spec_strict_min=True,
+        # Pre-α-CROWN PGD hook (zono-sorted). Fires after forward zono +
+        # adaptive CROWN, before α-CROWN. If SAT found, skip α-CROWN +
+        # cascade entirely. Budget per open spec is
+        # max(n × pgd_per_spec_min, time_left × total_frac) / n, capped
+        # at per_spec_cap. See verify_graph._pre_cascade_pgd_hook.
+        phase26_pre_cascade_enabled=True,
+        phase26_pre_cascade_total_frac=0.10,
+        phase26_pre_cascade_per_spec_cap=5.0,
         # Phase 1 gen-LP conv chunking. Default 256 = chunked with safe
         # block size + OOM-halve-retry fallback. The chunk loop itself
         # is ~0.3% overhead vs un-chunked; OOM halving costs ~0.2% per

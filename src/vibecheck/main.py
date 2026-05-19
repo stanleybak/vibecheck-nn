@@ -34,6 +34,12 @@ def main():
                         help='BnB timeout in seconds (default: 30)')
     parser.add_argument('--pgd-restarts', type=int, default=100,
                         help='PGD restarts for BnB (default: 100)')
+    parser.add_argument('--config', default=None,
+                        help='Per-benchmark YAML overrides on top of '
+                             'default_settings(). When set, overrides take '
+                             'precedence over CLI knobs; when omitted, '
+                             'default_settings_for(graph, spec) auto-detects '
+                             'a profile.')
     args = parser.parse_args()
 
     dtype = _DTYPES[args.dtype]
@@ -79,15 +85,29 @@ def main():
               f'timeout={args.timeout}s)...')
         result, details = milp_verify(graph, spec, settings)
     elif args.mode == 'graph':
-        from .config_profiles import default_settings_for
         from .verify_graph import verify_graph
-        settings = default_settings_for(
-            graph, spec,
-            device=args.device,
-            bits=args.bits,
-            total_timeout=args.timeout,
-            pgd_restarts=args.pgd_restarts,
-        )
+        if args.config is not None:
+            # Explicit per-benchmark YAML: load → use as overrides on top of
+            # default_settings(). CLI knobs (device/bits/timeout/...) apply
+            # too, but YAML overrides win when there's a conflict.
+            from .settings import default_settings
+            from .config_loader import load_config
+            yaml_overrides = load_config(args.config)
+            cli_overrides = dict(
+                device=args.device, bits=args.bits,
+                total_timeout=args.timeout, pgd_restarts=args.pgd_restarts)
+            cli_overrides.update(yaml_overrides)
+            settings = default_settings(**cli_overrides)
+            settings._profile = f'config:{args.config}'
+        else:
+            from .config_profiles import default_settings_for
+            settings = default_settings_for(
+                graph, spec,
+                device=args.device,
+                bits=args.bits,
+                total_timeout=args.timeout,
+                pgd_restarts=args.pgd_restarts,
+            )
         graph.optimize(settings)
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
