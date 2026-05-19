@@ -3500,6 +3500,43 @@ def _phase1_bab_refine(
         w_qs = np.zeros((1, n_output), dtype=np.float64)
         b_qs = np.zeros(1, dtype=np.float64)
 
+    # 2b. Pre-α-CROWN hook: zono-based spec lbs from z_final_initial give
+    # an *order* of disjuncts by closeness-to-SAT before paying for the
+    # α-CROWN intermediate refresh + spec backward. If PGD finds SAT here
+    # we skip α-CROWN entirely. For zonotope y = c + G·e, e∈[-1,1]^k:
+    #   spec_lb = w_q·c - b_q - ||w_q·G||_1
+    if pre_cascade_hook is not None and queries_flat:
+        _c = z_final_initial.center.flatten().detach().cpu().numpy(
+            ).astype(np.float64)
+        _G = z_final_initial.generators
+        _G_np = (_G.detach().cpu().numpy().astype(np.float64)
+                  if _G.numel() > 0
+                  else np.zeros((_c.size, 0), dtype=np.float64))
+        # `generators` is (n_flat, K) per TorchZonotope contract.
+        if _G_np.shape[0] != _c.size and _G_np.size > 0:
+            _G_np = _G_np.reshape(_c.size, -1)
+        spec_lbs_zono_dict = {}
+        for _qi in range(len(queries_flat)):
+            _wq = w_qs[_qi]
+            _bq = float(b_qs[_qi])
+            _wc = float(_wq @ _c) - _bq
+            _wG = _wq @ _G_np if _G_np.size > 0 else np.zeros(0)
+            spec_lbs_zono_dict[queries_flat[_qi][0]] = (
+                _wc - float(np.sum(np.abs(_wG))))
+        _open_qis_zono = [qi for qi in range(len(queries_flat))
+                           if spec_lbs_zono_dict[
+                               queries_flat[qi][0]] <= 0]
+        tb['spec_lbs_zono'] = dict(spec_lbs_zono_dict)
+        sat_witness = pre_cascade_hook(
+            spec_lbs_zono_dict, bounds_by_relu, _open_qis_zono)
+        if sat_witness is not None:
+            sb = {L: (torch.tensor(lo, dtype=dtype, device=device),
+                      torch.tensor(hi, dtype=dtype, device=device))
+                  for L, (lo, hi) in bounds_by_relu.items()}
+            tb['phase1_bab_refine'] = time.perf_counter() - t_total
+            tb['pre_cascade_sat'] = sat_witness
+            return sb, bounds_by_relu, z_final_initial, tb
+
     # 3. Window override (env var > setting).
     win = int(getattr(settings, 'bab_refine_window', 1))
     win_env = os.environ.get('VC_TIGHTEN_WINDOW', '')
@@ -3634,24 +3671,6 @@ def _phase1_bab_refine(
               for L, (lo, hi) in bounds_by_relu.items()}
         tb['phase1_bab_refine'] = time.perf_counter() - t_total
         return sb, bounds_by_relu, z_final_initial, tb
-
-    # Pre-cascade hook: try cheap per-spec PGD on still-open specs BEFORE
-    # spending the cascade budget on intermediate-bound tightening. If the
-    # hook returns a SAT witness, we abort Phase 1 and bubble the witness
-    # up to the caller via `tb['pre_cascade_sat']`. The hook receives the
-    # current spec lbs (so it can sort specs by closeness-to-SAT) and the
-    # current bounds_by_relu.
-    if pre_cascade_hook is not None:
-        spec_lbs_dict = {queries_flat[i][0]: float(spec_lbs_phase05[i])
-                          for i in range(len(queries_flat))}
-        sat_witness = pre_cascade_hook(spec_lbs_dict, bounds_by_relu, open_qis)
-        if sat_witness is not None:
-            sb = {L: (torch.tensor(lo, dtype=dtype, device=device),
-                      torch.tensor(hi, dtype=dtype, device=device))
-                  for L, (lo, hi) in bounds_by_relu.items()}
-            tb['phase1_bab_refine'] = time.perf_counter() - t_total
-            tb['pre_cascade_sat'] = sat_witness
-            return sb, bounds_by_relu, z_final_initial, tb
 
     # ---------- ew sweep restricted to OPEN queries ----------
     # min_ew_per_layer[L][j] = min over open specs of ew[i, j]. The
@@ -4866,10 +4885,29 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         # Restrict to OPEN disjuncts (spec_lb ≤ 0).
         ordered = sorted([d for d in disj_lb if disj_lb[d] <= 0],
                           key=lambda d: disj_lb[d])
-        _per = float(getattr(settings, 'phase26_pgd_per_spec_min_per_spec', 0.5))
+        # DotMap returns empty DotMap (not the default!) for missing keys.
+        _per_min = (float(settings.phase26_pgd_per_spec_min_per_spec)
+                     if 'phase26_pgd_per_spec_min_per_spec' in settings
+                     else 0.5)
+        # Uniform-split: total = max(n×per_min, time_left×frac). When few
+        # open specs (e.g. case 22: 2 open), each gets a much bigger slice
+        # without exceeding a small frac of the remaining wall budget.
+        _frac = (float(settings.phase26_pre_cascade_total_frac)
+                  if 'phase26_pre_cascade_total_frac' in settings
+                  else 0.10)
+        _n = max(len(ordered), 1)
+        _total = max(_n * _per_min, time_left() * _frac)
+        _per = _total / _n
+        # Per-spec hard cap so a single spec never gobbles the budget.
+        _per_cap = (float(settings.phase26_pre_cascade_per_spec_cap)
+                     if 'phase26_pre_cascade_per_spec_cap' in settings
+                     else 5.0)
+        _per = min(_per, _per_cap)
         if print_progress:
             print(f'  [pre-cascade PGD] {len(ordered)} open disjuncts, '
-                  f'{_per}s each (sorted by spec_lb asc)', flush=True)
+                  f'{_per:.2f}s each (sorted by spec_lb asc; '
+                  f'frac={_frac:.2f}, per_min={_per_min:.2f}, '
+                  f'cap={_per_cap:.1f})', flush=True)
         n_attacked = 0
         for di in ordered:
             if time_left() <= 0.5: break
