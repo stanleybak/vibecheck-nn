@@ -628,6 +628,15 @@ def default_settings(**overrides):
         # prevents thread from bleeding into Phase 7/8.
         parallel_pgd_enabled=False,
         parallel_pgd_max_attacks=20,
+        # ONNXRuntime SAT-witness validation (defense-in-depth).
+        # Before returning 'sat' from any path, run the witness through
+        # the ORIGINAL ONNX model + check it actually violates the spec
+        # within `sat_validate_atol` (mirrors VNNCOMP scoring's
+        # COUNTEREXAMPLE_ATOL=1e-4). Spurious witnesses are downgraded
+        # to 'unknown' with `details['spurious_witness']` populated.
+        # `skip_sat_validation=True` opts out (e.g. for ORT-free envs).
+        sat_validate_atol=1e-4,
+        skip_sat_validation=False,
         # Phase 1 gen-LP conv chunking. Default 256 = chunked with safe
         # block size + OOM-halve-retry fallback. The chunk loop itself
         # is ~0.3% overhead vs un-chunked; OOM halving costs ~0.2% per

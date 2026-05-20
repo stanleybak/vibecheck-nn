@@ -100,7 +100,9 @@ phase8_use_alpha_ew: true
 phase8_use_dual_ascent_gpu: false
 print_progress: true
 raise_on_oom: true
+sat_validate_atol: 0.0001
 skip_phase8_milp: false
+skip_sat_validation: false
 spec_impl: gen_lp
 tighten_formulation: gen_cone
 tighten_solver: milp

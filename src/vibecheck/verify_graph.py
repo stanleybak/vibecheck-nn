@@ -4736,6 +4736,67 @@ def _compute_avg_layer_width(gg, bounds_by_relu):
     return out
 
 
+def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
+    """Run a SAT witness through ONNXRuntime + check it actually violates
+    the spec. Catches spurious counterexamples from PGD/MILP bugs OR from
+    graph-builder bugs (vibecheck's internal forward might compute a
+    different value than the original ONNX). Mirrors VNNCOMP scoring's
+    counterexample-validation step (COUNTEREXAMPLE_ATOL=1e-4).
+
+    Returns (ok, info_dict). `ok=True` iff witness is in the input box
+    (within atol) AND its ORT output satisfies the unsafe condition
+    (i.e., `spec.check(out, out)` returns 'unknown', within atol on
+    constraint margins).
+    """
+    info = {'ok': False, 'reason': None}
+    if onnx_path is None:
+        info['reason'] = 'no onnx_path stashed on graph; skipping validation'
+        return True, info
+    w = np.asarray(witness).flatten().astype(np.float64)
+    if w.shape != spec.x_lo.shape:
+        info['reason'] = (f'witness shape {w.shape} != x_lo shape '
+                           f'{spec.x_lo.shape}')
+        return False, info
+    if (np.any(w < spec.x_lo - atol)
+            or np.any(w > spec.x_hi + atol)):
+        info['reason'] = (f'witness outside input box (atol={atol})')
+        info['out_of_box'] = (
+            float((spec.x_lo - w).max()), float((w - spec.x_hi).max()))
+        return False, info
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        info['reason'] = 'onnxruntime not installed; skipping validation'
+        return True, info
+    try:
+        sess = ort.InferenceSession(
+            onnx_path, providers=['CPUExecutionProvider'])
+        in_meta = sess.get_inputs()[0]
+        in_shape = [d if isinstance(d, int) and d > 0 else 1
+                    for d in in_meta.shape]
+        x = w.reshape(in_shape).astype(np.float32)
+        out = sess.run(None, {in_meta.name: x})[0]
+        out_flat = np.asarray(out).flatten().astype(np.float64)
+    except Exception as e:
+        info['reason'] = f'ORT forward failed: {type(e).__name__}: {e}'
+        return False, info
+    info['out'] = out_flat
+    # spec.check returns 'unknown' iff worst margin <= 0. Apply atol slack
+    # by shifting output: pass (out-atol, out+atol) so margins computed
+    # against a generous output band — a witness near the boundary counts
+    # as a valid SAT if any output in the +/-atol envelope violates.
+    check_res, check_info = spec.check(out_flat - atol, out_flat + atol)
+    info['spec_check'] = check_res
+    info['worst_margin'] = check_info.get('worst_margin')
+    if check_res == 'unknown':
+        info['ok'] = True
+        return True, info
+    info['reason'] = (f'ORT output does not violate spec '
+                       f'(worst_margin={info["worst_margin"]:.4g}, '
+                       f'atol={atol})')
+    return False, info
+
+
 def _run_pipeline(graph, spec, settings, build_fn, impl):
     """Run the 9-phase graph verification pipeline.
 
@@ -4801,6 +4862,30 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         torch.cuda.reset_peak_memory_stats()
 
     def _finalize(result_str, phase, **extra):
+        # Defense-in-depth: every SAT verdict must pass ONNXRuntime
+        # validation against the spec (within COUNTEREXAMPLE_ATOL).
+        # Catches spurious witnesses from PGD/MILP bugs AND graph-
+        # builder bugs that would otherwise leak through silently.
+        # Spurious witnesses get downgraded to 'unknown' with
+        # `details['spurious_witness']` set and logged.
+        if (result_str == 'sat' and extra.get('witness') is not None
+                and not bool(getattr(
+                    settings, 'skip_sat_validation', False))):
+            _atol = float(settings.sat_validate_atol
+                           if 'sat_validate_atol' in settings else 1e-4)
+            _onnx_path = getattr(graph, 'onnx_path', None)
+            _ok, _info = _validate_sat_witness(
+                _onnx_path, spec, extra['witness'], atol=_atol)
+            if not _ok:
+                if print_progress:
+                    print(f'  [validate] SPURIOUS SAT from {phase}: '
+                          f'{_info.get("reason")}', flush=True)
+                # Stash for diagnostics + downgrade verdict.
+                extra = dict(extra)
+                extra['spurious_witness'] = _info
+                extra['original_phase'] = phase
+                result_str = 'unknown'
+                phase = f'spurious_sat_{phase}'
         details['result'] = result_str
         details['phase'] = phase
         details['time'] = time.perf_counter() - t_start

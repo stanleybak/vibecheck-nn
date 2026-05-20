@@ -49,8 +49,24 @@ class Conjunct:
     constraints: list
 
     def margin(self, output_lo, output_hi):
-        """Worst margin across constraints. Positive = conjunction verified safe."""
-        return min(c.margin(output_lo, output_hi) for c in self.constraints)
+        """Best margin across constraints — conjunction is safe iff ANY
+        constraint is provably violated for all outputs in [lo, hi].
+
+        The conjunct's unsafe region is `c1 AND c2 AND ...`. To prove
+        the conjunct's unsafe region unreachable, we only need to prove
+        ONE of the constraints provably-not-satisfied (since AND fails
+        if any operand fails). So conjunct safe iff max(c.margin) > 0.
+
+        Earlier this used `min`, which only declared safe when ALL
+        constraints were individually safe — wrong semantics for AND.
+        Silent on benchmarks where every conjunct has one constraint
+        (cifar100, tinyimagenet — `min(single) == max(single)`);
+        triggered on cersyve where each conjunct has two constraints.
+        The ORT-based `_validate_sat_witness` in verify_graph is the
+        pipeline-level defense-in-depth that catches the SAT side of
+        this kind of bug; this fix corrects the verification side.
+        """
+        return max(c.margin(output_lo, output_hi) for c in self.constraints)
 
     def __str__(self):
         return ' AND '.join(str(c) for c in self.constraints)
