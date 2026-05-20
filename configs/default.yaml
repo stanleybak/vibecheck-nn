@@ -53,6 +53,8 @@ milp_lp_per_worker: true
 milp_sample_timeout: 5.0
 milp_scoring: ew_frac
 optimize_relu_relation: true
+parallel_pgd_enabled: false
+parallel_pgd_max_attacks: 20
 pgd_alpha_frac: 0.25
 pgd_before_enabled: false
 pgd_hinge_threshold: -1.0e-05

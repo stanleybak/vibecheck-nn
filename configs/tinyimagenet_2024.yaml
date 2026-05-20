@@ -12,4 +12,5 @@ phase26_pgd_per_spec_min_per_spec: 0.5
 phase26_pgd_per_spec_strict_min: true
 phase26_pre_cascade_total_frac: 0.10
 phase26_pre_cascade_per_spec_cap: 5.0
+parallel_pgd_enabled: true
 pgd_restarts: 100

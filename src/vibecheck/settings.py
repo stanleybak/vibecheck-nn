@@ -616,6 +616,18 @@ def default_settings(**overrides):
         phase26_pre_cascade_enabled=True,
         phase26_pre_cascade_total_frac=0.10,
         phase26_pre_cascade_per_spec_cap=5.0,
+        # Parallel PGD (background THREAD) that runs PGD attacks during
+        # Phase 1's pure-CPU MILP windows. A GPU lock is held by main
+        # during all GPU work (α-CROWN, gen_cone_state setup, forward
+        # zono) and released only around `pool.imap_unordered` in the
+        # MILP cascade — the genuinely GPU-idle window (~13s on
+        # tinyimagenet medium). The thread acquires the lock per attack,
+        # so PGD's CUDA kernels only run during MILP windows and α-CROWN
+        # is not slowed (validated: α-CROWN time unchanged at 2.5s
+        # locked vs 2.5s solo). Cap on attacks via `parallel_pgd_max_attacks`
+        # prevents thread from bleeding into Phase 7/8.
+        parallel_pgd_enabled=False,
+        parallel_pgd_max_attacks=20,
         # Phase 1 gen-LP conv chunking. Default 256 = chunked with safe
         # block size + OOM-halve-retry fallback. The chunk loop itself
         # is ~0.3% overhead vs un-chunked; OOM halving costs ~0.2% per

@@ -2699,7 +2699,8 @@ def _tighten_layer_gen_cone(gg_ops_ser, x_lo, x_hi, bounds_by_relu,
                             target_layer_idx, unstable, input_name,
                             sample_timeout, n_cores, time_left, *,
                             mode='probe', device, dtype,
-                            use_milp=False, precomputed=None):
+                            use_milp=False, precomputed=None,
+                            gpu_lock=None):
     """G-cone per-target-neuron tightening for one ReLU layer.
 
     Obtains the gen-LP-style per-ReLU rows either from `precomputed`
@@ -2800,6 +2801,12 @@ def _tighten_layer_gen_cone(gg_ops_ser, x_lo, x_hi, bounds_by_relu,
         chunksize = 1
         n_timeouts = 0; n_solved = 0
         pool = multiprocessing.Pool(n_cores)
+        # GPU is truly idle here — only Gurobi CPU work in worker
+        # subprocesses. Signal `milp_active` so a parallel PGD worker
+        # thread knows it can launch CUDA kernels without contending
+        # with main. Main never blocks; the thread polls this flag.
+        if gpu_lock is not None:
+            gpu_lock.set()  # gpu_lock is a threading.Event named milp_active
         try:
             for j, lb_j, ub_j, to_j, db_j, ds_j in pool.imap_unordered(
                     _solve_gen_cone_neuron_worker, tasks,
@@ -2817,6 +2824,8 @@ def _tighten_layer_gen_cone(gg_ops_ser, x_lo, x_hi, bounds_by_relu,
         finally:
             pool.terminate()
             pool.join()
+            if gpu_lock is not None:
+                gpu_lock.clear()
         if os.environ.get('VC_LOG_MILP_TIMEOUTS', '') == '1' and n_solved > 0:
             print(f'    [tighten L{target_layer_idx}] {n_timeouts}/{n_solved} '
                   f'neurons hit MILP timeout '
@@ -3393,7 +3402,8 @@ def _phase1_bab_refine(
         sample_timeout, n_cores, time_left,
         device, dtype, settings, spec=None,
         print_progress=False, verbose_cb=None,
-        rec_zono=None, pre_cascade_hook=None):
+        rec_zono=None, pre_cascade_hook=None, gpu_lock=None,
+        parallel_pgd_ctx=None):
     """α,β-CROWN-style bab-refine cascade Phase 1.
 
     Algorithm:
@@ -3672,6 +3682,73 @@ def _phase1_bab_refine(
         tb['phase1_bab_refine'] = time.perf_counter() - t_total
         return sb, bounds_by_relu, z_final_initial, tb
 
+    # ---------- Parallel PGD worker (only open disjuncts, MILP-window) ----------
+    # Spawn AFTER Phase 0.5 so we target only the queries Phase 0.5
+    # couldn't close. Thread runs PGD on each open disjunct (sorted by
+    # spec_lb ascending = most-likely-SAT first) during cascade's MILP
+    # windows (signaled via `gpu_lock` which is a threading.Event used
+    # as `milp_active`). Thread stops + joins at end of bab_refine so it
+    # never runs concurrently with Phase 8.
+    parallel_pgd_thread = None
+    parallel_pgd_state = None
+    if (parallel_pgd_ctx is not None and gpu_lock is not None
+            and open_qis and not bool(getattr(
+                settings, 'disable_sat_finding', False))):
+        import threading as _threading
+        # Map open queries → disjuncts, sorted by spec_lb ascending.
+        _open_disjs = {}
+        for _qi in open_qis:
+            _di = queries_flat[_qi][0]
+            _lb = float(spec_lbs_phase05[_qi])
+            if _di not in _open_disjs or _lb < _open_disjs[_di]:
+                _open_disjs[_di] = _lb
+        _ordered_disjs = sorted(_open_disjs.keys(),
+                                  key=lambda _d: _open_disjs[_d])
+        _per_b = (float(settings.phase26_pgd_per_spec_min_per_spec)
+                   if 'phase26_pgd_per_spec_min_per_spec' in settings
+                   else 0.5)
+        parallel_pgd_state = {
+            'witness': None, 'di': None,
+            'stop': _threading.Event(), 'n': 0}
+        _xl_pgd = parallel_pgd_ctx['xl_pgd']
+        _xh_pgd = parallel_pgd_ctx['xh_pgd']
+        _gg_pgd = parallel_pgd_ctx['gg_pgd']
+        _spec_pgd = parallel_pgd_ctx['spec']
+        milp_active = gpu_lock  # alias for clarity (it's a threading.Event)
+
+        def _pgd_thread_main():
+            for _di in _ordered_disjs:
+                # Poll for milp_active in short ticks; don't break on
+                # any single timeout — pre-cascade or α-CROWN may run
+                # many seconds before the first MILP window opens.
+                while True:
+                    if parallel_pgd_state['stop'].is_set(): return
+                    if time_left() <= 1.0: return
+                    if milp_active.wait(timeout=0.5):
+                        break
+                if parallel_pgd_state['stop'].is_set(): return
+                try:
+                    _ok, _w = _pgd_attack_general(
+                        _xl_pgd, _xh_pgd, _spec_pgd, _gg_pgd, settings,
+                        restrict_disj={_di},
+                        time_budget=min(_per_b,
+                                          max(time_left() - 0.5, 0.1)))
+                except (RuntimeError, torch.cuda.OutOfMemoryError):
+                    _ok, _w = False, None
+                parallel_pgd_state['n'] += 1
+                if _ok:
+                    parallel_pgd_state['witness'] = _w
+                    parallel_pgd_state['di'] = _di
+                    return
+
+        parallel_pgd_thread = _threading.Thread(
+            target=_pgd_thread_main, daemon=True)
+        parallel_pgd_thread.start()
+        if print_progress:
+            print(f'  [parallel-PGD] thread started (open-only, '
+                  f'{len(_ordered_disjs)} disj, per={_per_b}s)',
+                  flush=True)
+
     # ---------- ew sweep restricted to OPEN queries ----------
     # min_ew_per_layer[L][j] = min over open specs of ew[i, j]. The
     # AB-CROWN `remove_unstable_neurons` filter skips neurons whose
@@ -3783,7 +3860,8 @@ def _phase1_bab_refine(
                 gg['input_name'],
                 sample_timeout=sample_timeout, n_cores=n_cores,
                 time_left=_layer_time_left, mode='gen_cone_milp',
-                device=device, dtype=dtype, use_milp=True, precomputed=None)
+                device=device, dtype=dtype, use_milp=True, precomputed=None,
+                gpu_lock=gpu_lock)
             bounds_by_relu[L] = (np.maximum(lo_l, new_lo),
                                   np.minimum(hi_l, new_hi))
             tb['phase1_milp_total'] += time.perf_counter() - t_m
@@ -3869,6 +3947,25 @@ def _phase1_bab_refine(
             _, z_final_initial = _forward_zonotope_graph(
                 xl, xh, gg, device, dtype, settings=settings,
                 rec_zono=rec_zono, tight_bounds=bounds_by_relu)
+
+    # Stop + join parallel PGD thread (if spawned). MUST happen before
+    # return so the thread never runs concurrently with Phase 7/8.
+    if parallel_pgd_thread is not None:
+        parallel_pgd_state['stop'].set()
+        if gpu_lock is not None:
+            gpu_lock.set()  # wake any pending .wait()
+        parallel_pgd_thread.join(timeout=2.0)
+        tb['parallel_pgd_attacks'] = parallel_pgd_state['n']
+        if parallel_pgd_state['witness'] is not None:
+            tb['parallel_pgd_sat'] = parallel_pgd_state['witness']
+            tb['parallel_pgd_di'] = parallel_pgd_state['di']
+        if print_progress:
+            _alive = parallel_pgd_thread.is_alive()
+            print(f'  [parallel-PGD] joined: '
+                  f'n_attacks={parallel_pgd_state["n"]}, '
+                  f'sat={parallel_pgd_state["witness"] is not None}, '
+                  f'alive_after_join={_alive}', flush=True)
+
     tb['phase1_bab_refine'] = time.perf_counter() - t_total
     return sb, bounds_by_relu, z_final_initial, tb
 
@@ -4847,6 +4944,23 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         if pgd_sat:
             return _finalize('sat', 'pgd', witness=pgd_witness)
 
+    # --- Parallel PGD context (spawned inside Phase 1 after Phase 0.5). ---
+    # Pass the float32 GPU graph + bounds; _phase1_bab_refine spawns the
+    # worker thread AFTER Phase 0.5 closes the easy specs so the thread
+    # only attacks actually-open disjuncts. `milp_active` is a
+    # threading.Event toggled by main inside the cascade's MILP loop.
+    milp_active = None
+    parallel_pgd_ctx = None
+    _parallel_pgd = (
+        bool(settings.parallel_pgd_enabled)
+        if 'parallel_pgd_enabled' in settings else False)
+    if (_parallel_pgd and not _disable_sat
+            and disj_queries and time_left() > 5):
+        import threading as _threading
+        milp_active = _threading.Event()
+        parallel_pgd_ctx = dict(
+            xl_pgd=xl_pgd, xh_pgd=xh_pgd, gg_pgd=gg_pgd, spec=spec)
+
     # --- Phase 1: interleaved zonotope forward + per-layer tightening ---
     # At every ReLU we pause, run the per-neuron adaptive backward and
     # an optional LP probe, then apply the ReLU using the tightened
@@ -4945,7 +5059,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     settings, spec=spec,
                     print_progress=print_progress, verbose_cb=_verbose_cb,
                     rec_zono=rec_zono,
-                    pre_cascade_hook=_pre_cascade_pgd_hook)
+                    pre_cascade_hook=_pre_cascade_pgd_hook,
+                    gpu_lock=milp_active,
+                    parallel_pgd_ctx=parallel_pgd_ctx)
         else:
             sb, bounds_by_relu, z_final_phase1, phase1_tb = \
                 _forward_zonotope_interleaved(
@@ -4987,6 +5103,16 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     timing['phase1_zono_tighten'] = time.perf_counter() - t0
     timing['phase1_breakdown'] = phase1_tb
     _mem_audit('after phase1')
+
+    # --- Check parallel PGD result (thread joined inside Phase 1) ---
+    if isinstance(phase1_tb, dict):
+        _pp_attacks = phase1_tb.get('parallel_pgd_attacks')
+        if _pp_attacks is not None:
+            timing['parallel_pgd_attacks'] = _pp_attacks
+        _pp_witness = phase1_tb.get('parallel_pgd_sat')
+        if _pp_witness is not None:
+            return _finalize('sat', 'parallel_pgd', witness=_pp_witness)
+
     # Phase 1 done — drop the pre-Phase-8 budget cap so Phase 2/2.5/2.6/7/8
     # all see the full remaining time_left. The cap's purpose is to stop
     # the cascade from eating Phase 8's budget; once the cascade has
@@ -5143,6 +5269,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     # queries) so the budget is spent where SAT is most plausible.
     if (still_open_disj and not _disable_sat
             and getattr(settings, 'phase26_pgd_per_spec_enabled', True)
+            and parallel_pgd_ctx is None    # skip when parallel ran inside Phase 1
             and time_left() > 0):
         t0 = time.perf_counter()
         _p26_total = float(getattr(

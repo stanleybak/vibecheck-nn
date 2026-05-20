@@ -21,7 +21,7 @@ def load_config(path):
     """
     p = Path(path)
     assert p.exists(), f'config not found: {path}'
-    with open(p) as f:
+    with open(p, encoding='utf-8') as f:
         overrides = yaml.safe_load(f) or {}
     assert isinstance(overrides, dict), (
         f'config must be a YAML mapping, got {type(overrides).__name__}')
