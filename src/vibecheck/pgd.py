@@ -223,7 +223,30 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
     t_start = time.perf_counter()
 
     eps_input = (xh - xl) / 2.0
-    step_size_tensor = eps_input * alpha_frac
+    # Multi-α restart pool: a single α is brittle on benchmarks with
+    # narrow-SAT regions where the right step size varies across cases
+    # (cersyve: lane_keep wants α≈0.01, pendulum wants α≈0.005, and
+    # different alphas crack different SAT cases). When
+    # `pgd_alpha_multi=True` (default False), partition the restart
+    # pool across the log-spaced alphas in `pgd_alpha_multi_fractions`
+    # so each restart gets its own α. Equivalent throughput, much
+    # broader coverage.
+    _alpha_multi = bool(getattr(settings, 'pgd_alpha_multi', False))
+    if _alpha_multi:
+        _alpha_fracs = list(getattr(
+            settings, 'pgd_alpha_multi_fractions', [0.25, 0.05, 0.01, 0.002]))
+        # Per-restart α: cycle through the alpha list
+        # step_size_tensor shape will be (n_restarts, *eps_input.shape)
+        per_restart_alpha = torch.tensor(
+            [_alpha_fracs[i % len(_alpha_fracs)] for i in range(n_restarts)],
+            dtype=dt, device=dev)
+        # Broadcast (n_restarts,) × eps_input shape via outer product on
+        # dimension 0
+        while per_restart_alpha.dim() < eps_input.dim() + 1:
+            per_restart_alpha = per_restart_alpha.unsqueeze(-1)
+        step_size_tensor = eps_input.unsqueeze(0) * per_restart_alpha
+    else:
+        step_size_tensor = eps_input * alpha_frac
     pgd_optim = str(getattr(settings, 'pgd_optim', 'adam_sign'))
 
     # Select disjuncts
@@ -320,14 +343,13 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
         # Flatten margins into one tensor for hinge loss.
         # Loss formulation matches α,β-CROWN's `default_pgd_loss`:
         # sum (over surviving spec rows) of clamp(margin, min=-1e-5).
-        # Earlier formulation took MAX over rows — only the worst spec
-        # got gradient, so PGD couldn't notice if a different spec was
-        # closer to violation. SUM gives every still-positive spec
+        # Tried per-disjunct max-over-constraints loss (focuses gradient
+        # on the AND group's least-violated constraint), but on cersyve
+        # it oscillates between constraints and lands on 1/12 SAT vs the
+        # sum loss's 2/12. Sum gives every still-positive constraint
         # gradient simultaneously; once one drops below the hinge it
         # freezes and the optimizer redistributes effort. Required to
-        # match α,β-CROWN's PGD success rate on near-boundary CEXes
-        # (e.g. CIFAR100 resnet_large idx 3585 sidx 3469: α,β-CROWN
-        # finds CEX in 0.07s, MAX loss missed it entirely).
+        # match α,β-CROWN's PGD success rate on near-boundary CEXes.
         flat_margins = torch.cat(margins_pd, dim=1) if margins_pd else None
         if flat_margins is None or flat_margins.numel() == 0:
             return False, None

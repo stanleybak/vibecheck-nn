@@ -6340,8 +6340,35 @@ def verify_graph(graph, spec, settings):
     n_in = int(np.prod(spec.x_lo.shape)) if hasattr(spec, 'x_lo') else 10**9
     if (getattr(settings, 'input_split_enabled', True)
             and n_in <= int(getattr(settings, 'input_split_max_dims', 20))):
-        return _input_split_verify(graph, spec, settings, build_fn, impl)
-    return _run_pipeline(graph, spec, settings, build_fn, impl)
+        result, details = _input_split_verify(
+            graph, spec, settings, build_fn, impl)
+    else:
+        result, details = _run_pipeline(
+            graph, spec, settings, build_fn, impl)
+    # Top-level SAT witness validation — defense-in-depth against
+    # spurious counterexamples from any code path (input_split bypasses
+    # _finalize). Idempotent: if _finalize already validated, the
+    # witness is already a real one and the second check just confirms.
+    if (result == 'sat' and isinstance(details, dict)
+            and details.get('witness') is not None
+            and not bool(getattr(settings, 'skip_sat_validation', False))
+            and not details.get('witness_validated_at_topvel', False)):
+        _atol = float(settings.sat_validate_atol
+                       if 'sat_validate_atol' in settings else 1e-4)
+        _ok, _info = _validate_sat_witness(
+            getattr(graph, 'onnx_path', None), spec, details['witness'],
+            atol=_atol)
+        details['witness_validated_at_topvel'] = True
+        if not _ok:
+            if getattr(settings, 'print_progress', False):
+                print(f'  [validate-top] SPURIOUS SAT from '
+                      f'{details.get("phase")}: '
+                      f'{_info.get("reason")}', flush=True)
+            details['spurious_witness'] = _info
+            details['original_phase'] = details.get('phase')
+            details['phase'] = f'spurious_sat_{details.get("phase")}'
+            result = 'unknown'
+    return result, details
 
 
 def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):

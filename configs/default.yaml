@@ -56,6 +56,12 @@ optimize_relu_relation: true
 parallel_pgd_enabled: false
 parallel_pgd_max_attacks: 20
 pgd_alpha_frac: 0.25
+pgd_alpha_multi: false
+pgd_alpha_multi_fractions:
+- 0.25
+- 0.05
+- 0.01
+- 0.002
 pgd_before_enabled: false
 pgd_hinge_threshold: -1.0e-05
 pgd_init_mode: osi

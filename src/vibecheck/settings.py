@@ -60,6 +60,13 @@ def default_settings(**overrides):
         pgd_lr_decay=0.99,               # step-size × this every iter
         pgd_hinge_threshold=-1e-5,       # clamp margins at this from below
         pgd_alpha_frac=0.25,             # step_size = eps_input * this
+        # Multi-α restart pool: when True, partition the n_restarts pool
+        # across the log-spaced alphas in `pgd_alpha_multi_fractions` so
+        # each restart gets a different step size. Helps when the right
+        # α varies across cases (cersyve: lane_keep wants ~0.01,
+        # pendulum ~0.005). Equivalent compute, much broader coverage.
+        pgd_alpha_multi=False,
+        pgd_alpha_multi_fractions=(0.25, 0.05, 0.01, 0.002),
         # PGD optimizer choice. Three modes:
         #   'adam_sign'    — bias-corrected Adam moment, sign-clipped step
         #                    (current vibecheck behavior, kept as default
