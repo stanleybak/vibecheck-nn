@@ -1,0 +1,17 @@
+# cifar100_2024 — CIFAR100 ResNet (medium/large), VNNCOMP regular track.
+# Overrides match scratch/runner_p25off.py (the runner used in the v6 sweep
+# that beat AB-CROWN on most SAT cases).
+phase8_use_dual_ascent_gpu: true
+phase8_dual_ascent_max_iter: 1
+zono_lift_enabled: false             # skip Phase 2.5
+phase2_crown_enabled: false          # reuse Phase 0.5 spec_lbs
+phase8_min_budget_frac: 0.5          # Phase 8 gets >= half of total_timeout
+pgd_middle_enabled: false            # skip Phase 3.5 (2.6 strictly better)
+phase26_pgd_per_spec_min_per_spec: 0.5
+phase26_pgd_per_spec_strict_min: true
+# Pre-cascade PGD uniform-split (catches missed SAT like prop_6583).
+phase26_pre_cascade_total_frac: 0.10
+phase26_pre_cascade_per_spec_cap: 5.0
+# Parallel PGD during MILP windows (~10s win on UNSAT).
+parallel_pgd_enabled: true
+pgd_restarts: 100

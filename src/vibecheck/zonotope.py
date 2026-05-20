@@ -1,4 +1,35 @@
-"""Zonotope forward propagation — dense numpy and torch implementations."""
+"""Zonotope forward propagation — dense numpy and torch implementations.
+
+Generator column-order invariant (load-bearing for skip-connection add)
+-----------------------------------------------------------------------
+Each generator column in a zonotope's G matrix represents the sensitivity
+to one noise symbol ε_i ∈ [-1, 1]. When two branches of a fork-and-merge
+DAG meet at a skip-connection add, the first ``shared_gens`` columns in
+both branches MUST correspond to the same noise symbols in the same
+order — otherwise positional elementwise add produces UNSOUND bounds.
+
+This invariant is maintained STATICALLY by:
+
+  1. Every propagation op preserves column count and order:
+       - ``propagate_conv`` applies the conv to each column in place
+         (preserves count, no reorder).
+       - ``propagate_fc`` does ``G_out = W @ G_in`` (preserves count,
+         no reorder).
+       - ``apply_relu`` / ``apply_relu_custom`` scale existing columns
+         by λ in place, then APPEND new μ-columns at the end via
+         ``torch.cat([old, new], dim=1)`` — never insert mid-matrix.
+       - ``copy`` clones column-for-column.
+
+  2. ``_find_shared_gens_count`` (in ``verify_zono_bnb.py`` and
+     ``network.py``) returns the K at the deepest common fork ancestor
+     — precisely the count of columns that both branches inherited in
+     order from the fork.
+
+Any future op that reorders, drops, or inserts generator columns must
+also update ``_find_shared_gens_count`` and re-verify that skip merges
+stay sound. No runtime tracking is done — the invariant is entirely
+static.
+"""
 
 import numpy as np
 import torch
@@ -14,11 +45,49 @@ class TorchZonotope:
     """Zonotope with torch tensors on GPU/CPU for BnB verification.
 
     Representation: { center + G @ e | ||e||_inf <= 1 }
+
+    The external generator view is the 2D `(n_flat, K)` tensor exposed
+    via the `generators` property — shape contract unchanged. Internally
+    we keep two alternate representations and pick whichever avoids
+    reshapes:
+
+      - `_gen_2d`: shape `(n_flat, K)` — canonical for FC, merge-add,
+        external reads.
+      - `_gen_4d`: shape `(K, C, H, W)` — canonical after a conv. Lets
+        consecutive conv + relu steps avoid the non-contiguous transpose
+        that the naive (n_flat, K) form forces through F.conv2d.
+
+    Exactly one is populated at a time; the property getter transitions
+    4D → 2D on demand. Setter writes store 2D. `propagate_conv` and
+    `apply_relu` operate in whichever form is already populated, so a
+    `conv → relu → conv → relu` sequence stays 4D end-to-end.
     """
 
     def __init__(self, center, generators):
         self.center = center
-        self.generators = generators
+        self._gen_2d = generators
+        self._gen_4d = None
+
+    @property
+    def generators(self):
+        """External 2D view — (n_flat, K). Materializes from 4D on demand."""
+        if self._gen_4d is not None:
+            K = self._gen_4d.shape[0]
+            self._gen_2d = self._gen_4d.reshape(K, -1).t().contiguous()
+            self._gen_4d = None
+        return self._gen_2d
+
+    @generators.setter
+    def generators(self, value):
+        self._gen_2d = value
+        self._gen_4d = None
+
+    @property
+    def n_gens(self):
+        """Number of generator columns without materialising the 2D view."""
+        if self._gen_4d is not None:
+            return self._gen_4d.shape[0]
+        return self._gen_2d.shape[1]
 
     @classmethod
     def from_input_bounds(cls, x_lo, x_hi, device, dtype):
@@ -34,28 +103,99 @@ class TorchZonotope:
 
     def bounds(self):
         """Compute element-wise (lo, hi) bounds."""
-        abs_sum = torch.abs(self.generators).sum(dim=1)
+        if self._gen_4d is not None:
+            K = self._gen_4d.shape[0]
+            abs_sum = torch.abs(self._gen_4d).reshape(K, -1).sum(dim=0)
+        else:
+            abs_sum = torch.abs(self._gen_2d).sum(dim=1)
         return self.center - abs_sum, self.center + abs_sum
 
+    def get_gen_row(self, neuron_idx):
+        """Read a single row of G at flat neuron_idx without forcing 4D→2D.
+
+        Returns a 1-D tensor of shape `(K,)`. When _gen_4d is populated,
+        this reshape-indexes the 4D tensor (cheap view; no materialization
+        of the 2D cache). When _gen_2d is populated, returns a row slice.
+        """
+        if self._gen_4d is not None:
+            K = self._gen_4d.shape[0]
+            return self._gen_4d.reshape(K, -1)[:, neuron_idx]
+        return self._gen_2d[neuron_idx, :]
+
     def propagate_conv(self, kernel, bias, input_shape, stride, padding):
-        """Propagate through a Conv2d layer."""
+        """Propagate through a Conv2d layer.
+
+        Operates natively in 4D `(K, C, H, W)`. If incoming generators
+        are in 2D form, converts once (single transpose+reshape); the
+        output stays 4D so a subsequent conv/relu is reshape-free.
+
+        For large G (K ≫ 1000), `F.conv2d` on the full generator batch
+        triggers a cuDNN workspace + output-alloc that can reach 3-4 GB
+        on resnet-sized nets. When K exceeds a threshold, we split G
+        into chunks, convolve each, and write directly into a
+        pre-allocated output — avoiding the cat-based double-alloc.
+        """
         self.center = F.conv2d(
             self.center.reshape(1, *input_shape), kernel, bias=bias,
             stride=stride, padding=padding).flatten()
-        K = self.generators.shape[1]
-        if K > 0:
-            self.generators = F.conv2d(
-                self.generators.T.reshape(K, *input_shape), kernel,
-                stride=stride, padding=padding).reshape(K, -1).T
+        if self._gen_4d is None:
+            if self._gen_2d is None or self._gen_2d.shape[1] == 0:
+                return
+            K = self._gen_2d.shape[1]
+            g4d = self._gen_2d.t().contiguous().reshape(K, *input_shape)
+        else:
+            g4d = self._gen_4d
+            if g4d.shape[0] == 0:
+                return
+            K = g4d.shape[0]
+        # Chunked convolution: bounds cuDNN workspace to ~chunk_size gens.
+        # Threshold 512 picked so chunks on 32×32 maps fit in ~300 MB.
+        chunk_size = 512
+        if K > chunk_size:
+            # Probe output shape with a tiny slice, preallocate, stream.
+            sample = F.conv2d(
+                g4d[:1], kernel, stride=stride, padding=padding)
+            out_shape = (K,) + tuple(sample.shape[1:])
+            out = torch.empty(
+                out_shape, dtype=g4d.dtype, device=g4d.device)
+            out[:1] = sample
+            del sample
+            for start in range(1, K, chunk_size):
+                end = min(start + chunk_size, K)
+                out[start:end] = F.conv2d(
+                    g4d[start:end], kernel, stride=stride, padding=padding)
+            self._gen_4d = out
+        else:
+            self._gen_4d = F.conv2d(
+                g4d, kernel, stride=stride, padding=padding)
+        self._gen_2d = None
 
     def propagate_fc(self, W, bias):
-        """Propagate through a fully-connected layer."""
+        """Propagate through a fully-connected layer (forces 2D form)."""
         self.center = F.linear(self.center, W, bias)
         self.generators = W @ self.generators
 
-    def apply_relu(self):
-        """Standard min-area ReLU relaxation, appending new generators."""
-        lo, hi = self.bounds()
+    def apply_relu(self, tight_lo=None, tight_hi=None):
+        """Standard min-area ReLU relaxation, appending new generators.
+
+        Optional `tight_lo` / `tight_hi` are externally-computed sound
+        over-approximations of the pre-activation range (e.g. from a
+        per-neuron adaptive-zonotope backward pass or an LP probe).
+        When provided, the relu relaxation uses the intersection of
+        these with the zonotope's internal bounds. This is sound: the
+        true reachable set is contained in both the zonotope and the
+        external bounds, so the triangle relaxation using the
+        intersection still covers all true post-relu values.
+
+        Returns the (lo, hi) *actually used* for the relaxation, so
+        the caller can record the tightest pre-activation bounds.
+
+        Operates in-place on 4D when the generators are already in 4D;
+        otherwise in 2D. Output shape matches the input shape.
+        """
+        lo_int, hi_int = self.bounds()
+        lo = lo_int if tight_lo is None else torch.maximum(lo_int, tight_lo)
+        hi = hi_int if tight_hi is None else torch.minimum(hi_int, tight_hi)
         ust = (lo < 0) & (hi > 0)
         dead = hi <= 0
         lam = torch.where(ust, hi / (hi - lo),
@@ -64,35 +204,219 @@ class TorchZonotope:
         mu = torch.where(ust, -hi * lo / (2 * (hi - lo)),
                          torch.zeros_like(hi))
         self.center = lam * self.center + mu
-        self.generators = lam.unsqueeze(1) * self.generators
         ui = torch.where(ust)[0]
         nu = len(ui)
-        if nu > 0:
-            n = len(self.center)
-            ng = torch.zeros(n, nu, dtype=self.center.dtype,
-                             device=self.center.device)
-            ng[ui, torch.arange(nu, device=self.center.device)] = mu[ui]
-            self.generators = torch.cat([self.generators, ng], dim=1)
+
+        if self._gen_4d is not None:
+            K, C, H, W = self._gen_4d.shape
+            lam_4d = lam.reshape(1, C, H, W)
+            # In-place scale: avoids doubling G transiently.
+            self._gen_4d.mul_(lam_4d)
+            if nu > 0:
+                new_flat = torch.zeros(
+                    nu, C * H * W,
+                    dtype=self.center.dtype, device=self.center.device)
+                new_flat[torch.arange(nu, device=new_flat.device), ui] = mu[ui]
+                new_4d = new_flat.reshape(nu, C, H, W)
+                self._gen_4d = torch.cat([self._gen_4d, new_4d], dim=0)
+        else:
+            # In-place scale.
+            self._gen_2d.mul_(lam.unsqueeze(1))
+            if nu > 0:
+                n = len(self.center)
+                ng = torch.zeros(n, nu, dtype=self.center.dtype,
+                                 device=self.center.device)
+                ng[ui, torch.arange(nu, device=self.center.device)] = mu[ui]
+                self._gen_2d = torch.cat([self._gen_2d, ng], dim=1)
         return lo, hi
+
+    def nonzero_rows(self, unstable_idx):
+        """Return sparse triples ``(row_ids, col_ids, values)`` of all
+        nonzero entries in ``G[unstable_idx, :]``.
+
+        ``row_ids`` index into ``unstable_idx`` (0..len(unstable_idx)-1),
+        not into the flat neuron space, so the caller can join back via
+        ``unstable_idx[row_ids]``. ``col_ids`` are gen indices.
+
+        Both ``TorchZonotope`` and ``PatchesZonotope`` implement this so
+        ``_record_zono_pre_relu_rows`` can dispatch polymorphically.
+        """
+        if not isinstance(unstable_idx, torch.Tensor):
+            unstable_idx = torch.as_tensor(unstable_idx, dtype=torch.long)
+        if self._gen_4d is not None:
+            K = self._gen_4d.shape[0]
+            G2d = self._gen_4d.reshape(K, -1).t()  # (n_flat, K) view
+            sub = G2d.index_select(0, unstable_idx.to(G2d.device))
+        else:
+            sub = self._gen_2d.index_select(
+                0, unstable_idx.to(self._gen_2d.device))
+        nz = sub.nonzero(as_tuple=False)
+        if nz.numel() == 0:
+            return (
+                torch.empty(0, dtype=torch.long, device=sub.device),
+                torch.empty(0, dtype=torch.long, device=sub.device),
+                torch.empty(0, dtype=sub.dtype, device=sub.device))
+        rid, cid = nz[:, 0], nz[:, 1]
+        return rid, cid, sub[rid, cid]
+
+    def apply_relu_custom(self, lam, mu, shift):
+        """Apply a caller-supplied (lam, mu, shift) ReLU relaxation.
+
+        Unlike ``apply_relu`` — which computes min-area (lam, mu) from
+        its internal bounds — this takes them as arguments. Used by
+        α-CROWN direction-adaptive forward, which picks the tight
+        triangle edge (lower for `ep > 0`, upper otherwise) per neuron.
+
+        Semantics:
+            new_center = lam * center + shift
+            generators (rows) are scaled by lam
+            for neurons with ``mu != 0`` a new generator column of value
+            ``mu`` at that neuron index is appended.
+
+        Shapes:
+            lam, mu, shift: 1-D tensors of length ``n_flat``.
+        """
+        self.center = lam * self.center + shift
+        if self._gen_4d is not None:
+            K, C, H, W = self._gen_4d.shape
+            self._gen_4d.mul_(lam.reshape(1, C, H, W))
+        else:
+            self._gen_2d.mul_(lam.unsqueeze(1))
+        ui = torch.where(mu != 0)[0]
+        nu = ui.numel()
+        if nu > 0:
+            # Force 2D form for the concat (cheaper than appending in 4D).
+            gens_2d = self.generators  # collapses 4D -> 2D if needed
+            n = self.center.numel()
+            new_g = torch.zeros(
+                n, nu, dtype=gens_2d.dtype, device=gens_2d.device)
+            new_g[ui, torch.arange(nu, device=new_g.device)] = mu[ui]
+            self._gen_2d = torch.cat([gens_2d, new_g], dim=1)
+            self._gen_4d = None
 
     def copy(self):
         """Return an independent copy."""
-        return TorchZonotope(self.center.clone(), self.generators.clone())
+        out = TorchZonotope(self.center.clone(), None)
+        if self._gen_4d is not None:
+            out._gen_4d = self._gen_4d.clone()
+        else:
+            out._gen_2d = self._gen_2d.clone()
+        return out
+
+    def to_(self, device, non_blocking=False):
+        """Move this zonotope's tensors to `device` in place."""
+        self.center = self.center.to(device, non_blocking=non_blocking)
+        if self._gen_2d is not None:
+            self._gen_2d = self._gen_2d.to(device, non_blocking=non_blocking)
+        if self._gen_4d is not None:
+            self._gen_4d = self._gen_4d.to(device, non_blocking=non_blocking)
+        return self
 
     def add(self, other, shared_gens):
         """Element-wise addition for skip connections (mirrors DenseZonotope.add).
 
-        First `shared_gens` generator columns are shared noise symbols
-        (from before the fork point) — added element-wise.
-        Remaining columns are branch-specific and get concatenated.
+        Relies on the column-order invariant documented at the top of this
+        module: the first ``shared_gens`` columns of ``self.G`` and
+        ``other.G`` correspond to the same noise symbols in the same order.
+        That invariant is maintained statically by propagation ops (conv,
+        fc, relu, copy) and by ``_find_shared_gens_count`` returning the
+        fork's K value.
+
+        Two implementation paths
+        ------------------------
+        FAST (in-place): triggered when ``K_b == shared_gens`` (the skip
+          branch has no branch-specific extras). The merged G is then
+          structurally ``[a.G[:, :s] + b.G[:, :s] | a.G[:, s:]]``, which
+          equals ``a.G`` with its first ``s`` columns incremented by
+          ``b.G[:, :s]``. Mutating ``self`` avoids the fresh
+          ``torch.empty(n, K_out)`` allocation (~1.5 GB per ResBlock
+          merge at 32×32×64 on resnet_large). This is the standard
+          ResNet skip pattern: the skip fork exits immediately after a
+          ReLU and hits the add unchanged, so its K equals ``shared_gens``.
+          Returns ``self`` (mutated). Caller must not rely on ``self``
+          keeping its pre-add state (current use pattern in
+          ``forward_zono_dir_adaptive`` / ``_forward_zonotope_interleaved``
+          always replaces the old ``zono_state[...]`` entry with the
+          merged result, so this is safe).
+
+        SLOW: allocates a fresh output tensor and returns a fresh
+          ``TorchZonotope``. Used when the skip branch has its own
+          branch-specific generators (K_b > shared_gens), which happens
+          only if a ReLU (or other gen-appending op) sat on the skip
+          path — rare in standard ResNets but correct in general.
         """
-        g_shared = (self.generators[:, :shared_gens]
-                    + other.generators[:, :shared_gens])
-        return TorchZonotope(
-            self.center + other.center,
-            torch.cat([g_shared,
-                       self.generators[:, shared_gens:],
-                       other.generators[:, shared_gens:]], dim=1))
+        # Force 2D form; cheap if already there.
+        a = self.generators
+        b = other.generators
+        n = a.shape[0]
+        K_a, K_b = a.shape[1], b.shape[1]
+
+        # Invariant guards (cheap shape checks; no value check possible —
+        # see docstring for why).
+        assert a.shape[0] == b.shape[0], (
+            f"row-dim mismatch in add: {a.shape[0]} vs {b.shape[0]}")
+        assert 0 <= shared_gens <= K_a, (
+            f"shared_gens={shared_gens} out of range [0, {K_a}] (K_a)")
+        assert 0 <= shared_gens <= K_b, (
+            f"shared_gens={shared_gens} out of range [0, {K_b}] (K_b)")
+
+        if K_b == shared_gens:
+            # Fast path: skip has no extras. Mutate self in place.
+            # Correctness: merged G = [a[:,:s] + b[:,:s] | a[:,s:]].
+            # Since K_b == s, the slow path's `out[:, K_a:] = b[:, s:]`
+            # branch would copy zero columns, so out == a with first s
+            # columns updated. In-place mutation of a gives the same.
+            # Column ordering invariant is maintained statically by the
+            # propagation ops (see module docstring).
+            if shared_gens > 0:
+                a[:, :shared_gens].add_(b[:, :shared_gens])
+            self.center.add_(other.center)
+            return self
+
+        # Slow path: skip has its own branch-specific generators.
+        K_out = K_a + K_b - shared_gens
+        out = torch.empty(n, K_out, dtype=a.dtype, device=a.device)
+        # Shared prefix: element-wise sum of first `shared_gens` cols
+        torch.add(a[:, :shared_gens], b[:, :shared_gens],
+                   out=out[:, :shared_gens])
+        # Branch extras: copy into the rest of `out`
+        if K_a > shared_gens:
+            out[:, shared_gens:K_a] = a[:, shared_gens:]
+        if K_b > shared_gens:
+            out[:, K_a:] = b[:, shared_gens:]
+        return TorchZonotope(self.center + other.center, out)
+
+
+def make_input_zonotope(settings, x_lo, x_hi, device, dtype, in_shape=None):
+    """Build the initial input zonotope per ``settings.zono_impl``.
+
+    Args:
+        settings: DotMap-style settings (uses ``zono_impl``: 'dense' or
+            'patches'; default 'dense').
+        x_lo, x_hi: input bound tensors (1-D flat).
+        device, dtype: torch placement.
+        in_shape: (C, H, W) for image inputs. Required for 'patches' mode;
+            ignored for 'dense'.
+
+    Returns:
+        A ``TorchZonotope`` (dense) or ``PatchesZonotope`` (patches) with
+        the same external API.
+    """
+    impl = str(getattr(settings, 'zono_impl', 'dense'))
+    if impl == 'patches':
+        # Strip a leading batch dim if the network reports (1, C, H, W).
+        if in_shape is not None and len(in_shape) == 4 and in_shape[0] == 1:
+            in_shape = tuple(in_shape[1:])
+        # Patches representation only makes sense for image-shaped inputs.
+        # Sequential / FC-only networks (in_shape None or non-3D) get dense.
+        if in_shape is None or len(in_shape) != 3:
+            return TorchZonotope.from_input_bounds(x_lo, x_hi, device, dtype)
+        # Local import to avoid circular dependency at module load.
+        from .patches_zonotope import PatchesZonotope
+        return PatchesZonotope.from_input_bounds(
+            x_lo, x_hi, in_shape, device, dtype)
+    assert impl == 'dense', f"unknown zono_impl={impl!r}"
+    return TorchZonotope.from_input_bounds(x_lo, x_hi, device, dtype)
 
 
 def conv_output_shape(input_shape, kernel, params):

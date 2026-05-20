@@ -1115,18 +1115,13 @@ class TestSettings:
     def test_default_settings_have_new_keys(self):
         from vibecheck.settings import default_settings
         s = default_settings()
-        assert s.milp_tighten_method == 'lp'
-        assert s.milp_tighten_sparse is True
-        assert s.milp_tighten_parallel is True
-        assert s.milp_tighten_rebuild is False
         assert s.milp_callback is None
 
     def test_override_settings(self):
         from vibecheck.settings import default_settings
-        s = default_settings(milp_tighten_method='milp',
-                             milp_tighten_parallel=False)
-        assert s.milp_tighten_method == 'milp'
-        assert s.milp_tighten_parallel is False
+        s = default_settings(total_timeout=60.0, pgd_restarts=10)
+        assert s.total_timeout == 60.0
+        assert s.pgd_restarts == 10
 
 
 class TestReturnDetails:

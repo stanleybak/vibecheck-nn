@@ -1272,6 +1272,17 @@ class ComputeGraph:
         from .onnx_loader import load_onnx
         return load_onnx(onnx_path, dtype=dtype)
 
+    def optimize(self, settings):
+        """Apply semantics-preserving rewrites gated by settings flags."""
+        from .onnx_optimizer import (fold_relusplitter,
+                                     fold_relusplitter_gemm,
+                                     fuse_gemm_reshape_conv)
+        if settings.optimize_relu_relation:
+            fold_relusplitter(self)
+            fold_relusplitter_gemm(self)
+        if settings.fuse_gemm_conv:
+            fuse_gemm_reshape_conv(self)
+
     def topological_sort(self):
         """Kahn's algorithm."""
         in_degree = {name: 0 for name in self.nodes}
@@ -1553,6 +1564,7 @@ class ComputeGraph:
             'n_relu': len(relu_names),
             'input_name': self.input_name,
             'input_n': n_input,
+            'input_shape': self.input_shape,
         }
 
     def __repr__(self):

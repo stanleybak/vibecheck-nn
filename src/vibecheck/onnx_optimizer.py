@@ -1,15 +1,25 @@
-"""Graph optimizations for BnB verification.
+"""Semantics-preserving graph optimizations applied after ONNX loading.
 
-Fuses Gemm → Reshape → Conv into a single equivalent FC layer so that
-the backward pass operates on fewer, larger layers (matching the
-structure expected by CROWN-style tightening).
+Two passes:
+
+- `fold_relusplitter(graph)` folds the expanded
+  `Conv(C→2C) → ReLU → Conv(2C→C, 1×1) → ReLU` pattern (used by some
+  exporters to make every neuron pairwise-symmetric) back into a single
+  `Conv(C→C) → ReLU`. Exact because ReLU(z) − ReLU(−z) = z. Mirrors
+  auto_LiRPA / α,β-CROWN's `optimize_relu_relation`.
+
+- `fuse_gemm_reshape_conv(graph)` fuses `Gemm → Reshape → Conv` into a
+  single equivalent FC layer, so the backward pass operates on fewer,
+  larger layers (matches what CROWN-style tightening expects).
+
+Both are called from `ComputeGraph.optimize(settings)`.
 """
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .network import ComputeGraph, GemmNode, _prod
+from .network import _prod
 
 
 def fuse_gemm_reshape_conv(graph):
@@ -38,7 +48,6 @@ def fuse_gemm_reshape_conv(graph):
             continue
         reshape_node = succs_reshape[0]
 
-        # Reshape must have exactly one consumer which is Conv
         succs_conv = [n for n in graph.nodes.values()
                       if reshape_node.name in n.inputs
                       and n.op_type == 'Conv']
@@ -67,7 +76,6 @@ def fuse_gemm_reshape_conv(graph):
         reshape_shape = reshape_node.output_shape
         if reshape_shape is None:
             continue
-        # Strip batch dim
         if len(reshape_shape) == 4 and reshape_shape[0] == 1:
             chw = reshape_shape[1:]
         elif len(reshape_shape) == 3:
@@ -78,12 +86,8 @@ def fuse_gemm_reshape_conv(graph):
         if _prod(chw) != W_gemm.shape[0]:
             continue
 
-        # Compute fused weight by matrix composition:
         # output = Conv(reshape(W_gemm @ x + b_gemm)) + b_conv
-        # = Conv_linear(W_gemm @ x + b_gemm) + b_conv
-        # = Conv_linear(W_gemm) @ x + Conv_linear(b_gemm) + b_conv
-        #
-        # Conv_linear is the conv applied as a linear operator (no bias).
+        #        = Conv_linear(W_gemm) @ x + Conv_linear(b_gemm) + b_conv
         n_in = W_gemm.shape[1]
         dt = torch.float64
 
@@ -96,9 +100,7 @@ def fuse_gemm_reshape_conv(graph):
         b_fused_t = F.conv2d(b_4d, k_t, bias=torch.tensor(b_conv, dtype=dt),
                               stride=stride, padding=padding).flatten()
 
-        # Push each column of W_gemm through conv to get fused W
-        # W_gemm is (m, n), columns are (m,) vectors to reshape to (C,H,W)
-        # Batch all n columns at once: (n, C, H, W)
+        # Push each column of W_gemm through conv (batched over n cols)
         W_4d = W_t.T.reshape(n_in, *chw)  # (n, C, H, W)
         W_fused_t = F.conv2d(W_4d, k_t, stride=stride,
                               padding=padding)  # (n, C', H', W')
@@ -108,7 +110,6 @@ def fuse_gemm_reshape_conv(graph):
         W_fused_np = W_fused.numpy().astype(graph.dtype)
         b_fused_np = b_fused_t.numpy().astype(graph.dtype)
 
-        # Replace: update the Gemm node with fused params
         node.params['W'] = W_fused_np
         node.params['b'] = b_fused_np
 
@@ -120,18 +121,14 @@ def fuse_gemm_reshape_conv(graph):
         if graph.output_name == conv_name:
             graph.output_name = name
 
-        # Remove reshape and conv nodes
         del graph.nodes[reshape_node.name]
         del graph.nodes[conv_name]
         fused_any = True
 
     if fused_any:
         graph.topological_sort()
-        # Re-infer shapes
-        from .onnx_loader import _infer_shapes
+        from .onnx_loader import _infer_shapes, _precache_conv_tensors
         _infer_shapes(graph)
-        # Re-precache conv tensors
-        from .onnx_loader import _precache_conv_tensors
         _precache_conv_tensors(graph)
 
     return fused_any
@@ -140,25 +137,18 @@ def fuse_gemm_reshape_conv(graph):
 def fold_relusplitter(graph):
     """Fold ReLU-split pattern back into a single Conv → ReLU.
 
-    Mirrors ``optimize_relu_relation`` in auto_LiRPA's
-    ``auto_LiRPA/optimize_graph.py`` (α,β-CROWN). That implementation
-    operates on BoundedModule nodes; this one operates on our ONNX
-    ComputeGraph with numpy weights.
-
     Detects: Conv(C_in → 2C, k×k) → ReLU → Conv(2C → C, 1×1) → ReLU
     where the expanded conv has adjacent paired filters (w, -w) with
     biases (b, -b), and the 1×1 conv has [+1, -1] entries recombining
     each pair into a single output channel.
 
-    This is equivalent to the original Conv(C_in → C, k×k) → ReLU because:
-        ReLU(z) - ReLU(-z) = z  for all z
-    so the 1×1 recombination recovers the pre-ReLU value, and the second
-    ReLU gives the same result as a single ReLU on the original.
+    Equivalent to the original Conv(C_in → C, k×k) → ReLU because
+    ReLU(z) - ReLU(-z) = z, so the 1×1 recombination recovers the
+    pre-ReLU value and the second ReLU gives the same result as a
+    single ReLU on the original.
 
-    The 1×1 bias is absorbed into the fused bias:
-        b_fused = b_orig + b_1x1
+    The 1×1 bias is absorbed:  b_fused = b_orig + b_1x1
     """
-    from .network import ConvNode, ReluNode
     folded_any = False
     topo = list(graph.topo_order)
 
@@ -167,7 +157,6 @@ def fold_relusplitter(graph):
         if node is None or node.op_type != 'Conv':
             continue
 
-        # Pattern: Conv → ReLU → Conv(1x1) → ReLU
         relu1_list = [n for n in graph.nodes.values()
                       if name in n.inputs and n.op_type == 'Relu']
         if len(relu1_list) != 1:
@@ -185,7 +174,7 @@ def fold_relusplitter(graph):
         if len(relu2_list) != 1:
             continue
 
-        # Each node must have exactly one consumer
+        # Each intermediate node must have exactly one consumer.
         if len([n for n in graph.nodes.values()
                 if name in n.inputs]) != 1:
             continue
@@ -201,7 +190,6 @@ def fold_relusplitter(graph):
         A = conv1x1.params['kernel']        # (C, 2C, 1, 1)
         b_1x1 = conv1x1.params['bias']     # (C,)
 
-        # Check: 1x1 kernel, output channels = half of expanded
         if A.shape[2] != 1 or A.shape[3] != 1:
             continue
         C_out = A.shape[0]
@@ -209,11 +197,9 @@ def fold_relusplitter(graph):
         if C_exp != 2 * C_out:
             continue
 
-        # Check: A has [1, -1] block structure and biases are (b, -b)
         A_mat = A[:, :, 0, 0]  # (C, 2C)
         tol = 1e-5
 
-        # Verify structure and extract original kernel
         K_orig = np.zeros((C_out,) + K_exp.shape[1:], dtype=K_exp.dtype)
         b_orig = np.zeros(C_out, dtype=b_exp.dtype)
         valid = True
@@ -226,18 +212,15 @@ def fold_relusplitter(graph):
             i_pos, i_neg = nonzero
             v_pos, v_neg = A_mat[j, i_pos], A_mat[j, i_neg]
 
-            # One should be +1 and other -1
             if not (abs(abs(v_pos) - 1.0) < tol and abs(abs(v_neg) - 1.0) < tol
                     and v_pos * v_neg < 0):
                 valid = False
                 break
 
-            # Filters should be negatives of each other
             if not np.allclose(K_exp[i_pos], -K_exp[i_neg], atol=tol):
                 valid = False
                 break
 
-            # Biases should be negatives of each other
             if not abs(b_exp[i_pos] + b_exp[i_neg]) < tol:
                 valid = False
                 break
@@ -253,14 +236,10 @@ def fold_relusplitter(graph):
         if not valid:
             continue
 
-        # Replace: update the expanded conv with original weights
-        # The 1x1 bias gets absorbed: output = z + b_1x1, so
-        # ReLU(z + b_1x1) = ReLU(w·x + b_orig + b_1x1)
         node.params['kernel'] = K_orig
         node.params['bias'] = b_orig + b_1x1
 
-        # Rewire: relu2's consumers now point to relu1,
-        # and relu1 now follows the (now-original) conv directly
+        # Rewire: relu2's consumers now point to relu1.
         relu2_name = relu2_list[0].name
         for other in graph.nodes.values():
             other.inputs = [relu1.name if inp == relu2_name else inp
@@ -268,8 +247,135 @@ def fold_relusplitter(graph):
         if graph.output_name == relu2_name:
             graph.output_name = relu1.name
 
-        # Remove relu1's old successor chain: conv1x1 and relu2
         del graph.nodes[conv1x1.name]
+        del graph.nodes[relu2_name]
+        folded_any = True
+
+    if folded_any:
+        graph.topological_sort()
+        from .onnx_loader import _infer_shapes, _precache_conv_tensors
+        _infer_shapes(graph)
+        _precache_conv_tensors(graph)
+
+    return folded_any
+
+
+def fold_relusplitter_gemm(graph):
+    """Fold ReLU-split pattern back into a single Gemm → ReLU.
+
+    Detects: Gemm(C_in → C+S) → ReLU → Gemm(C+S → C) → ReLU
+    where the expanded Gemm has S split neurons with paired rows
+    (w, -w) and biases (b, -b), and the merge Gemm has a (C, C+S)
+    selector matrix with two kinds of rows:
+
+      - **passthrough** (one +1 nonzero): selects an unsplit neuron's
+        ReLU output; the merge bias entry must be 0 — otherwise
+        ReLU(ReLU(z)+b) ≠ ReLU(z+b).
+      - **split pair** (one +1 and one −1 nonzero on a w/−w pair):
+        recombines via ReLU(z) − ReLU(−z) = z; the merge bias entry
+        absorbs cleanly into the original bias.
+    """
+    folded_any = False
+    topo = list(graph.topo_order)
+
+    for name in topo:
+        node = graph.nodes.get(name)
+        if node is None or node.op_type != 'Gemm':
+            continue
+
+        relu1_list = [n for n in graph.nodes.values()
+                      if name in n.inputs and n.op_type == 'Relu']
+        if len(relu1_list) != 1:
+            continue
+        relu1 = relu1_list[0]
+
+        gemm2_list = [n for n in graph.nodes.values()
+                      if relu1.name in n.inputs and n.op_type == 'Gemm']
+        if len(gemm2_list) != 1:
+            continue
+        gemm2 = gemm2_list[0]
+
+        relu2_list = [n for n in graph.nodes.values()
+                      if gemm2.name in n.inputs and n.op_type == 'Relu']
+        if len(relu2_list) != 1:
+            continue
+
+        # Each intermediate node must have exactly one consumer.
+        if len([n for n in graph.nodes.values()
+                if name in n.inputs]) != 1:
+            continue
+        if len([n for n in graph.nodes.values()
+                if relu1.name in n.inputs]) != 1:
+            continue
+        if len([n for n in graph.nodes.values()
+                if gemm2.name in n.inputs]) != 1:
+            continue
+
+        W1 = node.params['W']        # (C+S, C_in)
+        b1 = node.params['b']        # (C+S,)
+        W2 = gemm2.params['W']       # (C, C+S)
+        b2 = gemm2.params['b']       # (C,)
+
+        C_out = W2.shape[0]
+        C_exp = W2.shape[1]
+        if W1.shape[0] != C_exp or C_exp < C_out:
+            continue
+
+        tol = 1e-5
+        W_orig = np.zeros((C_out, W1.shape[1]), dtype=W1.dtype)
+        b_orig = np.zeros(C_out, dtype=b1.dtype)
+        valid = True
+
+        for j in range(C_out):
+            nonzero = np.where(np.abs(W2[j]) > tol)[0]
+            if len(nonzero) == 1:
+                # Passthrough: must be +1 with zero merge bias.
+                i = nonzero[0]
+                if not (abs(W2[j, i] - 1.0) < tol and abs(b2[j]) < tol):
+                    valid = False
+                    break
+                W_orig[j] = W1[i]
+                b_orig[j] = b1[i]
+                continue
+            if len(nonzero) != 2:
+                valid = False
+                break
+            i_pos, i_neg = nonzero
+            v_pos, v_neg = W2[j, i_pos], W2[j, i_neg]
+            if not (abs(abs(v_pos) - 1.0) < tol
+                    and abs(abs(v_neg) - 1.0) < tol
+                    and v_pos * v_neg < 0):
+                valid = False
+                break
+            if not np.allclose(W1[i_pos], -W1[i_neg], atol=tol):
+                valid = False
+                break
+            if not abs(b1[i_pos] + b1[i_neg]) < tol:
+                valid = False
+                break
+            if v_pos > 0:
+                W_orig[j] = W1[i_pos]
+                b_orig[j] = b1[i_pos]
+                b_orig[j] += b2[j]
+            else:
+                W_orig[j] = W1[i_neg]
+                b_orig[j] = b1[i_neg]
+                b_orig[j] += b2[j]
+
+        if not valid:
+            continue
+
+        node.params['W'] = W_orig
+        node.params['b'] = b_orig
+
+        relu2_name = relu2_list[0].name
+        for other in graph.nodes.values():
+            other.inputs = [relu1.name if inp == relu2_name else inp
+                            for inp in other.inputs]
+        if graph.output_name == relu2_name:
+            graph.output_name = relu1.name
+
+        del graph.nodes[gemm2.name]
         del graph.nodes[relu2_name]
         folded_any = True
 

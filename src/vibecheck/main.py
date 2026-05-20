@@ -21,9 +21,9 @@ def main():
     parser.add_argument('--spec', required=True, help='Path to VNNLIB specification')
     parser.add_argument('--dtype', default='float32', choices=list(_DTYPES),
                         help='Computation dtype (default: float32)')
-    parser.add_argument('--mode', default='zonotope',
-                        choices=['zonotope', 'bnb', 'milp'],
-                        help='Verification mode (default: zonotope)')
+    parser.add_argument('--mode', default='graph',
+                        choices=['zonotope', 'bnb', 'milp', 'graph'],
+                        help='Verification mode (default: graph)')
     parser.add_argument('--device', default='gpu', choices=['cpu', 'gpu'],
                         help='Device for BnB mode (default: gpu)')
     parser.add_argument('--bits', type=int, default=32, choices=[16, 32, 64],
@@ -34,6 +34,12 @@ def main():
                         help='BnB timeout in seconds (default: 30)')
     parser.add_argument('--pgd-restarts', type=int, default=100,
                         help='PGD restarts for BnB (default: 100)')
+    parser.add_argument('--config', default=None,
+                        help='Per-benchmark YAML overrides on top of '
+                             'default_settings(). When set, overrides take '
+                             'precedence over CLI knobs; when omitted, '
+                             'default_settings_for(graph, spec) auto-detects '
+                             'a profile.')
     args = parser.parse_args()
 
     dtype = _DTYPES[args.dtype]
@@ -61,6 +67,7 @@ def main():
             bnb_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        graph.optimize(settings)
         print(f'Running BnB verification (device={args.device}, '
               f'bits={args.bits}, order={args.bnb_order})...')
         result, details = zonotope_bnb_verify(graph, spec, settings)
@@ -73,9 +80,39 @@ def main():
             total_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        graph.optimize(settings)
         print(f'Running MILP verification (device={args.device}, '
               f'timeout={args.timeout}s)...')
         result, details = milp_verify(graph, spec, settings)
+    elif args.mode == 'graph':
+        from .verify_graph import verify_graph
+        if args.config is not None:
+            # Explicit per-benchmark YAML: load → use as overrides on top of
+            # default_settings(). CLI knobs (device/bits/timeout/...) apply
+            # too, but YAML overrides win when there's a conflict.
+            from .settings import default_settings
+            from .config_loader import load_config
+            yaml_overrides = load_config(args.config)
+            cli_overrides = dict(
+                device=args.device, bits=args.bits,
+                total_timeout=args.timeout, pgd_restarts=args.pgd_restarts)
+            cli_overrides.update(yaml_overrides)
+            settings = default_settings(**cli_overrides)
+            settings._profile = f'config:{args.config}'
+        else:
+            from .config_profiles import default_settings_for
+            settings = default_settings_for(
+                graph, spec,
+                device=args.device,
+                bits=args.bits,
+                total_timeout=args.timeout,
+                pgd_restarts=args.pgd_restarts,
+            )
+        graph.optimize(settings)
+        print(f'Running graph verification (device={args.device}, '
+              f'impl={settings.graph_impl}, profile={settings._profile}, '
+              f'timeout={args.timeout}s)...')
+        result, details = verify_graph(graph, spec, settings)
     else:
         print('Running zonotope analysis...')
         result, details = zonotope_verify(graph, spec)
@@ -92,6 +129,34 @@ def main():
         print(f'  BnB evals: {details["n_evals"]}')
     if 'volume_proven' in details:
         print(f'  Volume proven: {details["volume_proven"]:.1%}')
+    if args.mode == 'graph':
+        phase_timing = details.get('timing', {})
+        if phase_timing:
+            parts = [f'{k.replace("phase", "p").split("_", 1)[0]}={v:.2f}s'
+                     if k.startswith('phase') else f'{k}={v:.2f}s'
+                     for k, v in phase_timing.items()
+                     if isinstance(v, (int, float))]
+            print('  Timing: ' + '  '.join(parts))
+        n_splits = details.get('n_splits', {})
+        if n_splits:
+            split_str = ' '.join(f'{k}:{v}' for k, v in n_splits.items() if v > 0)
+            print(f'  Splits: {split_str}')
+        if 'build_time_total' in details:
+            print(f'  Build time total: {details["build_time_total"]:.2f}s')
+        per_layer = details.get('per_layer_timing', {})
+        if per_layer:
+            print('  Per-layer tightening:')
+            for name, t in per_layer.items():
+                wz = t.get('width_zono', 0.0)
+                wa = t.get('width_adapt', 0.0)
+                wl = t.get('width_lp', 0.0)
+                wf = t.get('width_final', 0.0)
+                print(f'    {name}: '
+                      f'build={t["build"]:.2f}s '
+                      f'probe={t["probe"]:.2f}s '
+                      f'solve={t["solve"]:.2f}s  '
+                      f'width zono={wz:.3f}→adapt={wa:.3f}'
+                      f'→lp={wl:.3f}→final={wf:.3f}')
     print(f'  Time: {t_total:.2f}s')
 
     sys.exit(0 if result == 'verified' else 1)

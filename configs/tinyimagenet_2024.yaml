@@ -1,0 +1,16 @@
+# tinyimagenet_2024 — TinyImageNet ResNet, VNNCOMP regular track.
+# Same config as cifar100_2024 — both ran under runner_p25off.py in v6
+# side-by-side. PatchesZonotope is auto-engaged via settings.zono_impl when
+# the input shape is image-like (default: 'patches'); no explicit knob here.
+phase8_use_dual_ascent_gpu: true
+phase8_dual_ascent_max_iter: 1
+zono_lift_enabled: false
+phase2_crown_enabled: false
+phase8_min_budget_frac: 0.5
+pgd_middle_enabled: false
+phase26_pgd_per_spec_min_per_spec: 0.5
+phase26_pgd_per_spec_strict_min: true
+phase26_pre_cascade_total_frac: 0.10
+phase26_pre_cascade_per_spec_cap: 5.0
+parallel_pgd_enabled: true
+pgd_restarts: 100
