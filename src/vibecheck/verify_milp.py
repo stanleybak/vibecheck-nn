@@ -2887,12 +2887,27 @@ def milp_verify(graph, spec, settings=None):
         return 'unknown', {'time': total_timeout, 'phase': 'crown_timeout'}
 
     # --- PGD attack (GPU, fast) ---
+    # Use `pgd_attack_general` (spec-aware) instead of the legacy
+    # `_pgd_attack`. The legacy function flattens the spec to (pred,
+    # comps_set) via `as_pairwise`, losing the disjunct structure, and
+    # checks SAT as `min(Y_pred - Y_comp) < 0` over comps — that's OR
+    # semantics. For AND-conjunct specs (acasxu prop_3: single
+    # disjunct with 4 pairwise constraints) this falsely claims SAT
+    # when ANY constraint is in the unsafe direction, even if siblings
+    # are provably safe (witness on prop_3 / `1_1` had Y_3 > Y_0,
+    # disproving the AND, but legacy PGD accepted it because Y_1, Y_2,
+    # Y_4 < Y_0). `pgd_attack_general` uses `spec.check` in its
+    # confirm step, so it correctly handles both AND and OR conjuncts.
     _disable_sat = bool(getattr(settings, 'disable_sat_finding', False))
-    pgd_sat, pgd_witness, pgd_best = False, None, None
+    pgd_sat, pgd_witness = False, None
     if not _disable_sat:
         t_pgd = time.perf_counter()
-        pgd_sat, pgd_witness, pgd_best = _pgd_attack(
-            xl_g, xh_g, still_open, pred, fwd_data, nh, settings)
+        gg_for_pgd = graph.gpu_graph(device, dtype)
+        try:
+            pgd_sat, pgd_witness = _pgd_attack_general(
+                xl_g, xh_g, spec, gg_for_pgd, settings)
+        except RuntimeError:
+            pgd_sat, pgd_witness = False, None
         if print_progress:
             print(f'PGD attack: {time.perf_counter()-t_pgd:.2f}s  '
                   f'sat={pgd_sat}')
@@ -2955,9 +2970,24 @@ def milp_verify(graph, spec, settings=None):
                                  device=device, dtype=dtype)
         xh_at = torch.as_tensor(spec.x_hi.flatten().astype(np.float64),
                                  device=device, dtype=dtype)
-        # Build linear queries from spec
-        last_op = gg['ops'][-1]
-        n_out = int(np.prod(last_op.get('out_shape', (10,))))
+        # Build linear queries from spec.
+        # n_out from the last *linear* op (fc or conv); the network's
+        # last op may be an `add` (separate bias-add common in ACASXU
+        # / safenlp ONNXes), which has no `out_shape` and would have
+        # silently defaulted to 10 — wrong for non-10-output nets, and
+        # produced a downstream shape mismatch in α-CROWN backward
+        # (ew @ bias_at_add: ew shape (4, 10), bias (5,) → crash).
+        n_out = None
+        for op in reversed(gg['ops']):
+            if op.get('type') == 'fc':
+                W = op.get('W_np') if 'W_np' in op else op.get('W')
+                if W is not None:
+                    n_out = int(W.shape[0]); break
+            if op.get('type') == 'conv':
+                _no = int(op.get('n_out', 0))
+                if _no > 0:
+                    n_out = _no; break
+        assert n_out is not None, 'no fc/conv op found for n_out'
         queries_at = spec.as_linear_queries(n_out)
         if queries_at:
             w_qs_at = np.stack([q[1] for q in queries_at])
@@ -3208,18 +3238,21 @@ def milp_verify(graph, spec, settings=None):
             'phase': 'crown_tightened'}
 
     # --- PGD attack again (seeded with best adversarial from first PGD) ---
+    # Same fix as the first PGD call above — use spec-aware general PGD
+    # to avoid the OR-flatten-AND unsoundness in legacy `_pgd_attack`.
     if time_left() > 0 and not _disable_sat:
         t_pgd2 = time.perf_counter()
-        pgd_sat2, pgd_witness2, pgd_best2 = _pgd_attack(
-            xl_g, xh_g, still_open, pred, fwd_data, nh, settings)
+        try:
+            pgd_sat2, pgd_witness2 = _pgd_attack_general(
+                xl_g, xh_g, spec, gg_for_pgd, settings)
+        except RuntimeError:
+            pgd_sat2, pgd_witness2 = False, None
         if print_progress:
             print(f'PGD attack (post-tighten): {time.perf_counter()-t_pgd2:.2f}s  '
                   f'sat={pgd_sat2}')
         if pgd_sat2:
             return 'sat', {'time': time.perf_counter() - (deadline - total_timeout),
                             'phase': 'pgd_post_tighten', 'witness': pgd_witness2}
-        if pgd_best2 is not None:
-            pgd_best = pgd_best2
 
     # --- Score neurons for spec MILP ---
     remaining = set(still_open)
@@ -3280,5 +3313,4 @@ def milp_verify(graph, spec, settings=None):
         return 'verified', {'time': t_total, 'phase': 'spec_milp',
                             'n_binaries': n_binaries}
     return 'unknown', {'time': t_total, 'phase': 'spec_milp_timeout',
-                        'remaining': len(remaining),
-                        'pgd_best': pgd_best}
+                        'remaining': len(remaining)}

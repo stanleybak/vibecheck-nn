@@ -35,8 +35,8 @@ class TestSettings:
     def test_default_settings(self):
         s = default_settings()
         assert s.device == 'gpu'
-        assert s.bits == 32
-        assert s.pgd_restarts == 100
+        assert s.bits == 64
+        assert s.pgd_restarts == 30
         assert s.bnb_order == 'bfs'
 
     def test_overrides(self):

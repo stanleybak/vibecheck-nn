@@ -114,7 +114,7 @@ Each VNNCOMP **regular-track** benchmark is optimized on its own branch, then sq
 5. **Integration tests**: add `tests/integration/test_<benchmark>.py` with **3 hard cases — 1 SAT we cracked + 2 hard UNSAT we verified** (each pinned with `max_wall_s` ~1.5× observed for regression detection). `@pytest.mark.integration`. Every merge re-runs *all* prior benchmarks' integration cases.
 6. **Per-benchmark README** at `docs/benchmarks/<benchmark>.md` capturing: (a) final score (vc + abc-server + abc-published, with timestamp + sweep id), (b) algorithmic wins vs published reference, (c) any benchmark-specific knobs in `configs/<benchmark>.yaml` and *why* they're there, (d) reproduction commands (single case + full sweep), (e) integration test cases with rationale, (f) known unsolved cases. This is the canonical record for the benchmark; the YAML + tests are the runnable artifacts.
 7. **Pre-merge gap report**: before squash-merging, present (a) cases still unsolved, (b) any visible AB-CROWN wins, (c) score delta vs published AB-CROWN results — to the user for feedback. Do not merge until they approve.
-8. **Squash-merge** to `main`; delete branch.
+8. **Squash-merge** to `main`. Keep the `bench/<benchmark>` branch around (do NOT delete) — useful as a rollback point and for going back to inspect non-squashed history later.
 
 Allowed references: read auto_LiRPA / AB-CROWN source (`~/Desktop/temp/abcrown/alpha-beta-CROWN_vnncomp2025` on remote) or run them with debug prints — especially for non-ReLU activations (tanh, sigmoid, GELU, MHA) — then re-implement.
 
