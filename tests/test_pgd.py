@@ -296,12 +296,14 @@ def test_pgd_optim_adam_clipping_box_clamped():
     from vibecheck.pgd import pgd_attack_general
     from vibecheck.settings import default_settings
     gg, _, xl, xh = _trivial_pgd_graph()
-    # Spec that is trivially safe so PGD runs to completion without an
-    # early SAT exit. Y[0] = max(x0,0) - max(x1,0) ∈ [-1, 1] for inputs
-    # in [-1, 1]^2 → 'Y[0] >= -2' is always true.
+    # Spec that is trivially SAFE so PGD runs to completion without an
+    # early SAT exit. VNNLIB convention: the asserted constraint is the
+    # UNSAFE condition. `Y[0] >= 100` is unsafe, but Y[0] = max(x0,0) -
+    # max(x1,0) ∈ [-1, 1] for inputs in [-1, 1]^2 → never reaches 100,
+    # so the unsafe region is trivially empty (always safe).
     spec = VNNSpec(
         x_lo=xl.numpy(), x_hi=xh.numpy(),
-        disjuncts=[Conjunct([Constraint(index=0, op='>=', value=-2.0)])])
+        disjuncts=[Conjunct([Constraint(index=0, op='>=', value=100.0)])])
     # Run to completion — when no SAT is found, the loop terminates normally.
     settings = default_settings(
         pgd_restarts=2, pgd_iter=15, pgd_optim='adam_clipping')

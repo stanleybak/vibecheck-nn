@@ -41,7 +41,9 @@ input_split_alpha_iters: 1
 input_split_alpha_max_start_nodes: 0
 input_split_enabled: true
 input_split_fast_leaf: true
-input_split_max_depth: 8
+input_split_leaf_pgd_enabled: false
+input_split_leaf_pgd_time: 0.1
+input_split_max_depth: null
 input_split_max_dims: 20
 input_split_node_timeout: 8.0
 max_tighten_layer: 3
@@ -56,6 +58,12 @@ optimize_relu_relation: true
 parallel_pgd_enabled: false
 parallel_pgd_max_attacks: 20
 pgd_alpha_frac: 0.25
+pgd_alpha_multi: false
+pgd_alpha_multi_fractions:
+- 0.25
+- 0.05
+- 0.01
+- 0.002
 pgd_before_enabled: false
 pgd_hinge_threshold: -1.0e-05
 pgd_init_mode: osi
@@ -100,7 +108,9 @@ phase8_use_alpha_ew: true
 phase8_use_dual_ascent_gpu: false
 print_progress: true
 raise_on_oom: true
+sat_validate_atol: 0.0001
 skip_phase8_milp: false
+skip_sat_validation: false
 spec_impl: gen_lp
 tighten_formulation: gen_cone
 tighten_solver: milp

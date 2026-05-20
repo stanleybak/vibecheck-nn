@@ -13,6 +13,8 @@ def _make_slopes(lo, hi):
     """Compute CROWN adaptive slopes for ReLU relaxation.
 
     Returns (lo_s, up_s, up_t, active_mask, dead_mask, unstable_mask).
+    Works for both 1-D (n,) and (B, n) inputs — operations are
+    elementwise so the batched form needs no separate implementation.
     """
     DT = lo.dtype
     lb_r = torch.clamp(lo, max=0)
@@ -477,19 +479,25 @@ def _find_shared_gens_count(name_a, name_b, gg, gen_count):
 @torch.no_grad()
 def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                           remaining_specs, nh, device, dtype,
-                          return_ew=False):
+                          return_ew=False, return_input_linear=False):
     """Graph-aware spec backward pass for networks with skip connections.
 
     spec_ew maps query_id -> (w, bias) where w is in OUTPUT space.
     Propagates backward through ALL ops including the final linear layer.
 
-    Returns (spec_lbs, still_open) or (spec_lbs, still_open, ew_at_relu)
-    if return_ew=True. ew_at_relu maps qid -> {layer_idx -> ew_numpy}.
+    Returns (spec_lbs, still_open). Optional flags add tuple tails:
+      - return_ew=True: appends ew_at_relu (qid -> {layer_idx -> ew_numpy})
+      - return_input_linear=True: appends input_linear
+        (qid -> (ew_inp_numpy, acc_float)), the linear lower-bound
+        coefficients in input space such that for all x in [xl, xh]:
+            spec(x) >= ew_inp · x + acc
+        Used by `_input_split_fast_leaf`'s joint-AND infeasibility LP.
     """
     ops = gg['ops']
 
     spec_lbs = {}
     all_ew_at_relu = {} if return_ew else None
+    input_linear = {} if return_input_linear else None
     for qid in remaining_specs:
         ew_init, b_spec = spec_ew[qid]
         ew_at = {}
@@ -566,11 +574,288 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
             ew_inp.clamp(min=0) @ xl + ew_inp.clamp(max=0) @ xh)
         if return_ew:
             all_ew_at_relu[qid] = qid_ew_at_relu
+        if return_input_linear:
+            input_linear[qid] = (
+                ew_inp.detach().cpu().numpy().astype(np.float64),
+                float(acc))
 
     still_open = {c for c in remaining_specs if spec_lbs[c] <= 0}
+    if return_input_linear and return_ew:
+        return spec_lbs, still_open, all_ew_at_relu, input_linear
+    if return_input_linear:
+        return spec_lbs, still_open, input_linear
     if return_ew:
         return spec_lbs, still_open, all_ew_at_relu
     return spec_lbs, still_open
+
+
+# ---------------------------------------------------------------------------
+# Batched forward zono + spec-backward CROWN for input-split BaB.
+# Each batch element is an INDEPENDENT input box [xl[b], xh[b]] processed
+# through the SAME network graph. Centers / generators carry a leading
+# batch dim B; intermediate tensors are (B, n, K) for generators and
+# (B, n) for centers/bounds. After each ReLU we append `n_layer` new
+# generator columns (one per neuron, with mu padded to zero for stable
+# neurons) — keeps gen-count uniform across the batch so ops stay
+# vectorized. For cersyve (200 ReLU total, input dim 4) this caps gens
+# at ~260 → at batch=4096 the largest intermediate is ~850 MB (fits 10
+# GB GPU).
+#
+# Not supported: conv, add-merge with non-trivially-shared gens, patches
+# zonotope. Add-merge with shared_gens equal to fork K is supported by
+# concat. The driver `_input_split_batched` falls back to the scalar
+# path when the graph requires unsupported ops.
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
+    """Batched forward zonotope on the graph.
+
+    Args:
+        xl, xh: (B, n_in) input bounds — one box per batch element.
+        gg: gpu_graph dict.
+
+    Returns:
+        sb: dict layer_idx → (lo, hi) shape (B, n_layer) per ReLU.
+        z_final: (c, G) tuple where c is (B, n_out) and G is (B, n_out, K).
+
+    Raises:
+        ValueError on unsupported op types (conv, add-merge with extras).
+    """
+    B, n_in = xl.shape
+    c = (xl + xh) / 2
+    radii = (xh - xl) / 2
+    # G is (B, n_in, n_in): diagonal of radii. nonzero radii get an own
+    # gen column; zero-radius inputs contribute zero columns (still
+    # presented in the tensor for shape uniformity — they don't add
+    # spurious mass since the matrix entry is 0).
+    G = torch.diag_embed(radii)
+    state = {gg['input_name']: (c, G)}
+    gen_count = {gg['input_name']: G.shape[2]}
+    forks = gg['fork_points']
+    sb = {}
+
+    last_use = {}
+    for i, op2 in enumerate(gg['ops']):
+        for inp in op2['inputs']:
+            last_use[inp] = i
+
+    def _get(name):
+        # `forks` means the value is consumed twice — clone (cheap on GPU)
+        c_, G_ = state[name]
+        if name in forks:
+            return c_.clone(), G_.clone()
+        return c_, G_
+
+    for op_idx, op in enumerate(gg['ops']):
+        name = op['name']
+        t = op['type']
+
+        if t == 'fc':
+            c_in, G_in = _get(op['inputs'][0])
+            W = op['W']  # (n_out, n_in_layer)
+            bias = op['bias']  # (n_out,)
+            c_out = c_in @ W.T + bias  # (B, n_out)
+            # G_out[b, o, k] = sum_i W[o, i] * G_in[b, i, k]
+            G_out = torch.einsum('oi,bik->bok', W, G_in)
+            state[name] = (c_out, G_out)
+
+        elif t == 'relu':
+            c_in, G_in = _get(op['inputs'][0])
+            abs_sum = G_in.abs().sum(dim=2)  # (B, n)
+            lo = c_in - abs_sum
+            hi = c_in + abs_sum
+            ust = (lo < 0) & (hi > 0)
+            dead = hi <= 0
+            lam = torch.where(ust, hi / (hi - lo),
+                               torch.where(dead, torch.zeros_like(hi),
+                                            torch.ones_like(hi)))  # (B, n)
+            mu = torch.where(ust, -hi * lo / (2 * (hi - lo)),
+                              torch.zeros_like(hi))  # (B, n)
+            c_out = lam * c_in + mu
+            G_scaled = G_in * lam.unsqueeze(-1)  # (B, n, K)
+            # Append n new gen columns (one per neuron). For stable
+            # neurons mu is zero so the new column is zero — wasteful
+            # but keeps gen count uniform across batch.
+            new_gens = torch.diag_embed(mu)  # (B, n, n)
+            G_out = torch.cat([G_scaled, new_gens], dim=2)  # (B, n, K+n)
+            state[name] = (c_out, G_out)
+            if 'layer_idx' in op:
+                sb[op['layer_idx']] = (lo.clone(), hi.clone())
+
+        elif t == 'add':
+            if op.get('is_merge'):
+                c_a, G_a = _get(op['inputs'][0])
+                c_b, G_b = _get(op['inputs'][1])
+                shared = _find_shared_gens_count(
+                    op['inputs'][0], op['inputs'][1], gg, gen_count)
+                K_a, K_b = G_a.shape[2], G_b.shape[2]
+                assert 0 <= shared <= K_a and 0 <= shared <= K_b
+                if K_b == shared:
+                    # Fast path: mutate a's first `shared` cols.
+                    G_a[:, :, :shared] = G_a[:, :, :shared] + G_b[:, :, :shared]
+                    state[name] = (c_a + c_b, G_a)
+                else:
+                    K_out = K_a + K_b - shared
+                    n = c_a.shape[1]
+                    G_out = torch.empty(B, n, K_out, dtype=dtype, device=device)
+                    G_out[:, :, :shared] = G_a[:, :, :shared] + G_b[:, :, :shared]
+                    if K_a > shared:
+                        G_out[:, :, shared:K_a] = G_a[:, :, shared:]
+                    if K_b > shared:
+                        G_out[:, :, K_a:] = G_b[:, :, shared:]
+                    state[name] = (c_a + c_b, G_out)
+            else:
+                c_in, G_in = _get(op['inputs'][0])
+                bias = op.get('bias')
+                if bias is not None:
+                    bt = torch.as_tensor(bias.flatten(),
+                                          dtype=dtype, device=device)
+                    c_in = c_in + bt  # broadcast across batch
+                state[name] = (c_in, G_in)
+
+        elif t == 'sub':
+            c_in, G_in = _get(op['inputs'][0])
+            bias = op.get('bias')
+            if bias is not None:
+                bt = torch.as_tensor(bias.flatten(),
+                                      dtype=dtype, device=device)
+                c_in = c_in - bt
+            state[name] = (c_in, G_in)
+
+        elif t == 'reshape':
+            state[name] = _get(op['inputs'][0])
+
+        elif t == 'conv':
+            raise ValueError(
+                'batched zono forward does not support conv ops; '
+                'fall back to scalar path')
+
+        else:
+            raise ValueError(
+                f'batched zono forward: unknown op type {t!r}')
+
+        gen_count[name] = state[name][1].shape[2]
+        for inp in op['inputs']:
+            if last_use.get(inp) == op_idx and inp in state:
+                del state[inp]
+
+    last_name = gg['ops'][-1]['name']
+    return sb, state[last_name]
+
+
+@torch.no_grad()
+def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
+                                   return_input_linear=False):
+    """Batched CROWN spec backward.
+
+    Args:
+        tight: {layer_idx: (lo, hi)} where lo, hi are (B, n_layer).
+        xl, xh: (B, n_in) per-batch input bounds.
+        spec_ew: dict {qid: (w, bias)} with w (n_out,), bias scalar.
+            Same w/bias applied across the batch.
+        return_input_linear: if True, also returns the linear lower
+            bound coefficients in input space:
+              A: (B, Q, n_in) such that spec_q(x) >= A[b,q] · x + acc[b,q]
+              acc: (B, Q) per-batch per-query bias
+            Used by domain clipping in `_input_split_batched`.
+
+    Returns:
+        spec_lbs: (B, Q) per-batch per-query lower bound on
+        `w_q · y(x) + bias_q` over x in the batch's box.
+        If return_input_linear: (spec_lbs, A, acc).
+    """
+    ops = gg['ops']
+    B, n_in = xl.shape
+
+    qids = sorted(spec_ew.keys())
+    Q = len(qids)
+    W_q = torch.stack([spec_ew[qid][0].flatten() for qid in qids])  # (Q, n_out)
+    b_q = torch.tensor([float(spec_ew[qid][1]) for qid in qids],
+                        dtype=dtype, device=device)  # (Q,)
+    # Seed ew at output: (B, Q, n_out) — broadcast queries across batch.
+    last_name = ops[-1]['name']
+    ew_at = {last_name: W_q.unsqueeze(0).expand(B, -1, -1).clone()}
+    acc = b_q.unsqueeze(0).expand(B, -1).clone()  # (B, Q)
+
+    for op in reversed(ops):
+        name = op['name']
+        if name not in ew_at:
+            continue
+        ew = ew_at[name]  # (B, Q, n)
+        t = op['type']
+
+        if t == 'fc':
+            W = op['W']
+            bias = op['bias']
+            acc = acc + ew @ bias  # (B, Q)
+            ew_back = ew @ W  # (B, Q, n_in_layer)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'relu':
+            if 'layer_idx' in op:
+                lo, hi = tight[op['layer_idx']]  # (B, n)
+                lo_s, up_s, up_t, _, _, _ = _make_slopes(lo, hi)
+                ep = ew.clamp(min=0)  # (B, Q, n)
+                en = ew.clamp(max=0)
+                # acc += (en * up_t).sum over n, per (b, q)
+                acc = acc + (en * up_t.unsqueeze(1)).sum(dim=-1)
+                ew_back = ep * lo_s.unsqueeze(1) + en * up_s.unsqueeze(1)
+            else:
+                ew_back = ew
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'add':
+            for inp in op['inputs']:
+                existing = ew_at.get(inp)
+                ew_at[inp] = ew.clone() if existing is None else existing + ew
+
+        elif t == 'sub':
+            bias = op.get('bias')
+            if bias is not None:
+                bt = torch.as_tensor(bias.flatten(),
+                                      dtype=dtype, device=device)
+                # acc -= (ew * bt).sum over n
+                acc = acc - (ew * bt).sum(dim=-1)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew.clone() if existing is None else existing + ew
+
+        elif t == 'reshape':
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew.clone() if existing is None else existing + ew
+
+        elif t == 'conv':
+            raise ValueError(
+                'batched spec backward does not support conv ops')
+
+        else:
+            raise ValueError(f'batched spec backward: unknown op {t!r}')
+
+    input_name = gg['input_name']
+    ew_inp = ew_at.get(input_name)
+    if ew_inp is None:
+        if return_input_linear:
+            zeros = torch.zeros(B, Q, n_in, dtype=dtype, device=device)
+            return acc, zeros, acc
+        return acc
+    # Per-batch interval bound: spec_lb[b, q] = acc[b, q]
+    # + sum_i [pos(ew[b, q, i]) * xl[b, i] + neg(ew[b, q, i]) * xh[b, i]]
+    pos = ew_inp.clamp(min=0)
+    neg = ew_inp.clamp(max=0)
+    spec_lbs = (acc
+                 + (pos * xl.unsqueeze(1)).sum(dim=-1)
+                 + (neg * xh.unsqueeze(1)).sum(dim=-1))
+    if return_input_linear:
+        # spec_q(x) >= ew_inp[b,q] · x + acc[b,q]
+        return spec_lbs, ew_inp, acc
+    return spec_lbs
 
 
 @torch.no_grad()

@@ -1,0 +1,13 @@
+# cersyve — small (2D/4D input) controller verification benchmarks,
+# VNNCOMP regular track. Pendulum/lane_keep/point_mass × pretrain/finetune
+# × con/inv = 12 instances. Networks: ~10 ReLU layers, ~200 neurons.
+#
+# Batched input-split BaB with domain clipping cracks all 12/12 at 60s
+# budget. The clipping (CROWN-input-space halfspace bounding box) is
+# what closes the 4D-input `_finetune_inv` boundary cases that pure
+# per-query CROWN can't — analogous to AB-CROWN's `clip_input_domain:
+# complete`. Without clipping we top out at 10/12 even with the joint-
+# LP fallbacks.
+input_split_batched_enabled: true
+input_split_batched_clip_enabled: true
+input_split_batch_size: 4096

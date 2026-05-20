@@ -60,6 +60,81 @@ def default_settings(**overrides):
         pgd_lr_decay=0.99,               # step-size × this every iter
         pgd_hinge_threshold=-1e-5,       # clamp margins at this from below
         pgd_alpha_frac=0.25,             # step_size = eps_input * this
+        # Multi-α restart pool: when True, partition the n_restarts pool
+        # across the log-spaced alphas in `pgd_alpha_multi_fractions` so
+        # each restart gets a different step size. Helps when the right
+        # α varies across cases (cersyve: lane_keep wants ~0.01,
+        # pendulum ~0.005). Equivalent compute, much broader coverage.
+        pgd_alpha_multi=False,
+        pgd_alpha_multi_fractions=(0.25, 0.05, 0.01, 0.002),
+        # Per-leaf PGD inside input_split BaB: when an `unknown` leaf is
+        # encountered, run a short PGD attack on that localized sub-box
+        # before splitting. Helps when root-PGD missed a narrow SAT
+        # region that's easier to find in a smaller sub-box. Off by
+        # default; opt-in per benchmark (cersyve uses this).
+        input_split_leaf_pgd_enabled=False,
+        input_split_leaf_pgd_time=0.1,
+        # Per-leaf JOINT-query CROWN check for AND conjuncts. Multi-
+        # query disjuncts (cersyve: 2 queries per disjunct) can fail
+        # the per-query "any q has lb > 0" check on UNSAT leaves
+        # because closing requires JOINT reasoning. A linear-combo
+        # λ·q0 + (1-λ)·q1 with lb > 0 proves the disjunct's unsafe
+        # AND-region is empty (any unsafe point satisfies both
+        # constraints, contradicting positive combo lb). Pass a list
+        # of λ ∈ [0,1] to try. `[0.5]` is the cheapest useful setting.
+        # `None` (default) disables. Opt-in per benchmark.
+        input_split_leaf_joint_lambdas=None,
+        # Per-leaf joint-AND INPUT-space LP check. Uses CROWN's
+        # per-query linear lower-bound coefficients in input space to
+        # check whether the joint unsafe-AND halfspaces have a
+        # non-empty intersection with the leaf input box. Catches
+        # CURVED separations between safe regions that λ-combo CROWN
+        # misses (the λ-combo collapses to a single hyperplane).
+        # Costs one extra spec backward + tiny LP per leaf. Disabled
+        # by default; opt-in per benchmark (cersyve).
+        input_split_leaf_joint_input_lp=False,
+        # Stronger fallback: when the CROWN-input-space joint LP
+        # doesn't close a disjunct, also try the LP on the OUTPUT
+        # ZONOTOPE. The zonotope captures dependence between outputs
+        # via shared e-generators (cifar pretrain models share the
+        # ReLU error structure across both Y_0 and Y_1) — strictly
+        # tighter than the single-hyperplane CROWN input bound. Only
+        # used when `input_split_leaf_joint_input_lp=True`; on by
+        # default because the extra cost is ~1 ms per leaf.
+        input_split_leaf_joint_zono_lp=True,
+        # Final fallback: full per-leaf TRIANGLE-LP that builds the
+        # whole network's LP relaxation with BOTH unsafe constraints
+        # added jointly. Captures correlations across the network that
+        # neither CROWN linearization nor the output zonotope can.
+        # Costs ~5-20 ms per leaf on tiny networks; opt-in per
+        # benchmark (cersyve 4D-input UNSAT cases — 2/12 boundary
+        # leaves not closable by zono LP).
+        input_split_leaf_joint_triangle_lp=False,
+        # Batched input-split BaB. When True, switches the input-split
+        # dispatch from sequential per-leaf processing to a worklist-
+        # based driver that stacks up to `input_split_batch_size` boxes
+        # into one tensor and runs a single batched forward zono + spec
+        # backward. Skips joint LP / α-CROWN at the leaf — pure per-
+        # query CROWN. The throughput jump (1000s of leaves/sec on GPU
+        # vs ~30/sec sequential) compensates by going deeper. Used by
+        # cersyve 4D-input UNSAT cases that the sequential path
+        # couldn't crack within budget.
+        input_split_batched_enabled=False,
+        input_split_batch_size=4096,
+        # Memory cap: bail out of batched BaB if worklist grows past
+        # this many open boxes (each is a (n_in,) tensor pair — 32 B
+        # for 4-D input, so 200K boxes ≈ 6 MB; safety net for
+        # divergent splits).
+        input_split_batched_max_worklist=200_000,
+        # Domain clipping inside batched BaB. After CROWN backward gives
+        # per-query input-space linearization (A_q, b_q), clip each
+        # leaf's box to the bounding box of the intersection of unsafe
+        # halfspaces `A_q·x + b_q ≤ 0`. For AND-conjuncts, leaves
+        # where the polytope is empty are verified directly; leaves
+        # where it's just smaller go into the next iteration with
+        # tighter bounds. Mirrors AB-CROWN's `clip_input_domain:
+        # complete`. On by default whenever `input_split_batched_enabled`.
+        input_split_batched_clip_enabled=True,
         # PGD optimizer choice. Three modes:
         #   'adam_sign'    — bias-corrected Adam moment, sign-clipped step
         #                    (current vibecheck behavior, kept as default
@@ -471,7 +546,11 @@ def default_settings(**overrides):
         # zono enclosure is too loose. No effect when input dim is large.
         input_split_enabled=True,
         input_split_max_dims=20,
-        input_split_max_depth=8,
+        # Time is the budget; no depth cap by default (was 8 — too
+        # aggressive; on cersyve UNSAT cases the BaB needs ~1k nodes
+        # per leaf-verification path). Set to a positive int to opt
+        # back into a depth cap.
+        input_split_max_depth=None,
         input_split_node_timeout=8.0,
         # Fast-leaf path for input-split BaB. When True, each leaf runs
         # only forward zono + CROWN backward + α-CROWN(N iters) + spec
@@ -628,6 +707,15 @@ def default_settings(**overrides):
         # prevents thread from bleeding into Phase 7/8.
         parallel_pgd_enabled=False,
         parallel_pgd_max_attacks=20,
+        # ONNXRuntime SAT-witness validation (defense-in-depth).
+        # Before returning 'sat' from any path, run the witness through
+        # the ORIGINAL ONNX model + check it actually violates the spec
+        # within `sat_validate_atol` (mirrors VNNCOMP scoring's
+        # COUNTEREXAMPLE_ATOL=1e-4). Spurious witnesses are downgraded
+        # to 'unknown' with `details['spurious_witness']` populated.
+        # `skip_sat_validation=True` opts out (e.g. for ORT-free envs).
+        sat_validate_atol=1e-4,
+        skip_sat_validation=False,
         # Phase 1 gen-LP conv chunking. Default 256 = chunked with safe
         # block size + OOM-halve-retry fallback. The chunk loop itself
         # is ~0.3% overhead vs un-chunked; OOM halving costs ~0.2% per

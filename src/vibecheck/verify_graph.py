@@ -3397,6 +3397,66 @@ def _forward_zonotope_interleaved(
     return sb, bounds_by_relu, z_final, tb
 
 
+def _zono_spec_lbs_and_open_qis(center, generators, queries_flat,
+                                   w_qs=None, b_qs=None):
+    """Compute per-query zonotope spec lower bounds + open-query list.
+
+    The unsafe region is OR-of-disjuncts of AND-of-queries (DNF). A
+    disjunct is "open" (potentially SAT, needing further refinement) iff
+    EVERY query in it has lb ≤ 0 — one provably-safe query closes the
+    whole conjunct (AND fails if any operand fails).
+
+    Returns (spec_lbs_dict, open_qis) where:
+      - spec_lbs_dict: {query_index: zono_lb_float}. KEYED BY QUERY INDEX,
+        not disjunct id. For multi-query conjuncts (e.g. cersyve has 2
+        queries per disjunct), disjunct-id keying silently overwrites
+        (last query wins), losing per-query info. Downstream consumers
+        read `spec_lbs.get(qi, 0.0)` expecting query-indexed dict; the
+        mismatch had previously masked a soundness-relevant bug where the
+        pre-cascade PGD sorted disjuncts by garbage `min` over partially-
+        missing lbs.
+      - open_qis: list of query indices belonging to still-open disjuncts.
+
+    Pure numpy / lightweight — kept testable independent of GPU graph.
+    """
+    c = np.asarray(center, dtype=np.float64).flatten()
+    G = np.asarray(generators, dtype=np.float64)
+    if G.size > 0 and G.shape[0] != c.size:
+        G = G.reshape(c.size, -1)
+    if w_qs is None:
+        w_qs = np.stack([np.asarray(q[1], dtype=np.float64)
+                          for q in queries_flat])
+    if b_qs is None:
+        b_qs = np.asarray([float(q[2]) for q in queries_flat],
+                           dtype=np.float64)
+    spec_lbs = {}
+    for qi in range(len(queries_flat)):
+        wq = w_qs[qi]
+        bq = float(b_qs[qi])
+        # `as_linear_queries` convention: verified safe iff
+        # min(w·y + bias) > 0. For zono y = c + G·e, e∈[-1,1]^k:
+        #   lb(w·y + bias) = w·c + bias - |w·G|_1.
+        # The bias is ADDED, not subtracted. Bias is 0 for pairwise
+        # constraints (cifar/tinyimagenet) AND for cersyve pendulum
+        # (threshold value=0), so a wc - bq sign error is silent on
+        # current benchmarks — but produces sort-order garbage on any
+        # threshold spec with value≠0.
+        wc = float(wq @ c) + bq
+        wG = wq @ G if G.size > 0 else np.zeros(0)
+        spec_lbs[qi] = wc - float(np.sum(np.abs(wG)))
+    disj_of_qi = {qi: queries_flat[qi][0]
+                   for qi in range(len(queries_flat))}
+    disj_open = set()
+    for di in {q[0] for q in queries_flat}:
+        qids_in_disj = [qi for qi in range(len(queries_flat))
+                         if disj_of_qi[qi] == di]
+        if all(spec_lbs[qi] <= 0 for qi in qids_in_disj):
+            disj_open.add(di)
+    open_qis = [qi for qi in range(len(queries_flat))
+                 if disj_of_qi[qi] in disj_open]
+    return spec_lbs, open_qis
+
+
 def _phase1_bab_refine(
         xl, xh, gg, gg_ops_ser, x_lo_64, x_hi_64,
         sample_timeout, n_cores, time_left,
@@ -3522,20 +3582,8 @@ def _phase1_bab_refine(
         _G_np = (_G.detach().cpu().numpy().astype(np.float64)
                   if _G.numel() > 0
                   else np.zeros((_c.size, 0), dtype=np.float64))
-        # `generators` is (n_flat, K) per TorchZonotope contract.
-        if _G_np.shape[0] != _c.size and _G_np.size > 0:
-            _G_np = _G_np.reshape(_c.size, -1)
-        spec_lbs_zono_dict = {}
-        for _qi in range(len(queries_flat)):
-            _wq = w_qs[_qi]
-            _bq = float(b_qs[_qi])
-            _wc = float(_wq @ _c) - _bq
-            _wG = _wq @ _G_np if _G_np.size > 0 else np.zeros(0)
-            spec_lbs_zono_dict[queries_flat[_qi][0]] = (
-                _wc - float(np.sum(np.abs(_wG))))
-        _open_qis_zono = [qi for qi in range(len(queries_flat))
-                           if spec_lbs_zono_dict[
-                               queries_flat[qi][0]] <= 0]
+        spec_lbs_zono_dict, _open_qis_zono = _zono_spec_lbs_and_open_qis(
+            _c, _G_np, queries_flat, w_qs=w_qs, b_qs=b_qs)
         tb['spec_lbs_zono'] = dict(spec_lbs_zono_dict)
         sat_witness = pre_cascade_hook(
             spec_lbs_zono_dict, bounds_by_relu, _open_qis_zono)
@@ -4736,6 +4784,80 @@ def _compute_avg_layer_width(gg, bounds_by_relu):
     return out
 
 
+def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
+    """Run a SAT witness through ONNXRuntime + check it actually violates
+    the spec. Catches spurious counterexamples from PGD/MILP bugs OR from
+    graph-builder bugs (vibecheck's internal forward might compute a
+    different value than the original ONNX). Mirrors VNNCOMP scoring's
+    counterexample-validation step (COUNTEREXAMPLE_ATOL=1e-4).
+
+    Returns (ok, info_dict). `ok=True` iff witness is in the input box
+    (within atol) AND its ORT output satisfies the unsafe condition
+    (i.e., `spec.check(out, out)` returns 'unknown', within atol on
+    constraint margins).
+    """
+    info = {'ok': False, 'reason': None}
+    if onnx_path is None:
+        info['reason'] = 'no onnx_path stashed on graph; skipping validation'
+        return True, info
+    w = np.asarray(witness).flatten().astype(np.float64)
+    if w.shape != spec.x_lo.shape:
+        info['reason'] = (f'witness shape {w.shape} != x_lo shape '
+                           f'{spec.x_lo.shape}')
+        return False, info
+    if (np.any(w < spec.x_lo - atol)
+            or np.any(w > spec.x_hi + atol)):
+        info['reason'] = (f'witness outside input box (atol={atol})')
+        info['out_of_box'] = (
+            float((spec.x_lo - w).max()), float((w - spec.x_hi).max()))
+        return False, info
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        info['reason'] = 'onnxruntime not installed; skipping validation'
+        return True, info
+    # ORT can't read .gz natively. Decompress to a bytes buffer first so
+    # the validator works on the VNNCOMP-shipped `.onnx.gz` files. A
+    # prior version called `ort.InferenceSession(path)` directly and
+    # rejected every PGD witness on cersyve as "spurious" because the
+    # session-load itself raised. Validation failures must come from
+    # the witness being wrong, not from file format.
+    try:
+        if onnx_path.endswith('.gz'):
+            import gzip
+            with gzip.open(onnx_path, 'rb') as _f:
+                _model_bytes = _f.read()
+            sess = ort.InferenceSession(
+                _model_bytes, providers=['CPUExecutionProvider'])
+        else:
+            sess = ort.InferenceSession(
+                onnx_path, providers=['CPUExecutionProvider'])
+        in_meta = sess.get_inputs()[0]
+        in_shape = [d if isinstance(d, int) and d > 0 else 1
+                    for d in in_meta.shape]
+        x = w.reshape(in_shape).astype(np.float32)
+        out = sess.run(None, {in_meta.name: x})[0]
+        out_flat = np.asarray(out).flatten().astype(np.float64)
+    except Exception as e:
+        info['reason'] = f'ORT forward failed: {type(e).__name__}: {e}'
+        return False, info
+    info['out'] = out_flat
+    # spec.check returns 'unknown' iff worst margin <= 0. Apply atol slack
+    # by shifting output: pass (out-atol, out+atol) so margins computed
+    # against a generous output band — a witness near the boundary counts
+    # as a valid SAT if any output in the +/-atol envelope violates.
+    check_res, check_info = spec.check(out_flat - atol, out_flat + atol)
+    info['spec_check'] = check_res
+    info['worst_margin'] = check_info.get('worst_margin')
+    if check_res == 'unknown':
+        info['ok'] = True
+        return True, info
+    info['reason'] = (f'ORT output does not violate spec '
+                       f'(worst_margin={info["worst_margin"]:.4g}, '
+                       f'atol={atol})')
+    return False, info
+
+
 def _run_pipeline(graph, spec, settings, build_fn, impl):
     """Run the 9-phase graph verification pipeline.
 
@@ -4801,6 +4923,30 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         torch.cuda.reset_peak_memory_stats()
 
     def _finalize(result_str, phase, **extra):
+        # Defense-in-depth: every SAT verdict must pass ONNXRuntime
+        # validation against the spec (within COUNTEREXAMPLE_ATOL).
+        # Catches spurious witnesses from PGD/MILP bugs AND graph-
+        # builder bugs that would otherwise leak through silently.
+        # Spurious witnesses get downgraded to 'unknown' with
+        # `details['spurious_witness']` set and logged.
+        if (result_str == 'sat' and extra.get('witness') is not None
+                and not bool(getattr(
+                    settings, 'skip_sat_validation', False))):
+            _atol = float(settings.sat_validate_atol
+                           if 'sat_validate_atol' in settings else 1e-4)
+            _onnx_path = getattr(graph, 'onnx_path', None)
+            _ok, _info = _validate_sat_witness(
+                _onnx_path, spec, extra['witness'], atol=_atol)
+            if not _ok:
+                if print_progress:
+                    print(f'  [validate] SPURIOUS SAT from {phase}: '
+                          f'{_info.get("reason")}', flush=True)
+                # Stash for diagnostics + downgrade verdict.
+                extra = dict(extra)
+                extra['spurious_witness'] = _info
+                extra['original_phase'] = phase
+                result_str = 'unknown'
+                phase = f'spurious_sat_{phase}'
         details['result'] = result_str
         details['phase'] = phase
         details['time'] = time.perf_counter() - t_start
@@ -6255,8 +6401,44 @@ def verify_graph(graph, spec, settings):
     n_in = int(np.prod(spec.x_lo.shape)) if hasattr(spec, 'x_lo') else 10**9
     if (getattr(settings, 'input_split_enabled', True)
             and n_in <= int(getattr(settings, 'input_split_max_dims', 20))):
-        return _input_split_verify(graph, spec, settings, build_fn, impl)
-    return _run_pipeline(graph, spec, settings, build_fn, impl)
+        if bool(getattr(settings, 'input_split_batched_enabled', False)):
+            # Build the GPU graph once at the top — the batched driver
+            # reuses it across all iterations.
+            from .settings import resolve_torch
+            _dev, _dtype = resolve_torch(settings)
+            _gg = graph.gpu_graph(_dev, _dtype)
+            result, details = _input_split_batched(
+                graph, spec, settings, _gg, _dev, _dtype)
+        else:
+            result, details = _input_split_verify(
+                graph, spec, settings, build_fn, impl)
+    else:
+        result, details = _run_pipeline(
+            graph, spec, settings, build_fn, impl)
+    # Top-level SAT witness validation — defense-in-depth against
+    # spurious counterexamples from any code path (input_split bypasses
+    # _finalize). Idempotent: if _finalize already validated, the
+    # witness is already a real one and the second check just confirms.
+    if (result == 'sat' and isinstance(details, dict)
+            and details.get('witness') is not None
+            and not bool(getattr(settings, 'skip_sat_validation', False))
+            and not details.get('witness_validated_at_topvel', False)):
+        _atol = float(settings.sat_validate_atol
+                       if 'sat_validate_atol' in settings else 1e-4)
+        _ok, _info = _validate_sat_witness(
+            getattr(graph, 'onnx_path', None), spec, details['witness'],
+            atol=_atol)
+        details['witness_validated_at_topvel'] = True
+        if not _ok:
+            if getattr(settings, 'print_progress', False):
+                print(f'  [validate-top] SPURIOUS SAT from '
+                      f'{details.get("phase")}: '
+                      f'{_info.get("reason")}', flush=True)
+            details['spurious_witness'] = _info
+            details['original_phase'] = details.get('phase')
+            details['phase'] = f'spurious_sat_{details.get("phase")}'
+            result = 'unknown'
+    return result, details
 
 
 def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):
@@ -6309,6 +6491,295 @@ def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):
     nz_np = nz.cpu().numpy()
     score_per_axis[nz_np] = score_per_col.cpu().numpy()
     return score_per_axis, nz_np
+
+
+def _joint_and_infeasible_in_box(linears, xl_np, xh_np):
+    """Return True if the system {A_i·x + b_i ≤ 0 for all i, x in box}
+    is INFEASIBLE — i.e., the AND-conjunct of unsafe halfspaces does
+    NOT intersect the input box.
+
+    `linears` is a list of (A, b) numpy pairs. A small Gurobi LP. For
+    tiny input dims (cersyve: 2-D / 4-D inputs) this is <1 ms per leaf.
+    """
+    import gurobipy as gp
+    from .gurobi_util import optimize_checked
+    n = len(xl_np)
+    env = gp.Env(empty=True)
+    env.setParam('OutputFlag', 0)
+    env.start()
+    m = gp.Model(env=env)
+    m.Params.OutputFlag = 0
+    m.Params.Threads = 1
+    x_vars = m.addMVar(n, lb=xl_np, ub=xh_np, name='x')
+    for A, b in linears:
+        # A·x + b ≤ 0
+        m.addConstr(A @ x_vars + b <= 0)
+    m.setObjective(0.0)
+    optimize_checked(m)
+    # Status 3 = INFEASIBLE. Any FEASIBLE status means the joint
+    # halfspace AND intersects the box — leaf can't be closed by this.
+    is_infeasible = (m.Status == 3)
+    m.dispose()
+    env.dispose()
+    return is_infeasible
+
+
+def _joint_and_infeasible_triangle_lp(gg_ops_ser, x_lo, x_hi,
+                                        bounds_by_relu, qlists_disj,
+                                        time_limit=2.0):
+    """Full triangle-LP joint feasibility check at a leaf.
+
+    Builds Gurobi LP with:
+      - Triangle relaxations for every unstable ReLU
+      - Linear pass-through for stable ones
+      - Linear layer constraints (Conv/Gemm)
+      - Input box [xl, xh]
+      - ALL queries of a disjunct as constraints: w_q · y + b_q ≤ 0
+    Then checks feasibility. Infeasible → the AND-conjunct is empty in
+    the leaf → leaf safe.
+
+    Tighter than CROWN's input-space hyperplane bound because the
+    triangle LP allows the ReLU error to be distributed *jointly* across
+    constraints, rather than independently per query (the CROWN bound
+    integrates the ReLU error per query).
+
+    Returns set of disjunct ids closed.
+    """
+    import gurobipy as gp
+    from .gurobi_util import optimize_checked
+    closed = set()
+    env = gp.Env(empty=True)
+    env.setParam('OutputFlag', 0)
+    env.start()
+    try:
+        for di, qlist in qlists_disj.items():
+            if len(qlist) < 2:
+                continue
+            m = _build_leaf_triangle_lp(
+                env, gg_ops_ser, x_lo, x_hi, bounds_by_relu)
+            if m is None:
+                continue
+            x_vars = m._x_vars
+            y_vars = m._y_vars
+            n_out = len(y_vars)
+            for w_q, b_q in qlist:
+                w_q = np.asarray(w_q, dtype=np.float64)
+                expr = gp.LinExpr()
+                for j in range(n_out):
+                    if w_q[j] != 0.0:
+                        expr.addTerms(float(w_q[j]), y_vars[j])
+                expr.addConstant(float(b_q))
+                m.addConstr(expr <= 0)
+            m.setObjective(0.0)
+            m.Params.TimeLimit = time_limit
+            optimize_checked(m)
+            if m.Status == 3:  # INFEASIBLE
+                closed.add(di)
+            m.dispose()
+    finally:
+        env.dispose()
+    return closed
+
+
+def _build_leaf_triangle_lp(env, gg_ops_ser, x_lo, x_hi, bounds_by_relu):
+    """Build a triangle-LP encoding of the network for a single leaf.
+
+    Returns the Gurobi Model with `m._x_vars` (input vars) and
+    `m._y_vars` (output vars) stashed, or None if the network has ops
+    the simple builder doesn't handle. Skips graph-specific cases (add,
+    sub, reshape with non-trivial pass-through) — the caller should
+    catch None and fall back.
+    """
+    import gurobipy as gp
+    m = gp.Model(env=env)
+    m.Params.OutputFlag = 0
+    m.Params.Threads = 1
+    x_lo_np = np.asarray(x_lo, dtype=np.float64).flatten()
+    x_hi_np = np.asarray(x_hi, dtype=np.float64).flatten()
+    n_in = len(x_lo_np)
+    x_vars = [m.addVar(lb=x_lo_np[i], ub=x_hi_np[i], name=f'x_{i}')
+              for i in range(n_in)]
+    # Track per-op output variables.
+    var_map = {}
+    input_name = gg_ops_ser[0].get('inputs', [None])[0] if gg_ops_ser else None
+    # gg_ops_ser ops use op['name'] for output, op['inputs'] for input refs.
+    # Find the model input name.
+    for op in gg_ops_ser:
+        for inp in op.get('inputs', []):
+            if inp not in var_map and inp != op.get('name'):
+                # Treat any unresolved input as the model input on first sight.
+                if input_name is None or inp == input_name:
+                    var_map[inp] = x_vars
+                    input_name = inp
+                    break
+        if input_name and input_name in var_map:
+            break
+    if input_name is None:
+        return None
+    if input_name not in var_map:
+        var_map[input_name] = x_vars
+
+    relu_idx = 0
+    for op_i, op in enumerate(gg_ops_ser):
+        name = op['name']
+        t = op['type']
+        if t == 'fc':
+            W = op.get('W_np')
+            b = op.get('bias_np')
+            if W is None or b is None:
+                m.dispose()
+                return None
+            W = np.asarray(W, dtype=np.float64)
+            b = np.asarray(b, dtype=np.float64).flatten()
+            in_vars = var_map[op['inputs'][0]]
+            if len(in_vars) != W.shape[1]:
+                m.dispose()
+                return None
+            out_vars = []
+            for i in range(W.shape[0]):
+                v = m.addVar(lb=-gp.GRB.INFINITY, ub=gp.GRB.INFINITY,
+                              name=f'fc{op_i}_{i}')
+                expr = gp.LinExpr()
+                for j in range(W.shape[1]):
+                    if W[i, j] != 0.0:
+                        expr.addTerms(float(W[i, j]), in_vars[j])
+                expr.addConstant(float(b[i]))
+                m.addConstr(v == expr)
+                out_vars.append(v)
+            var_map[name] = out_vars
+        elif t == 'relu':
+            in_vars = var_map[op['inputs'][0]]
+            L = op.get('layer_idx')
+            if L is None or L not in bounds_by_relu:
+                m.dispose()
+                return None
+            lo_arr, hi_arr = bounds_by_relu[L]
+            if len(in_vars) != len(lo_arr):
+                m.dispose()
+                return None
+            out_vars = []
+            for j in range(len(in_vars)):
+                lo_j = float(lo_arr[j])
+                hi_j = float(hi_arr[j])
+                if lo_j >= 0:
+                    out_vars.append(in_vars[j])
+                elif hi_j <= 0:
+                    out_vars.append(m.addVar(lb=0, ub=0,
+                                              name=f'relu{L}_{j}_zero'))
+                else:
+                    # Triangle: a >= 0, a >= z, a <= slope·(z - lo)
+                    a = m.addVar(lb=0, ub=hi_j, name=f'relu{L}_{j}')
+                    m.addConstr(a >= in_vars[j])
+                    slope = hi_j / (hi_j - lo_j)
+                    m.addConstr(a <= slope * (in_vars[j] - lo_j))
+                    out_vars.append(a)
+            var_map[name] = out_vars
+            relu_idx += 1
+        elif t == 'add':
+            ins = op.get('inputs', [])
+            if len(ins) != 2 or ins[0] not in var_map or ins[1] not in var_map:
+                m.dispose()
+                return None
+            a_vars = var_map[ins[0]]
+            b_vars = var_map[ins[1]]
+            if len(a_vars) != len(b_vars):
+                m.dispose()
+                return None
+            out_vars = []
+            for j in range(len(a_vars)):
+                v = m.addVar(lb=-gp.GRB.INFINITY, ub=gp.GRB.INFINITY,
+                              name=f'add{op_i}_{j}')
+                m.addConstr(v == a_vars[j] + b_vars[j])
+                out_vars.append(v)
+            var_map[name] = out_vars
+        elif t == 'sub':
+            in_vars = var_map[op['inputs'][0]]
+            bias = op.get('bias')
+            if bias is None:
+                var_map[name] = in_vars
+                continue
+            b_arr = np.asarray(bias, dtype=np.float64).flatten()
+            if len(in_vars) != len(b_arr):
+                m.dispose()
+                return None
+            out_vars = []
+            for j in range(len(in_vars)):
+                v = m.addVar(lb=-gp.GRB.INFINITY, ub=gp.GRB.INFINITY,
+                              name=f'sub{op_i}_{j}')
+                m.addConstr(v == in_vars[j] - float(b_arr[j]))
+                out_vars.append(v)
+            var_map[name] = out_vars
+        elif t == 'reshape':
+            var_map[name] = var_map[op['inputs'][0]]
+        else:
+            # Unsupported op for this minimalist builder.
+            m.dispose()
+            return None
+
+    out_name = gg_ops_ser[-1]['name']
+    if out_name not in var_map:
+        m.dispose()
+        return None
+    m._x_vars = x_vars
+    m._y_vars = var_map[out_name]
+    return m
+
+
+def _joint_and_infeasible_zono(z_center_np, z_gens_np, qlists_disj):
+    """Joint-AND infeasibility check using the OUTPUT ZONOTOPE.
+
+    The output zonotope Y(e) = c + G·e for e ∈ [-1,1]^k captures more
+    correlations between outputs than a single CROWN hyperplane in
+    input space (which already integrated out e via |·|_1 over each
+    column). For a multi-query AND-conjunct, the unsafe AND region in
+    OUTPUT space is empty within the zonotope iff:
+
+      ∄ e ∈ [-1,1]^k :  ∀q ∈ disj  w_q · (c + G·e) + b_q ≤ 0
+
+    i.e., the LP:
+      minimize 0
+      s.t.    w_q · G · e ≤ -(w_q · c + b_q)   for all q
+              -1 ≤ e_i ≤ 1
+    is infeasible.
+
+    `qlists_disj` is a dict {disjunct_id: [(w_q_np, b_q_float), ...]}.
+    Returns set of disjunct ids closed via this check.
+
+    Compared to `_joint_and_infeasible_in_box` (input-space LP), this
+    uses the zonotope's full generator structure — captures dependence
+    via internal e variables — so it's strictly tighter on cases where
+    CROWN over-approximates the input→output map.
+    """
+    import gurobipy as gp
+    from .gurobi_util import optimize_checked
+    if not qlists_disj or z_gens_np.size == 0:
+        return set()
+    k = z_gens_np.shape[1]
+    closed = set()
+    env = gp.Env(empty=True)
+    env.setParam('OutputFlag', 0)
+    env.start()
+    try:
+        for di, qlist in qlists_disj.items():
+            if len(qlist) < 2:
+                continue
+            m = gp.Model(env=env)
+            m.Params.OutputFlag = 0
+            m.Params.Threads = 1
+            e = m.addMVar(k, lb=-1.0, ub=1.0, name='e')
+            for w_q, b_q in qlist:
+                wG = (w_q @ z_gens_np).astype(np.float64)
+                wc = float(w_q @ z_center_np) + float(b_q)
+                # w_q · (c + G·e) + b_q ≤ 0  ⇔  wG · e ≤ -wc
+                m.addConstr(wG @ e <= -wc)
+            m.setObjective(0.0)
+            optimize_checked(m)
+            if m.Status == 3:
+                closed.add(di)
+            m.dispose()
+    finally:
+        env.dispose()
+    return closed
 
 
 def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
@@ -6375,13 +6846,163 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
         len(sb), device, dtype)
 
     def _all_verified():
+        # A conjunct (AND of queries) is safe iff ANY single query has
+        # lb > 0 — because the unsafe region requires ALL constraints to
+        # hold, and one provably-violated constraint makes the unsafe
+        # region unreachable. The old code required ALL queries to have
+        # lb > 0 — wrong semantics for AND; on cersyve made every leaf
+        # return 'unknown' even on a point-width input box. Mirrors the
+        # Conjunct.margin fix in spec.py.
         return all(
-            all(spec_lbs.get(qi, -1.0) > 0 for qi, _, _ in qlist)
+            any(spec_lbs.get(qi, -1.0) > 0 for qi, _, _ in qlist)
             for qlist in disj_queries.values())
 
     if _all_verified():
         return 'verified', {'phase': 'fast_leaf_crown',
                             'spec_lbs': dict(spec_lbs)}
+
+    # AND-conjunct JOINT input-space LP check. For multi-query disjuncts
+    # (cersyve), per-query CROWN often can't close because the AND-region
+    # in OUTPUT space (Y_0 ≤ 0 AND Y_1 ≥ 0) is non-empty BUT its preimage
+    # in the LEAF's input box is empty. CROWN gives linear lower-bound
+    # coefficients in input space for each query:
+    #   for x in leaf:  spec_q(x) >= A_q·x + b_q
+    # The AND-region is INFEASIBLE iff no x in leaf satisfies BOTH
+    # A_0·x + b_0 ≤ 0 AND A_1·x + b_1 ≤ 0 — a small LP feasibility on
+    # the input box. For 2-D / 4-D inputs (cersyve) this is trivial.
+    # Catches cases that single-query CROWN and λ-combo CROWN both
+    # miss because the joint infeasibility comes from CURVED separation
+    # in input space, not a single hyperplane. Disabled by default.
+    if (bool(getattr(settings, 'input_split_leaf_joint_input_lp', False))
+            and any(len(ql) > 1 for ql in disj_queries.values())):
+        _, _, input_linear = _spec_backward_graph(
+            sb, xl, xh, gg, spec_ew, list(range(len(queries))),
+            len(sb), device, dtype, return_input_linear=True)
+        xl_np = xl.detach().cpu().numpy().astype(np.float64)
+        xh_np = xh.detach().cpu().numpy().astype(np.float64)
+        closed_via_joint = set()
+        for di, qlist in disj_queries.items():
+            if len(qlist) < 2:
+                continue
+            # Build LP: find x in [xl, xh] with A_q·x + b_q ≤ 0 for
+            # ALL q in this disjunct. If infeasible, conjunct is
+            # UNSAT in this leaf.
+            if _joint_and_infeasible_in_box(
+                    [input_linear[qi] for qi, _, _ in qlist],
+                    xl_np, xh_np):
+                closed_via_joint.add(di)
+        # Stronger fallback: when CROWN-input-space LP doesn't close a
+        # disjunct, retry with the OUTPUT ZONOTOPE's joint feasibility
+        # LP. Captures correlations between outputs that the single-
+        # hyperplane CROWN bound integrates away. Tighter on boundary
+        # leaves of UNSAT cases where CROWN's input-space bound is
+        # one-hyperplane-too-loose. ~1-2ms extra per leaf for tiny
+        # zonotopes.
+        if bool(getattr(settings, 'input_split_leaf_joint_zono_lp', True)):
+            remaining = [di for di, qlist in disj_queries.items()
+                          if len(qlist) > 1 and di not in closed_via_joint]
+            if remaining:
+                z_c = z_final_leaf.center.detach().cpu().numpy().astype(
+                    np.float64).flatten()
+                _G = z_final_leaf.generators
+                z_G = (_G.detach().cpu().numpy().astype(np.float64)
+                        if _G.numel() > 0
+                        else np.zeros((z_c.size, 0), dtype=np.float64))
+                if z_G.size > 0 and z_G.shape[0] != z_c.size:
+                    z_G = z_G.reshape(z_c.size, -1)
+                qlists_for_zono = {
+                    di: [(w_qs[qi], float(b_qs[qi]))
+                          for qi, _, _ in disj_queries[di]]
+                    for di in remaining}
+                closed_via_joint |= _joint_and_infeasible_zono(
+                    z_c, z_G, qlists_for_zono)
+        # Strongest fallback: full per-leaf triangle-LP that builds the
+        # entire network's LP relaxation with BOTH unsafe constraints
+        # added jointly. Captures correlations across the network that
+        # neither CROWN linearization nor the output zonotope can. For
+        # tiny cersyve networks (~10 ReLU, 64 neurons total) the LP is
+        # ~5-20 ms per leaf. Only used when prior checks fail. Opt-in
+        # via `input_split_leaf_joint_triangle_lp`.
+        if bool(getattr(settings,
+                          'input_split_leaf_joint_triangle_lp', False)):
+            remaining_tri = [di for di, qlist in disj_queries.items()
+                              if len(qlist) > 1 and di not in closed_via_joint]
+            if remaining_tri:
+                qlists_for_tri = {
+                    di: [(w_qs[qi], float(b_qs[qi]))
+                          for qi, _, _ in disj_queries[di]]
+                    for di in remaining_tri}
+                try:
+                    closed_via_joint |= _joint_and_infeasible_triangle_lp(
+                        gg['ops'], spec.x_lo, spec.x_hi, bbr,
+                        qlists_for_tri)
+                except Exception:
+                    pass
+        if closed_via_joint:
+            # Mark first query of each closed disjunct as positive
+            # so `_all_verified` passes.
+            for di in closed_via_joint:
+                first_qi = disj_queries[di][0][0]
+                spec_lbs[first_qi] = max(spec_lbs.get(first_qi, -1e9), 1.0)
+            if _all_verified():
+                return 'verified', {'phase': 'fast_leaf_joint_input_lp',
+                                     'spec_lbs': dict(spec_lbs),
+                                     'closed_via_joint': list(closed_via_joint)}
+
+    # AND-conjunct joint check via λ-combo CROWN. For a multi-query
+    # conjunct, per-query lbs may all be ≤ 0 even on an UNSAT leaf
+    # because closing it requires JOINT reasoning over the queries.
+    # Concretely: if (w_a·y > 0) AND (w_b·y > 0) is the SAFE-side
+    # encoding, the unsafe AND-region is empty iff some convex combo
+    # `λ·w_a + (1-λ)·w_b` has lb > 0 — because any unsafe point has
+    # both w_a·y ≤ 0 and w_b·y ≤ 0, hence λ·w_a·y + (1-λ)·w_b·y ≤ 0
+    # for any λ ∈ [0,1], contradicting lb > 0. Cheap: one extra CROWN
+    # backward per (λ × disjunct), grid-searched. Disabled by default;
+    # `input_split_leaf_joint_lambdas` enables it. Setting `[0.5]`
+    # already covers most cersyve UNSAT leaves at +1 backward pass.
+    _lambdas = getattr(settings, 'input_split_leaf_joint_lambdas', None)
+    if (_lambdas
+            and any(len(ql) > 1 for ql in disj_queries.values())):
+        # For each multi-query disjunct, try linear combos.
+        joint_qid = max(spec_ew.keys()) + 1  # synthetic qid for combos
+        joint_ew = {}
+        joint_for_disj = {}  # synth_qid → disjunct id
+        for di, qlist in disj_queries.items():
+            if len(qlist) < 2:
+                continue
+            for lam in _lambdas:
+                w_combo = np.zeros_like(w_qs[qlist[0][0]])
+                b_combo = 0.0
+                # 2-query: λ·q0 + (1-λ)·q1. For ≥3 queries, evenly
+                # distribute (1-λ) across remaining queries.
+                wts = [lam] + [(1 - lam) / (len(qlist) - 1)] * (len(qlist) - 1)
+                for wt, (qi, w, b) in zip(wts, qlist):
+                    w_combo += wt * w_qs[qi]
+                    b_combo += wt * b_qs[qi]
+                joint_ew[joint_qid] = (
+                    torch.as_tensor(w_combo, dtype=dtype, device=device),
+                    float(b_combo))
+                joint_for_disj[joint_qid] = di
+                joint_qid += 1
+        if joint_ew:
+            joint_lbs, _ = _spec_backward_graph(
+                sb, xl, xh, gg, joint_ew, list(joint_ew.keys()),
+                len(sb), device, dtype)
+            # Mark a disjunct closed if any λ-combo gives lb > 0.
+            closed_disj = {di for sqid, di in joint_for_disj.items()
+                            if joint_lbs.get(sqid, -1.0) > 0}
+            if closed_disj:
+                # Synthesize a positive lb on the FIRST query of each
+                # closed disjunct so `_all_verified` sees it.
+                for di in closed_disj:
+                    first_qi = disj_queries[di][0][0]
+                    spec_lbs[first_qi] = max(
+                        spec_lbs.get(first_qi, -1e9),
+                        max(joint_lbs[sqid] for sqid, _di in
+                             joint_for_disj.items() if _di == di))
+                if _all_verified():
+                    return 'verified', {'phase': 'fast_leaf_joint_crown',
+                                         'spec_lbs': dict(spec_lbs)}
 
     # α-CROWN tightening — only run if it can fit in memory.
     #
@@ -6495,6 +7116,280 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
                        'axis_scores': score_per_axis}
 
 
+def _clip_box_by_halfspaces_batched(xl, xh, A, b):
+    """Sound bounding-box clip of `{x in [xl, xh] : A_q·x + b_q ≤ 0 for all q}`.
+
+    Inputs:
+      xl, xh: (B, n_in)
+      A: (B, Q, n_in), b: (B, Q) — per-query linear lower-bound coeffs
+        from CROWN backward. The query is interpreted as a SAFE-side
+        constraint `A_q·x + b_q ≤ 0` representing the possibly-unsafe
+        region for that query.
+
+    Returns:
+      xl_new, xh_new: (B, n_in) — tightened bounds (≥ xl, ≤ xh).
+      feasible: (B,) bool — False means the polytope ∩ box is empty
+        in this leaf, so the leaf is SAFE (verified by clipping).
+
+    Method: per (query, dim) independently. For halfspace `A·x ≤ -b`
+    with box [xl, xh], the projection of the polytope onto x_i is:
+      x_i ≤ (-b - min_other A·x_other) / A_i      if A_i > 0
+      x_i ≥ (-b - min_other A·x_other) / A_i      if A_i < 0
+      x_i unconstrained                            if A_i == 0
+    where `min_other A·x_other = pos(A[~i])·xl[~i] + neg(A[~i])·xh[~i]`.
+    Take the intersection across queries (tightest ub, tightest lb per
+    dim). Approximation: the true polytope bounding box can be tighter
+    by joint LP across queries; we trade tightness for ~free cost.
+    """
+    B, Q, n_in = A.shape
+    A_pos = A.clamp(min=0)
+    A_neg = A.clamp(max=0)
+    # total_min[b,q] = pos(A[b,q]) · xl[b] + neg(A[b,q]) · xh[b]   (B, Q)
+    total_min = ((A_pos * xl.unsqueeze(1)).sum(dim=-1)
+                  + (A_neg * xh.unsqueeze(1)).sum(dim=-1))
+    # contrib[b,q,i] = i-th term of total_min                       (B, Q, n_in)
+    contrib = A_pos * xl.unsqueeze(1) + A_neg * xh.unsqueeze(1)
+    L_other = total_min.unsqueeze(-1) - contrib  # min_{x_~i in box} A·x_~i
+    # threshold[b,q,i] = (-b[b,q] - L_other[b,q,i]) / A[b,q,i]
+    A_nz = A.abs() > 1e-12
+    A_safe = torch.where(A_nz, A, torch.ones_like(A))
+    threshold = (-b.unsqueeze(-1) - L_other) / A_safe  # (B, Q, n_in)
+
+    pos_mask = (A > 1e-12)
+    neg_mask = (A < -1e-12)
+
+    # Per-query candidate ub/lb. For positions where the query doesn't
+    # contribute (A==0, or wrong sign), use the original bound — so the
+    # cross-query min/max effectively ignores those queries on that dim.
+    xh_orig = xh.unsqueeze(1).expand(B, Q, n_in)
+    xl_orig = xl.unsqueeze(1).expand(B, Q, n_in)
+    xh_per_q = torch.where(pos_mask, threshold, xh_orig)
+    xl_per_q = torch.where(neg_mask, threshold, xl_orig)
+
+    xh_new = xh_per_q.min(dim=1).values  # tightest UB across queries
+    xl_new = xl_per_q.max(dim=1).values  # tightest LB
+    xh_new = torch.minimum(xh_new, xh)
+    xl_new = torch.maximum(xl_new, xl)
+
+    # Feasibility: tighter check via per-query halfspace feasibility too —
+    # if for some q, total_min + b > 0, polytope ∩ that halfspace empty.
+    # (Equivalent to "spec_lb_q > 0" — caller already screens those, but
+    # box-projection slack can hide it; cheap to recheck.)
+    per_q_infeasible = (total_min + b > 0)
+    halfspace_empty = per_q_infeasible.any(dim=1)
+    box_empty = (xl_new > xh_new).any(dim=-1)
+    feasible = ~(halfspace_empty | box_empty)
+    return xl_new, xh_new, feasible
+
+
+def _input_split_batched(graph, spec, settings, gg, device, dtype):
+    """Worklist-based input-split BaB with batched leaf evaluation.
+
+    Each iteration pops up to `input_split_batch_size` boxes from the
+    worklist, stacks them into (B, n_in) tensors, runs ONE batched
+    forward zono + spec backward, identifies verified vs unclosed
+    leaves, splits unclosed leaves on widest axis, pushes children
+    back. AB-CROWN-style; mirrors `_input_split_fast_leaf` semantics
+    but vectorized.
+
+    Closure semantics: a disjunct is verified at a leaf iff ANY of its
+    queries has lb > 0 (AND-conjunct: one provably-safe operand closes).
+
+    No per-leaf joint LP, no α-CROWN, no MILP — pure batched per-query
+    CROWN. The order-of-magnitude throughput gain (1000s of leaves /
+    second vs ~30 leaves / second sequential) compensates by going
+    deeper. For 4-D cersyve `_finetune_inv` cases the throughput jump
+    is the whole point.
+    """
+    from .verify_zono_bnb import (
+        _forward_zonotope_graph_batched, _spec_backward_graph_batched)
+    t_start = time.perf_counter()
+    total_budget = float(getattr(settings, 'total_timeout', 60.0))
+    batch_size = int(getattr(settings, 'input_split_batch_size', 4096))
+    max_worklist = int(getattr(
+        settings, 'input_split_batched_max_worklist', 200_000))
+    clip_enabled = bool(getattr(
+        settings, 'input_split_batched_clip_enabled', True))
+
+    # Root-level PGD attack — same as `_input_split_verify`.
+    if (not bool(getattr(settings, 'disable_sat_finding', False))
+            and bool(getattr(settings, 'pgd_phase0_enabled', True))):
+        try:
+            xl_pgd = torch.tensor(spec.x_lo, dtype=dtype, device=device)
+            xh_pgd = torch.tensor(spec.x_hi, dtype=dtype, device=device)
+            pgd_budget = float(getattr(
+                settings, 'pgd_time_budget_phase0', 5.0))
+            pgd_sat, pgd_witness = _pgd_attack_general(
+                xl_pgd, xh_pgd, spec, gg, settings, time_budget=pgd_budget)
+            if pgd_sat and pgd_witness is not None:
+                return 'sat', {'phase': 'batched_pgd', 'witness': pgd_witness}
+        except Exception:
+            pass
+
+    # Find n_output (mirror `_input_split_fast_leaf`).
+    n_output = None
+    for op in reversed(gg['ops']):
+        if op.get('type') == 'fc':
+            W = op.get('W_np') if 'W_np' in op else op.get('W')
+            if W is not None:
+                n_output = int(W.shape[0]); break
+        if op.get('type') == 'conv':
+            n_output = int(op.get('n_out', 0))
+            if n_output > 0:
+                break
+    if n_output is None:
+        return 'unknown', {'phase': 'batched_no_output'}
+
+    queries = spec.as_linear_queries(n_output)
+    if not queries:
+        return 'verified', {'phase': 'batched_no_queries'}
+    disj_queries = {}
+    for qi, (di, w, b) in enumerate(queries):
+        disj_queries.setdefault(di, []).append((qi, w, b))
+    spec_ew = {qi: (torch.as_tensor(w, dtype=dtype, device=device).flatten(),
+                      float(b))
+                for qi, (di, w, b) in enumerate(queries)}
+    qids_sorted = sorted(spec_ew.keys())
+    # Index of each query within the sorted batch order.
+    q_index = {qi: i for i, qi in enumerate(qids_sorted)}
+    # Pre-build per-disjunct query-index sets for the batched closure.
+    disj_q_idx = {di: [q_index[qi] for qi, _, _ in qlist]
+                   for di, qlist in disj_queries.items()}
+
+    # Initialize worklist with the root box.
+    xl0 = torch.as_tensor(spec.x_lo, dtype=dtype, device=device).flatten()
+    xh0 = torch.as_tensor(spec.x_hi, dtype=dtype, device=device).flatten()
+    n_in = xl0.numel()
+    worklist_xl = [xl0]
+    worklist_xh = [xh0]
+
+    n_leaves_visited = 0
+    n_iters = 0
+    n_open_at_timeout = 0
+
+    while worklist_xl:
+        if time.perf_counter() - t_start > total_budget - 0.5:
+            n_open_at_timeout = len(worklist_xl)
+            break
+        # Pop a batch (LIFO — depth-first; cheap as Python list ops).
+        B = min(batch_size, len(worklist_xl))
+        xl_list = worklist_xl[-B:]
+        xh_list = worklist_xh[-B:]
+        del worklist_xl[-B:]; del worklist_xh[-B:]
+        xl_batch = torch.stack(xl_list)  # (B, n_in)
+        xh_batch = torch.stack(xh_list)
+
+        # Batched bound.
+        try:
+            sb_b, _ = _forward_zonotope_graph_batched(
+                xl_batch, xh_batch, gg, device, dtype)
+            if clip_enabled:
+                spec_lbs_b, A_lin, b_lin = _spec_backward_graph_batched(
+                    sb_b, xl_batch, xh_batch, gg, spec_ew, device, dtype,
+                    return_input_linear=True)
+            else:
+                spec_lbs_b = _spec_backward_graph_batched(
+                    sb_b, xl_batch, xh_batch, gg, spec_ew, device, dtype)
+                A_lin, b_lin = None, None
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            new_bs = max(64, batch_size // 2)
+            if new_bs == batch_size:
+                return 'unknown', {'phase': 'batched_oom',
+                                    'batch_size': batch_size}
+            worklist_xl.extend(xl_list); worklist_xh.extend(xh_list)
+            batch_size = new_bs
+            continue
+
+        # Per-batch closure: every disjunct must have at least one
+        # query with lb > 0.
+        disj_closed_masks = []
+        for di, q_idxs in disj_q_idx.items():
+            disj_closed_masks.append(
+                (spec_lbs_b[:, q_idxs] > 0).any(dim=1))
+        if disj_closed_masks:
+            all_disj_closed = torch.stack(disj_closed_masks, dim=1).all(dim=1)
+        else:
+            all_disj_closed = torch.ones(B, dtype=torch.bool, device=device)
+
+        unclosed = (~all_disj_closed).nonzero(as_tuple=True)[0]
+        n_leaves_visited += B
+        n_verified_by_crown_iter = int(all_disj_closed.sum().item())
+
+        # Domain clipping: shrink unclosed leaves to the bounding box of
+        # the intersection of unsafe halfspaces (CROWN's input-space
+        # linearization). For AND-conjuncts where per-query CROWN can't
+        # close but the intersection of halfspaces is empty in input
+        # space, clipping verifies the leaf. For non-empty intersections,
+        # the smaller box gives tighter next CROWN bounds, propagating
+        # to faster convergence. Mirrors AB-CROWN's `clip_input_domain:
+        # complete`.
+        n_verified_by_clip_iter = 0
+        if clip_enabled and unclosed.numel() > 0 and A_lin is not None:
+            xl_u = xl_batch[unclosed]
+            xh_u = xh_batch[unclosed]
+            A_u = A_lin[unclosed]
+            b_u = b_lin[unclosed]
+            xl_c, xh_c, feasible_c = _clip_box_by_halfspaces_batched(
+                xl_u, xh_u, A_u, b_u)
+            n_verified_by_clip_iter = int((~feasible_c).sum().item())
+            # Only feasible-after-clip leaves continue to split.
+            feasible_idx = feasible_c.nonzero(as_tuple=True)[0]
+            if feasible_idx.numel() > 0:
+                xl_split = xl_c[feasible_idx]
+                xh_split = xh_c[feasible_idx]
+            else:
+                xl_split = xl_u[:0]
+                xh_split = xh_u[:0]
+        else:
+            xl_split = xl_batch[unclosed]
+            xh_split = xh_batch[unclosed]
+
+        # Split remaining boxes on widest axis.
+        if xl_split.numel() > 0:
+            widths = (xh_split - xl_split).cpu()
+            ax = widths.argmax(dim=1)
+            xl_cpu = xl_split.cpu()
+            xh_cpu = xh_split.cpu()
+            n = xl_split.shape[0]
+            for i in range(n):
+                xl_i = xl_cpu[i]
+                xh_i = xh_cpu[i]
+                a = int(ax[i].item())
+                if float(widths[i, a]) < 1e-12:
+                    n_open_at_timeout += 1
+                    continue
+                mid = float((xl_i[a] + xh_i[a]) / 2)
+                xh_a = xh_i.clone(); xh_a[a] = mid
+                xl_b_v = xl_i.clone(); xl_b_v[a] = mid
+                worklist_xl.append(xl_i.to(device, dtype=dtype))
+                worklist_xh.append(xh_a.to(device, dtype=dtype))
+                worklist_xl.append(xl_b_v.to(device, dtype=dtype))
+                worklist_xh.append(xh_i.to(device, dtype=dtype))
+            if len(worklist_xl) > max_worklist:
+                return 'unknown', {
+                    'phase': 'batched_worklist_overflow',
+                    'batched_n_leaves': n_leaves_visited,
+                    'batched_n_iters': n_iters,
+                    'worklist_size': len(worklist_xl)}
+        n_iters += 1
+
+    if not worklist_xl and n_open_at_timeout == 0:
+        return 'verified', {
+            'phase': 'batched_verified',
+            'batched_n_leaves': n_leaves_visited,
+            'batched_n_iters': n_iters,
+            'batched_batch_size': batch_size}
+    return 'unknown', {
+        'phase': 'batched_timeout',
+        'batched_n_leaves': n_leaves_visited,
+        'batched_n_iters': n_iters,
+        'batched_worklist_left': len(worklist_xl),
+        'batched_open_degenerate': n_open_at_timeout,
+        'batched_batch_size': batch_size}
+
+
 def _input_split_verify(graph, spec, settings, build_fn, impl):
     """Recursive input-space BaB with sensitivity-scored axis selection.
 
@@ -6514,9 +7409,30 @@ def _input_split_verify(graph, spec, settings, build_fn, impl):
     import copy
     t_start = time.perf_counter()
     total_budget = float(getattr(settings, 'total_timeout', 60.0))
-    max_depth = int(getattr(settings, 'input_split_max_depth', 8))
+    # Time is the budget; depth cap (when set) is just a safety net.
+    # `None` (default) means no cap — runs until time_left exhausted.
+    _md = getattr(settings, 'input_split_max_depth', None)
+    if isinstance(_md, (int, float)):
+        max_depth = int(_md)
+    else:
+        max_depth = 10**9
+    # Bump Python recursion limit so DFS recursion doesn't hit it at
+    # deep BaB. CPython default is 1000; raise to 10**6 (no practical
+    # downside other than later StackOverflow on truly pathological
+    # cases, which we'd hit time first anyway).
+    import sys
+    if sys.getrecursionlimit() < 10**6:
+        sys.setrecursionlimit(10**6)
     per_node_tl = float(getattr(settings, 'input_split_node_timeout', 8.0))
     fast_leaf = bool(getattr(settings, 'input_split_fast_leaf', True))
+    # Per-leaf PGD on unverifiable leaves — catches narrow SAT regions
+    # that root PGD missed but become attackable once the sub-box is
+    # localized (cersyve pretrain_inv cases live here). Off by default
+    # to avoid extra cost on benchmarks where root PGD is sufficient.
+    leaf_pgd_enabled = bool(getattr(
+        settings, 'input_split_leaf_pgd_enabled', False))
+    leaf_pgd_time = float(getattr(
+        settings, 'input_split_leaf_pgd_time', 0.1))
 
     # If fast_leaf is on, prepare GPU graph once at the top.
     fast_gg = None
@@ -6601,6 +7517,23 @@ def _input_split_verify(graph, spec, settings, build_fn, impl):
         r, d = _run_node(s)
         if r in ('verified', 'sat'):
             return r, d
+        # Per-leaf PGD on unknown sub-domains — sub-box is now localized,
+        # so narrow SAT regions become easier to find than from the
+        # original full box. Only fires when `input_split_leaf_pgd_enabled`.
+        if (leaf_pgd_enabled and fast_leaf
+                and not bool(getattr(settings, 'disable_sat_finding', False))):
+            try:
+                xl_l = torch.tensor(
+                    s.x_lo, dtype=fast_dtype, device=fast_device)
+                xh_l = torch.tensor(
+                    s.x_hi, dtype=fast_dtype, device=fast_device)
+                ok, w = _pgd_attack_general(
+                    xl_l, xh_l, s, fast_gg, settings,
+                    time_budget=leaf_pgd_time)
+                if ok and w is not None:
+                    return 'sat', {'phase': 'leaf_pgd', 'witness': w}
+            except (RuntimeError, torch.cuda.OutOfMemoryError):
+                pass
         if depth >= max_depth:
             return r, d
         if time.perf_counter() - t_start > total_budget - 0.5:
@@ -6626,8 +7559,16 @@ def _input_split_verify(graph, spec, settings, build_fn, impl):
         # infinite recursion on degenerate dims).
         scores = np.where(widths > 1e-9, scores, -np.inf)
         ax = int(np.argmax(scores))
+        # When score-based pick gives nothing useful, fall back to the
+        # widest axis with positive width — keeps BaB making progress
+        # on benchmarks where sensitivity scores under-rank some axes
+        # (cersyve: after axis 1 narrows to ~1e-3, its score becomes 0
+        # but axes 0/2/3 still need splitting too).
         if not np.isfinite(scores[ax]) or scores[ax] <= 0:
-            return r, d
+            widths_alive = np.where(widths > 1e-9, widths, -np.inf)
+            ax = int(np.argmax(widths_alive))
+            if not np.isfinite(widths_alive[ax]):
+                return r, d
         mid = (float(s.x_lo.flatten()[ax]) + float(s.x_hi.flatten()[ax])) / 2.0
         sa = copy.deepcopy(s)
         sb = copy.deepcopy(s)

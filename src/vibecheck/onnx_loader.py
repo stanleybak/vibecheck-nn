@@ -411,6 +411,11 @@ def load_onnx(onnx_path, dtype=None):
     _fold_batchnorm(graph)
     _cast_params(graph)
     _precache_conv_tensors(graph)
+    # Stash the original ONNX path so verify_graph can re-run it via
+    # ONNXRuntime to validate any SAT witness (defense-in-depth: catches
+    # spec-encoding or graph-builder bugs that would otherwise silently
+    # produce spurious counterexamples).
+    graph.onnx_path = str(onnx_path)
     return graph
 
 
