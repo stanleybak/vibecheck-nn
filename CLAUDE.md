@@ -111,9 +111,10 @@ Each VNNCOMP **regular-track** benchmark is optimized on its own branch, then sq
 2. **Config**: create `configs/<benchmark>.yaml` containing ONLY the overrides on top of `configs/default.yaml`. Keys map 1:1 to `Settings` attrs (no hidden mapping). Loaded explicitly with `--config configs/<benchmark>.yaml`; if no `--config`, fall back to `default_settings_for(graph, spec)`.
 3. **Optimize on the remote GPU**: run vibecheck + AB-CROWN live side-by-side; cross-check against the published `~/repositories/vnncomp2025_results/alpha_beta_crown/2025_<benchmark>/results.csv`. Fix any obvious misses.
 4. **Stuck-case rule**: if a case won't crack after 1-2 attack angles, surface a diag (timing breakdown, open-spec count, phase outcome) back to the user rather than spinning indefinitely.
-5. **Integration tests**: add `tests/integration/test_<benchmark>.py` with ~3 cases (1 SAT if cracked + 2 hard UNSAT we verified). `@pytest.mark.integration`. Every merge re-runs *all* prior benchmarks' integration cases.
-6. **Pre-merge gap report**: before squash-merging, present (a) cases still unsolved, (b) any visible AB-CROWN wins, (c) score delta vs published AB-CROWN results — to the user for feedback. Do not merge until they approve.
-7. **Squash-merge** to `main`; delete branch.
+5. **Integration tests**: add `tests/integration/test_<benchmark>.py` with **3 hard cases — 1 SAT we cracked + 2 hard UNSAT we verified** (each pinned with `max_wall_s` ~1.5× observed for regression detection). `@pytest.mark.integration`. Every merge re-runs *all* prior benchmarks' integration cases.
+6. **Per-benchmark README** at `docs/benchmarks/<benchmark>.md` capturing: (a) final score (vc + abc-server + abc-published, with timestamp + sweep id), (b) algorithmic wins vs published reference, (c) any benchmark-specific knobs in `configs/<benchmark>.yaml` and *why* they're there, (d) reproduction commands (single case + full sweep), (e) integration test cases with rationale, (f) known unsolved cases. This is the canonical record for the benchmark; the YAML + tests are the runnable artifacts.
+7. **Pre-merge gap report**: before squash-merging, present (a) cases still unsolved, (b) any visible AB-CROWN wins, (c) score delta vs published AB-CROWN results — to the user for feedback. Do not merge until they approve.
+8. **Squash-merge** to `main`; delete branch.
 
 Allowed references: read auto_LiRPA / AB-CROWN source (`~/Desktop/temp/abcrown/alpha-beta-CROWN_vnncomp2025` on remote) or run them with debug prints — especially for non-ReLU activations (tanh, sigmoid, GELU, MHA) — then re-implement.
 
