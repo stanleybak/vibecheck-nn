@@ -75,27 +75,22 @@ Three test categories:
 
 When running a verify experiment for the user, pickle the returned `details` dict to `/tmp/vibecheck_runs/{slug}.pkl`. The user often asks for different views of the same run ("what was Phase 7 timing?", "unstable count at L3?"); re-running a 60s benchmark to re-derive numbers already in `details` is wasteful. Include the instance id and config in the slug. When answering from cache, say so explicitly. For new experiments (different instance/settings/code change), re-run and overwrite.
 
-## Remote GPU machines
+## Remote GPU machine
 
-Two servers, identical hardware (RTX 3080 / 10 GB, 64 GB RAM, 16-thread i9). Mirrored layout — same paths on both. Software setup may diverge during ad-hoc experiments; treat server1 as canonical and re-sync server2 when in doubt.
+**Use server1 only.** `ssh stan@100.83.144.97` (RTX 3080 / 10 GB, 64 GB RAM, 16-thread i9). Steady-state α-CROWN throughput ~1 s/freeze, rock-solid consistent. Persistence mode off but doesn't matter — GPU clocks ramp cleanly.
 
-- **server1** (canonical): `ssh stan@100.83.144.97`
-- **server2**: `ssh stan@100.107.254.48`
+(There used to be a server2 for parallel sweeps. It's been removed from this guide because its RTX 3080 shows 30× slower and highly variable α-CROWN timing on the same code, even with persistence mode on — apparent thermal/power degradation. Don't fall back to it; it's untrustworthy for benchmarking.)
 
-server1 → server2 SSH is keyed (server1's `~/.ssh/id_ed25519`), so direct rsync works for fan-out: `ssh stan@100.83.144.97 'rsync -az ~/path/ stan@100.107.254.48:~/path/'`.
-
-Shared layout on each server:
+Layout on server1:
 
 - **Vibecheck checkout**: `~/Desktop/temp/vibecheck-temp` (editable install, `.venv/bin/python`).
 - **VNNCOMP benchmarks**: `~/repositories/vnncomp2025_benchmarks/benchmarks/`.
 - **VNNCOMP reference results** (α,β-CROWN verdicts): `~/repositories/vnncomp2025_results/alpha_beta_crown/2025_*/results.csv`.
 - **α,β-CROWN source** (for behaviour comparisons): `~/Desktop/temp/abcrown/alpha-beta-CROWN_vnncomp2025`. Conda env: `~/miniconda/envs/abcrown/bin/python`.
-- **Sweep scripts + results**: `~/persistent_runs/{scripts,results}` (sweep_sxs.py, runner_p25off.py, sxs_v* result dirs).
-- **Sync from local**: `rsync -az --exclude '.venv' --exclude '__pycache__' /home/stan/repositories/vibecheck/ stan@<server>:~/Desktop/temp/vibecheck-temp/`. Re-run `pip install -e .` on the server if `pyproject.toml` changed.
+- **Sweep scripts + results**: `~/persistent_runs/{scripts,results}` (sweep_sxs.py, runner_p25off.py, sxs_v* result dirs). Use this directory for sweep logs — survives reboot (unlike `/tmp`).
+- **Sync from local**: `rsync -az --exclude '.venv' --exclude '__pycache__' /home/stan/repositories/vibecheck/ stan@100.83.144.97:~/Desktop/temp/vibecheck-temp/`. Re-run `pip install -e .` on the server if `pyproject.toml` changed.
 
 **Long-running GPU sweeps may degrade the driver** — after a 6-hour cifar100+tinyimagenet sweep, server1's NVIDIA driver hit "Unable to determine the device handle" (load avg pinned at 5.0 from D-state threads). Recovery requires either `sudo modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia` (asks user to run) or reboot. Verdicts going from `verified` → `error_no_result` near sweep end are a tell.
-
-**Use both servers in parallel for sweeps** — they have identical hardware (RTX 3080) and benchmark + ABCROWN + vibecheck checkouts are mirrored. Split work by benchmark or by case index to halve wall time. `scratch/sweep_sxs.py` supports `SWEEP_CATEGORIES=cifar100_2024` to run only one benchmark per server, and `SWEEP_OUT_DIR` to direct output to a server-specific results dir. Sweep launch pattern: launch in `tmux` on each server with nohup-style logging to a file (NOT tmux pipe-pane — it killed a sweep mid-run during the v6 cifar100 + tinyimagenet measurement). Periodically reload reference results to merge per-server outputs.
 
 ## Active investigations — keep iterating
 

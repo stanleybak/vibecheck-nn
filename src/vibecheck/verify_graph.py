@@ -7116,6 +7116,111 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
                        'axis_scores': score_per_axis}
 
 
+# Module-level worker state: persistent Gurobi env per multiprocessing
+# worker (init once, reuse across many LP solves). Reduces per-LP cost
+# from ~5 ms (env init dominates) to ~0.2 ms (LP-only).
+_GRB_WORKER_ENV = None
+
+
+def _grb_worker_init():
+    """Init a persistent Gurobi env in this worker process."""
+    global _GRB_WORKER_ENV
+    import gurobipy as gp
+    _GRB_WORKER_ENV = gp.Env(empty=True)
+    _GRB_WORKER_ENV.setParam('OutputFlag', 0)
+    _GRB_WORKER_ENV.start()
+
+
+def _grb_lp_clip_worker(args):
+    """Per-leaf full-LP clipping: tightest box-projection bounds on each
+    input dim, OR return infeasible.
+
+    Args:
+      xl, xh: (n_in,) numpy float64 — input box
+      A, b: (Q, n_in) and (Q,) — query linear-lb coeffs
+
+    Returns:
+      (xl_new, xh_new, feasible):
+        feasible=False → polytope ∩ box empty → leaf verified
+        else: tight projection bounds (xl_new ≥ xl, xh_new ≤ xh)
+    """
+    import gurobipy as gp
+    global _GRB_WORKER_ENV
+    if _GRB_WORKER_ENV is None:
+        _grb_worker_init()
+    xl, xh, A, b = args
+    n_in = len(xl)
+    Q = A.shape[0]
+    m = gp.Model(env=_GRB_WORKER_ENV)
+    m.Params.OutputFlag = 0
+    m.Params.Threads = 1
+    m.Params.Method = 0  # primal simplex — small problems, fast warm-start
+    x_vars = m.addMVar(n_in, lb=xl, ub=xh)
+    for q in range(Q):
+        m.addConstr(A[q] @ x_vars + float(b[q]) <= 0)
+    # Quick infeasibility check first: solve with no objective.
+    m.setObjective(0)
+    m.optimize()
+    if m.Status == 3:  # INFEASIBLE
+        m.dispose()
+        return (xl, xh, False)
+    # Feasible: solve 2 LPs per dim for tight projection bounds.
+    xl_new = xl.copy()
+    xh_new = xh.copy()
+    for i in range(n_in):
+        m.setObjective(x_vars[i], gp.GRB.MINIMIZE)
+        m.optimize()
+        if m.Status == 2:
+            xl_new[i] = max(xl_new[i], m.ObjBound)
+        m.setObjective(x_vars[i], gp.GRB.MAXIMIZE)
+        m.optimize()
+        if m.Status == 2:
+            xh_new[i] = min(xh_new[i], m.ObjBound)
+    m.dispose()
+    return (xl_new, xh_new, True)
+
+
+def _clip_box_by_full_lp_batched(xl, xh, A, b, pool=None):
+    """Parallel full-LP clipping across leaves via multiprocessing pool.
+
+    Strictly tighter than `_clip_box_by_halfspaces_batched` (uses joint
+    constraints in one LP per leaf), at the cost of CPU-bound LP solves.
+    For 5-D input / 4-query constraints (acasxu prop_2): ~0.5-1 ms per
+    LP × 11 LPs per leaf (1 feasibility + 2×n_in projection) = ~10 ms
+    per leaf serial; with `pool` of N workers, ~10 ms × B / N parallel.
+
+    Args:
+      xl, xh: (B, n_in) torch tensors
+      A: (B, Q, n_in), b: (B, Q) torch tensors
+      pool: optional `multiprocessing.Pool` (with `_grb_worker_init`
+        initializer for persistent Gurobi env). If None, runs serial
+        on the calling process.
+
+    Returns:
+      xl_new, xh_new, feasible: same contract as the per-halfspace
+      variant.
+    """
+    import torch as _t
+    B = xl.shape[0]
+    xl_np = xl.detach().cpu().numpy().astype(np.float64)
+    xh_np = xh.detach().cpu().numpy().astype(np.float64)
+    A_np = A.detach().cpu().numpy().astype(np.float64)
+    b_np = b.detach().cpu().numpy().astype(np.float64)
+    args_list = [(xl_np[i], xh_np[i], A_np[i], b_np[i]) for i in range(B)]
+    if pool is not None:
+        results = pool.map(_grb_lp_clip_worker, args_list,
+                            chunksize=max(1, B // (4 * pool._processes)))
+    else:
+        results = [_grb_lp_clip_worker(a) for a in args_list]
+    xl_out = np.stack([r[0] for r in results])
+    xh_out = np.stack([r[1] for r in results])
+    feasible = np.array([r[2] for r in results], dtype=bool)
+    device = xl.device
+    return (_t.tensor(xl_out, dtype=xl.dtype, device=device),
+            _t.tensor(xh_out, dtype=xh.dtype, device=device),
+            _t.tensor(feasible, dtype=_t.bool, device=device))
+
+
 def _clip_box_by_halfspaces_batched(xl, xh, A, b):
     """Sound bounding-box clip of `{x in [xl, xh] : A_q·x + b_q ≤ 0 for all q}`.
 
@@ -7182,6 +7287,40 @@ def _clip_box_by_halfspaces_batched(xl, xh, A, b):
     return xl_new, xh_new, feasible
 
 
+def _milp_escalate_worker(args):
+    """Per-leaf MILP escalation: for each disjunct, try queries in
+    best-CROWN-lb order; first MILP-UNSAT closes that disjunct. Leaf
+    closes iff every disjunct closes.
+    """
+    (ci, gg_ops_ser, xl_l_np, xh_l_np, bbr_l, last_op_name,
+     per_disj_queries, per_query_tl) = args
+    import torch as _torch
+    from . import verify_gen_lp as _glp
+    milp_set = set()
+    for L in bbr_l:
+        if L > 0:
+            lo, hi = bbr_l[L]
+            for j in np.where((lo < 0) & (hi > 0))[0]:
+                milp_set.add((L, int(j)))
+    for ordered_queries in per_disj_queries:
+        disj_closed = False
+        for qw_np, qb_v in ordered_queries:
+            try:
+                res, _, _ = _glp.solve_spec(
+                    gg_ops_ser, xl_l_np, xh_l_np, bbr_l, 'input',
+                    last_op_name, qw_np, qb_v, device='cpu',
+                    dtype=_torch.float64, time_limit=per_query_tl,
+                    n_threads=1, milp_set=milp_set)
+                if res == 'UNSAT':
+                    disj_closed = True
+                    break
+            except Exception:
+                pass
+        if not disj_closed:
+            return (ci, False)
+    return (ci, True)
+
+
 def _input_split_batched(graph, spec, settings, gg, device, dtype):
     """Worklist-based input-split BaB with batched leaf evaluation.
 
@@ -7206,10 +7345,53 @@ def _input_split_batched(graph, spec, settings, gg, device, dtype):
     t_start = time.perf_counter()
     total_budget = float(getattr(settings, 'total_timeout', 60.0))
     batch_size = int(getattr(settings, 'input_split_batch_size', 4096))
+    # Persistent multiprocessing pool for full-LP clipping (one Gurobi
+    # env per worker, reused across all iterations). Init cost ~50 ms
+    # once vs ~5 ms per LP forever; pays off after ~10 LPs per worker.
+    _lp_pool = None
+    if bool(getattr(settings, 'input_split_batched_clip_full_lp', False)):
+        import multiprocessing as _mp
+        _w = getattr(settings, 'input_split_batched_clip_lp_workers', None)
+        # DotMap can return empty DotMap for missing keys.
+        if not isinstance(_w, (int, float)) or _w is None or _w <= 0:
+            _n_lp_workers = max(1, _mp.cpu_count() - 1)
+        else:
+            _n_lp_workers = int(_w)
+        _lp_pool = _mp.Pool(_n_lp_workers, initializer=_grb_worker_init)
+    try:
+        return _input_split_batched_inner(
+            graph, spec, settings, gg, device, dtype, _lp_pool, t_start)
+    finally:
+        if _lp_pool is not None:
+            _lp_pool.close(); _lp_pool.join()
+
+
+def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
+                                  _lp_pool, t_start):
+    """Inner driver — split out so pool cleanup happens via try/finally."""
+    from .verify_zono_bnb import (
+        _forward_zonotope_graph_batched, _spec_backward_graph_batched)
+    total_budget = float(getattr(settings, 'total_timeout', 60.0))
+    batch_size = int(getattr(settings, 'input_split_batch_size', 4096))
     max_worklist = int(getattr(
         settings, 'input_split_batched_max_worklist', 200_000))
     clip_enabled = bool(getattr(
         settings, 'input_split_batched_clip_enabled', True))
+    # Serialize ops once (for MILP escalation; cheap, no torch tensors).
+    gg_ops_ser = []
+    for op in gg['ops']:
+        d = {'name': op['name'], 'type': op['type'],
+             'inputs': op['inputs']}
+        if op['type'] == 'fc':
+            d['W_np'] = op['W_np']; d['bias_np'] = op['bias_np']
+        elif op['type'] == 'relu' and 'layer_idx' in op:
+            d['layer_idx'] = op['layer_idx']
+        elif op['type'] == 'add':
+            d['is_merge'] = op.get('is_merge', False)
+            d['bias'] = op.get('bias')
+        elif op['type'] == 'sub':
+            d['bias'] = op.get('bias')
+        gg_ops_ser.append(d)
 
     # Root-level PGD attack — same as `_input_split_verify`.
     if (not bool(getattr(settings, 'disable_sat_finding', False))
@@ -7313,6 +7495,54 @@ def _input_split_batched(graph, spec, settings, gg, device, dtype):
         else:
             all_disj_closed = torch.ones(B, dtype=torch.bool, device=device)
 
+        # Selective α-CROWN on boundary leaves: per-query CROWN gives
+        # spec_lbs that plateau just below 0 (e.g., -0.018 on
+        # `1_8 prop_2`). α-CROWN with a few iters can push them
+        # positive, closing the leaf without splitting. Running it on
+        # ALL leaves would dominate cost; instead, target only the
+        # leaves where some query's lb is within `boundary_eps` of 0.
+        # Serial per leaf (~5-20 ms each). Win condition: closes
+        # enough boundary leaves to cancel the BaB explosion.
+        alpha_eps = float(getattr(
+            settings, 'input_split_batched_alpha_boundary_eps', 0.0))
+        alpha_max_iters = int(getattr(
+            settings, 'input_split_batched_alpha_iters', 0))
+        alpha_max_leaves = int(getattr(
+            settings, 'input_split_batched_alpha_max_leaves', 200))
+        if alpha_eps > 0 and alpha_max_iters > 0 and not all_disj_closed.all():
+            from .verify_zono_bnb import _run_alpha_crown_inputsplit_batched
+            best_per_disj_lb = []
+            for di, q_idxs in disj_q_idx.items():
+                best_per_disj_lb.append(spec_lbs_b[:, q_idxs].max(dim=1).values)
+            worst_disj_best = torch.stack(best_per_disj_lb, dim=1).min(dim=1).values
+            close_mask = (~all_disj_closed) & (worst_disj_best > -alpha_eps)
+            close_idx = close_mask.nonzero(as_tuple=True)[0]
+            if close_idx.numel() > 0:
+                order = worst_disj_best[close_idx].argsort(descending=True)
+                close_idx = close_idx[order[:alpha_max_leaves]]
+                # BATCHED α-CROWN on the boundary leaves' boxes. The
+                # whole batch is optimized on GPU in one Adam loop —
+                # massively faster than per-leaf serial. Per-iter cost
+                # is one forward zono + one batched spec backward
+                # (~5-20 ms for B=200) vs ~10-50 ms per leaf serial.
+                xl_close = xl_batch[close_idx]
+                xh_close = xh_batch[close_idx]
+                try:
+                    new_lbs_batch = _run_alpha_crown_inputsplit_batched(
+                        xl_close, xh_close, gg, spec_ew, device, dtype,
+                        n_iters=alpha_max_iters, lr=0.25, lr_decay=0.98)
+                    # Scatter back: spec_lbs_b[close_idx] = max(old, new)
+                    spec_lbs_b[close_idx] = torch.maximum(
+                        spec_lbs_b[close_idx], new_lbs_batch)
+                except Exception:
+                    pass
+                disj_closed_masks = []
+                for di, q_idxs in disj_q_idx.items():
+                    disj_closed_masks.append(
+                        (spec_lbs_b[:, q_idxs] > 0).any(dim=1))
+                all_disj_closed = torch.stack(
+                    disj_closed_masks, dim=1).all(dim=1)
+
         unclosed = (~all_disj_closed).nonzero(as_tuple=True)[0]
         n_leaves_visited += B
         n_verified_by_crown_iter = int(all_disj_closed.sum().item())
@@ -7331,8 +7561,42 @@ def _input_split_batched(graph, spec, settings, gg, device, dtype):
             xh_u = xh_batch[unclosed]
             A_u = A_lin[unclosed]
             b_u = b_lin[unclosed]
-            xl_c, xh_c, feasible_c = _clip_box_by_halfspaces_batched(
-                xl_u, xh_u, A_u, b_u)
+            # Iterate per-halfspace clipping until no further shrinkage.
+            clip_iters = int(getattr(
+                settings, 'input_split_batched_clip_iters', 1))
+            xl_c, xh_c, feasible_c = xl_u, xh_u, None
+            for _ci in range(clip_iters):
+                xl_new, xh_new, feasible_new = _clip_box_by_halfspaces_batched(
+                    xl_c, xh_c, A_u, b_u)
+                shrunk = ((xl_new > xl_c) | (xh_new < xh_c)).any().item()
+                xl_c, xh_c, feasible_c = xl_new, xh_new, feasible_new
+                if not shrunk:
+                    break
+            # Optional second stage: full-LP clip on the SURVIVING
+            # leaves. Strictly tighter than per-halfspace (joint
+            # constraints in one LP); catches infeasibility cases that
+            # cheap clip misses. Parallelized across CPU cores via
+            # persistent-env Gurobi workers. Roughly +10 ms per leaf
+            # per iter; only enable when batched_clip + per-halfspace
+            # isn't converging (acasxu prop_1/5/6/9 etc).
+            if (bool(getattr(settings,
+                              'input_split_batched_clip_full_lp', False))
+                    and feasible_c.any().item()):
+                surviving = feasible_c.nonzero(as_tuple=True)[0]
+                xl_s = xl_c[surviving]
+                xh_s = xh_c[surviving]
+                A_s = A_u[surviving]
+                b_s = b_u[surviving]
+                xl_lp, xh_lp, feas_lp = _clip_box_by_full_lp_batched(
+                    xl_s, xh_s, A_s, b_s, pool=_lp_pool)
+                # Write back into the per-halfspace results.
+                xl_c[surviving] = xl_lp
+                xh_c[surviving] = xh_lp
+                # Mark infeasibles via the LP.
+                inf_s = ~feas_lp
+                if inf_s.any().item():
+                    inf_global = surviving[inf_s]
+                    feasible_c[inf_global] = False
             n_verified_by_clip_iter = int((~feasible_c).sum().item())
             # Only feasible-after-clip leaves continue to split.
             feasible_idx = feasible_c.nonzero(as_tuple=True)[0]
@@ -7342,14 +7606,191 @@ def _input_split_batched(graph, spec, settings, gg, device, dtype):
             else:
                 xl_split = xl_u[:0]
                 xh_split = xh_u[:0]
+
+            # Clip → re-CROWN cycles: the old CROWN bounds were
+            # computed on the LARGER pre-clip box, so they're still
+            # valid (just loose). Re-running CROWN on the clipped box
+            # gives TIGHTER per-query lbs that may close the leaf
+            # without splitting. AB-CROWN-style inner iteration.
+            # Each cycle is one extra forward zono + spec backward
+            # (~5-20 ms per iter for the whole batch); pays off if it
+            # closes leaves that would otherwise become 2 children +
+            # next-iter CROWN.
+            n_recrown_cycles = int(getattr(
+                settings, 'input_split_batched_clip_recrown_cycles', 0))
+            for _rc in range(n_recrown_cycles):
+                if xl_split.numel() == 0:
+                    break
+                sb_r, _ = _forward_zonotope_graph_batched(
+                    xl_split, xh_split, gg, device, dtype)
+                spec_lbs_r, A_r, b_r = _spec_backward_graph_batched(
+                    sb_r, xl_split, xh_split, gg, spec_ew, device, dtype,
+                    return_input_linear=True)
+                # Closure on re-CROWN
+                closed_r = []
+                for di, q_idxs in disj_q_idx.items():
+                    closed_r.append((spec_lbs_r[:, q_idxs] > 0).any(dim=1))
+                if closed_r:
+                    all_closed_r = torch.stack(closed_r, dim=1).all(dim=1)
+                else:
+                    all_closed_r = torch.ones(
+                        xl_split.shape[0], dtype=torch.bool, device=device)
+                n_verified_by_clip_iter += int(all_closed_r.sum().item())
+                # Drop closed leaves
+                still_open_r = (~all_closed_r).nonzero(as_tuple=True)[0]
+                if still_open_r.numel() == 0:
+                    xl_split = xl_split[:0]
+                    xh_split = xh_split[:0]
+                    break
+                # Clip the still-open leaves with the new tighter A, b
+                xl_o = xl_split[still_open_r]
+                xh_o = xh_split[still_open_r]
+                A_o = A_r[still_open_r]
+                b_o = b_r[still_open_r]
+                xl_r2, xh_r2, feas_r2 = _clip_box_by_halfspaces_batched(
+                    xl_o, xh_o, A_o, b_o)
+                n_verified_by_clip_iter += int((~feas_r2).sum().item())
+                feas_r2_idx = feas_r2.nonzero(as_tuple=True)[0]
+                if feas_r2_idx.numel() == 0:
+                    xl_split = xl_split[:0]
+                    xh_split = xh_split[:0]
+                    break
+                xl_new = xl_r2[feas_r2_idx]
+                xh_new = xh_r2[feas_r2_idx]
+                # Stop if no significant shrinkage on this cycle.
+                old_widths = (xh_split[still_open_r][feas_r2_idx]
+                              - xl_split[still_open_r][feas_r2_idx])
+                new_widths = xh_new - xl_new
+                if (new_widths / (old_widths + 1e-12)).min().item() > 0.99:
+                    xl_split = xl_new; xh_split = xh_new
+                    break
+                xl_split = xl_new
+                xh_split = xh_new
         else:
             xl_split = xl_batch[unclosed]
             xh_split = xh_batch[unclosed]
 
-        # Split remaining boxes on widest axis.
+        # MILP escalation on stuck boundary leaves. After CROWN +
+        # α-CROWN + clipping fail to close a leaf, if its unstable-
+        # neuron count is low enough, the full triangle MILP (exact ReLU
+        # encoding via binaries) often closes in <50 ms. Only escalate
+        # leaves where the input box has been split enough that
+        # unstable ≤ `milp_max_unstable` (~80). At root, ACASXU has
+        # ~270 unstable and MILP times out; at 1/32 sub-box it drops
+        # to ~60 and MILP closes in 0 s. Per-leaf serial Gurobi (small
+        # MILPs solve fast), parallelizable across leaves via mp pool
+        # in future. Mirrors AB-CROWN's MIP attack on deep leaves.
+        milp_escalate = bool(getattr(
+            settings, 'input_split_batched_milp_escalate', False))
+        if (milp_escalate and xl_split.numel() > 0 and gg_ops_ser):
+            from . import verify_gen_lp as _glp
+            max_un = int(getattr(
+                settings, 'input_split_batched_milp_max_unstable', 80))
+            max_per_iter = int(getattr(
+                settings, 'input_split_batched_milp_max_leaves', 20))
+            per_query_tl = float(getattr(
+                settings, 'input_split_batched_milp_tl', 2.0))
+            # Per-leaf bbr from the batched sb_b. Get the indices in
+            # the FULL batch that correspond to xl_split (i.e., the
+            # `unclosed[feasible_idx]` mapping).
+            if clip_enabled and unclosed.numel() > 0 and A_lin is not None:
+                xl_split_idx = unclosed[feasible_idx]
+            else:
+                xl_split_idx = unclosed
+            # Compute per-leaf unstable count + worst-disjunct lb
+            n_un_per_leaf = torch.zeros(
+                xl_split.shape[0], dtype=torch.int32, device=device)
+            for L in sb_b:
+                lo, hi = sb_b[L]
+                lo_s = lo[xl_split_idx]; hi_s = hi[xl_split_idx]
+                n_un_per_leaf += ((lo_s < 0) & (hi_s > 0)).sum(dim=1).int()
+            # Pick leaves to escalate: low unstable count + worst lb
+            # close to 0.
+            best_lb_per_leaf = spec_lbs_b[xl_split_idx].max(dim=1).values
+            cand_mask = (n_un_per_leaf <= max_un) & (best_lb_per_leaf > -1.0)
+            cand_idx = cand_mask.nonzero(as_tuple=True)[0]
+            if cand_idx.numel() > 0:
+                # Sort by best_lb descending (closest to closing first).
+                order = best_lb_per_leaf[cand_idx].argsort(descending=True)
+                cand_idx = cand_idx[order[:max_per_iter]]
+                # Build per-leaf MILP tasks and dispatch in parallel
+                # via multiprocessing. Each task tries queries in
+                # best-CROWN-lb order; first MILP-UNSAT per disjunct
+                # closes that disjunct; leaf closes when every disjunct
+                # is MILP-closed.
+                qids_list = sorted(spec_ew.keys())
+                last_op_name = gg['ops'][-1]['name']
+                tasks = []
+                for ci in cand_idx.cpu().numpy():
+                    full_idx = int(xl_split_idx[ci].item())
+                    xl_l_np = xl_split[ci].cpu().numpy().astype(np.float64)
+                    xh_l_np = xh_split[ci].cpu().numpy().astype(np.float64)
+                    bbr_l = {L: (sb_b[L][0][full_idx].cpu().numpy().astype(np.float64),
+                                  sb_b[L][1][full_idx].cpu().numpy().astype(np.float64))
+                             for L in sb_b}
+                    # Per-disjunct best-lb query ordering.
+                    per_disj_queries = []
+                    for di, qlist in disj_queries.items():
+                        q_idxs = [qids_list.index(qi) for qi, _, _ in qlist]
+                        q_order = sorted(q_idxs,
+                                         key=lambda qix: -spec_lbs_b[full_idx, qix].item())
+                        ordered = []
+                        for qix in q_order:
+                            qi = qids_list[qix]
+                            ordered.append((
+                                spec_ew[qi][0].cpu().numpy().astype(np.float64),
+                                float(spec_ew[qi][1])))
+                        per_disj_queries.append(ordered)
+                    tasks.append((int(ci), gg_ops_ser, xl_l_np, xh_l_np,
+                                   bbr_l, last_op_name, per_disj_queries,
+                                   per_query_tl))
+                import multiprocessing as _mp
+                closed_via_milp = torch.zeros(
+                    xl_split.shape[0], dtype=torch.bool, device=device)
+                n_workers = min(_mp.cpu_count() - 1, len(tasks), 8)
+                if n_workers <= 1:
+                    results = [_milp_escalate_worker(t) for t in tasks]
+                else:
+                    with _mp.Pool(n_workers) as pool:
+                        results = pool.map(_milp_escalate_worker, tasks)
+                for ci, closed in results:
+                    if closed:
+                        closed_via_milp[ci] = True
+                n_milp_closed = int(closed_via_milp.sum().item())
+                if n_milp_closed > 0:
+                    n_verified_by_clip_iter += n_milp_closed
+                    # Drop closed leaves from xl_split.
+                    keep = ~closed_via_milp
+                    xl_split = xl_split[keep]
+                    xh_split = xh_split[keep]
+                    if A_lin is not None and clip_enabled and feasible_idx.numel() > 0:
+                        A_u = A_u[keep] if A_u.shape[0] == keep.shape[0] else A_u
+
+        # SB (smart branching) axis selection — pick the dim that most
+        # tightens the worst CROWN bound when split. Score_i = width_i ×
+        # |A_q*[i]| where q* is the worst query (closest-to-zero lb).
+        # Falls back to widest-axis if A_lin not available.
+        # AB-CROWN's `branching.method: sb` does similar; ours is a
+        # simpler form (sum |A_q[i]| across queries instead of full
+        # gradient on worst bound).
+        sb_enabled = bool(getattr(
+            settings, 'input_split_batched_branch_sb', True))
         if xl_split.numel() > 0:
             widths = (xh_split - xl_split).cpu()
-            ax = widths.argmax(dim=1)
+            if sb_enabled and A_lin is not None:
+                # Recover surviving indices in xl_split's coordinate
+                # frame. `unclosed`→A_u; clip restricts to feasible_idx
+                # of that; xl_split lines up with feasible_idx.
+                if clip_enabled and unclosed.numel() > 0 and A_lin is not None:
+                    A_split = A_u[feasible_idx]
+                else:
+                    A_split = A_lin[unclosed]
+                # Per-leaf sensitivity: sum_q |A_q[i]| × width_i
+                sens = A_split.abs().sum(dim=1).cpu()  # (B, n_in)
+                scores = widths * sens
+                ax = scores.argmax(dim=1)
+            else:
+                ax = widths.argmax(dim=1)
             xl_cpu = xl_split.cpu()
             xh_cpu = xh_split.cpu()
             n = xl_split.shape[0]

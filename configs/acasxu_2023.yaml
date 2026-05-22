@@ -1,0 +1,34 @@
+# acasxu_2023 — small FC controller (5-D input, 50×6 ReLU layers).
+# VNNCOMP regular track, 187 cases (47 SAT + 140 UNSAT).
+#
+# Spec shapes:
+#   prop_2: Y_0 ≥ Y_i for all i=1..4 (single-disjunct AND of 4 pairwise,
+#           "COC maximal"). Many SAT cases need narrow-region search.
+#   prop_3: Y_0 ≤ Y_i for all i=1..4 ("COC minimal"). UNSAT-leaning.
+#   prop_1, 5-10: threshold or pairwise; varied.
+#
+# Hybrid: batched + clipping (closes prop_1 UNSAT) + multi-α PGD + OSI
+# init (finds narrow-SAT prop_2 cases) + BATCHED GPU α-CROWN on
+# boundary leaves (closes prop_5 / 3_3 prop_2 / 4_2 prop_2). Without
+# any of this: 141/186 (75.8%); race v1+v2: 176/186; batched α-CROWN
+# alone (single-config): target 181+/186.
+input_split_batched_enabled: true
+input_split_batched_clip_enabled: true
+input_split_batch_size: 4096
+input_split_batched_max_worklist: 2000000
+input_split_batched_alpha_boundary_eps: 100.0
+input_split_batched_alpha_iters: 200
+input_split_batched_alpha_max_leaves: 5000
+pgd_alpha_multi: true
+pgd_init_mode: osi
+pgd_iter: 500
+pgd_restarts: 5000   # AB-CROWN uses 10000; 5000 cracks narrow prop_2 SAT cases
+# Phase 8-style escalation: when input split + α-CROWN can't close a
+# boundary leaf AND its unstable-neuron count is low (<= 100), try
+# the full triangle MILP per query. Closes 3_3 prop_2-class boundary
+# leaves that pure input split can't reach. Parallelized via Gurobi
+# multiprocessing pool.
+input_split_batched_milp_escalate: true
+input_split_batched_milp_max_unstable: 100
+input_split_batched_milp_max_leaves: 50
+input_split_batched_milp_tl: 1.0

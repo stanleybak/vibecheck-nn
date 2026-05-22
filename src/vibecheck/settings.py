@@ -41,6 +41,11 @@ def default_settings(**overrides):
         # restarts × 100 Adam-direction+signed-ε-step iters with 0.99 LR
         # decay + hinge loss catch counterexamples missed by the old 100×10.
         pgd_restarts=30,
+        # PGD plateau-based give-up: after `pgd_plateau_iters` iters of
+        # no margin improvement AND all restarts above hinge, abandon
+        # the attack (no SAT likely). Saves ~80% of PGD time on UNSAT
+        # cases. Defaults to 100 iters of plateau before giving up.
+        pgd_plateau_iters=100,
         pgd_iter=100,
         # Phase 0 PGD: run an attack BEFORE the bab_refine cascade.
         # Mirrors α,β-CROWN's pgd_order='before' default. If SAT is
@@ -135,6 +140,60 @@ def default_settings(**overrides):
         # tighter bounds. Mirrors AB-CROWN's `clip_input_domain:
         # complete`. On by default whenever `input_split_batched_enabled`.
         input_split_batched_clip_enabled=True,
+        # Iterate the per-halfspace clip until fixed point — box
+        # shrinks → L_other tightens → halfspace projection on x_i
+        # tightens further. Empirically converges in 1-2 passes for
+        # cersyve / acasxu (no extra shrinkage past iter 1). Knob kept
+        # for benchmarks where the fixed point isn't reached fast.
+        input_split_batched_clip_iters=1,
+        # Second-stage full-LP clipping after per-halfspace. For each
+        # leaf that's still feasible after per-halfspace, run a full
+        # Gurobi LP: 1 feasibility check + 2×n_in projection LPs.
+        # Strictly tighter than per-halfspace (captures joint
+        # constraints). Parallelized across CPU cores with persistent
+        # Gurobi envs per worker. Mirrors AB-CROWN's
+        # `clip_type: complete`. Costs ~5-30 ms per leaf per iter
+        # depending on n_in; only enable when per-halfspace isn't
+        # converging (acasxu prop_1/5/6/9 boundary cases).
+        input_split_batched_clip_full_lp=False,
+        input_split_batched_clip_lp_workers=None,  # default: cpu-1
+        # SB (smart branching) axis selection — pick split dim by
+        # `width × sum_q |A_q|` from CROWN's input linearization. Falls
+        # back to widest-axis if A_lin not available. Empirically on
+        # acasxu the simpler widest-axis converged about as fast (the
+        # sensitivity score barely re-orders the picks because the
+        # input box is approximately isotropic after splits). Default
+        # off; AB-CROWN's `naive` (= widest) is the empirical winner.
+        input_split_batched_branch_sb=False,
+        # Clip → re-CROWN inner cycles. After clipping a leaf, the OLD
+        # CROWN bounds are still sound on the smaller box but loose.
+        # Re-running CROWN on the clipped box gives tighter spec lbs
+        # that may close the leaf without splitting. Costs +1 forward
+        # zono + spec backward per cycle (~5-20 ms per batch). Stops
+        # early if clipping no longer shrinks. Default 0 (off);
+        # opt-in per benchmark.
+        input_split_batched_clip_recrown_cycles=0,
+        # MILP escalation on stuck boundary leaves. After CROWN +
+        # α-CROWN + clip, if a leaf still won't close AND its unstable
+        # count ≤ `milp_max_unstable`, try the full triangle MILP
+        # (exact ReLU encoding). At deep enough splits (~60 unstable
+        # remaining), MILP closes in <50 ms. Per-leaf serial Gurobi;
+        # capped at `milp_max_leaves` per iter to bound cost.
+        input_split_batched_milp_escalate=False,
+        input_split_batched_milp_max_unstable=80,
+        input_split_batched_milp_max_leaves=20,
+        input_split_batched_milp_tl=2.0,
+        # Selective α-CROWN on boundary leaves of batched BaB. Per iter,
+        # for leaves whose worst per-disjunct best-query lb is within
+        # `boundary_eps` of 0, run per-leaf α-CROWN with up to
+        # `alpha_iters` Adam steps and `early_stop_on_positive=True`.
+        # Closes leaves on the convergence plateau where per-query
+        # CROWN tightens but doesn't quite cross 0. Capped at
+        # `alpha_max_leaves` per iter to bound serial cost. Default
+        # disabled (eps=0); opt-in per benchmark.
+        input_split_batched_alpha_boundary_eps=0.0,
+        input_split_batched_alpha_iters=10,
+        input_split_batched_alpha_max_leaves=200,
         # PGD optimizer choice. Three modes:
         #   'adam_sign'    — bias-corrected Adam moment, sign-clipped step
         #                    (current vibecheck behavior, kept as default
