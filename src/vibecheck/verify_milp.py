@@ -1583,13 +1583,23 @@ def _racing_escalation(layers_np, x_lo, x_hi, bounds_np, pred, comp,
                     pool.join()
                     winner = 'escalate'
                     break
-                else:
+                elif feas_result == 'UNSAT':
                     if print_progress:
                         print(f'  Racing bins={n_bins}: '
                               f'feasibility UNSAT ({feas_dt:.1f}s) → verified')
                     pool.terminate()
                     pool.join()
                     return True, n_bins
+                else:
+                    # Same fix as `_racing_escalation_graph` — UNKNOWN /
+                    # TIMEOUT is NOT a verification signal.
+                    if print_progress:
+                        print(f'  Racing bins={n_bins}: '
+                              f'feasibility {feas_result} ({feas_dt:.1f}s) → escalate')
+                    pool.terminate()
+                    pool.join()
+                    winner = 'escalate'
+                    break
             if async_opt.ready():
                 opt_result, opt_dt, opt_lb = async_opt.get()
                 if opt_result == 'UNSAT':
@@ -1835,7 +1845,36 @@ def _build_graph_model_to_relu(gg_ops, x_lo, x_hi, bounds_by_relu,
                     target_vars = out
                     break
             else:
-                op_var_refs[nm] = op_var_refs[op['inputs'][0]]
+                # Same fix as `_solve_spec_graph_worker` — apply the
+                # bias of a non-merge add op. Silent bias-drop here
+                # encoded the whole network bias-less for ACASXU.
+                prev = op_var_refs[op['inputs'][0]]
+                bias = op.get('bias')
+                if bias is None:
+                    op_var_refs[nm] = prev
+                else:
+                    bias_flat = bias.flatten().astype(np.float64)
+                    out = []
+                    for j in range(len(prev)):
+                        if prev[j] is None:
+                            v = m.addVar(lb=float(bias_flat[j]),
+                                          ub=float(bias_flat[j]))
+                            out.append(v)
+                        else:
+                            v = m.addVar(lb=-grb.GRB.INFINITY,
+                                          ub=grb.GRB.INFINITY)
+                            m.addConstr(v == prev[j] + float(bias_flat[j]))
+                            out.append(v)
+                    m.update()
+                    op_var_refs[nm] = out
+                # An ACASXU-style network's target_input_name is the
+                # bias-add op feeding the next ReLU. Have to capture
+                # target_vars + break here too (the merge-add branch
+                # above did this for ResNets; the non-merge add path
+                # was silently skipping it).
+                if nm == target_input_name:
+                    target_vars = op_var_refs[nm]
+                    break
 
         elif t == 'sub':
             # Sub with constant: create shifted variables
@@ -2106,7 +2145,34 @@ def _solve_spec_graph_worker(args):
                 m.update()
                 op_var_refs[name] = out
             else:
-                op_var_refs[name] = op_var_refs[op['inputs'][0]]
+                # Constant bias add (non-merge add with a `bias` field —
+                # common ACASXU/safenlp pattern where ONNX exports the
+                # bias as a separate Add op after Gemm). Forwarding the
+                # input vars unchanged would silently drop the bias →
+                # entire network encoded bias-less → wildly wrong y
+                # bounds → falsely-infeasible spec LPs (observed: prop_2
+                # `4_4` got "feas UNSAT" in 0.0s even though brute-force
+                # found 500 real SAT witnesses).
+                prev = op_var_refs[op['inputs'][0]]
+                bias = op.get('bias')
+                if bias is None:
+                    op_var_refs[name] = prev
+                else:
+                    bias_flat = bias.flatten().astype(np.float64)
+                    out = []
+                    for j in range(len(prev)):
+                        if prev[j] is None:
+                            # all-dead upstream: emit a constant var.
+                            v = m.addVar(lb=float(bias_flat[j]),
+                                          ub=float(bias_flat[j]))
+                            out.append(v)
+                        else:
+                            v = m.addVar(lb=-grb.GRB.INFINITY,
+                                          ub=grb.GRB.INFINITY)
+                            m.addConstr(v == prev[j] + float(bias_flat[j]))
+                            out.append(v)
+                    m.update()
+                    op_var_refs[name] = out
 
         elif t == 'sub':
             prev = op_var_refs[op['inputs'][0]]
@@ -2233,12 +2299,22 @@ def _racing_escalation_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
                               f'feas SAT ({feas_dt:.1f}s) → escalate')
                     pool.terminate(); pool.join()
                     break
-                else:
+                elif feas_result == 'UNSAT':
                     if print_progress:
                         print(f'    Racing bins={n_bins}: '
                               f'feas UNSAT ({feas_dt:.1f}s) → verified')
                     pool.terminate(); pool.join()
                     return True, n_bins
+                else:
+                    # UNKNOWN / TIMEOUT / numeric trouble — NOT a sound
+                    # verification signal. Previously this branch
+                    # printed "feas UNSAT" and returned verified —
+                    # silent unsoundness when LP couldn't solve.
+                    if print_progress:
+                        print(f'    Racing bins={n_bins}: '
+                              f'feas {feas_result} ({feas_dt:.1f}s) → escalate')
+                    pool.terminate(); pool.join()
+                    break
             if async_opt.ready():
                 opt_result, opt_dt, opt_lb = async_opt.get()
                 if opt_result == 'UNSAT':
@@ -2423,6 +2499,11 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 d['layer_idx'] = op['layer_idx']
         elif op['type'] == 'add':
             d['is_merge'] = op.get('is_merge', False)
+            # Carry the bias for non-merge bias-adds (ACASXU / safenlp
+            # ONNXes export `Gemm → Add(bias)` separately). Dropping
+            # this used to silently encode the network bias-less in
+            # MILP workers → falsely-infeasible spec LPs.
+            d['bias'] = op.get('bias')
         elif op['type'] == 'sub':
             d['bias'] = op.get('bias')
         gg_ops_ser.append(d)
@@ -2496,12 +2577,26 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 if op['type'] == 'conv':
                     layers_np_seq.append({
                         'type': 'conv', 'kernel': op['kernel_np'],
-                        'bias': op['bias_np'], 'in_shape': op['in_shape'],
+                        'bias': op['bias_np'].copy(),
+                        'in_shape': op['in_shape'],
                         'stride': op['stride'], 'padding': op['padding']})
                 elif op['type'] == 'fc':
                     layers_np_seq.append({
                         'type': 'fc', 'W': op['W_np'],
-                        'bias': op['bias_np']})
+                        'bias': op['bias_np'].copy()})
+                elif (op['type'] == 'add' and not op.get('is_merge')
+                        and op.get('bias') is not None
+                        and layers_np_seq):
+                    # Fold this constant bias into the preceding fc/conv's
+                    # bias. ONNX exports `Gemm(no bias) → Add(bias) →
+                    # ReLU` for ACASXU / safenlp; without folding, the
+                    # sequential tightener sees a bias-less network and
+                    # produces UNSOUND tight bounds (proved neurons
+                    # always positive when reality says they straddle 0).
+                    bias_add = np.asarray(op['bias']).flatten().astype(
+                        layers_np_seq[-1]['bias'].dtype)
+                    layers_np_seq[-1]['bias'] = (
+                        layers_np_seq[-1]['bias'] + bias_add)
             seq_li = len(layers_np_seq) - 1
             seq_bounds = {}
             rc = 0
@@ -2736,6 +2831,7 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 d['layer_idx'] = op['layer_idx']
         elif op['type'] == 'add':
             d['is_merge'] = op.get('is_merge', False)
+            d['bias'] = op.get('bias')
         elif op['type'] == 'sub':
             d['bias'] = op.get('bias')
         gg_ops_ser.append(d)
@@ -2837,8 +2933,12 @@ def milp_verify(graph, spec, settings=None):
     print_progress = settings.print_progress
     deadline = time.perf_counter() + total_timeout
 
-    # Dispatch to graph-aware path for networks with skip connections
-    if graph.fork_points():
+    # Dispatch to graph-aware path for networks with skip connections,
+    # OR for specs that don't fit the "single pred, many comps" shape
+    # the sequential path requires (e.g. acasxu prop_2 has 4 different
+    # preds with comp=0 — "COC is maximal" form). The graph path uses
+    # `spec.as_linear_queries` which handles arbitrary DNF specs.
+    if graph.fork_points() or spec.as_pairwise() is None:
         return _milp_verify_graph(graph, spec, settings, device, dtype,
                                    deadline, total_timeout)
 
@@ -2851,9 +2951,7 @@ def milp_verify(graph, spec, settings=None):
     def time_left():
         return max(0, deadline - time.perf_counter())
 
-    pw = spec.as_pairwise()
-    assert pw is not None, "MILP verification requires pairwise constraints"
-    pred, comps = pw
+    pred, comps = spec.as_pairwise()
 
     gpu_layers_list, fwd_data = graph.gpu_layers(device, dtype)
     nh = len(gpu_layers_list) - 1
@@ -2887,12 +2985,27 @@ def milp_verify(graph, spec, settings=None):
         return 'unknown', {'time': total_timeout, 'phase': 'crown_timeout'}
 
     # --- PGD attack (GPU, fast) ---
+    # Use `pgd_attack_general` (spec-aware) instead of the legacy
+    # `_pgd_attack`. The legacy function flattens the spec to (pred,
+    # comps_set) via `as_pairwise`, losing the disjunct structure, and
+    # checks SAT as `min(Y_pred - Y_comp) < 0` over comps — that's OR
+    # semantics. For AND-conjunct specs (acasxu prop_3: single
+    # disjunct with 4 pairwise constraints) this falsely claims SAT
+    # when ANY constraint is in the unsafe direction, even if siblings
+    # are provably safe (witness on prop_3 / `1_1` had Y_3 > Y_0,
+    # disproving the AND, but legacy PGD accepted it because Y_1, Y_2,
+    # Y_4 < Y_0). `pgd_attack_general` uses `spec.check` in its
+    # confirm step, so it correctly handles both AND and OR conjuncts.
     _disable_sat = bool(getattr(settings, 'disable_sat_finding', False))
-    pgd_sat, pgd_witness, pgd_best = False, None, None
+    pgd_sat, pgd_witness = False, None
     if not _disable_sat:
         t_pgd = time.perf_counter()
-        pgd_sat, pgd_witness, pgd_best = _pgd_attack(
-            xl_g, xh_g, still_open, pred, fwd_data, nh, settings)
+        gg_for_pgd = graph.gpu_graph(device, dtype)
+        try:
+            pgd_sat, pgd_witness = _pgd_attack_general(
+                xl_g, xh_g, spec, gg_for_pgd, settings)
+        except RuntimeError:
+            pgd_sat, pgd_witness = False, None
         if print_progress:
             print(f'PGD attack: {time.perf_counter()-t_pgd:.2f}s  '
                   f'sat={pgd_sat}')
@@ -2955,9 +3068,24 @@ def milp_verify(graph, spec, settings=None):
                                  device=device, dtype=dtype)
         xh_at = torch.as_tensor(spec.x_hi.flatten().astype(np.float64),
                                  device=device, dtype=dtype)
-        # Build linear queries from spec
-        last_op = gg['ops'][-1]
-        n_out = int(np.prod(last_op.get('out_shape', (10,))))
+        # Build linear queries from spec.
+        # n_out from the last *linear* op (fc or conv); the network's
+        # last op may be an `add` (separate bias-add common in ACASXU
+        # / safenlp ONNXes), which has no `out_shape` and would have
+        # silently defaulted to 10 — wrong for non-10-output nets, and
+        # produced a downstream shape mismatch in α-CROWN backward
+        # (ew @ bias_at_add: ew shape (4, 10), bias (5,) → crash).
+        n_out = None
+        for op in reversed(gg['ops']):
+            if op.get('type') == 'fc':
+                W = op.get('W_np') if 'W_np' in op else op.get('W')
+                if W is not None:
+                    n_out = int(W.shape[0]); break
+            if op.get('type') == 'conv':
+                _no = int(op.get('n_out', 0))
+                if _no > 0:
+                    n_out = _no; break
+        assert n_out is not None, 'no fc/conv op found for n_out'
         queries_at = spec.as_linear_queries(n_out)
         if queries_at:
             w_qs_at = np.stack([q[1] for q in queries_at])
@@ -3208,18 +3336,21 @@ def milp_verify(graph, spec, settings=None):
             'phase': 'crown_tightened'}
 
     # --- PGD attack again (seeded with best adversarial from first PGD) ---
+    # Same fix as the first PGD call above — use spec-aware general PGD
+    # to avoid the OR-flatten-AND unsoundness in legacy `_pgd_attack`.
     if time_left() > 0 and not _disable_sat:
         t_pgd2 = time.perf_counter()
-        pgd_sat2, pgd_witness2, pgd_best2 = _pgd_attack(
-            xl_g, xh_g, still_open, pred, fwd_data, nh, settings)
+        try:
+            pgd_sat2, pgd_witness2 = _pgd_attack_general(
+                xl_g, xh_g, spec, gg_for_pgd, settings)
+        except RuntimeError:
+            pgd_sat2, pgd_witness2 = False, None
         if print_progress:
             print(f'PGD attack (post-tighten): {time.perf_counter()-t_pgd2:.2f}s  '
                   f'sat={pgd_sat2}')
         if pgd_sat2:
             return 'sat', {'time': time.perf_counter() - (deadline - total_timeout),
                             'phase': 'pgd_post_tighten', 'witness': pgd_witness2}
-        if pgd_best2 is not None:
-            pgd_best = pgd_best2
 
     # --- Score neurons for spec MILP ---
     remaining = set(still_open)
@@ -3280,5 +3411,4 @@ def milp_verify(graph, spec, settings=None):
         return 'verified', {'time': t_total, 'phase': 'spec_milp',
                             'n_binaries': n_binaries}
     return 'unknown', {'time': t_total, 'phase': 'spec_milp_timeout',
-                        'remaining': len(remaining),
-                        'pgd_best': pgd_best}
+                        'remaining': len(remaining)}

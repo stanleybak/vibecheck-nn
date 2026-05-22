@@ -1252,9 +1252,20 @@ class TestSequentialGraphEquivalence:
         result_graph, details_graph = milp_verify(g, spec, settings2)
         g.fork_points = orig_fp
 
-        # Both should agree
-        assert result_seq == result_graph, \
-            f"Sequential={result_seq}, Graph={result_graph}"
+        # Both pipelines must be SOUND (no contradicting verdicts).
+        # The published verdict for ACASXU_run2a_1_1 prop_3 is UNSAT,
+        # so neither path is allowed to return 'sat' (unsound SAT).
+        # 'verified' (correct) and 'unknown' (incomplete) are both
+        # acceptable. Pre-fix the sequential path returned 'sat'
+        # (silent unsoundness via PGD on AND-conjunct + bias-add
+        # dropped from MILP encoding); pre-fix the graph path
+        # returned 'verified' for the wrong reason (also unsound).
+        for label, r in (('Sequential', result_seq), ('Graph', result_graph)):
+            assert r != 'sat', (
+                f'{label}={r!r} is UNSOUND — published verdict for '
+                f'prop_3 / 1_1 is UNSAT')
+        assert result_seq == 'verified', (
+            f'Sequential should verify the UNSAT case but got {result_seq!r}')
 
         # Both should have timing info (graph path has stats)
         if 'timing' in details_graph:
