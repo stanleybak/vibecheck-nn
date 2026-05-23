@@ -644,6 +644,40 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
 
+        elif t == 'mul':
+            # Constant scalar / per-channel multiply: y = scale * x.
+            z = _get(op['inputs'][0])
+            scale_t = op.get('scale')
+            if scale_t is None:
+                raise ValueError("mul op missing 'scale' for forward zono")
+            if isinstance(scale_t, np.ndarray):
+                scale_t = torch.from_numpy(scale_t).to(device=device, dtype=dtype)
+            elif not isinstance(scale_t, torch.Tensor):
+                scale_t = torch.tensor(scale_t, dtype=dtype, device=device)
+            else:
+                scale_t = scale_t.to(device=device, dtype=dtype)
+            sflat = scale_t.flatten()
+            n = z.center.numel()
+            if sflat.numel() == 1:
+                new_c = z.center * sflat
+                new_g = z.generators * sflat
+            elif sflat.numel() == n:
+                new_c = z.center * sflat
+                new_g = z.generators * sflat.unsqueeze(-1)
+            else:
+                in_shape = op.get('in_shapes_nd', [None])[0]
+                if in_shape is None or len(in_shape) != 3:
+                    raise ValueError(
+                        f'mul: scale shape {sflat.shape} incompatible with '
+                        f'input ({n}); no spatial shape')
+                C, H, W = in_shape
+                assert sflat.numel() == C
+                scale_4d = sflat.view(1, C, 1, 1).expand(
+                    1, C, H, W).reshape(-1)
+                new_c = z.center * scale_4d
+                new_g = z.generators * scale_4d.unsqueeze(-1)
+            zono_state[name] = TorchZonotope(new_c, new_g)
+
         gen_count[name] = zono_state[name].n_gens
 
         # Free zonotopes that are no longer needed
@@ -783,6 +817,31 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
             elif t == 'reshape':
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+
+            elif t == 'mul':
+                # y = scale * x → ew_back = ew * scale.
+                scale_t = op.get('scale')
+                if isinstance(scale_t, np.ndarray):
+                    scale_t = torch.from_numpy(scale_t).to(
+                        device=ew.device, dtype=ew.dtype)
+                elif not isinstance(scale_t, torch.Tensor):
+                    scale_t = torch.tensor(scale_t, dtype=ew.dtype,
+                                            device=ew.device)
+                else:
+                    scale_t = scale_t.to(device=ew.device, dtype=ew.dtype)
+                sflat = scale_t.flatten()
+                n = ew.numel()
+                if sflat.numel() == 1 or sflat.numel() == n:
+                    ew_back = ew * sflat
+                else:
+                    in_shape = op.get('in_shapes_nd', [None])[0]
+                    C, H, W = in_shape
+                    assert sflat.numel() == C
+                    scale_4d = sflat.view(1, C, 1, 1).expand(
+                        1, C, H, W).reshape(-1)
+                    ew_back = ew * scale_4d
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
         # At input: interval bound
         input_name = gg['input_name']

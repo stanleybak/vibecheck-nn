@@ -67,6 +67,10 @@ def forward_point(gg_ops_ser, x, input_name, output_op_name):
             b = op.get('bias')
             vals[nm] = (a - np.asarray(b, dtype=np.float64).flatten()
                         if b is not None else a)
+        elif t == 'mul':
+            a = vals[op['inputs'][0]]
+            scale = np.asarray(op.get('scale'), dtype=np.float64).flatten()
+            vals[nm] = a * scale
         else:
             raise NotImplementedError(
                 f'forward_point: unsupported op {t!r}')
@@ -620,6 +624,33 @@ def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
         elif t == 'reshape':
             center[nm] = center[op['inputs'][0]]
             G_by_op[nm] = G_by_op[op['inputs'][0]]
+
+        elif t == 'mul':
+            # y = scale * x (constant scale, possibly scalar-broadcast).
+            prev_c = center[op['inputs'][0]]
+            prev_G = G_by_op[op['inputs'][0]]
+            scale = op.get('scale')
+            if isinstance(scale, np.ndarray):
+                st = torch.from_numpy(scale).to(device=gpu, dtype=dtype)
+            elif not isinstance(scale, torch.Tensor):
+                st = torch.tensor(scale, dtype=dtype, device=gpu)
+            else:
+                st = scale.to(device=gpu, dtype=dtype)
+            sflat = st.flatten()
+            n = prev_c.numel()
+            if sflat.numel() == 1 or sflat.numel() == n:
+                center[nm] = prev_c * sflat
+                Gm = _materialize_g(pad_cols(prev_G))
+                G_by_op[nm] = (Gm * sflat if sflat.numel() == 1
+                               else Gm * sflat.unsqueeze(-1))
+            else:
+                in_shape = op.get('in_shapes_nd', [None])[0]
+                C, H, W = in_shape
+                assert sflat.numel() == C
+                s4d = sflat.view(1, C, 1, 1).expand(1, C, H, W).reshape(-1)
+                center[nm] = prev_c * s4d
+                Gm = _materialize_g(pad_cols(prev_G))
+                G_by_op[nm] = Gm * s4d.unsqueeze(-1)
 
         for inp in op['inputs']:
             if (last_use.get(inp) == op_idx and inp in G_by_op
@@ -2092,6 +2123,33 @@ def tighten_bounds(gg_ops_ser, x_lo, x_hi, initial_bounds, input_name, *,
         elif t == 'reshape':
             center[nm] = center[op['inputs'][0]]
             G_by_op[nm] = G_by_op[op['inputs'][0]]
+
+        elif t == 'mul':
+            # y = scale * x (constant scale, possibly scalar-broadcast).
+            prev_c = center[op['inputs'][0]]
+            prev_G = G_by_op[op['inputs'][0]]
+            scale = op.get('scale')
+            if isinstance(scale, np.ndarray):
+                st = torch.from_numpy(scale).to(device=gpu, dtype=dtype)
+            elif not isinstance(scale, torch.Tensor):
+                st = torch.tensor(scale, dtype=dtype, device=gpu)
+            else:
+                st = scale.to(device=gpu, dtype=dtype)
+            sflat = st.flatten()
+            n = prev_c.numel()
+            if sflat.numel() == 1 or sflat.numel() == n:
+                center[nm] = prev_c * sflat
+                Gm = _materialize_g(pad_cols(prev_G))
+                G_by_op[nm] = (Gm * sflat if sflat.numel() == 1
+                               else Gm * sflat.unsqueeze(-1))
+            else:
+                in_shape = op.get('in_shapes_nd', [None])[0]
+                C, H, W = in_shape
+                assert sflat.numel() == C
+                s4d = sflat.view(1, C, 1, 1).expand(1, C, H, W).reshape(-1)
+                center[nm] = prev_c * s4d
+                Gm = _materialize_g(pad_cols(prev_G))
+                G_by_op[nm] = Gm * s4d.unsqueeze(-1)
 
         for inp in op['inputs']:
             if (last_use.get(inp) == op_idx and inp in G_by_op

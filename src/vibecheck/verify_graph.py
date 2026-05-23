@@ -86,6 +86,10 @@ def _serialize_gg_ops(gg):
                 d['bias'] = op.get('bias')
         elif t == 'sub':
             d['bias'] = op.get('bias')
+        elif t == 'mul':
+            d['scale'] = op.get('scale')
+            d['in_shapes_nd'] = op.get('in_shapes_nd')
+            d['out_shape_nd'] = op.get('out_shape_nd')
         out.append(d)
     return out
 
@@ -1273,24 +1277,28 @@ def _adaptive_spec_lb(gg, xl, xh, bounds_by_relu, spec_ew, spec_bias,
             else:
                 bias = op.get('bias')
                 if bias is not None:
-                    b_t = torch.tensor(
-                        bias.flatten(), dtype=dtype, device=device)
-                    acc += float(ew @ b_t)
+                    from .alpha_crown import _bias_dot_ew
+                    acc += float(_bias_dot_ew(ew, bias, dtype, device))
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
         elif t == 'sub':
             bias = op.get('bias')
             if bias is not None:
-                b_t = torch.tensor(
-                    bias.flatten(), dtype=dtype, device=device)
-                acc -= float(ew @ b_t)
+                from .alpha_crown import _bias_dot_ew
+                acc -= float(_bias_dot_ew(ew, bias, dtype, device))
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
         elif t == 'reshape':
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+
+        elif t == 'mul':
+            from .alpha_crown import _mul_scale_backward
+            ew_back = _mul_scale_backward(op, ew, dtype, device)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
     ew_inp = ew_at.get(input_name)
     if ew_inp is None:
@@ -3549,17 +3557,11 @@ def _phase1_bab_refine(
     # gg_ops_ser is the *serialized* op list — fc uses 'W_np', conv
     # uses 'kernel_np'. The gpu_graph live form (used in the prototype
     # script) uses 'W' / 'kernel' instead.
-    last_op = gg_ops_ser[-1]
-    if last_op['type'] == 'fc':
-        if 'W_np' in last_op:
-            n_output = int(last_op['W_np'].shape[0])
-        else:
-            n_output = int(last_op['W'].shape[0])
-    elif last_op['type'] == 'conv':
-        out_shape = last_op.get('out_shape')
-        n_output = int(np.prod(out_shape)) if out_shape else 10
-    else:
-        n_output = sb_init[max(sb_init.keys())][0].numel()
+    # Use the live forward zono's center as the source of truth for
+    # n_output. The op-list serializer strips shape metadata for some
+    # op types (e.g. 'add' at the tail of a Conv+Add output layer),
+    # which would otherwise fall back to the last ReLU's width.
+    n_output = int(z_final_initial.center.numel())
     queries_flat = spec.as_linear_queries(n_output) if spec is not None else []
     if queries_flat:
         w_qs = np.stack([np.asarray(q[1], dtype=np.float64)
