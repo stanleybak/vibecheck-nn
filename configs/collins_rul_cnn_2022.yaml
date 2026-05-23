@@ -1,0 +1,11 @@
+# collins_rul_cnn_2022 — VNNCOMP regular track. 62 instances, 3 small
+# CNN models (Conv×6 + ReLU×5 + Dropout + Flatten) verifying remaining-
+# useful-life predictions: robustness, monotonicity, if-then.
+#
+# Defaults work: every case crashes through CROWN's first pass or PGD's
+# root attack. Sweep: 62/62 in ~3 s total (vs AB-CROWN's ~430 s).
+# Auto-route sends Conv nets to `milp_verify`, which is the canonical
+# pipeline for this benchmark.
+#
+# No tuning needed; leaving this file as a hook for future benchmarks
+# whose defaults stop being optimal.
