@@ -28,6 +28,68 @@ from .verify_zono_bnb import _make_slopes, _find_shared_gens_count
 from .zonotope import TorchZonotope
 
 
+def _mul_scale_to_tensor(op, dtype, device):
+    scale_t = op.get('scale')
+    if isinstance(scale_t, np.ndarray):
+        scale_t = torch.from_numpy(scale_t).to(device=device, dtype=dtype)
+    elif not isinstance(scale_t, torch.Tensor):
+        scale_t = torch.tensor(scale_t, dtype=dtype, device=device)
+    else:
+        scale_t = scale_t.to(device=device, dtype=dtype)
+    return scale_t.flatten()
+
+
+def _mul_scale_broadcast(op, dtype, device, n_flat):
+    """Resolve op['scale'] to a (n_flat,) tensor with per-channel broadcast."""
+    sflat = _mul_scale_to_tensor(op, dtype, device)
+    if sflat.numel() == 1 or sflat.numel() == n_flat:
+        return sflat
+    in_shape = op.get('in_shapes_nd', [None])[0]
+    if in_shape is None or len(in_shape) != 3:
+        raise ValueError(
+            f'mul: scale {sflat.shape} incompatible with n={n_flat}; '
+            f'no spatial shape')
+    C, H, W = in_shape
+    assert sflat.numel() == C
+    return sflat.view(1, C, 1, 1).expand(1, C, H, W).reshape(-1)
+
+
+def _mul_scale_backward(op, ew, dtype, device):
+    """CROWN backward through y = scale * x: ew_back = ew * scale."""
+    n = ew.shape[-1]
+    sflat = _mul_scale_broadcast(op, dtype, device, n)
+    return ew * sflat
+
+
+def _mul_scale_zono(op, center, generators, dtype, device):
+    """Forward zono through y = scale * x: scale center and gens."""
+    n = center.numel()
+    sflat = _mul_scale_broadcast(op, dtype, device, n)
+    if sflat.numel() == 1:
+        return center * sflat, generators * sflat
+    return center * sflat, generators * sflat.unsqueeze(-1)
+
+
+def _bias_dot_ew(ew, bias_np, dtype, device):
+    """Compute the bias contribution to `acc` for an Add backward.
+
+    Returns the tensor to ADD to `acc`. Handles scalar / per-channel
+    broadcast against ew's last dim (the layer width):
+      - scalar bias (numel=1) → scalar * ew.sum(dim=-1)
+      - matching-size bias    → ew @ bias_vec
+    """
+    bt_full = torch.as_tensor(np.asarray(bias_np).flatten(),
+                                 dtype=dtype, device=device)
+    n = ew.shape[-1]
+    if bt_full.numel() == n:
+        return ew @ bt_full
+    if bt_full.numel() == 1:
+        return ew.sum(dim=-1) * bt_full
+    raise ValueError(
+        f'_bias_dot_ew: bias size {bt_full.numel()} incompatible with '
+        f'ew last dim {n}')
+
+
 # ---------------------------------------------------------------------------
 # CROWN backward helpers (batched, gradient-capable)
 # ---------------------------------------------------------------------------
@@ -129,21 +191,23 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             else:
                 bias = op.get('bias')
                 if bias is not None:
-                    bt = torch.tensor(
-                        bias.flatten(), dtype=dtype, device=device)
-                    acc = acc + ew @ bt
+                    acc = acc + _bias_dot_ew(ew, bias, dtype, device)
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
         elif t == 'sub':
             bias = op.get('bias')
             if bias is not None:
-                bt = torch.tensor(bias.flatten(), dtype=dtype, device=device)
-                acc = acc - ew @ bt
+                acc = acc - _bias_dot_ew(ew, bias, dtype, device)
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
         elif t == 'reshape':
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+
+        elif t == 'mul':
+            ew_back = _mul_scale_backward(op, ew, dtype, device)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
     input_name = gg['input_name']
     ew_inp = ew_at.get(input_name)
@@ -1054,21 +1118,23 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
             else:
                 bias = op.get('bias')
                 if bias is not None:
-                    bt = torch.tensor(
-                        bias.flatten(), dtype=dtype, device=device)
-                    acc = acc + ew @ bt
+                    acc = acc + _bias_dot_ew(ew, bias, dtype, device)
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
         elif t == 'sub':
             bias = op.get('bias')
             if bias is not None:
-                bt = torch.tensor(bias.flatten(), dtype=dtype, device=device)
-                acc = acc - ew @ bt
+                acc = acc - _bias_dot_ew(ew, bias, dtype, device)
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
         elif t == 'reshape':
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+
+        elif t == 'mul':
+            ew_back = _mul_scale_backward(op, ew, dtype, device)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
     xl_t = xl.to(dtype=dtype, device=device)
     xh_t = xh.to(dtype=dtype, device=device)
     ew_inp = ew_at.get(gg['input_name'])
@@ -1231,6 +1297,12 @@ def forward_zono_dir_adaptive(xl, xh, gg, alpha_per_layer, bbr,
             zono_state[name] = z
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
+        elif t == 'mul':
+            z = _get(op['inputs'][0])
+            new_c, new_g = _mul_scale_zono(op, z.center, z.generators,
+                                              dtype, device)
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            zono_state[name] = _TZ(new_c, new_g)
         gen_count[name] = zono_state[name].n_gens
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in zono_state:

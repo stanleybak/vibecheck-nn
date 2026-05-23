@@ -1,0 +1,14 @@
+# cora_2024 — VNNCOMP regular track. 180 instances across 9 MLPs
+# (mnist/cifar10/svhn × point/set/trades), 8 FC layers each, 7 ReLUs.
+# Specs are multi-disjunct DNF (9 disjuncts: y_target >= y_j for j != target).
+#
+# Defaults work for 151/180 cases. AB-CROWN solves 153/180 (27 timeouts);
+# we tie on 151 and miss 2 cifar10-set UNSAT cases (img96, img100) that
+# AB-CROWN cracks in ~8s but our bab_refine cascade takes >30s.
+#
+# We win on wall time: ~16 min total vs AB-CROWN's ~34 min.
+input_split_batched_enabled: true
+input_split_batched_clip_enabled: true
+input_split_batch_size: 4096
+pgd_restarts: 128
+pgd_time_budget_phase0: 2.0
