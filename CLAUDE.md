@@ -17,8 +17,10 @@ A zonotope-based neural network verification tool. Given an ONNX network and a V
 - **Use `.venv/bin/python`** for all commands. **Never run `git commit` or `git push`** — the user handles git.
 - **Don't broad-kill processes.** `pkill -f python` or `kill $(pgrep ...)` will take down the tmux session hosting Claude. Only kill specific PIDs you started (tracked via `run_in_background`) or narrow the pattern to the offending script.
 - **Run memory-uncertain experiments under a cgroup cap:** `systemd-run --user --scope -p MemoryMax=8G ...`. Without a cap a runaway tensor allocation kills tmux and Claude along with the process.
+- **Long-running or memory-uncertain experiments go to server1, NOT local.** Local hosts the tmux that Claude Code runs in — any process that OOMs or runs the GPU dry kills the whole session (lost context, mid-flight work). Local is for quick (~30s) smoke tests only. Anything that loops over benchmark cases, allocates large gen-tensors, or uses GPU memory at scale → `ssh stan@100.83.144.97` and run there. Same goes for `pkill`/`kill` from local — only safe to kill processes on the remote server, never on local.
 - **Single-threaded BLAS** is set in `__init__.py` (`OMP_NUM_THREADS=1` etc.) before numpy import — multi-threaded OpenBLAS causes huge run-to-run jitter on small matrices.
 - **Never silently swallow OOM.** Default behavior is to re-raise `torch.cuda.OutOfMemoryError` and `MemoryError`. Only catch when `settings.raise_on_oom=False` (e.g. a benchmarking loop that records OOM as an outcome).
+- **Bounds for nonlinear ops MUST be symbolic / provably-sound, never sampling-based.** This applies to ReLU, sigmoid, tanh, softmax, GELU, attention, layernorm — any nonlinear activation or transformer op. Sampling N points and taking max/min of the gap is *not* a sound upper/lower bound (the worst case may lie between samples). Use either: (a) closed-form bounds derived from monotonicity / convexity / concavity of the function, or (b) Newton / binary-search on a monotone condition that provably brackets the worst case (auto_LiRPA's `precompute_relaxation` pattern in `tanh.py`). When in doubt, verify soundness by sampling many adversarial points and checking that NONE violate the bound (this is the test, not the bound itself).
 
 ## Architecture
 
@@ -121,8 +123,8 @@ Allowed references: read auto_LiRPA / AB-CROWN source (`~/Desktop/temp/abcrown/a
 
 ### Already optimized
 
-cersyve · cifar100_2024 · mnist_fc (historical, regression-only) · tinyimagenet_2024 · relusplitter (extended; kept as deliverable).
+acasxu_2023 · cersyve · cgan_2023 · cifar100_2024 · mnist_fc (historical, regression-only) · tinyimagenet_2024 · relusplitter (extended; kept as deliverable).
 
 ### Queue (alphabetical, regular track only)
 
-acasxu_2023 · cgan_2023 · collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · linearizenn_2024 · malbeware · metaroom_2023 · nn4sys · safenlp_2024 · sat_relu · soundnessbench · tllverifybench_2023.
+collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · linearizenn_2024 · malbeware · metaroom_2023 · nn4sys · safenlp_2024 · sat_relu · soundnessbench · tllverifybench_2023.

@@ -9,6 +9,119 @@ from .settings import default_settings, resolve_torch
 from .zonotope import TorchZonotope
 
 
+def _sigmoid_tanh_linear_bounds(lo, hi, act_kind, n_iter=30):
+    """Sound closed-form linear bounds for sigmoid/tanh on [lo, hi].
+
+    Returns (lo_s, lo_t, up_s, up_t) such that for all x ∈ [lo, hi]:
+        lo_s * x + lo_t ≤ σ(x) ≤ up_s * x + up_t
+
+    Method (mirrors auto_LiRPA's `precompute_relaxation` in tanh.py).
+    Sigmoid σ'' = σ'(1 - 2σ), so σ is **convex** on (-∞, 0) (σ < 1/2) and
+    **concave** on (0, +∞) (σ > 1/2). Tanh has the same convexity sign
+    pattern about 0.
+      • Pure convex (hi ≤ 0): chord ABOVE σ → upper = chord.
+          tangent below σ → lower = tangent at midpoint.
+      • Pure concave (lo ≥ 0): chord BELOW σ → lower = chord.
+          tangent above σ → upper = tangent at midpoint.
+      • Mixed (lo < 0 < hi): σ convex on [lo, 0], concave on [0, hi].
+          Lower: tangent at p ∈ [lo, 0] such that the line passes through
+          (hi, σ(hi)). σ'(p)*(hi-p) + σ(p) = σ(hi). Binary-search the unique
+          root (g(p) is monotone increasing in p on (lo, 0) since σ'' > 0
+          on the convex half).
+          Upper: tangent at q ∈ [0, hi] such that the line passes through
+          (lo, σ(lo)). σ'(q)*(q-lo) − σ(q) + σ(lo) = 0. Mirror.
+
+    Returns tensors with the same shape as lo/hi."""
+    if act_kind == 'sigmoid':
+        act = torch.sigmoid
+        def dact(x):
+            s = act(x); return s * (1 - s)
+    elif act_kind == 'tanh':
+        act = torch.tanh
+        def dact(x):
+            s = act(x); return 1 - s * s
+    else:
+        raise ValueError(f'unknown act_kind {act_kind!r}')
+
+    s_lo = act(lo); s_hi = act(hi)
+    width = (hi - lo).clamp(min=1e-12)
+    chord_slope = (s_hi - s_lo) / width
+    chord_b = s_lo - chord_slope * lo
+
+    # Tangent at midpoint (used for pure cases).
+    mid = (lo + hi) / 2
+    s_mid = act(mid); ds_mid = dact(mid)
+    tang_mid_s = ds_mid
+    tang_mid_b = s_mid - ds_mid * mid
+
+    # -- Mixed-case lower tangent at p1 ∈ [lo, 0] s.t. line(hi) == σ(hi). --
+    # g(p) = σ'(p)*(hi-p) + σ(p) - σ(hi); g monotone increasing on [lo, 0].
+    p_l = torch.minimum(lo, torch.zeros_like(lo))
+    p_r = torch.zeros_like(lo)
+    for _ in range(n_iter):
+        p_m = (p_l + p_r) / 2
+        g_m = dact(p_m) * (hi - p_m) + act(p_m) - s_hi
+        mask = g_m > 0
+        p_r = torch.where(mask, p_m, p_r)
+        p_l = torch.where(mask, p_l, p_m)
+    p1 = (p_l + p_r) / 2
+    g_lo = dact(lo) * (hi - lo) + s_lo - s_hi
+    g_at_0 = dact(torch.zeros_like(lo)) * hi + act(torch.zeros_like(lo)) - s_hi
+    # Tangent point in [lo, 0] if root exists; else fall back later.
+    lo_s_mixed = dact(p1)
+    lo_t_mixed = act(p1) - lo_s_mixed * p1
+    # If g(lo) > 0: no root in [lo, 0]; the tangent at lo would have line(hi) > σ(hi).
+    # No tangent in [lo, hi] gives a sound lower bound — fall back to the
+    # constant y = σ(lo) (sound since σ is monotone increasing).
+    fallback_lower = g_lo > 0
+    lo_s_mixed = torch.where(fallback_lower, torch.zeros_like(lo), lo_s_mixed)
+    lo_t_mixed = torch.where(fallback_lower, s_lo, lo_t_mixed)
+    # If g(0) ≤ 0: no root either; use tangent at 0 (slope σ'(0)).
+    no_root_left = g_at_0 <= 0
+    lo_s_mixed = torch.where(no_root_left, dact(torch.zeros_like(lo)), lo_s_mixed)
+    lo_t_mixed = torch.where(no_root_left, act(torch.zeros_like(lo)), lo_t_mixed)
+
+    # -- Mixed-case upper tangent at q1 ∈ [0, hi] s.t. line(lo) == σ(lo). --
+    # h(q) = σ'(q)*(q-lo) - (σ(q) - σ(lo)); h monotone DECREASING on [0, hi].
+    q_l = torch.zeros_like(hi)
+    q_r = torch.maximum(hi, torch.zeros_like(hi))
+    for _ in range(n_iter):
+        q_m = (q_l + q_r) / 2
+        h_m = dact(q_m) * (q_m - lo) - (act(q_m) - s_lo)
+        mask = h_m > 0
+        q_l = torch.where(mask, q_m, q_l)
+        q_r = torch.where(mask, q_r, q_m)
+    q1 = (q_l + q_r) / 2
+    h_hi = dact(hi) * (hi - lo) - (s_hi - s_lo)
+    h_at_0 = dact(torch.zeros_like(hi)) * (-lo) - (act(torch.zeros_like(hi)) - s_lo)
+    up_s_mixed = dact(q1)
+    up_t_mixed = act(q1) - up_s_mixed * q1
+    # If h(hi) > 0 (σ'(hi)*(hi-lo) > σ(hi) - σ(lo)): no valid q in [0, hi].
+    # Fall back to constant y = σ(hi).
+    fallback_upper = h_hi > 0
+    up_s_mixed = torch.where(fallback_upper, torch.zeros_like(hi), up_s_mixed)
+    up_t_mixed = torch.where(fallback_upper, s_hi, up_t_mixed)
+    no_root_right = h_at_0 <= 0
+    up_s_mixed = torch.where(no_root_right, dact(torch.zeros_like(hi)), up_s_mixed)
+    up_t_mixed = torch.where(no_root_right, act(torch.zeros_like(hi)), up_t_mixed)
+
+    # Combine cases. Sigmoid/tanh: convex on x<0, concave on x>0.
+    is_convex = hi <= 0   # entire interval in convex region
+    is_concave = lo >= 0  # entire interval in concave region
+    # Convex: lower = tangent at midpoint, upper = chord
+    # Concave: lower = chord, upper = tangent at midpoint
+    # Mixed: lower/upper from binary search
+    lo_s = torch.where(is_convex, tang_mid_s,
+            torch.where(is_concave, chord_slope, lo_s_mixed))
+    lo_t = torch.where(is_convex, tang_mid_b,
+            torch.where(is_concave, chord_b, lo_t_mixed))
+    up_s = torch.where(is_convex, chord_slope,
+            torch.where(is_concave, tang_mid_s, up_s_mixed))
+    up_t = torch.where(is_convex, chord_b,
+            torch.where(is_concave, tang_mid_b, up_t_mixed))
+    return lo_s, lo_t, up_s, up_t
+
+
 def _make_slopes(lo, hi):
     """Compute CROWN adaptive slopes for ReLU relaxation.
 
@@ -77,6 +190,110 @@ def _forward_batch_graph(x, gg):
 
         elif t == 'reshape':
             act[name] = act[op['inputs'][0]]
+
+        elif t == 'conv_transpose':
+            a = act[op['inputs'][0]]
+            ins = op['in_shape']
+            a = F.conv_transpose2d(
+                a.reshape(batch, *ins), op['kernel'], bias=op['bias'],
+                stride=op['stride'], padding=op['padding'],
+                output_padding=op['output_padding']).reshape(batch, -1)
+            act[name] = a
+
+        elif t == 'bn':
+            a = act[op['inputs'][0]]
+            act[name] = a * op['factor'] + op['offset']
+
+        elif t == 'upsample':
+            a = act[op['inputs'][0]]
+            in_shape = op['in_shape']
+            sH, sW = op['scale']
+            a4 = a.reshape(batch, *in_shape)
+            a4 = F.interpolate(a4, scale_factor=(sH, sW), mode='nearest')
+            act[name] = a4.reshape(batch, -1)
+
+        elif t == 'sigmoid':
+            act[name] = torch.sigmoid(act[op['inputs'][0]])
+
+        elif t == 'tanh':
+            act[name] = torch.tanh(act[op['inputs'][0]])
+
+        elif t in ('avg_pool', 'max_pool'):
+            a = act[op['inputs'][0]]
+            in_shape = op['in_shape']
+            a4 = a.reshape(batch, *in_shape)
+            fn = F.avg_pool2d if t == 'avg_pool' else F.max_pool2d
+            a4 = fn(a4, kernel_size=op['kernel'], stride=op['stride'],
+                      padding=op['padding'])
+            act[name] = a4.reshape(batch, -1)
+
+        elif t == 'transpose':
+            a = act[op['inputs'][0]]
+            in_shape = op.get('in_shapes_nd', [None])[0]
+            perm = op['perm']
+            if in_shape and len(in_shape) + 1 == len(perm):
+                # ONNX perm includes batch dim (typically perm[0]==0); convert
+                # to N-D body perm by remapping.
+                # Reshape (batch, n) -> (batch, *in_shape), permute, flatten.
+                a_nd = a.reshape(batch, *in_shape)
+                if perm[0] == 0:
+                    body_perm = tuple(p - 1 for p in perm[1:])
+                    a_nd = a_nd.permute(0, *(p + 1 for p in body_perm))
+                else:
+                    a_nd = a_nd.permute(*perm)
+                act[name] = a_nd.reshape(batch, -1)
+            else:
+                act[name] = a  # passthrough fallback
+
+        elif t == 'squeeze':
+            act[name] = act[op['inputs'][0]]
+
+        elif t == 'mul':
+            a = act[op['inputs'][0]]
+            scale = op.get('scale')
+            if scale is not None:
+                s = torch.as_tensor(np.asarray(scale).flatten(),
+                                      dtype=a.dtype, device=a.device)
+                act[name] = a * s
+            else:
+                act[name] = a
+
+        elif t == 'mul_bilinear':
+            a = act[op['inputs'][0]]
+            b = act[op['inputs'][1]]
+            act[name] = a * b
+
+        elif t == 'matmul_bilinear':
+            a = act[op['inputs'][0]]
+            b = act[op['inputs'][1]]
+            shapes = op.get('in_shapes_nd', [None, None])
+            sh_a, sh_b = shapes[0], shapes[1]
+            assert sh_a and sh_b and len(sh_a) >= 2 and len(sh_b) >= 2, \
+                f'matmul_bilinear needs ≥2-D shapes; got {sh_a}, {sh_b}'
+            a_nd = a.reshape(batch, *sh_a)
+            b_nd = b.reshape(batch, *sh_b)
+            out_nd = a_nd @ b_nd
+            act[name] = out_nd.reshape(batch, -1)
+
+        elif t == 'softmax':
+            a = act[op['inputs'][0]]
+            in_shape = op.get('in_shapes_nd', [None])[0]
+            axis = op.get('axis', -1)
+            if in_shape and len(in_shape) >= 1:
+                a_nd = a.reshape(batch, *in_shape)
+                # ONNX axis may include batch dim; if axis 0 → batch dim
+                # which we don't want to softmax over. Normalize.
+                if axis == 0:
+                    axis = -1
+                elif axis > 0:
+                    axis = axis  # already counted including batch dim
+                act[name] = F.softmax(a_nd, dim=axis).reshape(batch, -1)
+            else:
+                act[name] = F.softmax(a, dim=axis)
+
+        else:
+            raise ValueError(
+                f'_forward_batch_graph: unknown op type {t!r} at {name!r}')
 
     return act[gg['ops'][-1]['name']]
 
@@ -675,11 +892,26 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
                               torch.zeros_like(hi))  # (B, n)
             c_out = lam * c_in + mu
             G_scaled = G_in * lam.unsqueeze(-1)  # (B, n, K)
-            # Append n new gen columns (one per neuron). For stable
-            # neurons mu is zero so the new column is zero — wasteful
-            # but keeps gen count uniform across batch.
-            new_gens = torch.diag_embed(mu)  # (B, n, n)
-            G_out = torch.cat([G_scaled, new_gens], dim=2)  # (B, n, K+n)
+            # Compact gen append: only one new column per UNSTABLE neuron
+            # (stable neurons have mu=0; full diag was 800MB+ on cGAN at
+            # n=28800). Per-batch unstable counts may differ; pad with
+            # zeros to max across batch.
+            ust_cnt = ust.sum(dim=1)  # (B,)
+            max_K = int(ust_cnt.max().item())
+            if max_K == 0:
+                G_out = G_scaled
+            else:
+                new_gens = torch.zeros(B, c_in.shape[1], max_K,
+                                          dtype=dtype, device=device)
+                # k-index within each batch's unstable list
+                ust_rank = ust.long().cumsum(dim=1) - 1  # (B, n)
+                b_idx = torch.arange(B, device=device).unsqueeze(-1).expand(
+                    -1, c_in.shape[1])  # (B, n)
+                r_idx = torch.arange(c_in.shape[1],
+                                       device=device).unsqueeze(0).expand(
+                    B, -1)  # (B, n)
+                new_gens[b_idx[ust], r_idx[ust], ust_rank[ust]] = mu[ust]
+                G_out = torch.cat([G_scaled, new_gens], dim=2)
             state[name] = (c_out, G_out)
             if 'layer_idx' in op:
                 sb[op['layer_idx']] = (lo.clone(), hi.clone())
@@ -727,10 +959,372 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
         elif t == 'reshape':
             state[name] = _get(op['inputs'][0])
 
+        elif t == 'conv_transpose':
+            c_in, G_in = _get(op['inputs'][0])
+            kernel = op['kernel']
+            bias = op['bias']
+            in_shape = op['in_shape']  # (C_in, H_in, W_in)
+            stride = op['stride']
+            padding = op['padding']
+            output_padding = op['output_padding']
+            n_in = c_in.shape[1]
+            assert n_in == in_shape[0] * in_shape[1] * in_shape[2]
+            # Center: (B, n_in) → (B, C_in, H, W) → conv_transpose → flatten
+            c_4d = c_in.reshape(B, *in_shape)
+            c_out_4d = F.conv_transpose2d(
+                c_4d, kernel, bias=bias, stride=stride, padding=padding,
+                output_padding=output_padding)
+            c_out = c_out_4d.reshape(B, -1)
+            # Generators: (B, n_in, K) → (B*K, C_in, H, W) per K → reshape
+            K = G_in.shape[2]
+            if K == 0:
+                G_out = torch.zeros(B, c_out.shape[1], 0,
+                                       dtype=dtype, device=device)
+            else:
+                # permute to (B, K, n_in) → (B*K, C, H, W)
+                g_perm = G_in.permute(0, 2, 1).reshape(B * K, *in_shape)
+                g_out = F.conv_transpose2d(
+                    g_perm, kernel, bias=None, stride=stride, padding=padding,
+                    output_padding=output_padding)
+                n_out = c_out.shape[1]
+                G_out = g_out.reshape(B, K, n_out).permute(0, 2, 1).contiguous()
+            state[name] = (c_out, G_out)
+
+        elif t == 'bn':
+            c_in, G_in = _get(op['inputs'][0])
+            factor = op['factor']  # (n,)
+            offset = op['offset']  # (n,)
+            c_out = c_in * factor + offset  # (B, n)
+            G_out = G_in * factor.unsqueeze(-1)  # (B, n, K)
+            state[name] = (c_out, G_out)
+
+        elif t in ('sigmoid', 'tanh'):
+            c_in, G_in = _get(op['inputs'][0])
+            abs_sum = G_in.abs().sum(dim=2)
+            lo_pre = c_in - abs_sum
+            hi_pre = c_in + abs_sum
+            act = torch.sigmoid if t == 'sigmoid' else torch.tanh
+            s_lo = act(lo_pre); s_hi = act(hi_pre)
+            c_out = (s_lo + s_hi) / 2
+            mu = (s_hi - s_lo) / 2
+            if 'layer_idx' in op:
+                sb[op['layer_idx']] = (lo_pre.clone(), hi_pre.clone())
+            # Collapse old gens (no preserved correlation through nonlinearity).
+            # Compact: only add gen columns for neurons with non-zero slack.
+            G_scaled = torch.zeros(B, c_in.shape[1], G_in.shape[2],
+                                      dtype=dtype, device=device)
+            nonzero_mask = mu.abs() > 1e-9
+            ust_cnt = nonzero_mask.sum(dim=1)
+            max_K = int(ust_cnt.max().item())
+            if max_K == 0:
+                G_out = G_scaled  # (B, n, K_old) zeros
+            else:
+                new_gens = torch.zeros(B, c_in.shape[1], max_K,
+                                          dtype=dtype, device=device)
+                rank = nonzero_mask.long().cumsum(dim=1) - 1
+                b_idx = torch.arange(B, device=device).unsqueeze(-1).expand(
+                    -1, c_in.shape[1])
+                r_idx = torch.arange(c_in.shape[1],
+                                       device=device).unsqueeze(0).expand(
+                    B, -1)
+                new_gens[b_idx[nonzero_mask], r_idx[nonzero_mask],
+                          rank[nonzero_mask]] = mu[nonzero_mask]
+                G_out = torch.cat([G_scaled, new_gens], dim=2)
+            state[name] = (c_out, G_out)
+
+        elif t == 'upsample':
+            c_in, G_in = _get(op['inputs'][0])
+            in_shape = op['in_shape']
+            sH, sW = op['scale']
+            n_in_layer = in_shape[0] * in_shape[1] * in_shape[2]
+            assert c_in.shape[1] == n_in_layer
+            c_4d = c_in.reshape(B, *in_shape)
+            c_out_4d = F.interpolate(c_4d, scale_factor=(sH, sW),
+                                       mode='nearest')
+            c_out = c_out_4d.reshape(B, -1)
+            K = G_in.shape[2]
+            if K == 0:
+                G_out = torch.zeros(B, c_out.shape[1], 0,
+                                       dtype=dtype, device=device)
+            else:
+                g_perm = G_in.permute(0, 2, 1).reshape(B * K, *in_shape)
+                g_out = F.interpolate(g_perm, scale_factor=(sH, sW),
+                                        mode='nearest')
+                n_out_layer = c_out.shape[1]
+                G_out = g_out.reshape(B, K, n_out_layer).permute(0, 2, 1).contiguous()
+            state[name] = (c_out, G_out)
+
         elif t == 'conv':
-            raise ValueError(
-                'batched zono forward does not support conv ops; '
-                'fall back to scalar path')
+            c_in, G_in = _get(op['inputs'][0])
+            kernel = op['kernel']
+            bias = op['bias']
+            in_shape = op['in_shape']
+            stride = op['stride']
+            padding = op['padding']
+            n_in_layer = in_shape[0] * in_shape[1] * in_shape[2]
+            assert c_in.shape[1] == n_in_layer
+            c_4d = c_in.reshape(B, *in_shape)
+            c_out_4d = F.conv2d(c_4d, kernel, bias=bias,
+                                  stride=stride, padding=padding)
+            c_out = c_out_4d.reshape(B, -1)
+            K = G_in.shape[2]
+            if K == 0:
+                G_out = torch.zeros(B, c_out.shape[1], 0,
+                                       dtype=dtype, device=device)
+            else:
+                g_perm = G_in.permute(0, 2, 1).reshape(B * K, *in_shape)
+                g_out = F.conv2d(g_perm, kernel, bias=None,
+                                   stride=stride, padding=padding)
+                n_out_layer = c_out.shape[1]
+                G_out = g_out.reshape(B, K, n_out_layer).permute(0, 2, 1).contiguous()
+            state[name] = (c_out, G_out)
+
+        elif t == 'avg_pool':
+            # avg_pool is linear: y = (1/k^2) * sum over window. Apply
+            # F.avg_pool2d to center and each generator column. No bound
+            # loss.
+            c_in, G_in = _get(op['inputs'][0])
+            in_shape = op['in_shape']
+            kH, kW = op['kernel']
+            sH, sW = op['stride']
+            pH, pW = op['padding']
+            n_in_layer = in_shape[0] * in_shape[1] * in_shape[2]
+            assert c_in.shape[1] == n_in_layer
+            c_4d = c_in.reshape(B, *in_shape)
+            c_out_4d = F.avg_pool2d(c_4d, kernel_size=(kH, kW),
+                                       stride=(sH, sW), padding=(pH, pW))
+            c_out = c_out_4d.reshape(B, -1)
+            K = G_in.shape[2]
+            if K == 0:
+                G_out = torch.zeros(B, c_out.shape[1], 0,
+                                       dtype=dtype, device=device)
+            else:
+                g_perm = G_in.permute(0, 2, 1).reshape(B * K, *in_shape)
+                g_out = F.avg_pool2d(g_perm, kernel_size=(kH, kW),
+                                       stride=(sH, sW), padding=(pH, pW))
+                n_out_layer = c_out.shape[1]
+                G_out = g_out.reshape(B, K, n_out_layer).permute(
+                    0, 2, 1).contiguous()
+            state[name] = (c_out, G_out)
+
+        elif t == 'max_pool':
+            # max_pool is nonlinear. Box approximation: per-cell bounds
+            # are lo_out=max(lo_in over window), hi_out=max(hi_in over
+            # window). Collapse correlations into a new gen column per
+            # cell with non-zero slack. Sound but loose; suffices for
+            # cgan small_transformer's attention (4 MaxPool ops).
+            c_in, G_in = _get(op['inputs'][0])
+            in_shape = op['in_shape']
+            kH, kW = op['kernel']
+            sH, sW = op['stride']
+            pH, pW = op['padding']
+            n_in_layer = in_shape[0] * in_shape[1] * in_shape[2]
+            abs_sum = G_in.abs().sum(dim=2)
+            lo_pre = (c_in - abs_sum).reshape(B, *in_shape)
+            hi_pre = (c_in + abs_sum).reshape(B, *in_shape)
+            lo_out = F.max_pool2d(lo_pre, (kH, kW), stride=(sH, sW),
+                                     padding=(pH, pW))
+            hi_out = F.max_pool2d(hi_pre, (kH, kW), stride=(sH, sW),
+                                     padding=(pH, pW))
+            n_out_layer = lo_out.shape[1] * lo_out.shape[2] * lo_out.shape[3]
+            lo_flat = lo_out.reshape(B, n_out_layer)
+            hi_flat = hi_out.reshape(B, n_out_layer)
+            c_out = (lo_flat + hi_flat) / 2
+            mu = (hi_flat - lo_flat) / 2
+            # Compact gen append (mirrors sigmoid/tanh).
+            nonzero_mask = mu.abs() > 1e-9
+            ust_cnt = nonzero_mask.sum(dim=1)
+            max_K = int(ust_cnt.max().item())
+            G_zeros = torch.zeros(B, n_out_layer, G_in.shape[2],
+                                     dtype=dtype, device=device)
+            if max_K == 0:
+                G_out = G_zeros
+            else:
+                new_gens = torch.zeros(B, n_out_layer, max_K,
+                                          dtype=dtype, device=device)
+                rank = nonzero_mask.long().cumsum(dim=1) - 1
+                b_idx = torch.arange(B, device=device).unsqueeze(-1).expand(
+                    -1, n_out_layer)
+                r_idx = torch.arange(n_out_layer,
+                                       device=device).unsqueeze(0).expand(B, -1)
+                new_gens[b_idx[nonzero_mask], r_idx[nonzero_mask],
+                          rank[nonzero_mask]] = mu[nonzero_mask]
+                G_out = torch.cat([G_zeros, new_gens], dim=2)
+            state[name] = (c_out, G_out)
+            # Record pre-act bounds for backward (used by box CROWN).
+            sb[op['name'] + '__maxpool_box'] = (lo_flat.clone(),
+                                                   hi_flat.clone())
+
+        elif t == 'mul':
+            # Constant scalar/per-channel multiply: y = scale * x.
+            c_in, G_in = _get(op['inputs'][0])
+            scale_t = op.get('scale')
+            if scale_t is None:
+                raise ValueError("mul op missing 'scale' for forward zono")
+            if isinstance(scale_t, np.ndarray):
+                scale_t = torch.from_numpy(scale_t).to(device=device, dtype=dtype)
+            elif not isinstance(scale_t, torch.Tensor):
+                scale_t = torch.tensor(scale_t, dtype=dtype, device=device)
+            else:
+                scale_t = scale_t.to(device=device, dtype=dtype)
+            sflat = scale_t.flatten()
+            # Broadcast: per-channel or scalar. Per-channel must match
+            # spatial layout; assume scalar or matches c_in.shape[1].
+            if sflat.numel() == 1:
+                c_out = c_in * sflat
+                G_out = G_in * sflat
+            elif sflat.numel() == c_in.shape[1]:
+                c_out = c_in * sflat.unsqueeze(0)
+                G_out = G_in * sflat.unsqueeze(0).unsqueeze(-1)
+            else:
+                # Per-channel broadcast over spatial: use op's input
+                # shape to expand.
+                in_shape = op.get('in_shapes_nd', [None])[0]
+                if in_shape is None or len(in_shape) != 3:
+                    raise ValueError(
+                        f'mul: scale shape {sflat.shape} incompatible with '
+                        f'input ({c_in.shape[1]}); no spatial shape known')
+                C, H, W = in_shape
+                assert sflat.numel() == C, (
+                    f'mul per-channel scale {sflat.numel()} != C={C}')
+                scale_4d = sflat.view(1, C, 1, 1).expand(1, C, H, W).reshape(1, -1)
+                c_out = c_in * scale_4d
+                G_out = G_in * scale_4d.unsqueeze(-1)
+            state[name] = (c_out, G_out)
+
+        elif t in ('mul_bilinear', 'matmul_bilinear', 'softmax'):
+            # Nonlinear / variable-x-variable ops: collapse to box.
+            # Forward computes interval bounds and emits a single new
+            # gen column per non-zero-slack cell. Center = midpoint.
+            c_a, G_a = _get(op['inputs'][0])
+            abs_a = G_a.abs().sum(dim=2)
+            lo_a = c_a - abs_a; hi_a = c_a + abs_a
+            if t == 'mul_bilinear':
+                c_b, G_b = _get(op['inputs'][1])
+                abs_b = G_b.abs().sum(dim=2)
+                lo_b = c_b - abs_b; hi_b = c_b + abs_b
+                # Sound bound for x*y where x in [lo_a, hi_a], y in [lo_b, hi_b].
+                corners = torch.stack(
+                    [lo_a * lo_b, lo_a * hi_b, hi_a * lo_b, hi_a * hi_b], dim=-1)
+                lo_out = corners.min(dim=-1).values
+                hi_out = corners.max(dim=-1).values
+            elif t == 'matmul_bilinear':
+                # (B, .., M, K) @ (B, .., K, N) -> (B, .., M, N).
+                # Reshape to N-D via op['in_shapes_nd'] and ['out_shape_nd'].
+                c_b, G_b = _get(op['inputs'][1])
+                abs_b = G_b.abs().sum(dim=2)
+                lo_b = c_b - abs_b; hi_b = c_b + abs_b
+                sh_a = op['in_shapes_nd'][0]
+                sh_b = op['in_shapes_nd'][1]
+                sh_o = op['out_shape_nd']
+                lo_a_nd = lo_a.reshape(B, *sh_a)
+                hi_a_nd = hi_a.reshape(B, *sh_a)
+                lo_b_nd = lo_b.reshape(B, *sh_b)
+                hi_b_nd = hi_b.reshape(B, *sh_b)
+                # For y = a @ b with each a_ij in [lo_a_ij, hi_a_ij] and
+                # b_jk in [lo_b_jk, hi_b_jk], element y_ik = sum_j a_ij * b_jk.
+                # Bound sum_j of min/max over corners.
+                # Per-pair corners:
+                #   p_jk^lo = min(lo_a_ij*lo_b_jk, lo_a_ij*hi_b_jk,
+                #                  hi_a_ij*lo_b_jk, hi_a_ij*hi_b_jk)
+                # Sum over j gives sound lower bound. (Conservative but
+                # straightforward; auto_LiRPA does tighter via McCormick.)
+                # Implementation via four matmuls + min/max.
+                pp = lo_a_nd.unsqueeze(-1) * lo_b_nd.unsqueeze(-3)  # (B, ..., M, K, N)
+                pn = lo_a_nd.unsqueeze(-1) * hi_b_nd.unsqueeze(-3)
+                np_ = hi_a_nd.unsqueeze(-1) * lo_b_nd.unsqueeze(-3)
+                nn = hi_a_nd.unsqueeze(-1) * hi_b_nd.unsqueeze(-3)
+                cmin = torch.minimum(torch.minimum(pp, pn),
+                                       torch.minimum(np_, nn))  # (B,...,M,K,N)
+                cmax = torch.maximum(torch.maximum(pp, pn),
+                                       torch.maximum(np_, nn))
+                lo_out_nd = cmin.sum(dim=-2)  # (B, ..., M, N)
+                hi_out_nd = cmax.sum(dim=-2)
+                n_out_layer = 1
+                for d in sh_o:
+                    n_out_layer *= d
+                lo_out = lo_out_nd.reshape(B, n_out_layer)
+                hi_out = hi_out_nd.reshape(B, n_out_layer)
+            else:  # softmax
+                # auto_LiRPA's interval bound:
+                #   lower = exp(lo - shift) / (sum exp(hi - shift)
+                #                              - exp(hi - shift) + exp(lo - shift) + eps)
+                #   upper = exp(hi - shift) / (sum exp(lo - shift)
+                #                              - exp(lo - shift) + exp(hi - shift) + eps)
+                # where shift = max(hi) per row.
+                axis = int(op.get('axis', -1))
+                # Reshape to (B, ..., n_axis) per op's in_shape.
+                sh_a = op['in_shapes_nd'][0]
+                if sh_a is None:
+                    raise ValueError('softmax requires in_shape_nd')
+                # Normalize axis to the reshaped (B, *sh_a) tensor.
+                ax = axis if axis >= 0 else axis + 1 + len(sh_a)
+                lo_nd = lo_a.reshape(B, *sh_a)
+                hi_nd = hi_a.reshape(B, *sh_a)
+                shift = hi_nd.max(dim=ax, keepdim=True).values
+                exp_lo = torch.exp(lo_nd - shift)
+                exp_hi = torch.exp(hi_nd - shift)
+                sum_hi = exp_hi.sum(dim=ax, keepdim=True)
+                sum_lo = exp_lo.sum(dim=ax, keepdim=True)
+                eps = 1e-12
+                lo_out_nd = exp_lo / (sum_hi - exp_hi + exp_lo + eps)
+                hi_out_nd = exp_hi / (sum_lo - exp_lo + exp_hi + eps)
+                lo_out = lo_out_nd.reshape(B, -1)
+                hi_out = hi_out_nd.reshape(B, -1)
+            n_out_layer = lo_out.shape[1]
+            c_out = (lo_out + hi_out) / 2
+            mu = (hi_out - lo_out) / 2
+            nonzero_mask = mu.abs() > 1e-9
+            ust_cnt = nonzero_mask.sum(dim=1)
+            max_K = int(ust_cnt.max().item())
+            G_zeros = torch.zeros(B, n_out_layer, G_a.shape[2],
+                                     dtype=dtype, device=device)
+            if max_K == 0:
+                G_out = G_zeros
+            else:
+                new_gens = torch.zeros(B, n_out_layer, max_K,
+                                          dtype=dtype, device=device)
+                rank = nonzero_mask.long().cumsum(dim=1) - 1
+                b_idx = torch.arange(B, device=device).unsqueeze(-1).expand(
+                    -1, n_out_layer)
+                r_idx = torch.arange(n_out_layer,
+                                       device=device).unsqueeze(0).expand(B, -1)
+                new_gens[b_idx[nonzero_mask], r_idx[nonzero_mask],
+                          rank[nonzero_mask]] = mu[nonzero_mask]
+                G_out = torch.cat([G_zeros, new_gens], dim=2)
+            state[name] = (c_out, G_out)
+            sb[op['name'] + f'__{t}_box'] = (lo_out.clone(), hi_out.clone())
+
+        elif t == 'transpose':
+            # Linear permutation of dims (excluding the batch dim).
+            # Equivalent to a permutation of the flat indices.
+            c_in, G_in = _get(op['inputs'][0])
+            sh_in = op['in_shapes_nd'][0]
+            sh_out = op['out_shape_nd']
+            perm = op['perm']
+            # Perm is given over (1, *sh_in) (with leading 1 for batch).
+            # Strip the leading 0 and shift the rest by -1 to apply on
+            # (B, *sh_in).
+            perm_b = [0] + [p for p in perm if p != 0]
+            c_nd = c_in.reshape(B, *sh_in)
+            c_out = c_nd.permute(*perm_b).reshape(B, -1).contiguous()
+            K = G_in.shape[2]
+            if K == 0:
+                G_out = torch.zeros(B, c_out.shape[1], 0,
+                                       dtype=dtype, device=device)
+            else:
+                # Permute each gen column the same way.
+                g_perm = G_in.permute(0, 2, 1).reshape(
+                    B * K, *sh_in)
+                g_out = g_perm.permute(*perm_b).reshape(
+                    B * K, -1).reshape(B, K, -1).permute(0, 2, 1).contiguous()
+                G_out = g_out
+            state[name] = (c_out, G_out)
+
+        elif t == 'squeeze':
+            # Reshape-only: data unchanged.
+            c_in, G_in = _get(op['inputs'][0])
+            state[name] = (c_in, G_in)
 
         else:
             raise ValueError(
@@ -891,8 +1485,205 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
             ew_at[inp] = ew.clone() if existing is None else existing + ew
 
         elif t == 'conv':
-            raise ValueError(
-                'batched spec backward does not support conv ops')
+            # Backward of conv2d is conv_transpose2d. ew shape (B, Q, n_out).
+            kernel = op['kernel']
+            bias = op['bias']
+            out_shape = op['out_shape']
+            in_shape = op['in_shape']
+            stride = op['stride']
+            padding = op['padding']
+            output_padding = op['output_padding']
+            # acc += sum over neurons of ew * bias_per_neuron.
+            # bias is per-channel, broadcast over spatial.
+            C_out, H_out, W_out = out_shape
+            spatial = H_out * W_out
+            bias_flat = bias.repeat_interleave(spatial)  # (C_out * spatial,)
+            acc = acc + (ew * bias_flat).sum(dim=-1)
+            # ew_back: reshape ew to (B*Q, C_out, H_out, W_out), apply
+            # conv_transpose2d with kernel, flatten back.
+            ew_4d = ew.reshape(B * Q, *out_shape)
+            ew_back_4d = F.conv_transpose2d(
+                ew_4d, kernel, bias=None, stride=stride, padding=padding,
+                output_padding=output_padding)
+            n_in_layer = in_shape[0] * in_shape[1] * in_shape[2]
+            ew_back = ew_back_4d.reshape(B, Q, n_in_layer)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'conv_transpose':
+            # Backward of conv_transpose2d is conv2d. ew shape (B, Q, n_out).
+            kernel = op['kernel']
+            bias = op['bias']
+            out_shape = op['out_shape']
+            in_shape = op['in_shape']
+            stride = op['stride']
+            padding = op['padding']
+            C_out, H_out, W_out = out_shape
+            spatial = H_out * W_out
+            bias_flat = bias.repeat_interleave(spatial)
+            acc = acc + (ew * bias_flat).sum(dim=-1)
+            ew_4d = ew.reshape(B * Q, *out_shape)
+            ew_back_4d = F.conv2d(
+                ew_4d, kernel, bias=None, stride=stride, padding=padding)
+            n_in_layer = in_shape[0] * in_shape[1] * in_shape[2]
+            assert ew_back_4d.shape[2] * ew_back_4d.shape[3] * ew_back_4d.shape[1] == n_in_layer, \
+                (f"conv_transpose backward shape mismatch: got "
+                 f"{ew_back_4d.shape} expected total {n_in_layer}")
+            ew_back = ew_back_4d.reshape(B, Q, n_in_layer)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'bn':
+            # Per-channel affine y = factor * x + offset.
+            # Backward: ew_back = ew * factor; acc += (ew * offset).sum.
+            factor = op['factor']  # (n,)
+            offset = op['offset']  # (n,)
+            acc = acc + (ew * offset).sum(dim=-1)
+            ew_back = ew * factor  # broadcast across (B, Q, n)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t in ('sigmoid', 'tanh'):
+            # CROWN backward through sigmoid/tanh — closed-form linear
+            # bounds from `_sigmoid_tanh_linear_bounds`.
+            # Pre-activation bounds come from `tight[L]`, recorded by
+            # the forward zono.
+            L = op['layer_idx']
+            lo_pre, hi_pre = tight[L]
+            lo_s, lo_t, up_s, up_t = _sigmoid_tanh_linear_bounds(
+                lo_pre, hi_pre, t)
+            ep = ew.clamp(min=0)
+            en = ew.clamp(max=0)
+            acc = acc + (ep * lo_t.unsqueeze(1)).sum(dim=-1) + \
+                    (en * up_t.unsqueeze(1)).sum(dim=-1)
+            ew_back = ep * lo_s.unsqueeze(1) + en * up_s.unsqueeze(1)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'upsample':
+            # Nearest-mode upsample y[c, h*sH+a, w*sW+b] = x[c, h, w] for
+            # all (a, b) in [0, sH)×[0, sW). Adjoint sums over the
+            # repeated output cells per input cell: avg_pool2d with
+            # divisor_override=1.
+            in_shape = op['in_shape']
+            out_shape = op['out_shape']
+            sH, sW = op['scale']
+            ew_4d = ew.reshape(B * Q, *out_shape)
+            ew_back_4d = F.avg_pool2d(
+                ew_4d, kernel_size=(sH, sW), stride=(sH, sW),
+                divisor_override=1)
+            n_in_layer = in_shape[0] * in_shape[1] * in_shape[2]
+            ew_back = ew_back_4d.reshape(B, Q, n_in_layer)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'avg_pool':
+            # avg_pool y = (1/(kH*kW)) * sum window. Adjoint = depthwise
+            # conv_transpose with (1/(kH*kW))-uniform kernel. For
+            # non-overlapping (stride==kernel) just F.conv_transpose2d
+            # works. For overlapping windows the same call gives the
+            # correct sum-of-broadcasted-gradients.
+            in_shape = op['in_shapes_nd'][0]
+            out_shape = op['out_shape_nd']
+            C, H_in, W_in = in_shape
+            kH, kW = op['kernel']
+            sH, sW = op['stride']
+            pH, pW = op['padding']
+            ew_4d = ew.reshape(B * Q, *out_shape)
+            w_avg = torch.full((C, 1, kH, kW), 1.0 / (kH * kW),
+                                  dtype=dtype, device=device)
+            ew_back_4d = F.conv_transpose2d(
+                ew_4d, w_avg, bias=None, stride=(sH, sW),
+                padding=(pH, pW), groups=C)
+            # Crop or pad to match input shape exactly.
+            if ew_back_4d.shape[2] != H_in or ew_back_4d.shape[3] != W_in:
+                ew_back_4d = ew_back_4d[:, :, :H_in, :W_in]
+                if ew_back_4d.shape[2] < H_in or ew_back_4d.shape[3] < W_in:
+                    pad_h = H_in - ew_back_4d.shape[2]
+                    pad_w = W_in - ew_back_4d.shape[3]
+                    ew_back_4d = F.pad(ew_back_4d, (0, pad_w, 0, pad_h))
+            n_in_layer = C * H_in * W_in
+            ew_back = ew_back_4d.reshape(B, Q, n_in_layer)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'mul':
+            # y = scale * x (constant scale). Backward: ew_back = ew * scale.
+            scale_t = op.get('scale')
+            if isinstance(scale_t, np.ndarray):
+                scale_t = torch.from_numpy(scale_t).to(
+                    device=device, dtype=dtype)
+            elif not isinstance(scale_t, torch.Tensor):
+                scale_t = torch.tensor(scale_t, dtype=dtype, device=device)
+            else:
+                scale_t = scale_t.to(device=device, dtype=dtype)
+            sflat = scale_t.flatten()
+            n_in_layer = ew.shape[-1]
+            if sflat.numel() == 1:
+                ew_back = ew * sflat
+            elif sflat.numel() == n_in_layer:
+                ew_back = ew * sflat.unsqueeze(0).unsqueeze(0)
+            else:
+                in_shape = op['in_shapes_nd'][0]
+                C, H, W = in_shape
+                assert sflat.numel() == C
+                scale_4d = sflat.view(1, C, 1, 1).expand(
+                    1, C, H, W).reshape(1, 1, -1)
+                ew_back = ew * scale_4d
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t in ('max_pool', 'mul_bilinear', 'matmul_bilinear', 'softmax'):
+            # Box-relaxation CROWN: y has constant bounds (lo_out, hi_out)
+            # stamped at forward time. Linear lower bound is the constant
+            # lo_out (slope 0); the contribution to acc is
+            # sum_n max(0, ew[n]) * lo_out[n] + sum_n min(0, ew[n]) * hi_out[n].
+            # No backward signal to inputs.
+            key = op['name'] + f'__{t}_box'
+            if key not in tight:
+                raise ValueError(
+                    f'batched backward: missing box bounds for {key}')
+            lo_box, hi_box = tight[key]  # (B, n_out)
+            ep = ew.clamp(min=0)
+            en = ew.clamp(max=0)
+            acc = acc + (ep * lo_box.unsqueeze(1)).sum(dim=-1) + \
+                    (en * hi_box.unsqueeze(1)).sum(dim=-1)
+            # No ew_back: inputs aren't propagated (box loses correlation).
+
+        elif t == 'transpose':
+            # Inverse-permutation of the gen layout.
+            sh_in = op['in_shapes_nd'][0]
+            sh_out = op['out_shape_nd']
+            perm = op['perm']
+            perm_b = [0] + [p for p in perm if p != 0]
+            # Inverse permutation.
+            inv_perm = [0] * len(perm_b)
+            for i, p in enumerate(perm_b):
+                inv_perm[p] = i
+            ew_nd = ew.reshape(B, Q, *sh_out)
+            # ew is (B, Q, *sh_out). We want to permute the sh_out axes
+            # by inv_perm. ew has 2 leading dims (B, Q) — shift inv_perm
+            # by +1 to account for the Q dim while keeping B at 0.
+            perm_eq = [0, 1] + [p + 1 for p in inv_perm if p != 0]
+            ew_back_nd = ew_nd.permute(*perm_eq).contiguous()
+            n_in_layer = ew_back_nd.numel() // (B * Q)
+            ew_back = ew_back_nd.reshape(B, Q, n_in_layer)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'squeeze':
+            # No-op: shape change only, data unchanged.
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew if existing is None else existing + ew
 
         else:
             raise ValueError(f'batched spec backward: unknown op {t!r}')

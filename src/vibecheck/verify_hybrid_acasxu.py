@@ -37,13 +37,18 @@ from vibecheck.settings import default_settings
 
 
 def _simple_pgd(xl, xh, spec, gg, n_output, device, dtype,
-                  n_restarts=10000, n_iter=50, lr=0.1, seed=0):
+                  n_restarts=10000, n_iter=50, lr=0.1, seed=0,
+                  min_restarts=64):
     """Simple sign-gradient PGD over the input box. Multi-disjunct DNF:
     SAT iff ∃ disjunct d such that all its constraints' margins ≤ 0.
     Per-restart loss = min_d(max_c margin_dc); SAT if min ≤ 0.
 
-    Sidesteps a bug in vibecheck.pgd.pgd_attack_general's _confirm_witness
-    on ACASXU. Returns (sat: bool, witness: np.ndarray or None)."""
+    On `torch.cuda.OutOfMemoryError` the call is retried with restarts
+    halved (down to `min_restarts`). Larger models like cGAN imgSz64
+    require fewer per-restart samples to fit in GPU memory; without
+    this halving we silently miss every imgSz64 SAT case.
+
+    Returns (sat: bool, witness: np.ndarray or None)."""
     xl0 = xl.flatten(); xh0 = xh.flatten()
     n_in = xl0.numel()
     Ws = []; bs = []
@@ -61,31 +66,37 @@ def _simple_pgd(xl, xh, spec, gg, n_output, device, dtype,
             else:
                 return False, None
         Ws.append(W); bs.append(b)
-    torch.manual_seed(seed)
-    x = xl0 + (xh0 - xl0) * torch.rand(n_restarts, n_in, device=device, dtype=dtype)
-    width = xh0 - xl0
-    x = x.detach().requires_grad_(True)
-    for _ in range(n_iter):
-        out = _forward_batch_graph(x, gg)
-        # max-over-constraints per disjunct
-        max_per_disj = []
-        for W, b in zip(Ws, bs):
-            m = out @ W.T + b
-            max_per_disj.append(m.max(dim=1).values)
-        # SAT iff min over disjuncts ≤ 0 (some disjunct fully satisfied)
-        stacked = torch.stack(max_per_disj, dim=1)  # (n_restarts, n_disjuncts)
-        min_m, _ = stacked.min(dim=1)
-        with torch.no_grad():
-            sat_mask = min_m <= 1e-6
-            if sat_mask.any():
-                idx = int(sat_mask.nonzero()[0].item())
-                return True, x[idx].detach().cpu().numpy()
-        loss = min_m.sum()
-        loss.backward()
-        with torch.no_grad():
-            step = lr * x.grad.sign() * width
-            x = (x - step).clamp(min=xl0, max=xh0)
-        x = x.detach().requires_grad_(True)
+    cur_restarts = n_restarts
+    while cur_restarts >= min_restarts:
+        try:
+            torch.manual_seed(seed)
+            x = xl0 + (xh0 - xl0) * torch.rand(cur_restarts, n_in, device=device, dtype=dtype)
+            width = xh0 - xl0
+            x = x.detach().requires_grad_(True)
+            for _ in range(n_iter):
+                out = _forward_batch_graph(x, gg)
+                max_per_disj = []
+                for W, b in zip(Ws, bs):
+                    m = out @ W.T + b
+                    max_per_disj.append(m.max(dim=1).values)
+                stacked = torch.stack(max_per_disj, dim=1)
+                min_m, _ = stacked.min(dim=1)
+                with torch.no_grad():
+                    sat_mask = min_m <= 1e-6
+                    if sat_mask.any():
+                        idx = int(sat_mask.nonzero()[0].item())
+                        return True, x[idx].detach().cpu().numpy()
+                loss = min_m.sum()
+                loss.backward()
+                with torch.no_grad():
+                    step = lr * x.grad.sign() * width
+                    x = (x - step).clamp(min=xl0, max=xh0)
+                x = x.detach().requires_grad_(True)
+            return False, None
+        except torch.cuda.OutOfMemoryError:
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            cur_restarts //= 2
     return False, None
 
 
