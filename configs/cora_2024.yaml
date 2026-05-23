@@ -1,14 +1,23 @@
-# cora_2024 — VNNCOMP regular track. 180 instances across 9 MLPs
-# (mnist/cifar10/svhn × point/set/trades), 8 FC layers each, 7 ReLUs.
-# Specs are multi-disjunct DNF (9 disjuncts: y_target >= y_j for j != target).
+# cora_2024 — VNNCOMP regular track. 180 instances across 9 MLPs.
 #
-# Defaults work for 151/180 cases. AB-CROWN solves 153/180 (27 timeouts);
-# we tie on 151 and miss 2 cifar10-set UNSAT cases (img96, img100) that
-# AB-CROWN cracks in ~8s but our bab_refine cascade takes >30s.
-#
-# We win on wall time: ~16 min total vs AB-CROWN's ~34 min.
+# Borrows the cifar100 Phase-8 dual-ascent config to crack hard cifar10-set
+# UNSAT cases (img96 cracked in 10 s with this; without it, hits 30 s timeout).
+phase8_use_dual_ascent_gpu: true
+phase8_dual_ascent_max_iter: 1
+zono_lift_enabled: false
+phase2_crown_enabled: false
+phase8_min_budget_frac: 0.7
+pgd_middle_enabled: false
+bab_refine_passes: 1
+bab_refine_window: 1
+# PGD knobs
+pgd_restarts: 128
+pgd_time_budget_phase0: 2.0
 input_split_batched_enabled: true
 input_split_batched_clip_enabled: true
 input_split_batch_size: 4096
-pgd_restarts: 128
-pgd_time_budget_phase0: 2.0
+phase26_pgd_per_spec_min_per_spec: 0.5
+phase26_pgd_per_spec_strict_min: true
+phase26_pre_cascade_total_frac: 0.1
+phase26_pre_cascade_per_spec_cap: 5.0
+parallel_pgd_enabled: true

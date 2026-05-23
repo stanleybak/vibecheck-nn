@@ -32,10 +32,10 @@ CASES = [
         expected='sat', timeout=30, max_wall_s=8.0,
     ),
     dict(
-        desc='cora cifar10-set img398 (UNSAT, scalar-bias normalization)',
+        desc='cora cifar10-set img96 (UNSAT, phase8 dual-ascent BaB)',
         net='onnx/cifar10-set.onnx',
-        vnnlib='vnnlib/cifar10-img398.vnnlib',
-        expected='verified', timeout=30, max_wall_s=10.0,
+        vnnlib='vnnlib/cifar10-img96.vnnlib',
+        expected='verified', timeout=30, max_wall_s=20.0,
     ),
     dict(
         desc='cora mnist-set img7 (UNSAT, n_output fix)',
