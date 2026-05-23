@@ -1456,6 +1456,10 @@ class ComputeGraph:
         forks = self.fork_points()
         # Track which names are the output of a node (vs graph input or initializer)
         computed = {self.input_name}
+        # Map skipped passthrough nodes (Dropout, Identity, Cast) to their
+        # real upstream producer so downstream ops reference the actual data.
+        # Without this, the verify_zono_bnb forward can't find state[skipped].
+        alias = {}
         # Track per-name shape (excluding batch dim) for ops that need it
         # (matmul-bilinear, transpose, softmax, etc. need true N-D shape).
         if self.input_shape:
@@ -1773,9 +1777,20 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
-            # Skip other ops (Identity, Dropout, etc.)
+            # Skip other ops (Identity, Dropout, etc.) — pass through to
+            # the real producer via the alias map.
             else:
+                if node.inputs:
+                    src = node.inputs[0]
+                    alias[name] = alias.get(src, src)
                 computed.add(name)
+
+        # Rewrite all emitted ops' inputs through the alias map so
+        # references to skipped passthrough nodes (Dropout, Identity)
+        # point at the real upstream producer.
+        if alias:
+            for op in ops:
+                op['inputs'] = [alias.get(inp, inp) for inp in op['inputs']]
 
         # Attach shape metadata to each emitted op so shape-sensitive ops
         # in the forward pass (matmul_bilinear, transpose, softmax, …) can
