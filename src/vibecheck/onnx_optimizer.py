@@ -65,6 +65,10 @@ def fuse_gemm_reshape_conv(graph):
         if len(reshape_consumers) != 1:
             continue
 
+        # Skip if Gemm doesn't have a constant W/b (e.g., after onnxsim
+        # produces a bilinear Gemm whose W comes from another node).
+        if 'W' not in node.params or 'b' not in node.params:
+            continue
         W_gemm = node.params['W']       # (m, n)
         b_gemm = node.params['b']       # (m,)
         kernel = conv_node.params['kernel']   # (C_out, C_in, kH, kW)

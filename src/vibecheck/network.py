@@ -656,27 +656,14 @@ class ConvTransposeNode(GraphNode):
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-
         z = get_input(self.inputs[0])
-        _require_point(self, z)
-        torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
         inp_shape = _get_spatial_shape(
             self, graph, len(z.center), self.params['kernel'], transpose=True)
-        center_4d = torch.tensor(z.center, dtype=torch_dt).reshape(
-            1, *inp_shape)
-        cache_attr = '_torch_kernel_f32' if torch_dt == torch.float32 else '_torch_kernel'
-        if not hasattr(self, cache_attr):
-            setattr(self, cache_attr, torch.tensor(self.params['kernel'], dtype=torch_dt))
-            setattr(self, cache_attr.replace('kernel', 'bias'),
-                    torch.tensor(self.params['bias'], dtype=torch_dt))
-        k = getattr(self, cache_attr)
-        b = getattr(self, cache_attr.replace('kernel', 'bias'))
-        out = F.conv_transpose2d(
-            center_4d, k, bias=b,
-            stride=self.params['stride'],
-            padding=self.params['padding'],
-            output_padding=self.params.get('output_padding', (0, 0)))
-        zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
+        z.propagate_conv_transpose(
+            self.params['kernel'], self.params['bias'], inp_shape,
+            self.params['stride'], self.params['padding'],
+            self.params.get('output_padding', (0, 0)))
+        zono_state[self.name] = z
 
 
 class GemmNode(GraphNode):
@@ -736,6 +723,32 @@ class GemmNode(GraphNode):
 
 class MatMulBilinearNode(GraphNode):
     """MatMul with two computed inputs (no constant weight)."""
+    def infer_shape(self, input_shapes):
+        sa = input_shapes.get(self.inputs[0])
+        sb = input_shapes.get(self.inputs[1])
+        if sa is None or sb is None:
+            return
+        # (..., M, K) @ (..., K, N) → (..., M, N). Broadcast the
+        # leading dims.
+        if len(sa) < 2 or len(sb) < 2:
+            return
+        M, K_a = sa[-2], sa[-1]
+        K_b, N = sb[-2], sb[-1]
+        if K_a != K_b:
+            # Inner dims don't match standard matmul rule. Leave shape
+            # unset and let downstream ops/tests deal with it.
+            return
+        # Broadcast leading dims (simple case: equal or one is empty).
+        lead_a = sa[:-2]; lead_b = sb[:-2]
+        if lead_a == lead_b or not lead_a:
+            lead = lead_b
+        elif not lead_b:
+            lead = lead_a
+        else:
+            # Conservative broadcast: match lengths.
+            lead = tuple(max(a, b) for a, b in zip(lead_a, lead_b))
+        self.output_shape = tuple(lead) + (M, N)
+
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
         z_a = get_input(self.inputs[0])
@@ -1126,23 +1139,38 @@ class ResizeNode(GraphNode):
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-
         z = get_input(self.inputs[0])
-        _require_point(self, z)
         scales = self.params.get('scales')
         inp_shape = (graph.nodes[self.inputs[0]].output_shape
                      if self.inputs[0] in graph.nodes else graph.input_shape)
-
-        if scales is not None and len(inp_shape) == 4:
-            # Use torch interpolate for nearest-neighbor upsampling
-            torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
-            center_4d = torch.tensor(z.center, dtype=torch_dt).reshape(inp_shape)
-            scale_h, scale_w = float(scales[2]), float(scales[3])
-            out = F.interpolate(center_4d, scale_factor=(scale_h, scale_w),
-                                mode='nearest')
-            zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
-        else:
+        if scales is None or len(inp_shape) != 4:
+            # No-op fallback when scales/shape are missing.
             zono_state[self.name] = z
+            return
+        torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
+        scale_h, scale_w = float(scales[2]), float(scales[3])
+        # Resize each generator column (and the center) by repeating values
+        # spatially. Nearest-mode = pure linear map; sound for zonotopes.
+        c_4d = torch.as_tensor(z.center, dtype=torch_dt).reshape(*inp_shape)
+        c_out = F.interpolate(c_4d, scale_factor=(scale_h, scale_w),
+                                mode='nearest')
+        z.center = c_out.flatten().numpy().astype(z.dtype)
+        n_gen = z.generators.shape[1]
+        if n_gen == 0:
+            z.generators = np.zeros((z.center.shape[0], 0), dtype=z.dtype)
+        else:
+            g_batch = torch.as_tensor(z.generators.T, dtype=torch_dt).reshape(
+                n_gen, *inp_shape[1:])  # (n_gen, C, H, W)
+            g_4d = g_batch.unsqueeze(1) if g_batch.ndim == 3 else g_batch
+            # We need (n_gen, C, H, W) — already correct if inp_shape was (N, C, H, W) with N=1
+            if g_batch.shape[1] != inp_shape[1]:
+                # Fallback: reshape via numel
+                g_batch = torch.as_tensor(z.generators.T, dtype=torch_dt)
+                g_batch = g_batch.reshape(n_gen, *inp_shape[1:])
+            g_out = F.interpolate(g_batch, scale_factor=(scale_h, scale_w),
+                                    mode='nearest')
+            z.generators = g_out.reshape(n_gen, -1).numpy().T.astype(z.dtype)
+        zono_state[self.name] = z
 
 
 class ConstantOfShapeNode(GraphNode):
@@ -1428,6 +1456,12 @@ class ComputeGraph:
         forks = self.fork_points()
         # Track which names are the output of a node (vs graph input or initializer)
         computed = {self.input_name}
+        # Track per-name shape (excluding batch dim) for ops that need it
+        # (matmul-bilinear, transpose, softmax, etc. need true N-D shape).
+        if self.input_shape:
+            shapes_by_name = {self.input_name: tuple(d for d in self.input_shape if d != 1) or (self.input_shape[-1],)}
+        else:
+            shapes_by_name = {self.input_name: None}
 
         # Determine which ReLU is the last hidden one (before the final linear layer)
         # by checking: if ReLU's successor is the output node, it's still hidden;
@@ -1474,7 +1508,139 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
+            elif node.op_type == 'ConvTranspose':
+                # Kernel layout: (C_in, C_out, kH, kW)
+                kernel = node.params['kernel']
+                bias = node.params['bias']
+                stride = node.params['stride']
+                padding = node.params['padding']
+                output_padding = node.params.get('output_padding', (0, 0))
+                inp_name = node.inputs[0]
+                inp_shape = (self.nodes[inp_name].output_shape
+                              if inp_name in self.nodes else self.input_shape)
+                if len(inp_shape) == 4:
+                    in_spatial = inp_shape[1:]
+                elif len(inp_shape) == 3:
+                    in_spatial = inp_shape
+                else:
+                    in_spatial = (kernel.shape[0], 1, 1)
+                C_in, C_out, kH, kW = kernel.shape
+                sH, sW = stride; pH, pW = padding
+                opH, opW = output_padding
+                H_out = (in_spatial[1] - 1) * sH - 2 * pH + kH + opH
+                W_out = (in_spatial[2] - 1) * sW - 2 * pW + kW + opW
+                out_shape = (C_out, H_out, W_out)
+                gk = torch.tensor(kernel, dtype=dtype, device=device)
+                gb = torch.tensor(bias, dtype=dtype, device=device)
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': 'conv_transpose',
+                    'inputs': inp_names,
+                    'kernel': gk, 'bias': gb,
+                    'kernel_np': kernel.astype(np.float64),
+                    'bias_np': bias.astype(np.float64),
+                    'in_shape': in_spatial, 'out_shape': out_shape,
+                    'stride': stride, 'padding': padding,
+                    'output_padding': output_padding,
+                    'n_out': out_shape[0] * out_shape[1] * out_shape[2],
+                })
+                computed.add(name)
+
+            elif node.op_type in ('Sigmoid', 'Tanh'):
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name,
+                    'type': 'sigmoid' if node.op_type == 'Sigmoid' else 'tanh',
+                    'inputs': inp_names,
+                    'layer_idx': relu_idx,
+                })
+                relu_names.append(name)
+                relu_idx += 1
+                computed.add(name)
+
+            elif node.op_type in ('Resize', 'Upsample'):
+                # Nearest-mode integer upsample on (N, C, H, W). Adjoint:
+                # avg_pool2d(divisor_override=1). Bilinear/other modes not
+                # yet supported here (cgan models use nearest only).
+                scales = node.params.get('scales', None)
+                if scales is None or len(scales) != 4:
+                    raise NotImplementedError(
+                        f'Resize/Upsample: scales required, got {scales}')
+                sH, sW = int(scales[2]), int(scales[3])
+                if scales[2] != sH or scales[3] != sW:
+                    raise NotImplementedError(
+                        f'Resize/Upsample: integer scale only, got {scales}')
+                inp_name = node.inputs[0]
+                inp_shape = (self.nodes[inp_name].output_shape
+                              if inp_name in self.nodes else self.input_shape)
+                if len(inp_shape) == 4:
+                    in_spatial = inp_shape[1:]
+                elif len(inp_shape) == 3:
+                    in_spatial = inp_shape
+                else:
+                    raise NotImplementedError(
+                        f'Resize: cannot infer spatial shape from {inp_shape}')
+                C, H_in, W_in = in_spatial
+                out_shape = (C, H_in * sH, W_in * sW)
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': 'upsample',
+                    'inputs': inp_names,
+                    'scale': (sH, sW),
+                    'in_shape': in_spatial,
+                    'out_shape': out_shape,
+                    'n_out': out_shape[0] * out_shape[1] * out_shape[2],
+                })
+                computed.add(name)
+
+            elif node.op_type == 'BatchNormalization':
+                # Per-channel affine: y[c, h, w] = factor[c]*x[c, h, w] + offset[c].
+                scale = node.params['scale']
+                bn_bias = node.params['bias']
+                mean = node.params['mean']
+                var = node.params['var']
+                eps = node.params['epsilon']
+                factor = scale / np.sqrt(var + eps)
+                offset = -factor * mean + bn_bias
+                inp_name = node.inputs[0]
+                inp_shape = (self.nodes[inp_name].output_shape
+                              if inp_name in self.nodes else self.input_shape)
+                if len(inp_shape) == 4:
+                    spatial = inp_shape[2] * inp_shape[3]
+                elif len(inp_shape) == 3:
+                    spatial = inp_shape[1] * inp_shape[2]
+                else:
+                    spatial = 1
+                factor_flat = np.repeat(factor.astype(np.float64), spatial)
+                offset_flat = np.repeat(offset.astype(np.float64), spatial)
+                gf = torch.tensor(factor_flat, dtype=dtype, device=device)
+                go = torch.tensor(offset_flat, dtype=dtype, device=device)
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': 'bn',
+                    'inputs': inp_names,
+                    'factor': gf, 'offset': go,
+                    'factor_np': factor_flat, 'offset_np': offset_flat,
+                })
+                computed.add(name)
+
             elif node.op_type in ('Gemm', 'MatMul'):
+                # Bilinear MatMul: both inputs computed (no W param). Forward
+                # only — no zonotope/CROWN bound implemented. PGD still works.
+                if 'W' not in node.params:
+                    inp_names = []
+                    for inp in node.inputs[:2]:
+                        inp_names.append(inp if inp in computed else '__input__')
+                    ops.append({
+                        'name': name, 'type': 'matmul_bilinear',
+                        'inputs': inp_names,
+                    })
+                    computed.add(name)
+                    continue
                 W = node.params['W']
                 b = node.params['b']
                 gW = torch.tensor(W, dtype=dtype, device=device)
@@ -1534,9 +1700,104 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
+            elif node.op_type in ('AveragePool', 'MaxPool'):
+                kernel = node.params.get('kernel_shape', (2, 2))
+                # Loader normalises to 'stride' (singular) and 'padding'.
+                stride = node.params.get('stride',
+                                          node.params.get('strides', kernel))
+                padding = node.params.get('padding',
+                                            node.params.get('pads', (0, 0)))
+                inp_name = node.inputs[0]
+                inp_shape = (self.nodes[inp_name].output_shape
+                              if inp_name in self.nodes else self.input_shape)
+                if len(inp_shape) == 4:
+                    in_spatial = inp_shape[1:]
+                else:
+                    in_spatial = inp_shape
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name,
+                    'type': 'avg_pool' if node.op_type == 'AveragePool' else 'max_pool',
+                    'inputs': inp_names,
+                    'kernel': tuple(kernel) if len(kernel) == 2 else (kernel[0], kernel[0]),
+                    'stride': tuple(stride) if len(stride) == 2 else (stride[0], stride[0]),
+                    'padding': tuple(padding[:2]) if len(padding) >= 2 else (padding[0], padding[0]),
+                    'in_shape': in_spatial,
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Transpose':
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': 'transpose',
+                    'inputs': inp_names,
+                    'perm': tuple(node.params.get('perm', ())),
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Squeeze':
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': 'squeeze',
+                    'inputs': inp_names,
+                    'axes': tuple(node.params.get('axes', ())),
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Mul':
+                # Constant Mul: scalar/per-channel multiplier in params['scale'].
+                # Variable Mul (both inputs computed): hadamard.
+                inp_names = []
+                for inp in node.inputs:
+                    if inp in computed or inp == self.input_name:
+                        inp_names.append(inp)
+                is_bilinear = len(inp_names) == 2
+                ops.append({
+                    'name': name,
+                    'type': 'mul_bilinear' if is_bilinear else 'mul',
+                    'inputs': inp_names,
+                    'scale': node.params.get('scale', None) if not is_bilinear else None,
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Softmax':
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': 'softmax',
+                    'inputs': inp_names,
+                    'axis': int(node.params.get('axis', -1)),
+                })
+                computed.add(name)
+
             # Skip other ops (Identity, Dropout, etc.)
             else:
                 computed.add(name)
+
+        # Attach shape metadata to each emitted op so shape-sensitive ops
+        # in the forward pass (matmul_bilinear, transpose, softmax, …) can
+        # reshape inputs back to N-D. `out_shape` and `in_shapes` exclude
+        # the batch dim by convention.
+        def _strip_batch(s):
+            if s is None: return None
+            if len(s) == 0: return s
+            return tuple(s[1:]) if s[0] == 1 else tuple(s)
+        for op in ops:
+            n_obj = self.nodes.get(op['name'])
+            if n_obj is not None and getattr(n_obj, 'output_shape', None):
+                op['out_shape_nd'] = _strip_batch(n_obj.output_shape)
+            in_shapes = []
+            for inp in op['inputs']:
+                if inp in self.nodes and getattr(self.nodes[inp], 'output_shape', None):
+                    in_shapes.append(_strip_batch(self.nodes[inp].output_shape))
+                elif inp == self.input_name and self.input_shape:
+                    in_shapes.append(_strip_batch(self.input_shape))
+                else:
+                    in_shapes.append(None)
+            op['in_shapes_nd'] = in_shapes
 
         # The last relu_name may actually be the last hidden relu.
         # If the output node is a linear layer (Gemm/Conv), then all ReLUs

@@ -9,7 +9,7 @@ from .network import (
 )
 
 
-def load_onnx(onnx_path, dtype=None):
+def load_onnx(onnx_path, dtype=None, simplify=None):
     """Load an ONNX model into a ComputeGraph."""
     import numpy as _np
     if dtype is None:
@@ -22,6 +22,27 @@ def load_onnx(onnx_path, dtype=None):
             model = onnx.load_from_string(f.read())
     else:
         model = onnx.load(onnx_path)
+
+    # Pre-simplify with onnxsim only when the model has patterns that
+    # require it (transformer attention with 68 MatMul + 44 Div folded
+    # to constants, etc.). Skipping onnxsim on FC-only nets avoids the
+    # MatMul+Add → Gemm fusion that measurably loosens milp_verify
+    # bounds on acasxu prop_3 (verified → unknown).
+    if simplify is None:
+        op_types = {n.op_type for n in model.graph.node}
+        # Trigger on attention-shaped sub-graphs that our loader can't
+        # eat without constant folding (Softmax + bilinear MatMul).
+        simplify = ('Softmax' in op_types
+                    and sum(1 for n in model.graph.node
+                            if n.op_type == 'MatMul') > 4)
+    if simplify:
+        try:
+            import onnxsim
+            model_sim, ok = onnxsim.simplify(model)
+            if ok:
+                model = model_sim
+        except Exception:
+            pass  # onnxsim missing or failed → use unsimplified model
 
     graph = ComputeGraph(dtype=dtype)
     inits = {init.name: numpy_helper.to_array(init).astype(np.float64)
@@ -501,7 +522,7 @@ def _infer_shapes(graph):
 
 
 def _fold_batchnorm(graph):
-    """Fold BatchNormalization into preceding Conv or Gemm."""
+    """Fold BatchNormalization into preceding Conv, ConvTranspose or Gemm."""
     to_remove = []
     for name in graph.topo_order:
         node = graph.nodes[name]
@@ -512,7 +533,7 @@ def _fold_batchnorm(graph):
         if pred_name not in graph.nodes:
             continue
         pred = graph.nodes[pred_name]
-        if pred.op_type not in ('Conv', 'Gemm'):
+        if pred.op_type not in ('Conv', 'ConvTranspose', 'Gemm'):
             continue
 
         scale = node.params['scale']
@@ -525,6 +546,12 @@ def _fold_batchnorm(graph):
         if pred.op_type == 'Conv':
             pred.params['kernel'] = (
                 pred.params['kernel'] * factor[:, None, None, None])
+            pred.params['bias'] = (
+                factor * (pred.params['bias'] - mean) + bn_bias)
+        elif pred.op_type == 'ConvTranspose':
+            # Kernel layout (C_in, C_out, kH, kW) — broadcast on C_out (axis 1).
+            pred.params['kernel'] = (
+                pred.params['kernel'] * factor[None, :, None, None])
             pred.params['bias'] = (
                 factor * (pred.params['bias'] - mean) + bn_bias)
         else:

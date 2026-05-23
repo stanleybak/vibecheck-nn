@@ -512,6 +512,36 @@ class DenseZonotope:
             g_out = F.conv2d(g_batch, k, stride=stride, padding=padding)
             self.generators = g_out.reshape(n_gen, -1).numpy().T
 
+    def propagate_conv_transpose(self, kernel, bias, input_shape,
+                                    stride, padding, output_padding=(0, 0)):
+        """Propagate through ConvTranspose2d. Kernel layout (C_in, C_out, kH, kW).
+
+        Mirrors `_propagate_conv` — apply F.conv_transpose2d to the center
+        (with bias) and to each generator (without bias).
+        """
+        torch_dt = torch.float32 if self.dtype == np.float32 else torch.float64
+        k = torch.as_tensor(kernel, dtype=torch_dt)
+        b = (torch.as_tensor(bias, dtype=torch_dt)
+             if bias is not None else None)
+        c_4d = torch.as_tensor(self.center,
+                                 dtype=torch_dt).reshape(1, *input_shape)
+        c_out = F.conv_transpose2d(
+            c_4d, k, bias=b, stride=stride, padding=padding,
+            output_padding=output_padding)
+        self.center = c_out.flatten().numpy().astype(self.dtype)
+        n_gen = self.generators.shape[1]
+        if n_gen == 0:
+            self.generators = np.zeros((self.center.shape[0], 0),
+                                          dtype=self.dtype)
+        else:
+            g_batch = torch.as_tensor(
+                self.generators.T, dtype=torch_dt).reshape(n_gen, *input_shape)
+            g_out = F.conv_transpose2d(
+                g_batch, k, stride=stride, padding=padding,
+                output_padding=output_padding)
+            self.generators = g_out.reshape(n_gen, -1).numpy().T.astype(
+                self.dtype)
+
     def _propagate_conv_slow(self, layer):
         """Original Conv implementation without kernel caching (for testing)."""
         kernel, bias, params = layer

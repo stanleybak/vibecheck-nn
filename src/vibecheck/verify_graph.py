@@ -6406,9 +6406,67 @@ def verify_graph(graph, spec, settings):
             # reuses it across all iterations.
             from .settings import resolve_torch
             _dev, _dtype = resolve_torch(settings)
-            _gg = graph.gpu_graph(_dev, _dtype)
-            result, details = _input_split_batched(
-                graph, spec, settings, _gg, _dev, _dtype)
+            try:
+                _gg = graph.gpu_graph(_dev, _dtype)
+            except (ValueError, NotImplementedError, KeyError, RuntimeError) as _e:
+                # gpu_graph can't represent this model (transformer
+                # attention, etc.). Fall back to raw-ONNX PGD as a SAT
+                # finder; if that fails the case is reported unknown.
+                _onnx_p = getattr(graph, 'onnx_path', None)
+                if _onnx_p is not None and not bool(getattr(
+                        settings, 'disable_sat_finding', False)):
+                    from .onnx_torch_runner import pgd_via_onnx
+                    try:
+                        _sat, _w = pgd_via_onnx(
+                            _onnx_p, spec,
+                            n_restarts=int(settings.pgd_phase0_restarts
+                                if 'pgd_phase0_restarts' in settings
+                                else 256),
+                            n_iter=int(settings.pgd_phase0_iters
+                                if 'pgd_phase0_iters' in settings
+                                else 100))
+                        if _sat:
+                            return 'sat', {
+                                'phase': 'onnx_pgd_unsupported_gpu_graph',
+                                'witness': _w}
+                    except Exception as _pe:
+                        if getattr(settings, 'print_progress', False):
+                            print(f'  [onnx-pgd] failed: {type(_pe).__name__}: '
+                                  f'{_pe}', flush=True)
+                return 'unknown', {
+                    'phase': 'gpu_graph_build_failed',
+                    'reason': f'{type(_e).__name__}: {_e}'}
+            try:
+                result, details = _input_split_batched(
+                    graph, spec, settings, _gg, _dev, _dtype)
+            except (ValueError, NotImplementedError, KeyError, RuntimeError) as _e:
+                # batched zono/CROWN can't handle some op (transformer
+                # attention's max_pool/softmax/matmul_bilinear). Fall
+                # back to raw-ONNX PGD as a SAT finder.
+                _onnx_p = getattr(graph, 'onnx_path', None)
+                if _onnx_p is not None and not bool(getattr(
+                        settings, 'disable_sat_finding', False)):
+                    from .onnx_torch_runner import pgd_via_onnx
+                    try:
+                        _sat, _w = pgd_via_onnx(
+                            _onnx_p, spec,
+                            n_restarts=int(settings.pgd_phase0_restarts
+                                if 'pgd_phase0_restarts' in settings
+                                else 256),
+                            n_iter=int(settings.pgd_phase0_iters
+                                if 'pgd_phase0_iters' in settings
+                                else 100))
+                        if _sat:
+                            return 'sat', {
+                                'phase': 'onnx_pgd_unsupported_batched',
+                                'witness': _w}
+                    except Exception as _pe:
+                        if getattr(settings, 'print_progress', False):
+                            print(f'  [onnx-pgd] failed: {type(_pe).__name__}: '
+                                  f'{_pe}', flush=True)
+                return 'unknown', {
+                    'phase': 'batched_forward_failed',
+                    'reason': f'{type(_e).__name__}: {_e}'}
         else:
             result, details = _input_split_verify(
                 graph, spec, settings, build_fn, impl)
@@ -7407,6 +7465,47 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 return 'sat', {'phase': 'batched_pgd', 'witness': pgd_witness}
         except Exception:
             pass
+        # Also try the simpler multi-disjunct-aware PGD (verify_hybrid_acasxu
+        # `_simple_pgd`): straight sign-gradient over the input box, no
+        # OSI/multi-α, 10K restarts × 50 iters. Catches multi-disjunct DNF
+        # SAT cases that _pgd_attack_general misses on cgan because the
+        # latter doesn't reduce loss across disjuncts.
+        try:
+            from .verify_hybrid_acasxu import _simple_pgd
+            n_out_pgd = None
+            for op in reversed(gg['ops']):
+                if op.get('type') == 'fc':
+                    n_out_pgd = int(op['W'].shape[0]); break
+                if op.get('type') in ('conv', 'conv_transpose'):
+                    n_out_pgd = op['n_out']; break
+            if n_out_pgd is not None:
+                xl_pgd2 = xl_pgd.flatten().unsqueeze(0)
+                xh_pgd2 = xh_pgd.flatten().unsqueeze(0)
+                sat_simple, w_simple = _simple_pgd(
+                    xl_pgd2, xh_pgd2, spec, gg, n_out_pgd, device, dtype,
+                    n_restarts=10000, n_iter=50)
+                if sat_simple:
+                    return 'sat', {'phase': 'batched_simple_pgd',
+                                    'witness': w_simple}
+        except Exception:
+            pass
+        # Last-resort: PGD via raw-ONNX interpreter. Catches models the
+        # gpu_graph forward can't handle (transformer attention, etc.).
+        try:
+            _onnx_p = getattr(graph, 'onnx_path', None)
+            if _onnx_p is not None:
+                from .onnx_torch_runner import pgd_via_onnx
+                sat_or, w_or = pgd_via_onnx(
+                    _onnx_p, spec,
+                    n_restarts=int(settings.pgd_phase0_restarts
+                        if 'pgd_phase0_restarts' in settings else 256),
+                    n_iter=int(settings.pgd_phase0_iters
+                        if 'pgd_phase0_iters' in settings else 100))
+                if sat_or:
+                    return 'sat', {'phase': 'batched_onnx_pgd',
+                                    'witness': w_or}
+        except Exception:
+            pass
 
     # Find n_output (mirror `_input_split_fast_leaf`).
     n_output = None
@@ -7437,6 +7536,15 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
     # Pre-build per-disjunct query-index sets for the batched closure.
     disj_q_idx = {di: [q_index[qi] for qi, _, _ in qlist]
                    for di, qlist in disj_queries.items()}
+
+    # Build per-disjunct query-index tensors for multi-disjunct clipping.
+    # Single-disjunct case: clip via AND of halfspaces directly.
+    # Multi-disjunct: clip each disjunct's halfspaces separately and
+    # take the union's bounding box.
+    disj_q_idx_tensors = {
+        di: torch.tensor(qixs, device=device, dtype=torch.long)
+        for di, qixs in disj_q_idx.items()}
+    multi_disjunct = len(disj_q_idx) > 1
 
     # Initialize worklist with the root box.
     xl0 = torch.as_tensor(spec.x_lo, dtype=dtype, device=device).flatten()
@@ -7473,10 +7581,15 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 spec_lbs_b = _spec_backward_graph_batched(
                     sb_b, xl_batch, xh_batch, gg, spec_ew, device, dtype)
                 A_lin, b_lin = None, None
-        except (torch.cuda.OutOfMemoryError, RuntimeError):
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
+            import os
+            if os.environ.get('VIBECHECK_DEBUG'):
+                import traceback
+                traceback.print_exc()
+                print(f'  [debug] caught {type(_e).__name__} at batch_size={batch_size}')
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            new_bs = max(64, batch_size // 2)
+            new_bs = max(1, batch_size // 2)
             if new_bs == batch_size:
                 return 'unknown', {'phase': 'batched_oom',
                                     'batch_size': batch_size}
@@ -7566,8 +7679,44 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 settings, 'input_split_batched_clip_iters', 1))
             xl_c, xh_c, feasible_c = xl_u, xh_u, None
             for _ci in range(clip_iters):
-                xl_new, xh_new, feasible_new = _clip_box_by_halfspaces_batched(
-                    xl_c, xh_c, A_u, b_u)
+                if multi_disjunct:
+                    # Per-disjunct clip; union the resulting bboxes.
+                    # Leaf is infeasible iff EVERY disjunct's polytope is
+                    # empty (no point can satisfy any disjunct).
+                    B_u = xl_c.shape[0]
+                    per_disj_xl = []
+                    per_disj_xh = []
+                    per_disj_feas = []
+                    for di, q_t in disj_q_idx_tensors.items():
+                        A_d = A_u.index_select(1, q_t)
+                        b_d = b_u.index_select(1, q_t)
+                        xl_d, xh_d, feas_d = _clip_box_by_halfspaces_batched(
+                            xl_c, xh_c, A_d, b_d)
+                        # For infeasible disjuncts: clamp xl_d > xh_d to a
+                        # null contribution to the union — equivalent to
+                        # excluding that disjunct from the union.
+                        per_disj_xl.append(torch.where(
+                            feas_d.unsqueeze(-1), xl_d,
+                            torch.full_like(xl_d, float('+inf'))))
+                        per_disj_xh.append(torch.where(
+                            feas_d.unsqueeze(-1), xh_d,
+                            torch.full_like(xh_d, float('-inf'))))
+                        per_disj_feas.append(feas_d)
+                    # Per-dim union: take min of mins and max of maxes
+                    # over disjuncts (only feasible ones contribute).
+                    xl_new = torch.stack(per_disj_xl, dim=0).min(dim=0).values
+                    xh_new = torch.stack(per_disj_xh, dim=0).max(dim=0).values
+                    feasible_new = torch.stack(per_disj_feas, dim=0).any(dim=0)
+                    # For leaves where all disjuncts are infeasible, the
+                    # min/max are inf/-inf — replace with original box so
+                    # downstream doesn't blow up; feasible_new masks them.
+                    xl_new = torch.where(
+                        feasible_new.unsqueeze(-1), xl_new, xl_c)
+                    xh_new = torch.where(
+                        feasible_new.unsqueeze(-1), xh_new, xh_c)
+                else:
+                    xl_new, xh_new, feasible_new = _clip_box_by_halfspaces_batched(
+                        xl_c, xh_c, A_u, b_u)
                 shrunk = ((xl_new > xl_c) | (xh_new < xh_c)).any().item()
                 xl_c, xh_c, feasible_c = xl_new, xh_new, feasible_new
                 if not shrunk:

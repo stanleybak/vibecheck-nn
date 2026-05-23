@@ -37,6 +37,19 @@ def run_case(case, config_yaml, vnncomp_root, benchmark_dir):
 
     net_path = Path(vnncomp_root) / benchmark_dir / case['net']
     vnn_path = Path(vnncomp_root) / benchmark_dir / case['vnnlib']
+    # Try .gz / non-.gz suffix swap — local mirrors are often .onnx.gz,
+    # server1 sometimes has .onnx unpacked.
+    if not net_path.exists():
+        alt = (Path(str(net_path) + '.gz') if not str(net_path).endswith('.gz')
+               else Path(str(net_path)[:-3]))
+        if alt.exists(): net_path = alt
+    if not vnn_path.exists():
+        alt = (Path(str(vnn_path) + '.gz') if not str(vnn_path).endswith('.gz')
+               else Path(str(vnn_path)[:-3]))
+        if alt.exists(): vnn_path = alt
+    if not net_path.exists() and case.get('skip_if_missing'):
+        import pytest
+        pytest.skip(f'missing net: {net_path}')
     assert net_path.exists(), f'missing net: {net_path}'
     assert vnn_path.exists(), f'missing vnnlib: {vnn_path}'
 
