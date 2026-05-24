@@ -124,8 +124,8 @@ Allowed references: read auto_LiRPA / AB-CROWN source (`~/Desktop/temp/abcrown/a
 
 ### Already optimized
 
-acasxu_2023 · cersyve · cgan_2023 · cifar100_2024 · collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · linearizenn_2024 · malbeware · mnist_fc (historical, regression-only) · tinyimagenet_2024 · relusplitter (extended; kept as deliverable).
+acasxu_2023 · cersyve · cgan_2023 · cifar100_2024 · collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · linearizenn_2024 · malbeware · metaroom_2023 · mnist_fc (historical, regression-only) · tinyimagenet_2024 · relusplitter (extended; kept as deliverable).
 
 ### Queue (alphabetical, regular track only)
 
-metaroom_2023 · nn4sys · safenlp_2024 · sat_relu · soundnessbench · tllverifybench_2023.
+nn4sys · safenlp_2024 · sat_relu · soundnessbench · tllverifybench_2023.

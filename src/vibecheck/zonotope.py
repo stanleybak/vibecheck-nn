@@ -138,14 +138,29 @@ class TorchZonotope:
         self.center = F.conv2d(
             self.center.reshape(1, *input_shape), kernel, bias=bias,
             stride=stride, padding=padding).flatten()
+        # Empty-K early return must still resize gens to the post-conv
+        # flat size — otherwise downstream `bounds()` mismatches the
+        # (updated) center against (pre-conv) gens. Manifests on metaroom
+        # specs where the input box has zero radii everywhere (point
+        # input) so K==0 at the first Conv.
+        n_out = self.center.numel()
         if self._gen_4d is None:
             if self._gen_2d is None or self._gen_2d.shape[1] == 0:
+                self._gen_2d = torch.zeros(
+                    n_out, 0, dtype=self.center.dtype,
+                    device=self.center.device)
                 return
             K = self._gen_2d.shape[1]
             g4d = self._gen_2d.t().contiguous().reshape(K, *input_shape)
         else:
             g4d = self._gen_4d
             if g4d.shape[0] == 0:
+                # K==0 in 4D form: drop the stale 4D, write empty 2D
+                # of the new flat output size.
+                self._gen_4d = None
+                self._gen_2d = torch.zeros(
+                    n_out, 0, dtype=self.center.dtype,
+                    device=self.center.device)
                 return
             K = g4d.shape[0]
         # Chunked convolution: bounds cuDNN workspace to ~chunk_size gens.

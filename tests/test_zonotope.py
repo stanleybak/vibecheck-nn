@@ -375,6 +375,58 @@ def test_torch_zono_4d_conv_matches_2d():
     torch.testing.assert_close(z_new.center, z_force2d.center)
 
 
+def test_torch_zono_conv_zero_K_resizes_gens():
+    """propagate_conv with K=0 (point input) must resize gens to match
+    the new (post-conv) flat output size.
+
+    Regression for metaroom_2023 `_tz_` cases: spec has eps but
+    x_lo==x_hi for every input dim, so `from_input_bounds` produces
+    a (n_in, 0) gen tensor. Pre-fix, propagate_conv updated `center`
+    but early-returned without resizing gens, leaving (5376, 0) gens
+    against a (57344,) center. Downstream `bounds()` then crashed
+    with `tensor a (57344) must match tensor b (5376)`.
+
+    Test both entry paths: 2D-form (_gen_2d set, _gen_4d None) AND
+    4D-form (_gen_4d set, _gen_2d None) — both early-return branches.
+    """
+    C_in, H_in, W_in = 3, 32, 56
+    n_in = C_in * H_in * W_in
+    kernel = torch.randn(32, C_in, 3, 3, dtype=torch.float64)
+    bias = torch.randn(32, dtype=torch.float64)
+    in_shape = (C_in, H_in, W_in)
+
+    # 2D-form path
+    center = torch.randn(n_in, dtype=torch.float64)
+    z_2d = TorchZonotope(center.clone(),
+                          torch.zeros(n_in, 0, dtype=torch.float64))
+    z_2d.propagate_conv(kernel, bias, in_shape, (1, 1), (1, 1))
+    n_out = z_2d.center.numel()
+    assert n_out == 32 * 32 * 56  # conv output flat size
+    assert z_2d.generators.shape == (n_out, 0)
+    # bounds() must not crash and must equal center (K=0 → no spread)
+    lo, hi = z_2d.bounds()
+    torch.testing.assert_close(lo, z_2d.center)
+    torch.testing.assert_close(hi, z_2d.center)
+
+    # 4D-form path (gens already in 4D after a prior conv with K=0)
+    z_4d = TorchZonotope(center.clone(),
+                          torch.zeros(n_in, 0, dtype=torch.float64))
+    z_4d.propagate_conv(kernel, bias, in_shape, (1, 1), (1, 1))
+    # Now _gen_2d is (n_out, 0). Force 4D by chaining another conv with
+    # _gen_4d set to empty 4D — we synthesize it explicitly.
+    z_4d._gen_4d = torch.zeros(0, 32, 32, 56, dtype=torch.float64)
+    z_4d._gen_2d = None
+    kernel2 = torch.randn(64, 32, 3, 3, dtype=torch.float64)
+    bias2 = torch.randn(64, dtype=torch.float64)
+    z_4d.propagate_conv(kernel2, bias2, (32, 32, 56), (2, 2), (1, 1))
+    n_out2 = z_4d.center.numel()
+    assert n_out2 == 64 * 16 * 28
+    assert z_4d.generators.shape == (n_out2, 0)
+    lo2, hi2 = z_4d.bounds()
+    torch.testing.assert_close(lo2, z_4d.center)
+    torch.testing.assert_close(hi2, z_4d.center)
+
+
 def test_torch_zono_4d_consecutive_convs_stay_in_4d():
     """A conv→conv chain stays 4D internally and matches a 2D-forced
     path bit-for-bit up to rounding."""
