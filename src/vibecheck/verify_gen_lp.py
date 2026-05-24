@@ -71,6 +71,13 @@ def forward_point(gg_ops_ser, x, input_name, output_op_name):
             a = vals[op['inputs'][0]]
             scale = np.asarray(op.get('scale'), dtype=np.float64).flatten()
             vals[nm] = a * scale
+        elif t == 'sigmoid':
+            from scipy.special import expit
+            vals[nm] = expit(vals[op['inputs'][0]])
+        elif t == 'tanh':
+            vals[nm] = np.tanh(vals[op['inputs'][0]])
+        elif t == 'reshape':
+            vals[nm] = vals[op['inputs'][0]]
         else:
             raise NotImplementedError(
                 f'forward_point: unsupported op {t!r}')
@@ -839,9 +846,26 @@ def state_from_alpha_zono(z_alpha, pre_relu_gpu, alpha_per_layer, bbr,
     obj_G_out_dense = G_t.detach().cpu().numpy().astype(np.float64)
     obj_G_out_csr = sp.csr_matrix(obj_G_out_dense)
 
+    # Tag sigmoid/tanh layers so downstream consumers
+    # (score_box_halfspace_delta_lb) can skip them — gen-LP encodes
+    # ReLU triangles only, but z_alpha includes Sigmoid's noise vars
+    # so we have to keep cur_n_gens aligned with z_alpha's column count.
+    sigmoid_tanh_layer_ids = {op['layer_idx'] for op in gg_ops_ser
+                              if op['type'] in ('sigmoid', 'tanh')
+                              and 'layer_idx' in op}
     unstable_list = []
     cur_n_gens = n_input  # starts with input generators
     for L in sorted(bbr.keys()):
+        # Sigmoid/tanh layers add one slack column per output cell
+        # (box-relax with preserved column indexing — see
+        # `alpha_crown.forward_zono_dir_adaptive` sigmoid branch).
+        # We don't put them in unstable_list (gen-LP MILP can't binarise
+        # them) but we MUST advance cur_n_gens past them so subsequent
+        # ReLU e_new_col indices align with z_alpha's actual columns.
+        if L in sigmoid_tanh_layer_ids:
+            n_cells = int(np.asarray(bbr[L][0]).flatten().size)
+            cur_n_gens += n_cells
+            continue
         lo_arr = np.asarray(bbr[L][0], dtype=np.float64)
         hi_arr = np.asarray(bbr[L][1], dtype=np.float64)
         # Identify unstable neurons in ascending neuron-index order
@@ -889,6 +913,9 @@ def state_from_alpha_zono(z_alpha, pre_relu_gpu, alpha_per_layer, bbr,
                     continue
                 c_in_j = float(c_pre[j])
                 row_full = G_pre[j]
+            # Defend against 1-elem upstream layers (e.g. dist_shift's
+            # mnist_concat Sigmoid output) collapsing G_pre[j] to scalar.
+            row_full = np.atleast_1d(row_full)
             nz = np.nonzero(row_full)[0]
             row_indices = nz.astype(np.int32)
             row_values = row_full[nz].astype(np.float64)
@@ -898,6 +925,12 @@ def state_from_alpha_zono(z_alpha, pre_relu_gpu, alpha_per_layer, bbr,
             mu_a = max((1.0 - lam_a) * hi_j / 2.0,
                         -lam_a * lo_j / 2.0)
 
+            # Defensive: skip if e_new_col would exceed z_alpha's actual
+            # n_gens. Misalignment can happen on weird graphs (e.g.,
+            # dist_shift's mnist_concat Sigmoid dead branch) where bbr
+            # disagrees with z_alpha's apply_relu_custom on stability.
+            if cur_n_gens + local_idx >= n_gens:
+                continue
             unstable_list.append({
                 'layer_idx': int(L),
                 'neuron_idx': j,
@@ -934,6 +967,10 @@ def state_from_alpha_zono(z_alpha, pre_relu_gpu, alpha_per_layer, bbr,
         'output_op_name': output_op_name,
         'x_lo': np.asarray(x_lo, dtype=np.float64),
         'x_hi': np.asarray(x_hi, dtype=np.float64),
+        # Tag layer indices whose nonlinearity is sigmoid/tanh — these
+        # don't form ReLU triangles, so binarisation scoring should
+        # skip them.
+        'sigmoid_tanh_layer_ids': sigmoid_tanh_layer_ids,
     }
 
 
@@ -1521,8 +1558,11 @@ def score_box_halfspace_delta_lb(state, qw, qb, ew_per_relu):
     baseline_lb = c0_obj_base - float(np.sum(np.abs(d_obj_base)))
 
     scores = {}
+    _skip_layers = state.get('sigmoid_tanh_layer_ids', set())
     for u in state.get('unstable_list', []):
         li = u['layer_idx']
+        if li in _skip_layers:
+            continue
         j = u['neuron_idx']
         c_in_k = float(u['c_in'])
         row_idx = np.asarray(u['row_indices'], dtype=np.int64)

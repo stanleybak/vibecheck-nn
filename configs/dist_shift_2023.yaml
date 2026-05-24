@@ -1,0 +1,21 @@
+# dist_shift_2023 — VNNCOMP regular track. 72 instances across 3 small
+# MLPs (mnist_concat with Sigmoid, mnist_generator, mnist_prior).
+#
+# Phase 2.5 zono-lift (box+halfspace LP) is critical here: with the
+# sigmoid parallelogram routing input correlation through α-slope, it
+# tightens pre-ReLU bounds enough to crack the 3 plateau cases that
+# ReLU-only BaB can't (sigmoid γ slack is not in the split set).
+zono_lift_enabled: true
+phase2_crown_enabled: false
+pgd_middle_enabled: false
+# box_halfspace_delta_lb scoring crashes on mnist_concat's dead Sigmoid
+# branch (gen-LP n_gens accounting mismatch); ew*frac fallback works.
+phase8_score_box_halfspace: false
+phase8_use_dual_ascent_gpu: true
+phase8_dual_ascent_max_iter: 1
+phase8_min_budget_frac: 0.5
+input_split_batched_enabled: true
+input_split_batched_clip_enabled: true
+input_split_batch_size: 4096
+pgd_restarts: 128
+pgd_time_budget_phase0: 2.0

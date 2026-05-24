@@ -178,6 +178,11 @@ def tighten_all_layers(pre_relu_gpu, c_out, G_out, w_q, b_q, bbr, layers,
             un_t = torch.as_tensor(un, device=device, dtype=torch.long)
             G_un = G_L_gpu[un_t].detach().cpu().numpy().astype(np.float64)
             c_un = c_L_gpu[un_t].detach().cpu().numpy().astype(np.float64)
+        # Ensure G_un is 2D — single-neuron layers (e.g., dist_shift's
+        # mnist_concat Sigmoid output is 1-elem) collapse to 1D.
+        if G_un.ndim == 1:
+            G_un = G_un.reshape(1, -1)
+            c_un = np.atleast_1d(c_un)
         if G_un.shape[1] < n_gens:
             G_un = np.hstack([
                 G_un,
@@ -259,6 +264,11 @@ def tighten_all_layers_with_halfspace(pre_relu_gpu, a, beta, n_gens, bbr,
             un_t = torch.as_tensor(un, device=device, dtype=torch.long)
             G_un = G_L_gpu[un_t].detach().cpu().numpy().astype(np.float64)
             c_un = c_L_gpu[un_t].detach().cpu().numpy().astype(np.float64)
+        # Ensure G_un is 2D — single-neuron layers (e.g., dist_shift's
+        # mnist_concat Sigmoid output is 1-elem) collapse to 1D.
+        if G_un.ndim == 1:
+            G_un = G_un.reshape(1, -1)
+            c_un = np.atleast_1d(c_un)
         if G_un.shape[1] < n_gens:
             G_un = np.hstack([
                 G_un,

@@ -9,6 +9,82 @@ from .settings import default_settings, resolve_torch
 from .zonotope import TorchZonotope
 
 
+def _sigmoid_tanh_chord_parallelogram(lo, hi, act_kind):
+    """Tight sound parallelogram for σ(x) over x ∈ [lo, hi].
+
+    Returns (alpha, beta, gamma) tensors of the same shape as lo, hi,
+    such that for all x in [lo[i], hi[i]] and all e_new ∈ [-1, 1]:
+        |σ(x) - (alpha[i] * x + beta[i] + gamma[i] * e_new)| <= 0
+
+    i.e., the parallelogram { y = α·x + β + γ·e_new : x ∈ [lo, hi],
+    e_new ∈ [-1,1] } strictly contains σ([lo, hi]).
+
+    Method:
+      - α = chord slope (σ(hi) - σ(lo)) / (hi - lo).
+      - f(x) := σ(x) - α·x. f(lo) = f(hi) = β_chord (chord intersects
+        σ at endpoints).
+      - Extremes of f over [lo, hi] occur at endpoints OR at critical
+        points where σ'(x) = α. For sigmoid σ'(x) = σ(x)(1-σ(x)) ≤ 0.25,
+        critical points are x_± = ±atanh(sqrt(1 - 4α)) (when α ≤ 0.25);
+        for tanh σ'(x) = 1 - tanh²(x) ≤ 1, critical points are
+        x_± = ±atanh(sqrt(1 - α)) (when α ≤ 1).
+      - β = midpoint of (min_f, max_f). γ = half-width.
+
+    Sound by construction: σ(x) - α·x ∈ [min_f, max_f] ⇒ β ± γ wide
+    enough to contain σ(x) - α·x for every x in [lo, hi].
+
+    Used by `forward_zono_dir_adaptive` to upgrade Sigmoid/Tanh from
+    box-relax (drops input correlation) to parallelogram (preserves
+    correlation through the α slope, only the γ slack noise is new).
+    """
+    if act_kind == 'sigmoid':
+        act = torch.sigmoid
+    elif act_kind == 'tanh':
+        act = torch.tanh
+    else:
+        raise ValueError(f'unknown act_kind {act_kind!r}')
+    s_lo = act(lo); s_hi = act(hi)
+    width = (hi - lo).clamp(min=1e-12)
+    alpha = (s_hi - s_lo) / width
+    beta_chord = s_lo - alpha * lo  # = s_hi - alpha * hi (chord intercept)
+
+    # Critical points where σ'(x) = α. For sigmoid σ' ≤ 0.25, for
+    # tanh σ' ≤ 1. If α exceeds the max, no critical points; f is
+    # monotone, extremes only at endpoints (both = β_chord).
+    #
+    # Sigmoid: σ'(x) = σ(x)(1-σ(x)) = α → σ = (1±sqrt(1-4α))/2,
+    #   x = logit(σ) = log(σ/(1-σ)) = 2·atanh(sqrt(1-4α)).
+    # Tanh:    σ'(x) = 1 - tanh²(x) = α → tanh²(x) = 1-α,
+    #   x = ±atanh(sqrt(1-α)).
+    if act_kind == 'sigmoid':
+        max_deriv = 0.25
+        disc = (1.0 - 4.0 * alpha).clamp(min=0.0)
+        sqrt_disc = torch.sqrt(disc).clamp(max=1 - 1e-9)
+        x_plus = 2.0 * torch.atanh(sqrt_disc)
+    else:  # tanh
+        max_deriv = 1.0
+        disc = (1.0 - alpha).clamp(min=0.0)
+        sqrt_disc = torch.sqrt(disc).clamp(max=1 - 1e-9)
+        x_plus = torch.atanh(sqrt_disc)
+    x_minus = -x_plus
+
+    # f at critical points (clamped to β_chord if outside [lo, hi]).
+    in_plus = (x_plus >= lo) & (x_plus <= hi) & (alpha <= max_deriv)
+    in_minus = (x_minus >= lo) & (x_minus <= hi) & (alpha <= max_deriv)
+    f_plus = act(x_plus) - alpha * x_plus
+    f_minus = act(x_minus) - alpha * x_minus
+    f_plus_eff = torch.where(in_plus, f_plus, beta_chord)
+    f_minus_eff = torch.where(in_minus, f_minus, beta_chord)
+
+    max_f = torch.maximum(beta_chord,
+                            torch.maximum(f_plus_eff, f_minus_eff))
+    min_f = torch.minimum(beta_chord,
+                            torch.minimum(f_plus_eff, f_minus_eff))
+    beta = (max_f + min_f) / 2
+    gamma = (max_f - min_f) / 2
+    return alpha, beta, gamma
+
+
 def _sigmoid_tanh_linear_bounds(lo, hi, act_kind, n_iter=30):
     """Sound closed-form linear bounds for sigmoid/tanh on [lo, hi].
 

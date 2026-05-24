@@ -1335,20 +1335,29 @@ def forward_zono_dir_adaptive(xl, xh, gg, alpha_per_layer, bbr,
             from .verify_zono_bnb import TorchZonotope as _TZ
             zono_state[name] = _TZ(new_c, new_g)
         elif t in ('sigmoid', 'tanh'):
-            # Box-relax: c = (lo+hi)/2, mu = (hi-lo)/2 per cell; zero out
-            # old gens, append diag(mu).
+            # Parallelogram-relax: y = α·x + β + γ·e_new where (α, β, γ)
+            # come from `_sigmoid_tanh_chord_parallelogram` (sound +
+            # ≥2× tighter than box on most intervals — preserves input
+            # correlation through α slope; only γ is new slack).
             z = _get(op['inputs'][0])
             lo_pre, hi_pre = z.bounds()
-            act = torch.sigmoid if t == 'sigmoid' else torch.tanh
-            s_lo = act(lo_pre); s_hi = act(hi_pre)
-            c_out = (s_lo + s_hi) / 2
-            mu = (s_hi - s_lo) / 2
-            new_g = torch.diag(mu)
+            from .verify_zono_bnb import _sigmoid_tanh_chord_parallelogram
+            alpha_p, beta_p, gamma_p = _sigmoid_tanh_chord_parallelogram(
+                lo_pre, hi_pre, t)
+            # c_out = α·c_in + β
+            c_out = alpha_p * z.center + beta_p
+            # G_out = α·G_in for old cols, append γ·diag for new slack.
+            G_old_scaled = alpha_p.unsqueeze(-1) * z.generators
+            new_gens = torch.diag(gamma_p)
+            new_g = torch.cat([G_old_scaled, new_gens], dim=1)
             from .verify_zono_bnb import TorchZonotope as _TZ
-            zono_state[name] = _TZ(c_out, new_g)
+            # Record pre-sigmoid zonotope center+gens in pre_relu_gpu so
+            # downstream state_from_alpha_zono can read it (expects
+            # (c_pre, G_pre) tensors).
             L = op.get('layer_idx')
             if L is not None and pre_relu_gpu is not None:
-                pre_relu_gpu[L] = (lo_pre.clone(), hi_pre.clone())
+                pre_relu_gpu[L] = (z.center.clone(), z.generators.clone())
+            zono_state[name] = _TZ(c_out, new_g)
         gen_count[name] = zono_state[name].n_gens
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in zono_state:

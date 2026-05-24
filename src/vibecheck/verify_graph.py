@@ -1482,6 +1482,29 @@ def _per_neuron_adaptive_bounds(gg, xl, xh, bounds_by_relu, target_layer_idx,
             _accum(ew_at_ub, inp,
                    _mul_scale_backward(op, ew_ub, dtype, device))
 
+        elif t in ('sigmoid', 'tanh'):
+            from .verify_zono_bnb import _sigmoid_tanh_linear_bounds
+            L_idx = op.get('layer_idx')
+            lo_k, hi_k = bounds_by_relu[L_idx]
+            lo_k_t = torch.as_tensor(lo_k, dtype=dtype, device=device)
+            hi_k_t = torch.as_tensor(hi_k, dtype=dtype, device=device)
+            lo_s, lo_t_b, up_s, up_t_b = _sigmoid_tanh_linear_bounds(
+                lo_k_t, hi_k_t, t)
+            # Lower bound backward: use lower-bound slope for positive
+            # part, upper-bound slope for negative part.
+            ep_lb = ew_lb.clamp(min=0); en_lb = ew_lb.clamp(max=0)
+            acc_lb = acc_lb + (ep_lb * lo_t_b).sum(dim=-1) \
+                            + (en_lb * up_t_b).sum(dim=-1)
+            ew_lb_back = ep_lb * lo_s + en_lb * up_s
+            # Upper bound backward: swap.
+            ep_ub = ew_ub.clamp(min=0); en_ub = ew_ub.clamp(max=0)
+            acc_ub = acc_ub + (ep_ub * up_t_b).sum(dim=-1) \
+                            + (en_ub * lo_t_b).sum(dim=-1)
+            ew_ub_back = ep_ub * up_s + en_ub * lo_s
+            inp = op['inputs'][0]
+            _accum(ew_at_lb, inp, ew_lb_back)
+            _accum(ew_at_ub, inp, ew_ub_back)
+
     input_name = gg['input_name']
     ew_inp_lb = ew_at_lb.get(
         input_name, torch.zeros(n, len(xl), device=device, dtype=dtype))
@@ -3880,6 +3903,18 @@ def _phase1_bab_refine(
         # branch on (nothing upstream is unstable) and produces the same
         # bound as the box. Saves the ~0.2s no-op and matches AB-CROWN's
         # `if relu_idx >= 1` guard at lp_mip_solver.py:1849.
+        # gen-LP MILP only encodes ReLU triangles. If any sigmoid/tanh
+        # layer exists at index ≤ L, the dependency cone for L's MILP
+        # would need to walk back through that nonlinear op which the
+        # gen-LP precompute can't handle. Cap max_layer to one less
+        # than the first sigmoid/tanh index.
+        non_relu_layer_ids = sorted({op['layer_idx'] for op in gg_ops_ser
+                                      if op['type'] in ('sigmoid', 'tanh')
+                                      and 'layer_idx' in op})
+        if non_relu_layer_ids:
+            cap = non_relu_layer_ids[0] - 1
+            if cap < max_layer:
+                max_layer = cap
         for L in range(cascade_start_layer, max_layer + 1):
             if time_left() <= 1:
                 break
