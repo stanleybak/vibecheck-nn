@@ -354,3 +354,24 @@ def test_witness_inside_x_subrange_is_counterexample():
         np.array([0.7]), np.array([-10.0]))
     assert is_ce, (
         'Witness x=0.7 (in [0.5, 1.0]) with y=-10 (≤0) IS a counterexample.')
+
+
+def test_per_disjunct_subboxes_uniqued():
+    """When multiple disjuncts share the same X subbox, the global
+    bounding box still UNIONs over all subranges (so when subranges
+    coincide, x_lo/x_hi equals that subrange). Used by the
+    `_verify_per_disjunct_subboxes` decomposition."""
+    text = """
+    (assert (or
+        (and (>= X_0 0.1) (<= X_0 0.2) (<= Y_0 -100))
+        (and (>= X_0 0.1) (<= X_0 0.2) (>= Y_0 +100))
+    ))
+    """
+    spec = parse_vnnlib_text(text)
+    # Both disjuncts have the same X subbox; bounding box = that subbox.
+    assert spec.x_lo[0] == pytest.approx(0.1)
+    assert spec.x_hi[0] == pytest.approx(0.2)
+    # Both disjuncts carry the same X bounds.
+    for conj in spec.disjuncts:
+        assert conj.input_lo[0] == pytest.approx(0.1)
+        assert conj.input_hi[0] == pytest.approx(0.2)

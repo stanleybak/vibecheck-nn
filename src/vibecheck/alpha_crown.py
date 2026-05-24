@@ -205,7 +205,7 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
-        elif t == 'slice':
+        elif t in ('slice', 'gather'):
             flat_idx = op.get('flat_idx')
             in_shape_nd = op.get('in_shapes_nd', [None])[0]
             n_in = int(np.prod(in_shape_nd)) if in_shape_nd is not None else None
@@ -1177,7 +1177,7 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
-        elif t == 'slice':
+        elif t in ('slice', 'gather'):
             flat_idx = op.get('flat_idx')
             in_shape_nd = op.get('in_shapes_nd', [None])[0]
             n_in = int(np.prod(in_shape_nd)) if in_shape_nd is not None else None
@@ -1381,7 +1381,7 @@ def forward_zono_dir_adaptive(xl, xh, gg, alpha_per_layer, bbr,
             zono_state[name] = z
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
-        elif t == 'slice':
+        elif t in ('slice', 'gather'):
             from .verify_zono_bnb import TorchZonotope as _TZ
             z = _get(op['inputs'][0])
             flat_idx = op.get('flat_idx')

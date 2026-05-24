@@ -6520,6 +6520,148 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     return _finalize('unknown', 'timeout', remaining=len(still_open_disj))
 
 
+def _verify_per_disjunct_subboxes(graph, spec, settings):
+    """Decompose a spec whose conjuncts each carry an X subbox into
+    per-unique-subbox sub-verifications.
+
+    For each unique (input_lo, input_hi) tuple across disjuncts, build a
+    sub-spec with:
+      - x_lo/x_hi = that subbox
+      - disjuncts = the Y-only Conjuncts (input_lo cleared so the
+        recursive call skips this branch) whose original subbox matches
+    Each sub-verification is a standard verify_graph call. Verdicts:
+      - SAT iff any sub returns SAT
+      - verified iff all subs return verified
+      - unknown otherwise
+
+    Time budget is split proportionally to sub count; per-sub minimum
+    is 0.2 s to avoid 0-budget no-ops on huge disjunct sets.
+    """
+    import copy
+    from .spec import VNNSpec, Conjunct
+    t_start = time.perf_counter()
+    total = float(getattr(settings, 'total_timeout', 30.0))
+
+    # Group disjuncts by their (input_lo, input_hi) tuple. Use bytes for
+    # hashable dict keys.
+    groups = {}
+    order = []
+    for conj in spec.disjuncts:
+        key = (conj.input_lo.tobytes(), conj.input_hi.tobytes())
+        if key not in groups:
+            groups[key] = (conj.input_lo, conj.input_hi, [])
+            order.append(key)
+        # Clone the Conjunct without per-disjunct X bounds — the sub-spec's
+        # global x_lo/x_hi IS the subbox.
+        groups[key][2].append(Conjunct(conj.constraints))
+
+    if getattr(settings, 'print_progress', False):
+        print(f'[per-disjunct] {len(groups)} unique X subboxes '
+              f'across {len(spec.disjuncts)} disjuncts', flush=True)
+
+    n_sub = len(groups)
+
+    # Fast inline CROWN path: when n_sub is large, calling verify_graph
+    # per sub-box pays ~50 ms of pipeline overhead per call (gg build,
+    # phase 0 PGD setup, etc.) — 10000 subs × 50 ms = 500 s, blowing
+    # past any reasonable budget. Instead, batch a single forward zono
+    # over ALL subboxes (one tensor of (B, n_in) lo/hi), CROWN backward
+    # per-sub, and emit verdicts inline. Falls back to per-sub
+    # verify_graph for any sub the cheap path can't close.
+    from .verify_zono_bnb import _forward_zonotope_graph_batched
+    from .settings import resolve_torch
+    dev, dt = resolve_torch(settings)
+    try:
+        gg_fast = graph.gpu_graph(dev, dt)
+    except Exception:
+        gg_fast = None
+
+    fast_results = {}
+    fast_wall = 0.0
+    if gg_fast is not None:
+        try:
+            xls = np.stack([groups[k][0] for k in order]).astype(
+                np.float64)
+            xhs = np.stack([groups[k][1] for k in order]).astype(
+                np.float64)
+            xl_t = torch.as_tensor(xls, dtype=dt, device=dev)
+            xh_t = torch.as_tensor(xhs, dtype=dt, device=dev)
+            t_fast = time.perf_counter()
+            sb_b, (c_b, G_b) = _forward_zonotope_graph_batched(
+                xl_t, xh_t, gg_fast, dev, dt)
+            n_out = c_b.shape[1]
+            # For each sub-box index b, check all its Y conjuncts.
+            for ki, key in enumerate(order):
+                _, _, conjs = groups[key]
+                lo_y = (c_b[ki] - G_b[ki].abs().sum(dim=-1))
+                hi_y = (c_b[ki] + G_b[ki].abs().sum(dim=-1))
+                lo_np = lo_y.detach().cpu().numpy()
+                hi_np = hi_y.detach().cpu().numpy()
+                # Build a sub-spec just to reuse spec.check semantics.
+                sub_spec_ck = VNNSpec(
+                    groups[key][0], groups[key][1], conjs)
+                ck_res, _ = sub_spec_ck.check(lo_np, hi_np)
+                if ck_res == 'verified':
+                    fast_results[ki] = 'verified'
+            fast_wall = time.perf_counter() - t_fast
+            del c_b, G_b
+        except Exception:
+            pass
+
+    if getattr(settings, 'print_progress', False):
+        print(f'[per-disjunct] fast batched CROWN closed '
+              f'{len(fast_results)}/{n_sub} subs in {fast_wall:.2f}s',
+              flush=True)
+
+    # Sub-budget for remaining (un-closed) sub-boxes
+    remaining_sub_idx = [ki for ki in range(n_sub) if ki not in fast_results]
+    rem_budget = total - (time.perf_counter() - t_start)
+    per_sub_budget = max(0.2, rem_budget / max(1, len(remaining_sub_idx)))
+
+    all_verified = (len(fast_results) == n_sub)
+    sub_details = [{'idx': ki, 'verdict': 'verified', 'phase': 'fast_crown'}
+                    for ki in fast_results]
+    for ki in remaining_sub_idx:
+        elapsed = time.perf_counter() - t_start
+        if elapsed > total:
+            sub_details.append({'idx': ki, 'verdict': 'unknown',
+                                'reason': 'total_timeout'})
+            all_verified = False
+            continue
+        key = order[ki]
+        x_lo, x_hi, conjs = groups[key]
+        sub_spec = VNNSpec(x_lo, x_hi, conjs)
+        sub_settings = copy.copy(settings)
+        sub_settings.total_timeout = min(per_sub_budget, max(0.05,
+                                                              total - elapsed))
+        sub_settings.print_progress = False
+        try:
+            sub_v, sub_d = verify_graph(graph, sub_spec, sub_settings)
+        except Exception as e:
+            sub_v = f'err:{type(e).__name__}'
+            sub_d = {'reason': str(e)[:200]}
+        sub_details.append({'idx': ki, 'verdict': sub_v,
+                            'phase': sub_d.get('phase')})
+        if sub_v == 'sat':
+            return 'sat', {
+                'phase': 'per_disjunct_sat',
+                'sub_idx': ki,
+                'witness': sub_d.get('witness'),
+                'sub_details': sub_details,
+            }
+        if sub_v != 'verified':
+            all_verified = False
+
+    verdict = 'verified' if all_verified else 'unknown'
+    return verdict, {
+        'phase': 'per_disjunct_split',
+        'n_subboxes': n_sub,
+        'n_fast_closed': len(fast_results),
+        'sub_details': sub_details,
+        'wall': time.perf_counter() - t_start,
+    }
+
+
 def verify_graph(graph, spec, settings):
     """Graph verification mode entry point.
 
@@ -6534,6 +6676,20 @@ def verify_graph(graph, spec, settings):
 
     Returns (result_str, details_dict).
     """
+    # Pre-pass: if conjuncts carry per-disjunct X subboxes (e.g., nn4sys
+    # lindex, acasxu prop_6), split into per-subbox sub-verifications.
+    # The vnnlib spec encodes the unsafe region as
+    #   UNION_i [x in subbox_i AND y in unsafe_Y_i].
+    # Verifying the global bounding box against the OR of all Y-disjuncts
+    # is unsound (a witness x outside subbox_i but in the bounding box
+    # could still falsely SAT a disjunct's Y constraint). The right
+    # decomposition: one sub-verification per unique X subbox, with the
+    # bound input box = that subbox and disjuncts = the Y-only conjuncts
+    # whose subbox matches. Overall SAT iff any sub-SAT; verified iff all
+    # verified; unknown otherwise.
+    _x_constrained = [c for c in spec.disjuncts if c.input_lo is not None]
+    if _x_constrained and len(_x_constrained) == len(spec.disjuncts):
+        return _verify_per_disjunct_subboxes(graph, spec, settings)
     # Route conv-heavy nets (e.g. oval21 cifar_base/deep/wide_kw) to
     # the historical milp_verify pipeline. The bab_refine cascade +
     # alpha-zono Phase 8 are tuned for FC nets like mnist_fc and

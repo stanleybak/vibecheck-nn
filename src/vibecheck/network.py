@@ -1827,6 +1827,46 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
+            elif node.op_type == 'Gather':
+                # Constant-index Gather: output = input.flatten()[flat_idx]
+                # for indices resolved against the named axis. Used in
+                # nn4sys pensieve_* models (select single timestep from
+                # rollout buffer). Behaves like Slice — both are flat
+                # index selections — but indices needn't be contiguous.
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed
+                              else '__input__']
+                indices = node.params.get('indices')
+                axis = int(node.params.get('axis', 0))
+                inp_shape = (self.nodes[node.inputs[0]].output_shape
+                              if node.inputs[0] in self.nodes
+                              else self.input_shape)
+                if indices is not None and inp_shape is not None:
+                    a = axis if axis >= 0 else len(inp_shape) + axis
+                    if a >= len(inp_shape):
+                        # axis past rank — fall through to identity
+                        flat_idx = None
+                    else:
+                        idx_arr = np.asarray(indices).flatten().astype(np.int64)
+                        # Map (axis-relative indices) to (flat indices in
+                        # input). For each idx in idx_arr, the gathered
+                        # slice is `input_nd[:..., idx, :...]` along `a`.
+                        full = np.arange(int(np.prod(inp_shape))).reshape(
+                            inp_shape)
+                        # Build slice tuple with `idx_arr` along `a`
+                        slicer = [slice(None)] * len(inp_shape)
+                        slicer[a] = idx_arr
+                        flat_idx = full[tuple(slicer)].reshape(-1).astype(
+                            np.int64)
+                else:
+                    flat_idx = None
+                ops.append({
+                    'name': name, 'type': 'gather',
+                    'inputs': inp_names,
+                    'flat_idx': flat_idx,
+                })
+                computed.add(name)
+
             # Skip other ops (Identity, Dropout, etc.) — pass through to
             # the real producer via the alias map.
             else:

@@ -1,0 +1,16 @@
+# nn4sys — VNNCOMP regular track. 194 instances across 12 models
+# (lindex, lindex_deep, mscn_*, pensieve_*).
+#
+# Defaults work for lindex/lindex_deep + pensieve_simple/mid_simple
+# variants (46/194). The remaining cases need either:
+#   - pensieve_*_parallel: ONNX model input-shape inference is wrong;
+#     loader picks (1, 8) but model expects (12, 8). Fix is in
+#     `onnx_loader.py` shape resolution (separate workstream).
+#   - mscn_*: Div + ReduceSum ops aren't supported in zonotope forward.
+#
+# This benchmark hit two critical soundness bugs (now fixed on main):
+#   1. milp_verify Gurobi FeasibilityTol vs float32-zono ulp mismatch
+#      (1/10 false-verified on metaroom; affected all milp_verify users).
+#   2. vnnlib parser dropped per-disjunct X constraints + overwrote
+#      X bounds across (and ...) blocks (22 of 194 lindex_* cases
+#      returned false-SAT pre-fix).

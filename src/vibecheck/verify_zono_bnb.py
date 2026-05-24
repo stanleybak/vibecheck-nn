@@ -267,7 +267,7 @@ def _forward_batch_graph(x, gg):
         elif t == 'reshape':
             act[name] = act[op['inputs'][0]]
 
-        elif t == 'slice':
+        elif t in ('slice', 'gather'):
             a = act[op['inputs'][0]]
             flat_idx = op.get('flat_idx')
             idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=a.device)
@@ -729,7 +729,7 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
 
-        elif t == 'slice':
+        elif t in ('slice', 'gather'):
             z = _get(op['inputs'][0])
             flat_idx = op.get('flat_idx')
             if flat_idx is None:
@@ -956,7 +956,7 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
-            elif t == 'slice':
+            elif t in ('slice', 'gather'):
                 flat_idx = op.get('flat_idx')
                 in_shape_nd = op.get('in_shapes_nd', [None])[0]
                 if flat_idx is None or in_shape_nd is None:
@@ -1199,7 +1199,7 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
         elif t == 'reshape':
             state[name] = _get(op['inputs'][0])
 
-        elif t == 'slice':
+        elif t in ('slice', 'gather'):
             c_in, G_in = _get(op['inputs'][0])
             flat_idx = op.get('flat_idx')
             if flat_idx is None:
@@ -1747,7 +1747,7 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
             existing = ew_at.get(inp)
             ew_at[inp] = ew.clone() if existing is None else existing + ew
 
-        elif t == 'slice':
+        elif t in ('slice', 'gather'):
             flat_idx = op.get('flat_idx')
             in_shape_nd = op.get('in_shapes_nd', [None])[0]
             if flat_idx is None or in_shape_nd is None:
