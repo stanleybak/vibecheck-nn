@@ -644,6 +644,25 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
 
+        elif t in ('sigmoid', 'tanh'):
+            # Nonlinear activation: collapse to box. Center = midpoint of
+            # the activation's range over [lo, hi]; one new gen per cell
+            # with magnitude (hi - lo)/2. Record pre-act bounds for CROWN.
+            z = _get(op['inputs'][0])
+            lo_pre, hi_pre = z.bounds()
+            act = torch.sigmoid if t == 'sigmoid' else torch.tanh
+            s_lo = act(lo_pre); s_hi = act(hi_pre)
+            c_out = (s_lo + s_hi) / 2
+            mu = (s_hi - s_lo) / 2
+            n = c_out.numel()
+            # New zonotope: zero old gens (no preserved correlation), add
+            # diag(mu) for the n new noise variables.
+            new_g = torch.diag(mu)
+            zono_state[name] = TorchZonotope(c_out, new_g)
+            layer_idx = op.get('layer_idx')
+            if layer_idx is not None:
+                sb[layer_idx] = (lo_pre.clone(), hi_pre.clone())
+
         elif t == 'mul':
             # Constant scalar / per-channel multiply: y = scale * x.
             z = _get(op['inputs'][0])
@@ -840,6 +859,20 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                     scale_4d = sflat.view(1, C, 1, 1).expand(
                         1, C, H, W).reshape(-1)
                     ew_back = ew * scale_4d
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif t in ('sigmoid', 'tanh'):
+                # CROWN backward: closed-form linear slopes via the
+                # same `_sigmoid_tanh_linear_bounds` helper used by the
+                # batched pipeline. Pre-activation bounds from `tight`.
+                L = op.get('layer_idx')
+                lo_pre, hi_pre = tight[L]
+                lo_s, lo_t, up_s, up_t = _sigmoid_tanh_linear_bounds(
+                    lo_pre, hi_pre, t)
+                ep = ew.clamp(min=0); en = ew.clamp(max=0)
+                acc += float((ep * lo_t).sum() + (en * up_t).sum())
+                ew_back = ep * lo_s + en * up_s
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 

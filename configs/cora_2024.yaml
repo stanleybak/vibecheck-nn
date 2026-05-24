@@ -6,10 +6,16 @@ phase8_use_dual_ascent_gpu: true
 phase8_dual_ascent_max_iter: 1
 zono_lift_enabled: false
 phase2_crown_enabled: false
-phase8_min_budget_frac: 0.7
+phase8_min_budget_frac: 0.5
 pgd_middle_enabled: false
 bab_refine_passes: 1
 bab_refine_window: 1
+# MILP at L1 + L2 with per-neuron timeout 2 s. Empirically (img100):
+# MILP@L1 alone gives spec_lb -0.55; MILP@L1+L2 (with adaptive-backward
+# propagation to L3-L6) closes it in ~29 s. Tuned via
+# scratch/cora_l1_compare.py and a sample_timeout sweep.
+max_tighten_layer: 2
+milp_sample_timeout: 2.0
 # PGD knobs
 pgd_restarts: 128
 pgd_time_budget_phase0: 2.0

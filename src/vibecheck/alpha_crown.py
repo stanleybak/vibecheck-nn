@@ -24,7 +24,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .verify_zono_bnb import _make_slopes, _find_shared_gens_count
+from .verify_zono_bnb import (
+    _make_slopes, _find_shared_gens_count, _sigmoid_tanh_linear_bounds)
 from .zonotope import TorchZonotope
 
 
@@ -206,6 +207,17 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
 
         elif t == 'mul':
             ew_back = _mul_scale_backward(op, ew, dtype, device)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t in ('sigmoid', 'tanh'):
+            L = op.get('layer_idx')
+            lo_pre, hi_pre = bbr_tensors[L][0], bbr_tensors[L][1]
+            lo_s, lo_t, up_s, up_t = _sigmoid_tanh_linear_bounds(
+                lo_pre, hi_pre, t)
+            ep = ew.clamp(min=0); en = ew.clamp(max=0)
+            acc = acc + (ep * lo_t).sum(dim=-1) + (en * up_t).sum(dim=-1)
+            ew_back = ep * lo_s + en * up_s
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
@@ -446,7 +458,8 @@ def run_alpha_crown(gg, xl, xh, bbr_init, w_q, b_q,
 def run_alpha_crown_fixed_intermediate(
         gg, xl, xh, bbr_init, w_q, b_q,
         device, dtype, n_iters=20, lr=0.25, lr_decay=0.98,
-        early_stop_on_positive=True, time_left_fn=None):
+        early_stop_on_positive=True, time_left_fn=None,
+        init_alpha=None):
     """α-CROWN with fixed intermediate bounds and spec-only α.
 
     Matches α,β-CROWN's effective `fix_intermediate_bounds=True` config: the
@@ -486,7 +499,8 @@ def run_alpha_crown_fixed_intermediate(
         ) for L in bbr_init
     }
 
-    # Initialize spec α at min-area's lo_s (0 or 1).
+    # Initialize spec α — warm-start from `init_alpha` (e.g. Phase 0.5's
+    # already-optimised slopes) when provided; otherwise min-area lo_s.
     spec_alpha = {}
     slopes_cache = {}
     for L in all_relu_layers:
@@ -494,9 +508,14 @@ def run_alpha_crown_fixed_intermediate(
         hi_t = bbr_tensors_fixed[L][1]
         lo_s, up_s, up_t, active, dead, unstable = _make_slopes(lo_t, hi_t)
         slopes_cache[L] = (active, dead)
-        alpha = torch.zeros_like(lo_t)
-        alpha = alpha + active.to(dtype) * 1.0
-        alpha = alpha + unstable.to(dtype) * lo_s
+        if (init_alpha is not None and L in init_alpha
+                and init_alpha[L].numel() == lo_t.numel()):
+            alpha = init_alpha[L].detach().to(
+                device=device, dtype=dtype).clone()
+        else:
+            alpha = torch.zeros_like(lo_t)
+            alpha = alpha + active.to(dtype) * 1.0
+            alpha = alpha + unstable.to(dtype) * lo_s
         alpha = alpha.clone().detach().requires_grad_(True)
         spec_alpha[L] = alpha
 
@@ -1135,6 +1154,18 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
             ew_back = _mul_scale_backward(op, ew, dtype, device)
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t in ('sigmoid', 'tanh'):
+            L = op.get('layer_idx')
+            lo_pre = torch.as_tensor(bbr[L][0], dtype=dtype, device=device)
+            hi_pre = torch.as_tensor(bbr[L][1], dtype=dtype, device=device)
+            lo_s, lo_t_b, up_s, up_t_b = _sigmoid_tanh_linear_bounds(
+                lo_pre, hi_pre, t)
+            ep = ew.clamp(min=0); en = ew.clamp(max=0)
+            acc = acc + float((ep * lo_t_b).sum() + (en * up_t_b).sum())
+            ew_back = ep * lo_s + en * up_s
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
     xl_t = xl.to(dtype=dtype, device=device)
     xh_t = xh.to(dtype=dtype, device=device)
     ew_inp = ew_at.get(gg['input_name'])
@@ -1303,6 +1334,21 @@ def forward_zono_dir_adaptive(xl, xh, gg, alpha_per_layer, bbr,
                                               dtype, device)
             from .verify_zono_bnb import TorchZonotope as _TZ
             zono_state[name] = _TZ(new_c, new_g)
+        elif t in ('sigmoid', 'tanh'):
+            # Box-relax: c = (lo+hi)/2, mu = (hi-lo)/2 per cell; zero out
+            # old gens, append diag(mu).
+            z = _get(op['inputs'][0])
+            lo_pre, hi_pre = z.bounds()
+            act = torch.sigmoid if t == 'sigmoid' else torch.tanh
+            s_lo = act(lo_pre); s_hi = act(hi_pre)
+            c_out = (s_lo + s_hi) / 2
+            mu = (s_hi - s_lo) / 2
+            new_g = torch.diag(mu)
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            zono_state[name] = _TZ(c_out, new_g)
+            L = op.get('layer_idx')
+            if L is not None and pre_relu_gpu is not None:
+                pre_relu_gpu[L] = (lo_pre.clone(), hi_pre.clone())
         gen_count[name] = zono_state[name].n_gens
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in zono_state:

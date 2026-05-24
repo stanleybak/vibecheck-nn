@@ -80,6 +80,9 @@ def _serialize_gg_ops(gg):
         elif t == 'relu':
             if 'layer_idx' in op:
                 d['layer_idx'] = op['layer_idx']
+        elif t in ('sigmoid', 'tanh'):
+            if 'layer_idx' in op:
+                d['layer_idx'] = op['layer_idx']
         elif t == 'add':
             d['is_merge'] = op.get('is_merge', False)
             if not d['is_merge']:
@@ -1449,9 +1452,9 @@ def _per_neuron_adaptive_bounds(gg, xl, xh, bounds_by_relu, target_layer_idx,
             else:
                 bias = op.get('bias')
                 if bias is not None:
-                    b_t = torch.tensor(bias.flatten(), dtype=dtype, device=device)
-                    acc_lb = acc_lb + ew_lb @ b_t
-                    acc_ub = acc_ub + ew_ub @ b_t
+                    from .alpha_crown import _bias_dot_ew
+                    acc_lb = acc_lb + _bias_dot_ew(ew_lb, bias, dtype, device)
+                    acc_ub = acc_ub + _bias_dot_ew(ew_ub, bias, dtype, device)
                 inp = op['inputs'][0]
                 _accum(ew_at_lb, inp, ew_lb)
                 _accum(ew_at_ub, inp, ew_ub)
@@ -1459,9 +1462,9 @@ def _per_neuron_adaptive_bounds(gg, xl, xh, bounds_by_relu, target_layer_idx,
         elif t == 'sub':
             bias = op.get('bias')
             if bias is not None:
-                b_t = torch.tensor(bias.flatten(), dtype=dtype, device=device)
-                acc_lb = acc_lb - ew_lb @ b_t
-                acc_ub = acc_ub - ew_ub @ b_t
+                from .alpha_crown import _bias_dot_ew
+                acc_lb = acc_lb - _bias_dot_ew(ew_lb, bias, dtype, device)
+                acc_ub = acc_ub - _bias_dot_ew(ew_ub, bias, dtype, device)
             inp = op['inputs'][0]
             _accum(ew_at_lb, inp, ew_lb)
             _accum(ew_at_ub, inp, ew_ub)
@@ -1470,6 +1473,14 @@ def _per_neuron_adaptive_bounds(gg, xl, xh, bounds_by_relu, target_layer_idx,
             inp = op['inputs'][0]
             _accum(ew_at_lb, inp, ew_lb)
             _accum(ew_at_ub, inp, ew_ub)
+
+        elif t == 'mul':
+            from .alpha_crown import _mul_scale_backward
+            inp = op['inputs'][0]
+            _accum(ew_at_lb, inp,
+                   _mul_scale_backward(op, ew_lb, dtype, device))
+            _accum(ew_at_ub, inp,
+                   _mul_scale_backward(op, ew_ub, dtype, device))
 
     input_name = gg['input_name']
     ew_inp_lb = ew_at_lb.get(
@@ -3719,6 +3730,12 @@ def _phase1_bab_refine(
             queries_flat[i][0]: float(spec_lbs_phase05[i])
             for i in range(len(queries_flat))
         }
+        # Stash Phase 0.5's per-layer α tensors so Phase 8's per-query
+        # α-CROWN can warm-start from already-optimised slopes instead
+        # of restarting at min-area. Keyed by spec qi for per-query
+        # passthrough (Phase 0.5 uses a shared α across queries; the
+        # same tensor is reused per qi).
+        tb['spec_alpha_phase05'] = spec_alpha_phase05
         if print_progress:
             n_closed = len(queries_flat) - len(open_qis)
             print(f'  [phase0.5] α-CROWN closed {n_closed}/'
@@ -3931,31 +3948,67 @@ def _phase1_bab_refine(
                         os._exit(0)
                 except ValueError:
                     pass
-            # α-CROWN refresh.
+            # Propagate the just-tightened L's bounds to ALL downstream
+            # layers Lk > L. Two passes:
+            #   (a) per-neuron adaptive backward CROWN at each Lk > L
+            #       (cheap, ~10 ms/layer; USES `bounds_by_relu[L]` as
+            #       fixed triangle slopes, so the MILP gain at L feeds
+            #       forward exactly).
+            #   (b) joint α-CROWN refresh on ALL intermediate bounds
+            #       (heavier, ~0.5-1 s; jointly optimizes α per layer).
+            # The joint α-CROWN re-computes L's bound from scratch and
+            # may DROP the MILP gain at L — we always max() to keep the
+            # tighter of (MILP, α-CROWN) per layer.
+            t_a = time.perf_counter()
+            # (a) Adaptive backward for downstream layers. ALWAYS run —
+            # this is ~10 ms / layer × few layers; even if MILP overran
+            # the Phase 8 budget reserve, the extra is negligible and
+            # propagates the L tightening to all Lk > L (the joint
+            # α-CROWN refresh below re-computes L's bound from scratch
+            # and discards the MILP gain, so this is the ONLY path the
+            # MILP-at-L gain reaches Lk > L).
+            for Lk in sorted(bounds_by_relu.keys()):
+                if Lk <= L:
+                    continue
+                lo_k, hi_k = bounds_by_relu[Lk]
+                un_k = np.where((lo_k < 0) & (hi_k > 0))[0]
+                if un_k.size == 0:
+                    continue
+                try:
+                    new_lo, new_hi = _per_neuron_adaptive_bounds_chunked(
+                        gg, xl, xh, bounds_by_relu, Lk,
+                        device, dtype, neuron_subset=un_k)
+                    bounds_by_relu[Lk] = (
+                        np.maximum(lo_k, new_lo),
+                        np.minimum(hi_k, new_hi))
+                except Exception:
+                    pass
+            # (b) Joint α-CROWN refresh (only if we still have time).
+            if time_left() > 0.5:
+                intermediate_start_nodes = [
+                    Lk for Lk in bounds_by_relu if Lk > 0 and
+                    ((bounds_by_relu[Lk][0] < 0)
+                     & (bounds_by_relu[Lk][1] > 0)).any()]
+                unstable_indices = {
+                    Lk: np.where((bounds_by_relu[Lk][0] < 0)
+                                  & (bounds_by_relu[Lk][1] > 0))[0].tolist()
+                    for Lk in bounds_by_relu}
+                if intermediate_start_nodes and queries_flat:
+                    best_bounds = _alpha_refresh_best_bounds(
+                        bounds_by_relu, intermediate_start_nodes,
+                        unstable_indices, alpha_iters)
+                    for Lk in best_bounds:
+                        lo_t, hi_t = best_bounds[Lk]
+                        lo_a = lo_t.detach().cpu().numpy().astype(np.float64)
+                        hi_a = hi_t.detach().cpu().numpy().astype(np.float64)
+                        lo_g, hi_g = bounds_by_relu[Lk]
+                        bounds_by_relu[Lk] = (
+                            np.maximum(lo_g, lo_a),
+                            np.minimum(hi_g, hi_a))
+            tb['phase1_alpha_total'] += time.perf_counter() - t_a
+            # Now check whether to continue cascade to next layer.
             if time_left() <= 1:
                 break
-            t_a = time.perf_counter()
-            intermediate_start_nodes = [
-                Lk for Lk in bounds_by_relu if Lk > 0 and
-                ((bounds_by_relu[Lk][0] < 0)
-                 & (bounds_by_relu[Lk][1] > 0)).any()]
-            unstable_indices = {
-                Lk: np.where((bounds_by_relu[Lk][0] < 0)
-                              & (bounds_by_relu[Lk][1] > 0))[0].tolist()
-                for Lk in bounds_by_relu}
-            if intermediate_start_nodes and queries_flat:
-                best_bounds = _alpha_refresh_best_bounds(
-                    bounds_by_relu, intermediate_start_nodes,
-                    unstable_indices, alpha_iters)
-                for Lk in best_bounds:
-                    lo_t, hi_t = best_bounds[Lk]
-                    lo_a = lo_t.detach().cpu().numpy().astype(np.float64)
-                    hi_a = hi_t.detach().cpu().numpy().astype(np.float64)
-                    lo_g, hi_g = bounds_by_relu[Lk]
-                    bounds_by_relu[Lk] = (
-                        np.maximum(lo_g, lo_a),
-                        np.minimum(hi_g, hi_a))
-            tb['phase1_alpha_total'] += time.perf_counter() - t_a
             if print_progress:
                 counts = ','.join(
                     f'L{Lk}={int(((bounds_by_relu[Lk][0]<0)&(bounds_by_relu[Lk][1]>0)).sum())}'
@@ -3981,6 +4034,26 @@ def _phase1_bab_refine(
     sb = {L: (torch.tensor(lo, dtype=dtype, device=device),
               torch.tensor(hi, dtype=dtype, device=device))
           for L, (lo, hi) in bounds_by_relu.items()}
+    # Re-run spec α-CROWN with the cascade-tightened intermediate bounds
+    # so Phase 8 can warm-start from the post-tighten optimal α. Without
+    # this, Phase 8 warm-starts from Phase 0.5's pre-tighten α, which is
+    # stale w.r.t. the new bounds. Cost: one batched spec α call (~0.1-1s).
+    if queries_flat and bool(getattr(
+            settings, 'phase1_final_spec_alpha', True)) and time_left() > 1.0:
+        t_a = time.perf_counter()
+        try:
+            _, alpha_dict_p1, _, _ = (
+                ac.run_alpha_crown_fixed_intermediate_batched(
+                    gg, xl, xh, bounds_by_relu, w_qs, b_qs,
+                    device, dtype, n_iters=phase05_spec_iters, lr=alpha_lr,
+                    lr_decay=0.98, early_stop_on_positive=True,
+                    per_spec_alpha=False, time_left_fn=time_left))
+            spec_alpha_phase1 = alpha_dict_p1.get('spec')
+            if spec_alpha_phase1 is not None:
+                tb['spec_alpha_phase05'] = spec_alpha_phase1
+        except Exception:
+            pass
+        tb['phase1_alpha_total'] += time.perf_counter() - t_a
     # If rec_zono was requested, redo the forward with the cascade-
     # tightened bounds_by_relu fed into apply_relu via tight_lo/tight_hi.
     # This recomputes (μ, λ) from the tighter (lo, hi) so that
@@ -5285,6 +5358,10 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     all_qids = set(spec_ew.keys())
     _phase2_crown = bool(getattr(settings, 'phase2_crown_enabled', True))
     _ph1_spec_lbs = phase1_tb.get('spec_lbs_phase05') if isinstance(phase1_tb, dict) else None
+    # Phase 0.5's optimised spec α — used to warm-start Phase 8's per-query
+    # α-CROWN (saves ~10 iters worth of Adam to re-find the same local
+    # optimum on a frozen-intermediate-bounds problem).
+    _ph1_spec_alpha = phase1_tb.get('spec_alpha_phase05') if isinstance(phase1_tb, dict) else None
     if _phase2_crown or not _ph1_spec_lbs:
         with torch.no_grad():
             spec_lbs, _ = _spec_backward_graph(
@@ -5840,6 +5917,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                                 np.maximum(bounds_by_relu[L][0], lo_t),
                                 np.minimum(bounds_by_relu[L][1], hi_t))
                 # α-CROWN with fixed intermediate bounds; spec-only α.
+                # Warm-start from Phase 0.5's optimised α when available.
                 t_ac = time.perf_counter()
                 _, alpha_params, _, _ = (
                     ac.run_alpha_crown_fixed_intermediate(
@@ -5853,7 +5931,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                             settings, 'alpha_crown_lr_decay', 0.98)),
                         early_stop_on_positive=bool(getattr(
                             settings,
-                            'alpha_crown_early_stop_on_positive', True))))
+                            'alpha_crown_early_stop_on_positive', True)),
+                        init_alpha=_ph1_spec_alpha))
                 _, ew_at_relu_q = ac.capture_ew_per_relu(
                     gg, xl_g, xh_g, alpha_params['spec'], merged_bbr,
                     qw_q, float(qb_q), device, dtype)
