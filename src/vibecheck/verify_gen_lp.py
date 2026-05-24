@@ -659,6 +659,11 @@ def precompute_gen_state(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
                 Gm = _materialize_g(pad_cols(prev_G))
                 G_by_op[nm] = Gm * s4d.unsqueeze(-1)
 
+        else:
+            raise NotImplementedError(
+                f'gen-LP state forward: unsupported op {t!r} (name={nm!r}). '
+                'Silent skip would leave stale G_by_op → unsound encoding.')
+
         for inp in op['inputs']:
             if (last_use.get(inp) == op_idx and inp in G_by_op
                     and inp != nm):
@@ -2190,6 +2195,11 @@ def tighten_bounds(gg_ops_ser, x_lo, x_hi, initial_bounds, input_name, *,
                 center[nm] = prev_c * s4d
                 Gm = _materialize_g(pad_cols(prev_G))
                 G_by_op[nm] = Gm * s4d.unsqueeze(-1)
+
+        else:
+            raise NotImplementedError(
+                f'gen-LP state forward: unsupported op {t!r} (name={nm!r}). '
+                'Silent skip would leave stale G_by_op → unsound encoding.')
 
         for inp in op['inputs']:
             if (last_use.get(inp) == op_idx and inp in G_by_op

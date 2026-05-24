@@ -21,6 +21,7 @@ A zonotope-based neural network verification tool. Given an ONNX network and a V
 - **Single-threaded BLAS** is set in `__init__.py` (`OMP_NUM_THREADS=1` etc.) before numpy import — multi-threaded OpenBLAS causes huge run-to-run jitter on small matrices.
 - **Never silently swallow OOM.** Default behavior is to re-raise `torch.cuda.OutOfMemoryError` and `MemoryError`. Only catch when `settings.raise_on_oom=False` (e.g. a benchmarking loop that records OOM as an outcome).
 - **Bounds for nonlinear ops MUST be symbolic / provably-sound, never sampling-based.** This applies to ReLU, sigmoid, tanh, softmax, GELU, attention, layernorm — any nonlinear activation or transformer op. Sampling N points and taking max/min of the gap is *not* a sound upper/lower bound (the worst case may lie between samples). Use either: (a) closed-form bounds derived from monotonicity / convexity / concavity of the function, or (b) Newton / binary-search on a monotone condition that provably brackets the worst case (auto_LiRPA's `precompute_relaxation` pattern in `tanh.py`). When in doubt, verify soundness by sampling many adversarial points and checking that NONE violate the bound (this is the test, not the bound itself).
+- **Op dispatches must `else: raise NotImplementedError`. Never silently skip an op.** Every `elif t == ...` chain (forward zono, CROWN backward, PGD forward, MILP builder, alpha_crown adaptive, etc.) must terminate in an explicit `else: raise NotImplementedError(f'...: unsupported op {t!r} at {name!r}')`. A real soundness bug (linearizenn `prop_10_10`) shipped because `_spec_backward_graph` had no `else`: Slice/Concat ops silently fell through, backward `ew` died mid-chain, `ew_at[input]` stayed zero, and `spec_lb = acc + 0` was vacuously positive — we declared `verified` on a SAT case ABC's witness easily satisfied. The same rule applies to bias-handling branches: never have `if bias is not None: acc += ...` without considering whether silently dropping the bias is sound. Adding the raise turns latent unsoundness into a loud failure that surfaces the missing op immediately.
 
 ## Architecture
 
@@ -123,8 +124,8 @@ Allowed references: read auto_LiRPA / AB-CROWN source (`~/Desktop/temp/abcrown/a
 
 ### Already optimized
 
-acasxu_2023 · cersyve · cgan_2023 · cifar100_2024 · collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · mnist_fc (historical, regression-only) · tinyimagenet_2024 · relusplitter (extended; kept as deliverable).
+acasxu_2023 · cersyve · cgan_2023 · cifar100_2024 · collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · linearizenn_2024 · mnist_fc (historical, regression-only) · tinyimagenet_2024 · relusplitter (extended; kept as deliverable).
 
 ### Queue (alphabetical, regular track only)
 
-linearizenn_2024 · malbeware · metaroom_2023 · nn4sys · safenlp_2024 · sat_relu · soundnessbench · tllverifybench_2023.
+malbeware · metaroom_2023 · nn4sys · safenlp_2024 · sat_relu · soundnessbench · tllverifybench_2023.

@@ -1777,6 +1777,56 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
+            elif node.op_type == 'Slice':
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed else '__input__']
+                inp_shape = (self.nodes[node.inputs[0]].output_shape
+                              if node.inputs[0] in self.nodes
+                              else self.input_shape)
+                axes = node.params.get('axes', [0])
+                starts = node.params.get('starts', [0])
+                ends = node.params.get('ends', [None])
+                # Resolve negative / None bounds to absolute indices.
+                rng = list(range(int(np.prod(inp_shape)))) if inp_shape \
+                    else None
+                if inp_shape is not None:
+                    slices = [slice(None)] * len(inp_shape)
+                    for ax, s, e in zip(axes, starts, ends):
+                        a = ax if ax >= 0 else len(inp_shape) + ax
+                        if a >= len(inp_shape):
+                            continue
+                        dim = inp_shape[a]
+                        if s < 0: s = dim + s
+                        if e is None or e > dim: e = dim
+                        if e < 0: e = dim + e
+                        slices[a] = slice(int(s), int(e))
+                    # Compute flat index permutation: which input
+                    # positions survive the slice.
+                    idx_grid = np.arange(int(np.prod(inp_shape))).reshape(
+                        inp_shape)[tuple(slices)].reshape(-1)
+                    flat_idx = idx_grid.astype(np.int64)
+                else:
+                    flat_idx = None
+                ops.append({
+                    'name': name, 'type': 'slice',
+                    'inputs': inp_names,
+                    'flat_idx': flat_idx,
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Concat':
+                inp_names = []
+                for inp in node.inputs:
+                    if inp in computed or inp == self.input_name:
+                        inp_names.append(inp)
+                axis = int(node.params.get('axis', 0))
+                ops.append({
+                    'name': name, 'type': 'concat',
+                    'inputs': inp_names,
+                    'axis': axis,
+                })
+                computed.add(name)
+
             # Skip other ops (Identity, Dropout, etc.) — pass through to
             # the real producer via the alias map.
             else:

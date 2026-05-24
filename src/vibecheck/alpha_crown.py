@@ -205,6 +205,28 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
+        elif t == 'slice':
+            flat_idx = op.get('flat_idx')
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            n_in = int(np.prod(in_shape_nd)) if in_shape_nd is not None else None
+            if flat_idx is None or n_in is None:
+                raise ValueError("slice backward missing flat_idx/in_shape")
+            idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+            ew_back = torch.zeros(ew.shape[0], n_in, dtype=ew.dtype, device=device)
+            ew_back.index_copy_(-1, idx_t, ew)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t == 'concat':
+            # Split ew along last dim per input's flat size.
+            in_shapes = op.get('in_shapes_nd', [])
+            offset = 0
+            for inp, in_shape_nd in zip(op['inputs'], in_shapes):
+                n_in = int(np.prod(in_shape_nd))
+                ew_i = ew[..., offset:offset + n_in]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_i)) + ew_i
+                offset += n_in
+
         elif t == 'mul':
             ew_back = _mul_scale_backward(op, ew, dtype, device)
             inp = op['inputs'][0]
@@ -220,6 +242,11 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             ew_back = ep * lo_s + en * up_s
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        else:
+            raise NotImplementedError(
+                f'_crown_backward_matrix: unsupported op {t!r} (name={name!r}). '
+                'Silent skip would drop ew and produce unsound bounds.')
 
     input_name = gg['input_name']
     ew_inp = ew_at.get(input_name)
@@ -1150,6 +1177,27 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
+        elif t == 'slice':
+            flat_idx = op.get('flat_idx')
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            n_in = int(np.prod(in_shape_nd)) if in_shape_nd is not None else None
+            if flat_idx is None or n_in is None:
+                raise ValueError("slice backward missing flat_idx/in_shape")
+            idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+            ew_back = torch.zeros(n_in, dtype=ew.dtype, device=device)
+            ew_back.index_copy_(-1, idx_t, ew)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t == 'concat':
+            in_shapes = op.get('in_shapes_nd', [])
+            offset = 0
+            for inp, in_shape_nd in zip(op['inputs'], in_shapes):
+                n_in = int(np.prod(in_shape_nd))
+                ew_i = ew[..., offset:offset + n_in]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_i)) + ew_i
+                offset += n_in
+
         elif t == 'mul':
             ew_back = _mul_scale_backward(op, ew, dtype, device)
             inp = op['inputs'][0]
@@ -1166,6 +1214,11 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
             ew_back = ep * lo_s + en * up_s
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        else:
+            raise NotImplementedError(
+                f'per-query CROWN backward: unsupported op {t!r} '
+                f'(name={name!r}). Silent skip would produce unsound bounds.')
     xl_t = xl.to(dtype=dtype, device=device)
     xh_t = xh.to(dtype=dtype, device=device)
     ew_inp = ew_at.get(gg['input_name'])
@@ -1328,6 +1381,32 @@ def forward_zono_dir_adaptive(xl, xh, gg, alpha_per_layer, bbr,
             zono_state[name] = z
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
+        elif t == 'slice':
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            z = _get(op['inputs'][0])
+            flat_idx = op.get('flat_idx')
+            idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+            c_flat = z.center.reshape(-1)
+            g_flat = z.generators.reshape(c_flat.numel(), -1)
+            zono_state[name] = _TZ(
+                c_flat.index_select(0, idx_t),
+                g_flat.index_select(0, idx_t))
+        elif t == 'concat':
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            zs = [_get(inp) for inp in op['inputs']]
+            n_gens = max(z.generators.shape[1] for z in zs)
+            cs, gs = [], []
+            for z in zs:
+                c_flat = z.center.reshape(-1)
+                g_flat = z.generators.reshape(c_flat.numel(), -1)
+                if g_flat.shape[1] < n_gens:
+                    pad = torch.zeros(c_flat.numel(),
+                                       n_gens - g_flat.shape[1],
+                                       dtype=g_flat.dtype, device=device)
+                    g_flat = torch.cat([g_flat, pad], dim=1)
+                cs.append(c_flat); gs.append(g_flat)
+            zono_state[name] = _TZ(
+                torch.cat(cs, dim=0), torch.cat(gs, dim=0))
         elif t == 'mul':
             z = _get(op['inputs'][0])
             new_c, new_g = _mul_scale_zono(op, z.center, z.generators,
@@ -1358,6 +1437,10 @@ def forward_zono_dir_adaptive(xl, xh, gg, alpha_per_layer, bbr,
             if L is not None and pre_relu_gpu is not None:
                 pre_relu_gpu[L] = (z.center.clone(), z.generators.clone())
             zono_state[name] = _TZ(c_out, new_g)
+        else:
+            raise NotImplementedError(
+                f'forward_zono_dir_adaptive: unsupported op {t!r} '
+                f'(name={name!r}). Silent skip would propagate stale zono.')
         gen_count[name] = zono_state[name].n_gens
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in zono_state:

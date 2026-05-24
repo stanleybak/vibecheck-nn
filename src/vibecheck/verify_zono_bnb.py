@@ -267,6 +267,15 @@ def _forward_batch_graph(x, gg):
         elif t == 'reshape':
             act[name] = act[op['inputs'][0]]
 
+        elif t == 'slice':
+            a = act[op['inputs'][0]]
+            flat_idx = op.get('flat_idx')
+            idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=a.device)
+            act[name] = a.index_select(1, idx_t)
+
+        elif t == 'concat':
+            act[name] = torch.cat([act[inp] for inp in op['inputs']], dim=1)
+
         elif t == 'conv_transpose':
             a = act[op['inputs'][0]]
             ins = op['in_shape']
@@ -720,6 +729,34 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
 
+        elif t == 'slice':
+            z = _get(op['inputs'][0])
+            flat_idx = op.get('flat_idx')
+            if flat_idx is None:
+                raise ValueError("slice op missing 'flat_idx'")
+            idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+            c_flat = z.center.reshape(-1)
+            g_flat = z.generators.reshape(c_flat.numel(), -1)
+            zono_state[name] = TorchZonotope(
+                c_flat.index_select(0, idx_t),
+                g_flat.index_select(0, idx_t))
+
+        elif t == 'concat':
+            zs = [_get(inp) for inp in op['inputs']]
+            n_gens = max(z.generators.shape[1] for z in zs)
+            cs, gs = [], []
+            for z in zs:
+                c_flat = z.center.reshape(-1)
+                g_flat = z.generators.reshape(c_flat.numel(), -1)
+                if g_flat.shape[1] < n_gens:
+                    pad = torch.zeros(c_flat.numel(),
+                                       n_gens - g_flat.shape[1],
+                                       dtype=g_flat.dtype, device=device)
+                    g_flat = torch.cat([g_flat, pad], dim=1)
+                cs.append(c_flat); gs.append(g_flat)
+            zono_state[name] = TorchZonotope(
+                torch.cat(cs, dim=0), torch.cat(gs, dim=0))
+
         elif t in ('sigmoid', 'tanh'):
             # Nonlinear activation: collapse to box. Center = midpoint of
             # the activation's range over [lo, hi]; one new gen per cell
@@ -772,6 +809,12 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                 new_c = z.center * scale_4d
                 new_g = z.generators * scale_4d.unsqueeze(-1)
             zono_state[name] = TorchZonotope(new_c, new_g)
+
+        else:
+            raise NotImplementedError(
+                f'_forward_zonotope_graph: unsupported op {t!r} '
+                f'(name={name!r}). Silent skip would propagate stale zono — '
+                'add a forward handler before using this op.')
 
         gen_count[name] = zono_state[name].n_gens
 
@@ -913,6 +956,29 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
+            elif t == 'slice':
+                flat_idx = op.get('flat_idx')
+                in_shape_nd = op.get('in_shapes_nd', [None])[0]
+                if flat_idx is None or in_shape_nd is None:
+                    raise ValueError(
+                        f"slice backward missing flat_idx/in_shape")
+                n_in = int(np.prod(in_shape_nd))
+                idx_t = torch.as_tensor(flat_idx, dtype=torch.long,
+                                          device=ew.device)
+                ew_back = torch.zeros(n_in, dtype=ew.dtype, device=ew.device)
+                ew_back.index_copy_(-1, idx_t, ew)
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif t == 'concat':
+                in_shapes = op.get('in_shapes_nd', [])
+                offset = 0
+                for inp, in_shape_nd in zip(op['inputs'], in_shapes):
+                    n_in = int(np.prod(in_shape_nd))
+                    ew_i = ew[offset:offset + n_in]
+                    ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_i)) + ew_i
+                    offset += n_in
+
             elif t == 'mul':
                 # y = scale * x → ew_back = ew * scale.
                 scale_t = op.get('scale')
@@ -951,6 +1017,12 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 ew_back = ep * lo_s + en * up_s
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            else:
+                raise NotImplementedError(
+                    f'_spec_backward_graph: unsupported op {t!r} (name={name!r}) — '
+                    'unhandled ops silently drop ew, producing unsound bounds. '
+                    'Add a backward handler before using this op type.')
 
         # At input: interval bound
         input_name = gg['input_name']
@@ -1126,6 +1198,29 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
 
         elif t == 'reshape':
             state[name] = _get(op['inputs'][0])
+
+        elif t == 'slice':
+            c_in, G_in = _get(op['inputs'][0])
+            flat_idx = op.get('flat_idx')
+            if flat_idx is None:
+                raise ValueError("slice op missing 'flat_idx' for batched fwd")
+            idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+            c_out = c_in.index_select(1, idx_t)
+            G_out = G_in.index_select(1, idx_t)
+            state[name] = (c_out, G_out)
+
+        elif t == 'concat':
+            cs_l, gs_l = [], []
+            inputs = [_get(inp) for inp in op['inputs']]
+            n_gens = max(G.shape[2] for _, G in inputs)
+            for c_in, G_in in inputs:
+                if G_in.shape[2] < n_gens:
+                    pad = torch.zeros(B, G_in.shape[1],
+                                       n_gens - G_in.shape[2],
+                                       dtype=dtype, device=device)
+                    G_in = torch.cat([G_in, pad], dim=2)
+                cs_l.append(c_in); gs_l.append(G_in)
+            state[name] = (torch.cat(cs_l, dim=1), torch.cat(gs_l, dim=1))
 
         elif t == 'conv_transpose':
             c_in, G_in = _get(op['inputs'][0])
@@ -1651,6 +1746,29 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
             inp = op['inputs'][0]
             existing = ew_at.get(inp)
             ew_at[inp] = ew.clone() if existing is None else existing + ew
+
+        elif t == 'slice':
+            flat_idx = op.get('flat_idx')
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            if flat_idx is None or in_shape_nd is None:
+                raise ValueError("slice backward (batched) missing flat_idx/in_shape")
+            n_in_layer = int(np.prod(in_shape_nd))
+            idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+            ew_back = torch.zeros(B, ew.shape[1], n_in_layer, dtype=dtype, device=device)
+            ew_back.index_copy_(-1, idx_t, ew)
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'concat':
+            in_shapes = op.get('in_shapes_nd', [])
+            offset = 0
+            for inp, in_shape_nd in zip(op['inputs'], in_shapes):
+                n_in_layer = int(np.prod(in_shape_nd))
+                ew_i = ew[..., offset:offset + n_in_layer]
+                existing = ew_at.get(inp)
+                ew_at[inp] = ew_i.clone() if existing is None else existing + ew_i
+                offset += n_in_layer
 
         elif t == 'conv':
             # Backward of conv2d is conv_transpose2d. ew shape (B, Q, n_out).

@@ -1,0 +1,11 @@
+# linearizenn_2024 — VNNCOMP regular track. 60 instances on 11 AllInOne
+# MLPs (4-input, deep ReLU + Slice/MatMul skip branch + Concat → output).
+#
+# Cersyve-style batched input-split BaB: tiny input dim (4) means the
+# leaf bound check is cheap, and batching many leaves through the GPU
+# graph in one forward pass is much faster than the unbatched
+# fast_leaf path which serializes per-leaf forward/CROWN. Cracked all
+# the AllInOne_120_120 timeouts in ~0.3s each.
+input_split_batched_enabled: true
+input_split_batched_clip_enabled: true
+input_split_batch_size: 4096

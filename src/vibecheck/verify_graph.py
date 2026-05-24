@@ -1303,6 +1303,11 @@ def _adaptive_spec_lb(gg, xl, xh, bounds_by_relu, spec_ew, spec_bias,
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
+        else:
+            raise NotImplementedError(
+                f'_compute_lb_direct backward: unsupported op {t!r} '
+                f'(name={op.get("name")!r}). Silent skip would drop ew → unsound.')
+
     ew_inp = ew_at.get(input_name)
     if ew_inp is None:
         return acc
@@ -1504,6 +1509,11 @@ def _per_neuron_adaptive_bounds(gg, xl, xh, bounds_by_relu, target_layer_idx,
             inp = op['inputs'][0]
             _accum(ew_at_lb, inp, ew_lb_back)
             _accum(ew_at_ub, inp, ew_ub_back)
+
+        else:
+            raise NotImplementedError(
+                f'_per_neuron_adaptive_bounds backward: unsupported op {t!r} '
+                f'(name={op.get("name")!r}). Silent skip would drop ew.')
 
     input_name = gg['input_name']
     ew_inp_lb = ew_at_lb.get(
@@ -3430,6 +3440,11 @@ def _forward_zonotope_interleaved(
             zono_state[name] = _get(op['inputs'][0])
             tb['reshape'] += time.perf_counter() - _ts
 
+        else:
+            raise NotImplementedError(
+                f'_sparse_neuron forward zono: unsupported op {t!r} '
+                f'(name={name!r}). Silent skip would propagate stale zono.')
+
         gen_count[name] = zono_state[name].n_gens
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in zono_state:
@@ -4265,6 +4280,10 @@ def _forward_keep_pre_gpu(xl, xh, gg, device, dtype, override_tight=None,
             zono_state[name] = z
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
+        else:
+            raise NotImplementedError(
+                f'_forward_keep_pre_gpu: unsupported op {t!r} '
+                f'(name={name!r}). Silent skip would propagate stale zono.')
         gen_count[name] = zono_state[name].n_gens
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in zono_state:
