@@ -122,12 +122,23 @@ def _parse_block_constraints(block):
     return constraints
 
 
-def _parse_block_x_bounds(block, x_bounds):
-    """Extract X bounds from an (and ...) block into x_bounds dict."""
+def _parse_block_x_bounds(block):
+    """Parse a single (and ...) block's X constraints.
+
+    Returns a dict `{i: [lo_or_None, hi_or_None]}` LOCAL to this block
+    (caller is responsible for merging across blocks). Pre-fix, this
+    function mutated a shared dict — successive blocks overwrote each
+    other's bounds, so the parsed input box was the LAST block's
+    range rather than the UNION. acasxu prop_6 sampled the second
+    X-or block's bounds and missed the first; nn4sys lindex_* picked
+    a single subrange of the 10000 listed.
+    """
+    block_bounds = {}
     for m in re.finditer(r'\(>=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)', block):
-        x_bounds.setdefault(int(m.group(1)), [None, None])[0] = float(m.group(2))
+        block_bounds.setdefault(int(m.group(1)), [None, None])[0] = float(m.group(2))
     for m in re.finditer(r'\(<=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)', block):
-        x_bounds.setdefault(int(m.group(1)), [None, None])[1] = float(m.group(2))
+        block_bounds.setdefault(int(m.group(1)), [None, None])[1] = float(m.group(2))
+    return block_bounds
 
 
 # ---------------------------------------------------------------------------
@@ -155,27 +166,74 @@ def _parse_or_and(text, or_body, dtype=np.float32):
 
     assert and_blocks, "No (and ...) blocks found in (or ...)"
 
-    all_x_bounds = {}
+    # Per-block X bounds, then merge as UNION for the global x_lo/x_hi.
+    block_x_bounds_list = []  # one dict per disjunct
     disjuncts = []
-
     for block in and_blocks:
-        _parse_block_x_bounds(block, all_x_bounds)
+        block_x = _parse_block_x_bounds(block)
+        block_x_bounds_list.append(block_x)
         constraints = _parse_block_constraints(block)
         if constraints:
-            disjuncts.append(Conjunct(constraints))
+            disjuncts.append((constraints, block_x))
 
-    # Also check for top-level X bounds (outside the or block)
+    # Top-level X bounds (outside the or block) apply to EVERY disjunct.
+    top_x_bounds = {}
     for m in re.finditer(r'\(assert\s+\(>=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)\)', text):
-        all_x_bounds.setdefault(int(m.group(1)), [None, None])[0] = float(m.group(2))
+        top_x_bounds.setdefault(int(m.group(1)), [None, None])[0] = float(m.group(2))
     for m in re.finditer(r'\(assert\s+\(<=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)\)', text):
-        all_x_bounds.setdefault(int(m.group(1)), [None, None])[1] = float(m.group(2))
+        top_x_bounds.setdefault(int(m.group(1)), [None, None])[1] = float(m.group(2))
 
-    assert all_x_bounds, "No input bounds found in VNNLIB (or/and format)"
+    # UNION across disjuncts + top-level for global bounding box. Take
+    # min of lo, max of hi. (Each disjunct contributes a sub-box of the
+    # input; the verification region is the UNION; the bounding box
+    # over-approximates that union and is what the rest of the pipeline
+    # works against.)
+    union = dict(top_x_bounds)
+    for bx in block_x_bounds_list:
+        for i, (lo, hi) in bx.items():
+            if i not in union:
+                union[i] = [lo, hi]
+            else:
+                ulo, uhi = union[i]
+                # min of los
+                if lo is not None:
+                    union[i][0] = lo if ulo is None else min(ulo, lo)
+                # max of his
+                if hi is not None:
+                    union[i][1] = hi if uhi is None else max(uhi, hi)
 
-    n_input = max(all_x_bounds.keys()) + 1
-    x_lo = np.array([all_x_bounds.get(i, [0, 0])[0] or 0 for i in range(n_input)], dtype=dtype)
-    x_hi = np.array([all_x_bounds.get(i, [0, 0])[1] or 0 for i in range(n_input)], dtype=dtype)
+    assert union, "No input bounds found in VNNLIB (or/and format)"
+
+    n_input = max(union.keys()) + 1
+    x_lo = np.array([union.get(i, [0, 0])[0] or 0 for i in range(n_input)], dtype=dtype)
+    x_hi = np.array([union.get(i, [0, 0])[1] or 0 for i in range(n_input)], dtype=dtype)
 
     assert disjuncts, "No output constraints found in (or (and ...)) blocks"
 
-    return VNNSpec(x_lo, x_hi, disjuncts)
+    # Build Conjuncts with their per-disjunct X subbox (merged with
+    # top-level X bounds). The subbox is stored on the Conjunct so
+    # witness validation can check `x in subbox AND y violates`.
+    conj_list = []
+    for constraints, block_x in disjuncts:
+        # Combined per-disjunct bounds: intersect block_x with top_x_bounds
+        # (both apply simultaneously per disjunct). Where unconstrained,
+        # fall back to the UNION bounding box so x_satisfied uses
+        # a sound over-approximation.
+        per_lo = np.empty(n_input, dtype=dtype); per_hi = np.empty(n_input, dtype=dtype)
+        for i in range(n_input):
+            top_lo, top_hi = top_x_bounds.get(i, [None, None])
+            blk_lo, blk_hi = block_x.get(i, [None, None])
+            cand_lo = [v for v in (top_lo, blk_lo) if v is not None]
+            cand_hi = [v for v in (top_hi, blk_hi) if v is not None]
+            per_lo[i] = max(cand_lo) if cand_lo else x_lo[i]
+            per_hi[i] = min(cand_hi) if cand_hi else x_hi[i]
+        # Only attach per-disjunct bounds if the conjunct actually has
+        # X constraints; otherwise leave as None (the conjunct accepts
+        # any x in the global box — preserves backward compat for
+        # Y-only or-and specs like malbeware, cifar100, etc.).
+        if block_x:
+            conj_list.append(Conjunct(constraints, input_lo=per_lo, input_hi=per_hi))
+        else:
+            conj_list.append(Conjunct(constraints))
+
+    return VNNSpec(x_lo, x_hi, conj_list)

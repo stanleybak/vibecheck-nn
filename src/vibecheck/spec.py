@@ -45,8 +45,17 @@ class PairwiseConstraint:
 
 @dataclass
 class Conjunct:
-    """Conjunction of constraints. All must hold for the unsafe region."""
+    """Conjunction of constraints. All must hold for the unsafe region.
+
+    Optionally carries per-disjunct input bounds (`input_lo`, `input_hi`)
+    when the source vnnlib placed X constraints inside (and ...) blocks
+    (e.g., nn4sys lindex, acasxu prop_6). When set, witness validation
+    must additionally check `x in [input_lo, input_hi]`; a witness with
+    x outside the subrange is NOT a counterexample for this conjunct.
+    """
     constraints: list
+    input_lo: 'np.ndarray | None' = None
+    input_hi: 'np.ndarray | None' = None
 
     def margin(self, output_lo, output_hi):
         """Best margin across constraints — conjunction is safe iff ANY
@@ -65,8 +74,20 @@ class Conjunct:
         The ORT-based `_validate_sat_witness` in verify_graph is the
         pipeline-level defense-in-depth that catches the SAT side of
         this kind of bug; this fix corrects the verification side.
+
+        NOTE: this method considers only output constraints. Input
+        constraints (when present in `input_lo`/`input_hi`) are handled
+        separately by `VNNSpec.check_witness`.
         """
         return max(c.margin(output_lo, output_hi) for c in self.constraints)
+
+    def x_satisfied(self, x):
+        """True iff the witness x is inside this conjunct's X subrange
+        (or the conjunct has no per-disjunct X constraints)."""
+        if self.input_lo is None:
+            return True
+        return bool(np.all(x >= self.input_lo - 1e-9)
+                    and np.all(x <= self.input_hi + 1e-9))
 
     def __str__(self):
         return ' AND '.join(str(c) for c in self.constraints)
@@ -99,6 +120,32 @@ class VNNSpec:
             'margins': margins,
             'worst_margin': float(worst),
         }
+
+    def check_witness(self, x, y):
+        """Check if a witness (x, y) is a real counterexample.
+
+        Evaluates each disjunct AT the witness point — needed when
+        conjuncts carry per-disjunct input subranges
+        (`Conjunct.input_lo`/`input_hi`, e.g., nn4sys lindex). A point
+        violates the full spec iff there is at least one disjunct whose
+        X-subrange contains `x` AND whose Y-constraints are violated by
+        `y`.
+
+        Returns:
+            (is_counterexample, details) — `is_counterexample` is True
+            iff some disjunct's full conjunction holds at (x, y).
+            details: list of (disjunct_idx, x_in_subrange, margin) for
+            each disjunct.
+        """
+        details = []
+        is_ce = False
+        for i, conj in enumerate(self.disjuncts):
+            x_ok = conj.x_satisfied(x)
+            m = conj.margin(y, y) if x_ok else None
+            details.append((i, x_ok, m))
+            if x_ok and m is not None and m <= 0:
+                is_ce = True
+        return is_ce, details
 
     def as_pairwise(self):
         """Extract (pred, comps_set) if all constraints are pairwise with same pred.

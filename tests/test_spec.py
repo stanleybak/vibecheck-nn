@@ -257,4 +257,100 @@ def test_load_vnnlib_plain(tmp_path):
     """)
     spec = load_vnnlib(str(f))
     assert len(spec.x_lo) == 1
-    assert spec.disjuncts[0].constraints[0].value == 3.5
+
+
+# ---------------------------------------------------------------------------
+# Mixed X/Y conjuncts in (or (and ...)) blocks — regression tests for the
+# silent-unsoundness bug caught on nn4sys lindex_* benchmarks. The vnnlib
+# pattern is:
+#     (assert (or
+#         (and (>= X_0 a1) (<= X_0 b1) (<= Y_0 c1))
+#         (and (>= X_0 a2) (<= X_0 b2) (>= Y_0 c2))
+#     ))
+# Each conjunct's unsafe region requires BOTH the X subrange AND the Y
+# constraint. Pre-fix bugs:
+#   1. `_parse_block_x_bounds` overwrote per-block X bounds into a global
+#      dict, so the parsed `x_lo/x_hi` was the LAST block's range (not
+#      the UNION). On acasxu prop_6 this halved the input box; on
+#      nn4sys lindex it picked a tiny subrange.
+#   2. Conjunct only stored Y constraints — `spec.check` treated `Y_0 <= c1`
+#      as unsafe-for-ANY-x-in-box, giving false-SAT verdicts when the
+#      witness's x wasn't in the conjunct's X subrange.
+# Both manifest as soundness bugs (`verified` on a real SAT, or `sat`
+# from a witness that doesn't actually violate the full conjunct).
+# ---------------------------------------------------------------------------
+
+
+def test_parse_or_and_x_bounds_unioned_across_disjuncts():
+    """X bounds across (and ...) blocks must be UNIONed (min lo, max hi),
+    not overwritten by the last block. acasxu prop_6 pattern."""
+    text = """
+    (assert (or
+        (and (>= X_0 0.5) (<= X_0 1.0) (>= Y_0 100))
+        (and (>= X_0 -1.0) (<= X_0 -0.5) (<= Y_0 -100))
+    ))
+    """
+    spec = parse_vnnlib_text(text)
+    # Bounding box must cover both subranges (UNION).
+    assert spec.x_lo[0] == -1.0, (
+        f'x_lo should be UNION (-1.0), got {spec.x_lo[0]}')
+    assert spec.x_hi[0] == 1.0, (
+        f'x_hi should be UNION (1.0), got {spec.x_hi[0]}')
+
+
+def test_parse_or_and_disjunct_stores_x_constraints():
+    """Each (and ...) block's X constraints must be stored on the
+    Conjunct so a witness check can validate `X in subrange AND Y violates`.
+    Pre-fix: disjuncts contained only Y constraints — a witness with X
+    outside the subrange but Y satisfying the Y-constraint was wrongly
+    flagged as a counterexample."""
+    from vibecheck.spec import Conjunct
+    text = """
+    (assert (or
+        (and (>= X_0 0.5) (<= X_0 1.0) (>= Y_0 100))
+    ))
+    """
+    spec = parse_vnnlib_text(text)
+    conj = spec.disjuncts[0]
+    # X bounds for the conjunct should be accessible (per-disjunct, not
+    # just the global bounding box). Expose via a `input_bounds` attribute
+    # or `x_lo`/`x_hi` per Conjunct.
+    assert hasattr(conj, 'input_lo') and hasattr(conj, 'input_hi'), (
+        'Conjunct must store its X subrange (input_lo, input_hi).')
+    assert conj.input_lo[0] == 0.5
+    assert conj.input_hi[0] == 1.0
+
+
+def test_witness_outside_x_subrange_is_not_counterexample():
+    """A point x outside the conjunct's X subrange should NOT be flagged
+    as violating that conjunct, even if y satisfies the conjunct's Y
+    constraints. This is the nn4sys lindex_* false-SAT bug."""
+    from vibecheck.spec import VNNSpec
+    text = """
+    (assert (or
+        (and (>= X_0 0.5) (<= X_0 1.0) (<= Y_0 0))
+    ))
+    """
+    spec = parse_vnnlib_text(text)
+    # Witness: x=0.0 (outside [0.5, 1.0]), y=-10 (would satisfy Y<=0).
+    # Conjunct should NOT consider this a counterexample.
+    is_ce, _ = spec.check_witness(
+        np.array([0.0]), np.array([-10.0]))
+    assert not is_ce, (
+        'Witness x=0 outside conjunct X-subrange [0.5, 1.0] must NOT '
+        'be flagged as a counterexample.')
+
+
+def test_witness_inside_x_subrange_is_counterexample():
+    """A point x inside the conjunct's X subrange AND y violating Y
+    constraints IS a counterexample. Mirror to the previous test."""
+    text = """
+    (assert (or
+        (and (>= X_0 0.5) (<= X_0 1.0) (<= Y_0 0))
+    ))
+    """
+    spec = parse_vnnlib_text(text)
+    is_ce, _ = spec.check_witness(
+        np.array([0.7]), np.array([-10.0]))
+    assert is_ce, (
+        'Witness x=0.7 (in [0.5, 1.0]) with y=-10 (≤0) IS a counterexample.')

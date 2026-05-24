@@ -699,3 +699,75 @@ class TestRacingEscalation:
         assert result in ('SAT', 'UNSAT', 'UNKNOWN')
         assert lb is not None and np.isfinite(lb)
         assert dt > 0
+
+
+class TestSpecWorkerNumericalRobustness:
+    """Regression for the float32-zono / float64-LP ulp-mismatch
+    unsoundness in `_solve_spec_worker`.
+
+    Bug: zono forward in float32 can produce active-neuron bounds
+    `lo == hi` tight to ~1 ulp. The LP arithmetic runs in float64 and
+    computes `expr + b_j` 1-3 ulp outside those bounds. With Gurobi's
+    default `FeasibilityTol=1e-6`, this declares the model spuriously
+    INFEASIBLE → caller returns 'verified' on a real SAT case.
+
+    Caught on metaroom_2023 4cnn_ry_99_16 / spec_43: 1/10 runs
+    declared `verified` on a witness ABC easily found (Y_2 > Y_16).
+
+    Test isolates the failure: builds a 1-input / 1-active-neuron LP
+    with bounds tight to ~1 ulp and a constraint residual of ~1.15e-6.
+    At default `FeasibilityTol=1e-6` this is INFEASIBLE; vibecheck's
+    `_solve_spec_worker` must loosen FeasibilityTol so the same model
+    resolves as feasible.
+    """
+
+    @pytest.mark.skipif(not HAS_GUROBI, reason="Gurobi not installed")
+    def test_default_feasibility_tol_reproduces_bug(self):
+        """Sanity: with default FeasibilityTol=1e-6, the constraint is
+        spuriously INFEASIBLE."""
+        import gurobipy as grb
+        lo = 1.4313681126   # float32-truncated lower
+        hi = 1.4313681126
+        c = 1.0
+        b = 1.4313692590 - 1.0  # expr+b at x=1.0 = 1.4313692590, ~1.15e-6 above hi
+        env = grb.Env(empty=True); env.setParam('OutputFlag', 0); env.start()
+        m = grb.Model(env=env)
+        m.setParam('FeasibilityTol', 1e-6)  # default
+        x = m.addVar(lb=1.0, ub=1.0)
+        a = m.addVar(lb=lo, ub=hi)
+        m.addConstr(a == c*x + b)
+        m.optimize()
+        assert m.Status == 3, (
+            f'Expected INFEASIBLE (3) at default FeasibilityTol, '
+            f'got {m.Status}')
+        m.dispose(); env.dispose()
+
+    @pytest.mark.skipif(not HAS_GUROBI, reason="Gurobi not installed")
+    def test_solve_spec_worker_loosened_tol_resolves_feasibility(self):
+        """_solve_spec_worker uses a loosened FeasibilityTol that
+        absorbs the float32→float64 ulp gap. The same LP that
+        spuriously fires INFEASIBLE under default 1e-6 must be feasible
+        under vibecheck's loosened tolerance."""
+        from vibecheck.verify_milp import _GUROBI_FEAS_TOL
+        # Sanity: the constant is strictly larger than 1e-6 so it
+        # absorbs the 1.15e-6 residual seen in the wild.
+        assert _GUROBI_FEAS_TOL >= 1e-5, (
+            f'_GUROBI_FEAS_TOL must be ≥ 1e-5 to absorb the float32/64 ulp '
+            f'gap; got {_GUROBI_FEAS_TOL}')
+
+        import gurobipy as grb
+        lo = 1.4313681126
+        hi = 1.4313681126
+        c = 1.0
+        b = 1.4313692590 - 1.0
+        env = grb.Env(empty=True); env.setParam('OutputFlag', 0); env.start()
+        m = grb.Model(env=env)
+        m.setParam('FeasibilityTol', _GUROBI_FEAS_TOL)
+        x = m.addVar(lb=1.0, ub=1.0)
+        a = m.addVar(lb=lo, ub=hi)
+        m.addConstr(a == c*x + b)
+        m.optimize()
+        assert m.Status == 2, (
+            f'Expected OPTIMAL (2) at loosened FeasibilityTol={_GUROBI_FEAS_TOL}, '
+            f'got {m.Status} — fix regressed')
+        m.dispose(); env.dispose()

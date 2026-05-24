@@ -90,6 +90,14 @@ from .verify_zono_bnb import (
 )
 
 
+# Loose Gurobi feasibility tolerance for the spec MILP. Default
+# (FeasibilityTol=1e-6) is too tight against float32-zono / float64-LP
+# round-trip; isolated test with bound width 1 ulp + constraint
+# residual ~1.15e-6 → INFEAS at default, OPT at 1e-5. See block comment
+# in `_solve_spec_worker` for the metaroom unsoundness this fixes.
+_GUROBI_FEAS_TOL = 1e-5
+
+
 def _pgd_attack_general(xl, xh, spec, gg, settings,
                          restrict_disj=None, time_budget=None):
     """Thin wrapper over `vibecheck.pgd.pgd_attack_general`.
@@ -1390,6 +1398,16 @@ def _solve_spec_worker(args):
     env.start()
     m = grb.Model(env=env)
     m.setParam('Threads', n_threads)
+    # Loosen Gurobi's default FeasibilityTol (1e-6) — zono forward in
+    # float32 produces bounds tight to ~1 ulp, and the float64 LP
+    # arithmetic computes `expr + b_j` 1-3 ulp outside those bounds,
+    # which is enough to declare the model spuriously INFEASIBLE.
+    # Caught on metaroom_2023 (4cnn_ry_99_16 / spec_43): 1/10 runs
+    # returned 'verified' on a real SAT case via racing
+    # `feasibility UNSAT @ bins=0`. 1e-5 absorbs the float32→float64
+    # round-trip without loosening the relaxation in any
+    # algorithmically-meaningful way (the gap is at the precision floor).
+    m.setParam('FeasibilityTol', _GUROBI_FEAS_TOL)
 
     # Input variables
     n_input = len(x_lo)
@@ -1434,7 +1452,7 @@ def _solve_spec_worker(args):
                 b_j = float(layer['bias'][j])
 
             if lo[j] >= 0:
-                # Active: a = z
+                # Active: a = z.
                 a = m.addVar(lb=float(lo[j]), ub=float(hi[j]))
                 m.update()
                 m.addConstr(a == expr + b_j)

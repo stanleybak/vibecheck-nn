@@ -1,14 +1,8 @@
 # metaroom_2023 — VNNCOMP regular track. 100 instances across 4cnn/6cnn
 # CNN models (3×32×56 inputs → 20 classes). Tiny CNNs, mostly UNSAT.
 #
-# Disable auto-route to milp_verify. Two reasons:
-#   1. milp_verify has a *separate* latent soundness bug on these specs
-#      (4cnn_ry_99_16 / spec_43): under timing pressure the Phase 5
-#      racing 'feasibility UNSAT @ bins=0' fires incorrectly,
-#      declaring `verified` on a case with a real SAT witness (1/10
-#      runs). The bug is in the historical milp_verify pipeline's
-#      bounds-tightening cascade, not in the underlying zonotope code.
-#   2. The graph pipeline (CROWN + α-CROWN + spec MILP) closes
-#      everything correctly and is just as fast.
-auto_route_milp_for_conv: false
-input_split_enabled: false
+# No overrides needed. The historical milp_verify path was bypassed
+# during initial benchmark work because of (a) the K=0 propagate_conv
+# crash (fixed in zonotope.py) and (b) the FeasibilityTol=1e-6 vs
+# float32-zono ulp-mismatch unsoundness (fixed in verify_milp.py).
+# Both root causes are now patched; defaults handle the benchmark.

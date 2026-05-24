@@ -1303,6 +1303,20 @@ def _adaptive_spec_lb(gg, xl, xh, bounds_by_relu, spec_ew, spec_bias,
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
+        elif t in ('sigmoid', 'tanh'):
+            from .verify_zono_bnb import _sigmoid_tanh_linear_bounds
+            L = op.get('layer_idx')
+            lo_pre_np, hi_pre_np = bounds_by_relu[L]
+            lo_pre = torch.as_tensor(lo_pre_np, dtype=dtype, device=device)
+            hi_pre = torch.as_tensor(hi_pre_np, dtype=dtype, device=device)
+            lo_s, lo_t_b, up_s, up_t_b = _sigmoid_tanh_linear_bounds(
+                lo_pre, hi_pre, t)
+            ep = ew.clamp(min=0); en = ew.clamp(max=0)
+            acc += float((ep * lo_t_b).sum() + (en * up_t_b).sum())
+            ew_back = ep * lo_s + en * up_s
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
         else:
             raise NotImplementedError(
                 f'_compute_lb_direct backward: unsupported op {t!r} '
@@ -4977,10 +4991,28 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
         info['reason'] = f'ORT forward failed: {type(e).__name__}: {e}'
         return False, info
     info['out'] = out_flat
-    # spec.check returns 'unknown' iff worst margin <= 0. Apply atol slack
-    # by shifting output: pass (out-atol, out+atol) so margins computed
-    # against a generous output band — a witness near the boundary counts
-    # as a valid SAT if any output in the +/-atol envelope violates.
+    # When ANY conjunct carries per-disjunct X subranges (e.g., nn4sys
+    # lindex, acasxu prop_6), `spec.check(out)` ignores those X
+    # constraints and may report 'unknown' on a witness whose x is
+    # outside every disjunct's subbox — yielding a false SAT. Use
+    # `check_witness(x, y)` which evaluates each conjunct's full
+    # X-AND-Y unsafe region at the witness point.
+    if any(c.input_lo is not None for c in spec.disjuncts):
+        is_ce, _ = spec.check_witness(w.astype(np.float64), out_flat)
+        info['spec_check'] = 'unknown' if is_ce else 'verified'
+        if is_ce:
+            info['ok'] = True
+            return True, info
+        info['reason'] = (
+            'ORT output does not violate any disjunct '
+            "whose X-subrange contains the witness "
+            '(check_witness rejected)')
+        return False, info
+    # Default Y-only path: spec.check returns 'unknown' iff worst
+    # margin <= 0. Apply atol slack by shifting output: pass
+    # (out-atol, out+atol) so margins are computed against a generous
+    # output band — a witness near the boundary counts as a valid SAT
+    # if any output in the +/-atol envelope violates.
     check_res, check_info = spec.check(out_flat - atol, out_flat + atol)
     info['spec_check'] = check_res
     info['worst_margin'] = check_info.get('worst_margin')
