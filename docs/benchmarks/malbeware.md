@@ -1,0 +1,81 @@
+# malbeware — vibecheck benchmark record
+
+VNNCOMP 2025 regular track. 150 instances across 3 malware-image
+classifier models (64×64 grayscale → 25 classes):
+
+- `malware_malimg_family_scaled_linear-25.onnx` — pure linear (Flatten
+  + Gemm), no ReLU. 50 instances.
+- `malware_malimg_family_scaled_4-25.onnx` — 1 Conv (4 filters) +
+  ReLU + Flatten + Gemm. 50 instances.
+- `malware_malimg_family_scaled_16-25.onnx` — 1 Conv (16 filters) +
+  ReLU + Flatten + Gemm. 50 instances.
+
+Specs are pairwise-AND disjuncts over the 24 non-true classes
+(`Y_i ≥ Y_true` unsafe).
+
+## Final score (server1, 2026-05-24, RTX 3080 / 10 GB, 30 s budget)
+
+| Solver | Solved / 150 | Wall (total) | Notes |
+| --- | --- | --- | --- |
+| **vibecheck** | **150** | **~66 s** | 19 SAT + 131 UNSAT |
+| AB-CROWN (published, 2025) | 150 | ~1026 s | all verified / sat |
+
+**0 misses.** Wall: 66 s vs AB-CROWN's 1026 s — **~15× faster** at full
+coverage.
+
+## Algorithmic adds for this benchmark
+
+- **Pure-linear (no ReLU) fast path** in `_phase1_bab_refine`
+  (`verify_graph.py`) — bail early when `bounds_by_relu` is empty,
+  since there's nothing to BaB-tighten on an affine net. Pre-fix this
+  crashed with `ValueError: max() arg is an empty sequence` on all
+  50 linear-25 cases.
+- **Match AB-CROWN's full-MIP fallback**: ABC's malbeware config uses
+  `complete_verifier: mip` (single full-MIP solve on α-CROWN-tightened
+  bounds; no β-CROWN). Our Phase 8 fallback defaulted to 200 binarized
+  neurons, plateauing at LB ≈ {-0.59, -1.19} on the 4-25 eps-3 cases.
+  Raising `phase8_high_bin_count` to encode ALL unstable neurons
+  (~5k-8k binaries) lets the fallback return INFEASIBLE → verified in
+  ~5-18 s, matching ABC's wall.
+
+## Knobs (`configs/malbeware.yaml`)
+
+- `auto_route_milp_for_conv: false` — the historical `milp_verify`
+  pipeline (auto-selected for conv nets > 20 input dims) racing-
+  escalates Gurobi bins without converging on these eps-3 cases;
+  the graph pipeline (α-CROWN + spec MILP) closes everything.
+- `input_split_enabled: false` — 4096-input image is too high-dim
+  for input split BaB; disabled to keep the graph pipeline as the
+  default routing path.
+- `phase8_high_bin_count: 10000` / `phase8_high_bin_time_limit: 25.0`
+  — full-unstable MILP encoding with 25s per-query budget. The
+  4-25 eps-3 cases need ALL ~5k-8k unstable neurons binarized to
+  return INFEASIBLE; default 200 is far too small.
+
+## Reproducing a single case
+
+```bash
+.venv/bin/vibecheck \
+  --net path/to/malbeware/onnx/malware_malimg_family_scaled_16-25.onnx \
+  --spec path/to/malbeware/vnnlib/malbeware_family-Allaple.A_label-2_eps-3_idx-11.vnnlib \
+  --mode graph --timeout 30 --bits 32 \
+  --config configs/malbeware.yaml
+```
+
+## Full sweep
+
+```bash
+.venv/bin/python scratch/malbeware_smoke.py
+```
+
+## Integration test coverage
+
+`tests/integration/test_malbeware.py`:
+- `linear-25 Adialer.C idx-0` (UNSAT, ~0.5 s) — regression for the
+  pure-linear no-ReLU fast path.
+- `16-25 Allaple.A idx-11` (SAT, ~3 s) — root-PGD finds the witness.
+- `16-25 Wintrim.BX idx-119` (SAT, ~3 s) — root-PGD finds the witness.
+
+## Known unsolved cases
+
+None.

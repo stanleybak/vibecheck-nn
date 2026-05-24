@@ -3657,6 +3657,12 @@ def _phase1_bab_refine(
     os.environ['VC_TIGHTEN_WINDOW'] = str(win)
 
     # 4. Cascade.
+    # Pure-linear nets (no ReLU layers) — nothing to BaB-tighten; CROWN
+    # is already exact. Bail early.
+    if not bounds_by_relu:
+        sb = {}
+        tb['phase1_bab_refine'] = time.perf_counter() - t_total
+        return sb, bounds_by_relu, z_final_initial, tb
     max_layer = getattr(settings, 'max_tighten_layer', None)
     if max_layer is None:
         max_layer = max(bounds_by_relu.keys())

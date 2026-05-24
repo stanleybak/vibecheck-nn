@@ -1,0 +1,17 @@
+# malbeware — VNNCOMP regular track. 150 instances across 3 small
+# malware-classifier models: linear (Gemm only), 4-25 (1 Conv + 1 Gemm),
+# 16-25 (1 Conv + 1 Gemm, wider). 4096-input 64×64 images, 25 classes.
+#
+# Disable the `auto_route_milp_for_conv` shortcut — the historical
+# milp_verify path racing-escalates bins without converging on these
+# eps-3 perturbations. The graph pipeline (CROWN + α-CROWN + spec MILP)
+# closes SAT and most UNSAT in seconds.
+auto_route_milp_for_conv: false
+input_split_enabled: false
+# Push Phase 8 fallback MILP to encode ALL unstable neurons (~8k binaries)
+# with full Gurobi defaults (cuts/presolve ON). 4-25 eps-3 cases plateau
+# at 200 bins (default) but close exactly at full encoding — matches AB-CROWN's
+# `complete_verifier: mip` strategy (single full-MIP solve on
+# α-CROWN-tightened bounds; ABC solves in ~5-7 s, we solve in ~6-18 s).
+phase8_high_bin_count: 10000
+phase8_high_bin_time_limit: 25.0
