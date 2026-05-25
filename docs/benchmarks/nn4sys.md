@@ -11,7 +11,7 @@ database/networking predictors).
 
 | Solver | Solved / 194 | Wall (total) | Notes |
 | --- | --- | --- | --- |
-| **vibecheck** | **46** | **~1407 s** | 24 lindex + 22 pensieve_simple |
+| **vibecheck** | **121** | **~1449 s** | 24 lindex + 22 pensieve_simple + 75 pensieve_big_parallel |
 | AB-CROWN (published, 2025) | 194 | ~2559 s | all UNSAT |
 
 **0 WRONG** (was 22 pre-fix — see soundness fixes below).
@@ -54,6 +54,12 @@ database/networking predictors).
 - **Gather op support** (`network.py:gg-ops`, dispatches reuse Slice
   handlers): unlocks pensieve_simple models. Gather is semantically a
   flat-index selection — same handler shape as Slice.
+- **ONNX input-shape loader fix** (`onnx_loader.py`): pre-fix, dim 0
+  was unconditionally stripped as "batch dim" — broke nn4sys
+  pensieve_*_parallel models which use fixed `[12, 8]` input (no
+  batch dim). Post-fix: if all dims are concrete, keep them as-is;
+  if dim 0 is dynamic/0, strip it. Unlocked 75 pensieve_big_parallel
+  cases.
 
 ## Knobs (`configs/nn4sys.yaml`)
 
@@ -61,13 +67,16 @@ No tuning; defaults verify all currently-supported model types.
 
 ## Known unsolved
 
-- **83 pensieve_*_parallel cases**: ONNX model expects input shape
-  `[12, 8]` but vibecheck's onnx_loader picks `[1, 8]` (drops the
-  first non-batch dim incorrectly). Reshape semantics for input dim 0
-  also need work. Separate workstream from this benchmark.
-- **65 mscn_* cases**: models use Div + ReduceSum + Sigmoid (latter
-  supported); Div and ReduceSum dispatchers not implemented for
-  zonotope forward. Separate op-support workstream.
+- **8 pensieve_small_parallel cases**: Gather/Slice topology produces
+  a (1,) tensor where the next Gemm expects 6 elements. Model-specific
+  shape inference quirk; not blocking on standard architecture support.
+- **65 mscn_* cases**: each uses
+  `Div(ReduceSum(features * mask), ReduceSum(mask))` (masked mean).
+  Both Div inputs are computed (not constant initializers), so we
+  can't pre-convert to Mul-by-reciprocal. The fix path is per-disjunct:
+  within a sub-disjunct's tight X subbox the mask portion has zero
+  radius → denominator becomes a runtime scalar → Div = Mul. Requires
+  Div + ReduceSum dispatchers that read input bounds at forward time.
 
 ## Reproducing
 
@@ -86,3 +95,5 @@ No tuning; defaults verify all currently-supported model types.
   (parser unsoundness was fired by this case).
 - `pensieve_small_simple / pensieve_simple_0` (UNSAT, ~2 s) — Gather
   op support + per-disjunct.
+- `pensieve_big_parallel / pensieve_parallel_1` (UNSAT, ~2 s) —
+  fixed-shape `[12, 8]` input loader regression.

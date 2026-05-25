@@ -412,20 +412,29 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
     # dims from ONNX: first is batch (0 or dynamic), rest are data dims
     # e.g. [0, 1, 20, 20] -> (1, 1, 20, 20)
     # e.g. [0, 0, 0, 5]   -> (1, 5)  (only last dim is real data)
+    # e.g. [12, 8]        -> (12, 8)  (no batch dim — both dims are data)
     dims = graph._raw_input_dims
     is_concrete = [isinstance(d, int) and d > 0 for d in dims]
-    # Find where the concrete (non-dynamic) dims start after the batch dim
-    first_data = 1  # skip dim 0 (batch)
-    while first_data < len(dims) and not is_concrete[first_data]:
-        first_data += 1
-    if first_data >= len(dims):
-        # All dims dynamic except maybe last — treat as flat
-        last_val = dims[-1] if isinstance(dims[-1], int) and dims[-1] > 0 else 1
-        graph.input_shape = (1, last_val)
+    if all(is_concrete):
+        # Every dim is concrete — no batch dim to strip. Use as-is.
+        # nn4sys pensieve_*_parallel uses fixed input shape [12, 8]
+        # (no batch dim); pre-fix the loader incorrectly stripped dim 0
+        # and produced (1, 8), breaking downstream propagate_fc.
+        graph.input_shape = tuple(dims)
     else:
-        resolved = [1] + [d if isinstance(d, int) and d > 0 else 1
-                          for d in dims[first_data:]]
-        graph.input_shape = tuple(resolved)
+        # Standard case: dim 0 is dynamic batch (or 0). Replace with 1
+        # and find first concrete data dim.
+        first_data = 1
+        while first_data < len(dims) and not is_concrete[first_data]:
+            first_data += 1
+        if first_data >= len(dims):
+            # All dims dynamic except maybe last — treat as flat
+            last_val = dims[-1] if isinstance(dims[-1], int) and dims[-1] > 0 else 1
+            graph.input_shape = (1, last_val)
+        else:
+            resolved = [1] + [d if isinstance(d, int) and d > 0 else 1
+                              for d in dims[first_data:]]
+            graph.input_shape = tuple(resolved)
 
     graph.topological_sort()
     _infer_shapes(graph)
