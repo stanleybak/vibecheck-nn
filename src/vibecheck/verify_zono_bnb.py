@@ -442,6 +442,25 @@ def _sigmoid_tanh_linear_bounds(lo, hi, act_kind, n_iter=30):
             torch.where(is_concave, tang_mid_s, up_s_mixed))
     up_t = torch.where(is_convex, chord_b,
             torch.where(is_concave, tang_mid_b, up_t_mixed))
+    # ABC-style direct-chord fallback in mixed case (matches their
+    # bound_relax_impl in tanh.py:270): when k_direct < dfunc(lower),
+    # the chord from (lower, f(lower)) to (upper, f(upper)) is itself
+    # below the curve on the convex half (and thus a valid LB on the
+    # whole interval — chord at extremes equals f, between extremes
+    # chord stays below curve in convex half, and below the linear UB
+    # in the concave half). Similarly chord is valid UB when
+    # k_direct < dfunc(upper). For mixed leaves where this triggers,
+    # the chord is much tighter than the tangent-from-endpoint
+    # (verified on mscn_2048d_dual_240 leaf 5: sigmoid input
+    # [-2.99, 0.32], chord_slope=0.160 < dfunc(0.32)=0.244 → use chord
+    # for UB; our tangent path gave looser UB).
+    mixed = ~is_convex & ~is_concave
+    chord_lb_ok = mixed & (chord_slope < dact(lo))
+    chord_ub_ok = mixed & (chord_slope < dact(hi))
+    lo_s = torch.where(chord_lb_ok, chord_slope, lo_s)
+    lo_t = torch.where(chord_lb_ok, chord_b, lo_t)
+    up_s = torch.where(chord_ub_ok, chord_slope, up_s)
+    up_t = torch.where(chord_ub_ok, chord_b, up_t)
     return lo_s, lo_t, up_s, up_t
 
 
