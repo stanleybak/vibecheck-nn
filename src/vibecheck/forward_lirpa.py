@@ -340,7 +340,6 @@ def _batched_eval_box(A_lo, b_lo, A_up, b_up, xl_b, xh_b):
     """
     A_lo_pos = A_lo.clamp(min=0); A_lo_neg = A_lo.clamp(max=0)
     A_up_pos = A_up.clamp(min=0); A_up_neg = A_up.clamp(max=0)
-    # (B, n_out, n_in) @ (B, n_in, 1) → (B, n_out, 1) → squeeze.
     xl_e = xl_b.unsqueeze(-1); xh_e = xh_b.unsqueeze(-1)
     out_lo = (A_lo_pos @ xl_e + A_lo_neg @ xh_e).squeeze(-1) + b_lo
     out_hi = (A_up_pos @ xh_e + A_up_neg @ xl_e).squeeze(-1) + b_up
@@ -384,10 +383,53 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
     # The final output op MUST be kept (caller uses it).
     last_name = gg['ops'][-1]['name']
     refcount[last_name] = max(refcount.get(last_name, 0), 1)
-    # Initial: y = x → A_lo = A_up = identity, b = 0 (per batch).
-    A_id = torch.eye(n_in, dtype=dtype, device=device).unsqueeze(0).expand(
-        B, -1, -1).contiguous()
+    # When free_states=True, ALSO capture (lo_box, hi_box) at ops
+    # consumed by ReLU/sigmoid/tanh (their pre-activations) and
+    # bilinear inputs. Backward CROWN needs these intermediate
+    # intervals; the full A matrices can be freed after consumption.
+    # Stash them on a function attribute so callers can read after
+    # the call (mirrors how forward_zonotope returns last_bilinear_op_bounds).
+    interm_needed = set()
+    for op in gg['ops']:
+        if op['type'] in ('relu', 'sigmoid', 'tanh') and op['inputs']:
+            interm_needed.add(op['inputs'][0])
+        if op['type'] in ('mul_bilinear', 'div_bilinear'):
+            for inp in op['inputs']:
+                interm_needed.add(inp)
+    interm_box = {}  # op_name -> (lo_box, hi_box)
+    # Initial: y = x. Standard CROWN form would use identity A of shape
+    # (n_in, n_in) but we can compress to (n_in, K) where K is the
+    # number of input dims with non-zero radius across the batch — the
+    # constant dims contribute zero rows in any A coefficient that ever
+    # gets multiplied through downstream ops, but they keep showing up
+    # in our memory. Dropping them is exact (they multiply x by 0 in
+    # `_batched_eval_box`). For mscn cardinality with 1-2 varying dims
+    # out of 308 this shrinks per-leaf A by 150×.
+    radii = (xh_b - xl_b) / 2
+    varying_mask = (radii.abs().max(dim=0).values > 0)  # (n_in,)
+    K = int(varying_mask.sum())
+    if K == n_in or K == 0:
+        # No compression possible / nothing to do.
+        A_id = torch.eye(n_in, dtype=dtype, device=device).unsqueeze(0).expand(
+            B, -1, -1).contiguous()
+    else:
+        var_idx = varying_mask.nonzero(as_tuple=True)[0]  # (K,)
+        # Build (B, n_in, K) sparse identity: column k is e_{var_idx[k]}
+        A_id = torch.zeros(B, n_in, K, dtype=dtype, device=device)
+        A_id[:, var_idx, torch.arange(K, device=device)] = 1.0
     b_zero = torch.zeros(B, n_in, dtype=dtype, device=device)
+    # When K < n_in, b_zero holds the CONSTANT part (= x_lo[constant_dim]).
+    # Specifically, since x = b_const + A @ z where z lives in the K-dim
+    # subspace, the constant offset is the constant-dim values of x_lo.
+    if K < n_in:
+        const_mask = ~varying_mask
+        b_zero = b_zero + (xl_b * const_mask.to(dtype))  # (B, n_in)
+        # Compressed input-box subspace (K-dim).
+        xl_eval = xl_b[:, varying_mask].contiguous()
+        xh_eval = xh_b[:, varying_mask].contiguous()
+    else:
+        xl_eval = xl_b
+        xh_eval = xh_b
     state = {gg['input_name']: _BBound(
         A_id, b_zero, A_id.clone(), b_zero.clone(), xl_b.clone(), xh_b.clone())}
     def _maybe_free(op_input_names):
@@ -396,6 +438,9 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
         for inp in op_input_names:
             refcount[inp] -= 1
             if refcount[inp] <= 0 and inp in state:
+                if inp in interm_needed:
+                    bd = state[inp]
+                    interm_box[inp] = (bd.lo_box.clone(), bd.hi_box.clone())
                 del state[inp]
     for op in gg['ops']:
         name = op['name']; t = op['type']; ins = op['inputs']
@@ -410,7 +455,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             A_up_o = bound_in.A_up.index_select(1, idx_t)
             b_up_o = bound_in.b_up.index_select(1, idx_t)
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'concat':
             bounds = [state[i] for i in ins]
@@ -419,7 +464,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             A_up_o = torch.cat([b.A_up for b in bounds], dim=1)
             b_up_o = torch.cat([b.b_up for b in bounds], dim=1)
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'fc':
             W = op['W'].to(device=device, dtype=dtype)
@@ -463,7 +508,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 b_up_o = (bound_in.b_up @ W_pos.T + bound_in.b_lo @ W_neg.T
                           + bias)
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'relu':
             lo = bound_in.lo_box; hi = bound_in.hi_box  # (B, n)
@@ -487,7 +532,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             A_up_o = ub_slope.unsqueeze(-1) * bound_in.A_up
             b_up_o = ub_slope * bound_in.b_up + ub_int_v
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'pow':
             lo = bound_in.lo_box; hi = bound_in.hi_box
@@ -510,7 +555,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             A_up_o = ub_slope.unsqueeze(-1) * bound_in.A_up
             b_up_o = ub_slope * bound_in.b_up + ub_int
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'reduce_sum':
             in_shape_nd = op.get('in_shapes_nd', [None])[0]
@@ -533,7 +578,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             A_up_o = A_up_nd.reshape(B, -1, n_input_orig)
             b_up_o = b_up_nd.reshape(B, -1)
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'sub_bilinear':
             bound_a = state[ins[0]]; bound_b = state[ins[1]]
@@ -542,7 +587,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             A_up_o = bound_a.A_up - bound_b.A_lo
             b_up_o = bound_a.b_up - bound_b.b_lo
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'sub':
             bias = op.get('bias')
@@ -557,7 +602,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 A_lo_o, b_lo_o = bound_in.A_lo, bound_in.b_lo
                 A_up_o, b_up_o = bound_in.A_up, bound_in.b_up
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'add':
             if op.get('is_merge'):
@@ -588,7 +633,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                     A_lo_o, b_lo_o = bound_in.A_lo, bound_in.b_lo
                     A_up_o, b_up_o = bound_in.A_up, bound_in.b_up
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t in ('sigmoid', 'tanh'):
             from .verify_zono_bnb import _sigmoid_tanh_linear_bounds
@@ -599,7 +644,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             A_up_o = up_s.unsqueeze(-1) * bound_in.A_up
             b_up_o = up_s * bound_in.b_up + up_t
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'mul_bilinear':
             bound_a = state[ins[0]]; bound_b = state[ins[1]]
@@ -690,7 +735,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                           + beta_u.clamp(min=0) * b_up_b_o
                           + gamma_u)
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'div_bilinear':
             from .verify_zono_bnb import (
@@ -741,7 +786,7 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 b_lo_o = inv_b_const.clamp(min=0) * b_lo_a_o + inv_b_const.clamp(max=0) * b_up_a_o
                 b_up_o = inv_b_const.clamp(min=0) * b_up_a_o + inv_b_const.clamp(max=0) * b_lo_a_o
                 lo_box, hi_box = _batched_eval_box(
-                    A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                    A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
                 state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
                 _maybe_free(ins)
                 continue
@@ -780,13 +825,24 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                       + cb_ub_pos * b_up_b_o + cb_ub_neg * b_lo_b_o
                       + const_ub_div)
             lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         else:
             raise NotImplementedError(
                 f'batched_forward_linear_bounds: unsupported op {t!r}')
         # Free input states once refcount hits zero (streaming mode).
         _maybe_free(ins)
+    # Capture any intermediates that are needed but never had their
+    # refcount hit zero (final-layer outputs in the chain).
+    if free_states:
+        for nm in interm_needed:
+            if nm not in interm_box and nm in state:
+                bd = state[nm]
+                interm_box[nm] = (bd.lo_box.clone(), bd.hi_box.clone())
+    # Expose via function attribute so callers can read the
+    # intermediate (lo_box, hi_box) needed by backward CROWN without a
+    # signature change (existing callers ignore the attribute).
+    batched_forward_linear_bounds.last_interm_box = interm_box
     return state
 
 
