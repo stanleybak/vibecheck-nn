@@ -164,7 +164,7 @@ def test_gather_flat():
     """Gather specific indices from flat vector"""
     node = GatherNode(name='g', op_type='Gather', inputs=['input'],
                       params={'indices': np.array([4, 1, 0])})
-    g = _make_graph([node], input_shape=(1, 5))
+    g = _make_graph([node], input_shape=(5,))
     assert node.output_shape == (3,)
 
     data = np.array([10, 20, 30, 40, 50], dtype=float)

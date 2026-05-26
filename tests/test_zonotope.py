@@ -745,3 +745,127 @@ def test_torch_zonotope_add_Ka_equals_shared_Kb_equals_shared():
     assert merged is z_a
 
 
+
+
+# ---------------------------------------------------------------------------
+# Bilinear ops with one point side, and ReduceSum (linear).
+#
+# Targets nn4sys mscn_* models which encode masked mean as:
+#   y = ReduceSum(features * mask) / ReduceSum(mask)
+# where features vary with the input and mask is constant per-disjunct
+# (the per-disjunct X-subbox has zero radius on the mask positions).
+# When mask is a point zonotope (lo == hi), Mul-by-mask and Div-by-
+# ReduceSum(mask) are linear scales; full bilinear support isn't needed.
+# These tests pin both the supported (point-side) and unsupported
+# (both-varying) cases so the unsupported case raises rather than
+# silently producing unsound bounds.
+# ---------------------------------------------------------------------------
+
+
+def test_torch_zono_reduce_sum_axis1():
+    """ReduceSum along axis=1 of a (3, 4) zonotope is linear: center sums
+    along axis=1 and generators sum along axis=1."""
+    from vibecheck.verify_zono_bnb import (
+        _forward_zonotope_graph, TorchZonotope as TZ)
+    # Build a synthetic 2D zonotope by hand.
+    # 3 rows × 4 cols, 2 gens (vary input by ±1 in 2 ways)
+    n = 3 * 4
+    center = torch.arange(n, dtype=torch.float64).reshape(3, 4).flatten()
+    gens = torch.randn(n, 2, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
+    z = TZ(center.clone(), gens.clone())
+
+    # Manually ReduceSum along axis=1 (the cols axis) of the (3, 4) tensor:
+    # output shape (3,), output[i] = sum_j (center[i, j] + gens[i, j, k] * e_k).
+    # Center: row sums = sum of input over cols.
+    expected_center = center.reshape(3, 4).sum(dim=1)
+    # Generators: sum over the same axis.
+    expected_gens = gens.reshape(3, 4, 2).sum(dim=1)
+
+    # The handler we'll implement should compute these.
+    from vibecheck.zonotope import _torch_zono_reduce_sum
+    c_out, g_out = _torch_zono_reduce_sum(
+        center, gens, in_shape_nd=(3, 4), axes=(1,), keepdims=False)
+    torch.testing.assert_close(c_out, expected_center)
+    torch.testing.assert_close(g_out, expected_gens)
+
+
+def test_torch_zono_mul_bilinear_with_point_b():
+    """Mul(a, b) where b is a point zonotope (zero-radius gens) reduces
+    to element-wise scaling: c_out = c_a * c_b, g_out = g_a * c_b."""
+    from vibecheck.zonotope import _torch_zono_mul_bilinear
+    n = 5
+    c_a = torch.randn(n, dtype=torch.float64, generator=torch.Generator().manual_seed(1))
+    g_a = torch.randn(n, 3, dtype=torch.float64, generator=torch.Generator().manual_seed(2))
+    c_b = torch.tensor([2.0, -1.5, 0.0, 3.0, 1.0], dtype=torch.float64)
+    g_b = torch.zeros(n, 3, dtype=torch.float64)  # point: zero gens
+    c_out, g_out = _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b)
+    torch.testing.assert_close(c_out, c_a * c_b)
+    torch.testing.assert_close(g_out, g_a * c_b.unsqueeze(-1))
+
+
+def test_torch_zono_mul_bilinear_with_point_a():
+    """Mul(a, b) where a is point: symmetric — scale b by a's center."""
+    from vibecheck.zonotope import _torch_zono_mul_bilinear
+    n = 5
+    c_a = torch.tensor([2.0, -1.5, 0.0, 3.0, 1.0], dtype=torch.float64)
+    g_a = torch.zeros(n, 3, dtype=torch.float64)
+    c_b = torch.randn(n, dtype=torch.float64, generator=torch.Generator().manual_seed(3))
+    g_b = torch.randn(n, 3, dtype=torch.float64, generator=torch.Generator().manual_seed(4))
+    c_out, g_out = _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b)
+    torch.testing.assert_close(c_out, c_a * c_b)
+    torch.testing.assert_close(g_out, g_b * c_a.unsqueeze(-1))
+
+
+def test_torch_zono_mul_bilinear_both_varying_raises():
+    """Mul where BOTH sides have nonzero radius is bilinear (nonlinear).
+    We don't approximate it — raise NotImplementedError. Silent zonotope
+    propagation would over-/under-estimate the product's range."""
+    from vibecheck.zonotope import _torch_zono_mul_bilinear
+    n = 3
+    c_a = torch.randn(n, dtype=torch.float64)
+    g_a = torch.randn(n, 2, dtype=torch.float64)
+    c_b = torch.randn(n, dtype=torch.float64)
+    g_b = torch.randn(n, 2, dtype=torch.float64)
+    with pytest.raises(NotImplementedError, match='bilinear'):
+        _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b)
+
+
+def test_torch_zono_div_bilinear_point_denom():
+    """Div(a, b) where b is point: linear scale by 1/c_b. Tests both
+    integer and float denominators."""
+    from vibecheck.zonotope import _torch_zono_div_bilinear
+    n = 4
+    c_a = torch.tensor([10.0, 6.0, -8.0, 12.0], dtype=torch.float64)
+    g_a = torch.tensor([[1.0, 0.0], [0.5, -1.0], [2.0, 1.0], [0.0, 0.5]],
+                        dtype=torch.float64)
+    c_b = torch.tensor([2.0, 3.0, 4.0, -6.0], dtype=torch.float64)
+    g_b = torch.zeros(n, 2, dtype=torch.float64)
+    c_out, g_out = _torch_zono_div_bilinear(c_a, g_a, c_b, g_b)
+    torch.testing.assert_close(c_out, c_a / c_b)
+    torch.testing.assert_close(g_out, g_a / c_b.unsqueeze(-1))
+
+
+def test_torch_zono_div_bilinear_nonpoint_denom_raises():
+    """Div with non-point denominator is genuinely nonlinear (1/x is
+    not affine in x). Must raise."""
+    from vibecheck.zonotope import _torch_zono_div_bilinear
+    n = 3
+    c_a = torch.randn(n, dtype=torch.float64)
+    g_a = torch.randn(n, 2, dtype=torch.float64)
+    c_b = torch.tensor([5.0, 5.0, 5.0], dtype=torch.float64)
+    g_b = torch.tensor([[0.1, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                        dtype=torch.float64)  # element 0 varies
+    with pytest.raises(NotImplementedError, match='non-point denominator'):
+        _torch_zono_div_bilinear(c_a, g_a, c_b, g_b)
+
+
+def test_torch_zono_div_bilinear_zero_denom_raises():
+    """Div by 0 (even if it's a 'point' 0) is undefined — must raise."""
+    from vibecheck.zonotope import _torch_zono_div_bilinear
+    n = 3
+    c_a = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
+    g_a = torch.zeros(n, 1, dtype=torch.float64)
+    c_b = torch.tensor([1.0, 0.0, 2.0], dtype=torch.float64)
+    g_b = torch.zeros(n, 1, dtype=torch.float64)
+    with pytest.raises((ZeroDivisionError, ValueError, RuntimeError)):
+        _torch_zono_div_bilinear(c_a, g_a, c_b, g_b)

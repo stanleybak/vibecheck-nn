@@ -671,3 +671,433 @@ class DenseZonotope:
             self.center + other.center,
             np.hstack([g_shared, g_self_extra, g_other_extra]),
         )
+
+
+# ---------------------------------------------------------------------------
+# Bilinear ops with one point side, and ReduceSum (linear).
+#
+# Used by nn4sys mscn_* models: masked mean encoded as
+#   Div(ReduceSum(features * mask), ReduceSum(mask))
+# where features vary with the input and mask is constant per-disjunct.
+# The dispatch site in `_forward_zonotope_graph` calls these helpers
+# after detecting whether the bilinear's other side is a point zonotope
+# (zero-radius generators); both-varying raises NotImplementedError
+# rather than silently propagating an unsound bound.
+# ---------------------------------------------------------------------------
+
+
+def _torch_zono_reduce_sum(center, gens, in_shape_nd, axes, keepdims):
+    """Linear ReduceSum on a flat (n,) center + (n, K) gens, reshaped
+    to `in_shape_nd` for axis indexing.
+
+    Returns (center_out, gens_out) — both flat per the same convention
+    as the rest of TorchZonotope's API (`(n_out,)` and `(n_out, K)`).
+
+    ReduceSum is purely linear: summing across an axis sums centers and
+    generators identically. The result's flat layout is the post-reduce
+    nd-shape flattened in C order.
+    """
+    K = gens.shape[1] if gens.numel() > 0 else 0
+    c_nd = center.reshape(*in_shape_nd)
+    if K > 0:
+        g_nd = gens.reshape(*in_shape_nd, K)
+    for ax in sorted(axes, reverse=True):
+        c_nd = c_nd.sum(dim=ax, keepdim=bool(keepdims))
+        if K > 0:
+            g_nd = g_nd.sum(dim=ax, keepdim=bool(keepdims))
+    c_out = c_nd.flatten() if not keepdims else c_nd.reshape(-1)
+    if K > 0:
+        g_out = g_nd.reshape(-1, K)
+    else:
+        g_out = gens.new_zeros(c_out.numel(), 0)
+    return c_out, g_out
+
+
+def _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b,
+                              shape_a=None, shape_b=None, shape_out=None):
+    """Element-wise Mul(a, b) where one side is a point zonotope
+    (zero generators). Supports ND broadcasting via optional shapes.
+
+    If both sides have nonzero gens, raises NotImplementedError — the
+    product is bilinear (nonlinear) in the noise vars and cannot be
+    represented exactly as a zonotope without a sound over-approximation.
+    """
+    a_is_point = (g_a.numel() == 0
+                  or bool(g_a.abs().max() < 1e-12))
+    b_is_point = (g_b.numel() == 0
+                  or bool(g_b.abs().max() < 1e-12))
+    if not (a_is_point or b_is_point):
+        raise NotImplementedError(
+            'mul_bilinear: both sides have nonzero generator radius; '
+            'no sound zonotope encoding without explicit over-approximation. '
+            'For mscn-style models, ensure the mask side has zero radius '
+            '(per-disjunct subbox), or add a McCormick / box '
+            'over-approximation.')
+
+    if shape_a is None and shape_b is None:
+        # Plain element-wise (same shape both sides).
+        if a_is_point and b_is_point:
+            return c_a * c_b, c_a.new_zeros(c_a.numel(), 0)
+        if b_is_point:
+            return c_a * c_b, g_a * c_b.unsqueeze(-1)
+        return c_a * c_b, g_b * c_a.unsqueeze(-1)
+
+    # Broadcasting path: reshape to nd, multiply.
+    K = max(g_a.shape[1] if g_a.numel() > 0 else 0,
+             g_b.shape[1] if g_b.numel() > 0 else 0)
+    a_nd = c_a.reshape(*shape_a)
+    b_nd = c_b.reshape(*shape_b)
+    c_out_nd = a_nd * b_nd
+    out_shape = shape_out if shape_out is not None else c_out_nd.shape
+    c_out = c_out_nd.reshape(-1)
+    if a_is_point and b_is_point:
+        return c_out, c_out.new_zeros(c_out.numel(), 0)
+    if b_is_point:
+        if g_a.numel() == 0:
+            return c_out, c_out.new_zeros(c_out.numel(), 0)
+        g_a_nd = g_a.reshape(*shape_a, K)
+        g_out_nd = (g_a_nd * b_nd.unsqueeze(-1)).expand(*out_shape, K)
+        return c_out, g_out_nd.contiguous().reshape(-1, K)
+    # a is point
+    if g_b.numel() == 0:
+        return c_out, c_out.new_zeros(c_out.numel(), 0)
+    g_b_nd = g_b.reshape(*shape_b, K)
+    g_out_nd = (g_b_nd * a_nd.unsqueeze(-1)).expand(*out_shape, K)
+    return c_out, g_out_nd.contiguous().reshape(-1, K)
+
+
+def _torch_zono_div_scalar_b(c_a, g_a, c_b, g_b):
+    """Div(a_vector, b_scalar) — preserves a-correlations + a↔b shared eps.
+
+    Encoding (b sign-stable, scalar shape):
+      1) Linearize v = 1/b on [b_lo, b_hi] via chord-tangent parallelogram:
+           v = lam·b + mu + gamma·eps_v   (eps_v ∈ [-1, 1])
+         For b>0: 1/b convex decreasing → chord (UB) parallel to tangent
+         at b* = 1/sqrt(|lam|).
+      2) Bilinear y_i = a_i · v as a sound zonotope:
+           c_y_i = c_a_i · c_v
+           g_y_i[k] = c_a_i · (lam·g_b[0,k]) + c_v · g_a_i[k]   (shared cols)
+           g_y_i[K_v] = c_a_i · gamma                            (new eps_v col)
+           g_y_i[K+1+i] = rad_a_i · (|lam|·rad_b + gamma)        (per-i remainder)
+
+    Preserves a_i ↔ a_j correlation (via shared linear gens) AND a ↔ b
+    correlation (via lam·g_b sharing columns with g_a). Strictly tighter
+    than the 4-corner decorrelated `_torch_zono_div_bilinear` fallback when
+    b is scalar.
+    """
+    import torch
+    assert c_b.numel() == 1, (
+        f'_torch_zono_div_scalar_b expects scalar b, got {c_b.shape}')
+    K_a = g_a.shape[1] if g_a.numel() > 0 else 0
+    K_b = g_b.shape[1] if g_b.numel() > 0 else 0
+    K = max(K_a, K_b)
+    n = c_a.numel()
+    # Pad gens to common K (gens are eps-index-aligned by construction).
+    if K_a < K:
+        g_a = torch.cat([g_a, g_a.new_zeros(n, K - K_a)], dim=1)
+    if K_b < K:
+        g_b = torch.cat([g_b, g_b.new_zeros(1, K - K_b)], dim=1)
+    rad_a = g_a.abs().sum(dim=1) if K > 0 else torch.zeros_like(c_a)
+    rad_b_s = (g_b.abs().sum(dim=1) if K > 0
+               else torch.zeros_like(c_b)).reshape(-1)[0]
+    c_b_s = c_b.reshape(-1)[0]
+    b_lo = c_b_s - rad_b_s
+    b_hi = c_b_s + rad_b_s
+    if not (bool((b_lo > 0).item()) or bool((b_hi < 0).item())):
+        raise ZeroDivisionError(
+            'div_scalar_b: denominator not sign-stable')
+    # Chord-tangent for 1/b on [b_lo, b_hi].
+    f_lo = 1.0 / b_lo
+    f_hi = 1.0 / b_hi
+    diff_b = (b_hi - b_lo).clamp(min=1e-30)
+    lam = (f_hi - f_lo) / diff_b  # negative (1/b is decreasing on sign-stable)
+    # b* with f'(b*) = lam.  f'(b) = -1/b^2  → b* = ±1/sqrt(|lam|).
+    bstar_mag = 1.0 / lam.abs().clamp(min=1e-30).sqrt()
+    bstar = torch.where(b_hi < 0, -bstar_mag, bstar_mag)
+    bstar = torch.maximum(torch.minimum(bstar, b_hi), b_lo)
+    f_star = 1.0 / bstar
+    chord_intercept = f_lo - lam * b_lo
+    tan_intercept = f_star - lam * bstar
+    mu = (chord_intercept + tan_intercept) / 2
+    gamma = (chord_intercept - tan_intercept).abs() / 2
+    c_v_s = lam * c_b_s + mu  # scalar 1/b center
+    # Linear gens for y:
+    if K > 0:
+        # g_v_row = lam · g_b, shape (1, K) → broadcast to (n, K) per i.
+        g_y_lin = c_a.unsqueeze(-1) * (lam * g_b) + c_v_s * g_a  # (n, K)
+    else:
+        g_y_lin = g_a.new_zeros(n, 0)
+    g_y_slack_v = (c_a * gamma).unsqueeze(-1)  # (n, 1)  shared eps_v col
+    quad_mag = rad_a * (lam.abs() * rad_b_s + gamma)  # (n,)
+    g_y_quad = torch.diag(quad_mag)  # (n, n)
+    c_y = c_a * c_v_s
+    g_y = torch.cat([g_y_lin, g_y_slack_v, g_y_quad], dim=1)
+    # Sound structural tightening for SOFTMAX-LIKE pattern:
+    #   b = sum(a) exactly (same gens, b's center = sum of a's centers).
+    # AND a element-wise non-negative.
+    # Then y_i = a_i / sum(a) satisfies y_i ∈ [0, 1] and sum_i y_i = 1.
+    # We intersect the encoded y range with [0, 1] per element. For
+    # pensieve-style Pow→ReduceSum→Div the Y range collapses from
+    # O(magnitude of weights × box width) to O(1), often closing leaves
+    # that otherwise stay below 0.
+    #
+    # Detection: check `c_b ≈ sum(c_a)` AND `g_b ≈ sum(g_a, axis=0)`
+    # (b = ReduceSum(a) in zono-arithmetic terms). Soundness depends on
+    # this exact identity; the check uses a tight tolerance.
+    a_lo = c_a - rad_a
+    g_a_sum = (g_a.sum(dim=0, keepdim=True) if K > 0
+               else g_a.new_zeros(1, 0))
+    is_softmax = (
+        bool((a_lo >= -1e-9).all())
+        and bool((c_b_s - c_a.sum()).abs() < 1e-6 * c_b_s.abs().clamp(min=1.0))
+        and (K == 0 or bool((g_b - g_a_sum).abs().max()
+                            < 1e-6 * g_b.abs().max().clamp(min=1.0))))
+    if is_softmax:
+        y_lo_enc = c_y - g_y.abs().sum(dim=1)
+        y_hi_enc = c_y + g_y.abs().sum(dim=1)
+        y_lo_c = torch.maximum(y_lo_enc, torch.zeros_like(c_y))
+        y_hi_c = torch.minimum(y_hi_enc, torch.ones_like(c_y))
+        # Only intersect when current encoding is LOOSER than [0, 1].
+        needs_tighten = ((y_lo_enc < y_lo_c - 1e-12)
+                         | (y_hi_enc > y_hi_c + 1e-12))
+        if bool(needs_tighten.any()):
+            # Per-element shrink: keep gens for elements not needing
+            # tighten; for tight-needed elements, re-encode as
+            # decorrelated box [y_lo_c, y_hi_c]. Mixed encoding:
+            # `g_y_keep` retains existing gens for non-tight elements,
+            # `g_y_box` adds n new diag cols for tight elements.
+            # Drop old gens for tight elements (set their row to 0).
+            tight_mask = needs_tighten  # (n,)
+            keep_mask = ~tight_mask
+            # Zero out existing gen rows for tight elements.
+            g_y_keep = g_y.clone()
+            g_y_keep[tight_mask] = 0
+            # Tight elements get new diagonal gens of magnitude
+            # (y_hi_c - y_lo_c) / 2.
+            new_rad = (y_hi_c - y_lo_c) / 2
+            new_center = (y_lo_c + y_hi_c) / 2
+            n_y = c_y.numel()
+            # Replace center for tight elements.
+            c_y = torch.where(tight_mask, new_center, c_y)
+            # Add diag gens for tight elements (zeros for keep).
+            new_diag = torch.zeros(n_y, n_y, dtype=g_y.dtype,
+                                    device=g_y.device)
+            idx_t = torch.arange(n_y, device=g_y.device)
+            new_diag[idx_t, idx_t] = torch.where(
+                tight_mask, new_rad, torch.zeros_like(new_rad))
+            g_y = torch.cat([g_y_keep, new_diag], dim=1)
+    return c_y, g_y
+
+
+def _torch_zono_div_bilinear(c_a, g_a, c_b, g_b, fallback='raise',
+                              prefer_shared_when_scalar_b=True):
+    """Element-wise Div(a, b). Four regimes:
+
+    1) `b` is a point zonotope (zero radius): exact linear pass —
+       `(c_a / c_b, g_a / c_b)`. Always applied when applicable.
+    2) `b` is scalar (1 element) AND `prefer_shared_when_scalar_b`:
+       use `_torch_zono_div_scalar_b` (preserves correlations).
+    3) `b` is non-point but sign-stable AND `fallback='box'`: sound
+       box-bound encoding using 4-corner enclosure of `a * (1/b)`,
+       returning a decorrelated zonotope (new error gen per element).
+       Looser than (2) when applicable; used for vector-b cases.
+    4) Otherwise: `NotImplementedError`.
+    """
+    b_is_point = (g_b.numel() == 0
+                  or bool(g_b.abs().max() < 1e-12))
+    if b_is_point:
+        if bool((c_b == 0).any()):
+            raise ZeroDivisionError(
+                'div_bilinear: denominator has a zero element')
+        inv = c_b.reciprocal()
+        if g_a.numel() == 0:
+            return c_a * inv, g_a.new_zeros(c_a.numel(), 0)
+        return c_a * inv, g_a * inv.unsqueeze(-1)
+    if prefer_shared_when_scalar_b and c_b.numel() == 1:
+        return _torch_zono_div_scalar_b(c_a, g_a, c_b, g_b)
+    if fallback != 'box':
+        raise NotImplementedError(
+            'div_bilinear: non-point denominator. 1/x is nonlinear; no '
+            'sound zonotope encoding without explicit handling. '
+            "Pass fallback='box' for a sound decorrelated bound when "
+            'the denominator is sign-stable.')
+    import torch
+    K_a = g_a.shape[1] if g_a.numel() > 0 else 0
+    rad_a = g_a.abs().sum(dim=1) if K_a > 0 else torch.zeros_like(c_a)
+    rad_b = g_b.abs().sum(dim=1)
+    a_lo = c_a - rad_a; a_hi = c_a + rad_a
+    b_lo = c_b - rad_b; b_hi = c_b + rad_b
+    if not (bool((b_lo > 0).all()) or bool((b_hi < 0).all())):
+        raise ZeroDivisionError(
+            'div_bilinear box-fallback: denominator not sign-stable '
+            '(range crosses zero). 1/b unbounded.')
+    # For all-positive AND all-negative b alike, 1/b on [b_lo, b_hi]
+    # has range [1/b_hi, 1/b_lo].
+    inv_lo = 1.0 / b_hi
+    inv_hi = 1.0 / b_lo
+    corners = torch.stack([
+        a_lo * inv_lo, a_lo * inv_hi, a_hi * inv_lo, a_hi * inv_hi,
+    ])
+    out_lo = corners.min(dim=0).values
+    out_hi = corners.max(dim=0).values
+    c_out = (out_lo + out_hi) / 2
+    rad_out = (out_hi - out_lo) / 2
+    n = c_out.numel()
+    new_eye = torch.diag(rad_out)
+    return c_out, new_eye
+
+
+def _torch_zono_pow_int(c_in, g_in, exponent, relaxation='chord'):
+    """Element-wise x^p for integer p >= 2 as a sound zonotope.
+
+    Returns (c_out, g_out). Two relaxation modes:
+
+    - `relaxation='chord'` (default): chord-tangent parallelogram per
+      element. For each i where [lo_i, hi_i] has a uniform-curvature
+      regime (lo_i >= 0 always; or lo_i, hi_i same sign and odd p),
+      use the chord slope λ_i = (hi_i^p - lo_i^p)/(hi_i - lo_i) and
+      sandwich the curve between chord and tangent at the interior
+      extremum. The output zonotope preserves x-y correlation through
+      the λ slope; a single new gen per element carries the chord-tangent
+      half-gap as slack. For mixed-curvature intervals (0 strictly
+      inside [lo, hi] and even/odd cases that defy uniform chord),
+      fall back to box-decorrelated for that element.
+
+    - `relaxation='box'`: box-decorrelated encoding (no x-y correlation
+      preserved). Sound, simpler, but loose.
+
+    Soundness is the invariant in all paths.
+    """
+    import torch
+    p = int(exponent)
+    assert p == exponent, (
+        f'_torch_zono_pow_int requires integer exponent, got {exponent}')
+    assert p >= 2, f'_torch_zono_pow_int requires p >= 2, got {p}'
+    K = g_in.shape[1] if g_in.numel() > 0 else 0
+    rad_in = g_in.abs().sum(dim=1) if K > 0 else torch.zeros_like(c_in)
+    lo = c_in - rad_in
+    hi = c_in + rad_in
+    n = c_in.numel()
+    if relaxation == 'box':
+        return _pow_int_box(c_in, g_in, p, lo, hi, K)
+    # Chord-tangent path. For each element decide:
+    #   uniform_convex: convex on [lo, hi] AND f differentiable inside
+    #   - lo >= 0 (any p >= 2)
+    #   - hi <= 0 AND p even (convex for x < 0 too)
+    #   uniform_concave: concave on [lo, hi]
+    #   - hi <= 0 AND p odd (f = x^p concave on x < 0, since f'' = p(p-1)x^(p-2) < 0 when x < 0 and p odd)
+    # else mixed → use box bound for that element.
+    eps = torch.tensor(1e-12, dtype=c_in.dtype, device=c_in.device)
+    diff = (hi - lo).clamp(min=1e-30)
+    f_lo = lo ** p
+    f_hi = hi ** p
+    # Slope of chord through endpoints.
+    lam = (f_hi - f_lo) / diff
+    # x* where f'(x*) = lam, i.e. p * x*^(p-1) = lam → x* = (lam/p)^(1/(p-1))
+    # Only valid when sign-stable (no zero crossing in derivative).
+    sign_stable_pos = lo >= 0  # all x >= 0
+    sign_stable_neg_oddp = (hi <= 0) & (p % 2 == 1)
+    sign_stable_neg_evenp = (hi <= 0) & (p % 2 == 0)
+    use_chord = sign_stable_pos | sign_stable_neg_oddp | sign_stable_neg_evenp
+    # x* candidate (handle sign properly).
+    # For lo >= 0 and lam >= 0: x* = (lam/p)^(1/(p-1)) >= 0.
+    # For hi <= 0 (negative x): x* may be derived analogously but signs flip.
+    # Use abs to compute magnitude, then attach the right sign.
+    lam_abs = lam.abs()
+    x_star_mag = (lam_abs / p).clamp(min=0).pow(1.0 / (p - 1))
+    # For the positive branch x* >= 0; for negative branch x* <= 0.
+    x_star = torch.where(hi <= 0, -x_star_mag, x_star_mag)
+    # Clip x* into [lo, hi] for safety (rounding).
+    x_star = torch.maximum(torch.minimum(x_star, hi), lo)
+    f_star = x_star ** p
+    # Chord values at x_star and tangent values: tangent has same slope
+    # so y_tangent(x) = f(x_star) + lam*(x - x_star) → at x_star: f(x_star).
+    # y_chord(x_star) = lam * (x_star - lo) + f(lo).
+    chord_at_star = lam * (x_star - lo) + f_lo
+    # Sign of curvature on the interval (1 = convex chord_above, -1 = concave chord_below).
+    # For lo >= 0, p >= 2: convex (chord above curve).
+    # For hi <= 0, p even: convex (chord above curve).
+    # For hi <= 0, p odd: concave (chord below curve).
+    # Map: convex → chord_at_star >= f_star; concave → chord_at_star <= f_star.
+    # Half-gap γ = |chord_at_star - f_star| / 2 (clamp to 0).
+    gap_at_star = (chord_at_star - f_star).abs()
+    # Midline μ such that y(x) ∈ [λx + μ - γ, λx + μ + γ].
+    # μ_chord_intercept = f_lo - λ*lo (intercept of chord line)
+    # convex: chord above curve; midline = chord_intercept - γ
+    # concave: chord below curve; midline = chord_intercept + γ
+    # In both cases: midline_intercept = chord_intercept - sign * γ where
+    #   sign = +1 convex, -1 concave. But because gap_at_star is already
+    #   |chord - f|, midline always lies between the two lines:
+    #   midline_intercept = (chord_intercept + tangent_intercept) / 2
+    #   tangent_intercept = f_star - λ * x_star
+    chord_intercept = f_lo - lam * lo
+    tangent_intercept = f_star - lam * x_star
+    mu = (chord_intercept + tangent_intercept) / 2
+    gamma = (gap_at_star / 2)
+    # Build chord-relaxed output:
+    #   c_out_i = λ_i * c_in_i + μ_i
+    #   g_out_i_old = λ_i * g_in_i  (preserve correlation through chord slope)
+    #   g_out_i_new = γ_i  (new gen column for this element)
+    c_chord = lam * c_in + mu
+    if K > 0:
+        g_chord_old = lam.unsqueeze(-1) * g_in
+    else:
+        g_chord_old = c_in.new_zeros(n, 0)
+    new_eye = torch.diag(gamma)
+    g_chord = torch.cat([g_chord_old, new_eye], dim=1)
+    # Where chord regime isn't valid (mixed-sign interval), fall back to
+    # box-decorrelated bound for that element.
+    if bool((~use_chord).any()):
+        # Box for those elements.
+        if p % 2 == 1:
+            box_lo = torch.minimum(f_lo, f_hi)
+            box_hi = torch.maximum(f_lo, f_hi)
+        else:
+            zero_in = (lo <= 0) & (hi >= 0)
+            box_lo = torch.where(zero_in, torch.zeros_like(lo),
+                                   torch.minimum(f_lo, f_hi))
+            box_hi = torch.maximum(f_lo, f_hi)
+        c_box = (box_lo + box_hi) / 2
+        rad_box = (box_hi - box_lo) / 2
+        # Replace element-wise.
+        c_out = torch.where(use_chord, c_chord, c_box)
+        # For non-chord elements: zero out chord-derived old-gen rows and
+        # set new-gen diagonal to rad_box; for chord elements: keep.
+        not_chord = ~use_chord
+        if K > 0:
+            g_old = torch.where(use_chord.unsqueeze(-1), g_chord_old,
+                                 torch.zeros_like(g_chord_old))
+        else:
+            g_old = g_chord_old
+        # New eye column: chord -> gamma, non-chord -> rad_box.
+        new_gen_diag = torch.where(use_chord, gamma, rad_box)
+        new_eye_combined = torch.diag(new_gen_diag)
+        g_out = torch.cat([g_old, new_eye_combined], dim=1)
+        return c_out, g_out
+    return c_chord, g_chord
+
+
+def _pow_int_box(c_in, g_in, p, lo, hi, K):
+    """Box-decorrelated zonotope encoding of x^p — sound but loses
+    correlation between input and output noise."""
+    import torch
+    f_lo = lo ** p
+    f_hi = hi ** p
+    if p % 2 == 1:
+        box_lo = torch.minimum(f_lo, f_hi)
+        box_hi = torch.maximum(f_lo, f_hi)
+    else:
+        zero_in = (lo <= 0) & (hi >= 0)
+        box_lo = torch.where(zero_in, torch.zeros_like(lo),
+                              torch.minimum(f_lo, f_hi))
+        box_hi = torch.maximum(f_lo, f_hi)
+    c_out = (box_lo + box_hi) / 2
+    rad_out = (box_hi - box_lo) / 2
+    n = c_out.numel()
+    new_eye = torch.diag(rad_out)
+    if K > 0:
+        zeros_pad = c_in.new_zeros(n, K)
+        g_out = torch.cat([zeros_pad, new_eye], dim=1)
+    else:
+        g_out = new_eye
+    return c_out, g_out

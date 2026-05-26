@@ -177,7 +177,7 @@ def test_slice_flat():
 def test_gather_indices():
     node = GatherNode(name='g', op_type='Gather', inputs=['input'],
                       params={'indices': np.array([0, 3, 1])})
-    g = _make_graph([node], input_shape=(1, 5))
+    g = _make_graph([node], input_shape=(5,))
     assert node.output_shape == (3,)
 
     center = np.array([10, 20, 30, 40, 50], dtype=float)

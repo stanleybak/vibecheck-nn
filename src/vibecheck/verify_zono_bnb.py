@@ -85,6 +85,253 @@ def _sigmoid_tanh_chord_parallelogram(lo, hi, act_kind):
     return alpha, beta, gamma
 
 
+def _reciprocal_linear_bounds(b_lo, b_hi, alpha_norm=None):
+    """Sound linear bounds for 1/b on [b_lo, b_hi] (b > 0).
+
+    Returns `(slope_lb, const_lb, slope_ub, const_ub)` such that for
+    b ∈ [b_lo, b_hi]:
+        slope_lb·b + const_lb ≤ 1/b ≤ slope_ub·b + const_ub
+
+    The 1/b function is convex decreasing on b > 0:
+      - Upper (chord): slope = -1/(b_lo·b_hi), passes through
+        (b_lo, 1/b_lo). Independent of α.
+      - Lower (tangent at α-tunable mid ∈ [b_lo, b_hi]):
+        slope = -1/mid², const = 2/mid.
+        Mirrors α,β-CROWN's `BoundReciprocal.bound_relax`.
+
+    `alpha_norm`: optional tensor in [0, 1] (broadcastable to b_lo).
+        mid = b_lo + alpha_norm·(b_hi - b_lo). If None: midpoint.
+    """
+    import torch
+    assert bool((b_lo > 0).all()), (
+        f'_reciprocal_linear_bounds requires b > 0; got b_lo={b_lo}')
+    # Upper: chord with slope -1/(b_lo·b_hi).
+    slope_ub = -1.0 / (b_lo * b_hi)
+    const_ub = 1.0 / b_lo + 1.0 / b_hi  # since chord through (b_lo, 1/b_lo)
+    # Lower: tangent at mid.
+    if alpha_norm is None:
+        mid = (b_lo + b_hi) / 2
+    else:
+        mid = b_lo + alpha_norm * (b_hi - b_lo)
+        mid = torch.maximum(torch.minimum(mid, b_hi), b_lo)
+    slope_lb = -1.0 / (mid * mid)
+    const_lb = 2.0 / mid
+    return slope_lb, const_lb, slope_ub, const_ub
+
+
+def _mccormick_linear_bounds(a_lo, a_hi, v_lo, v_hi, r_l=None, r_u=None):
+    """α-interpolated McCormick linear bounds for a·v on a box.
+
+    Returns `(slope_a_lb, slope_v_lb, const_lb, slope_a_ub, slope_v_ub,
+    const_ub)` such that for (a, v) ∈ [a_lo, a_hi] × [v_lo, v_hi]:
+        slope_a_lb·a + slope_v_lb·v + const_lb ≤ a·v
+        a·v ≤ slope_a_ub·a + slope_v_ub·v + const_ub
+
+    McCormick LB lines:
+      line1 (at corner (a_lo, v_lo)):
+        slope_a = v_lo, slope_v = a_lo, const = -a_lo·v_lo
+      line2 (at corner (a_hi, v_hi)):
+        slope_a = v_hi, slope_v = a_hi, const = -a_hi·v_hi
+      LB = max(line1, line2). For α-interp:
+        LB_interp = r_l·line1 + (1-r_l)·line2, with r_l ∈ [0, 1].
+
+    McCormick UB lines (mirror with crossing corners):
+      line3 (at (a_hi, v_lo)): slope_a = v_lo, slope_v = a_hi,
+        const = -a_hi·v_lo
+      line4 (at (a_lo, v_hi)): slope_a = v_hi, slope_v = a_lo,
+        const = -a_lo·v_hi
+      UB = min(line3, line4). Interp:
+        UB_interp = r_u·line3 + (1-r_u)·line4.
+
+    r_l, r_u: optional tensors in [0, 1]. Default: 0.5 (midpoint).
+
+    Soundness: each McCormick corner-line is a SOUND tangent at that
+    corner; convex combinations of two sound LB lines are sound LB.
+    Mirrors α,β-CROWN's `MulHelper.interpolated_relaxation`.
+    """
+    import torch
+    if r_l is None:
+        r_l = torch.full_like(a_lo, 0.5)
+    if r_u is None:
+        r_u = torch.full_like(a_lo, 0.5)
+    # LB lines (interpolated).
+    slope_a_lb = (v_lo - v_hi) * r_l + v_hi
+    slope_v_lb = (a_lo - a_hi) * r_l + a_hi
+    const_lb = (v_hi * a_hi - v_lo * a_lo) * r_l - v_hi * a_hi
+    # UB lines.
+    slope_a_ub = (v_hi - v_lo) * r_u + v_lo
+    slope_v_ub = (a_lo - a_hi) * r_u + a_hi
+    const_ub = (v_lo * a_hi - v_hi * a_lo) * r_u - v_lo * a_hi
+    return (slope_a_lb, slope_v_lb, const_lb,
+            slope_a_ub, slope_v_ub, const_ub)
+
+
+def _div_backward_rm_mccormick(a_lo, a_hi, b_lo, b_hi, ew,
+                                 alpha_r=None, r_l=None, r_u=None):
+    """ABC-style Div backward: Mul(a, Reciprocal(b)) with α-tunable
+    McCormick + α-tunable Recip tangent. Returns the backward CROWN
+    contribution for `ew · y` where `y = a / b`, sound on b > 0.
+
+    Args (all torch tensors, broadcasting across leading dims):
+      a_lo, a_hi: pre-Div input `a` bounds, shape (..., n_y).
+      b_lo, b_hi: pre-Div input `b` bounds, shape (..., n_y) or broadcast.
+      ew: output gradient slopes, shape (..., n_y).
+      alpha_r: Reciprocal tangent normalized α ∈ [0, 1], shape
+        broadcastable to b_lo. Default 0.5.
+      r_l, r_u: McCormick LB/UB interpolation α ∈ [0, 1]. Default 0.5.
+
+    Returns `(acc_contrib, ew_a, ew_b)`:
+      acc_contrib: scalar contribution to acc (sum over n_y).
+      ew_a: backward slopes on a, shape (..., n_y).
+      ew_b: backward slopes on b, shape (..., n_y).
+
+    Soundness: for ANY α ∈ [0, 1]^*, the bound below is sound. Adam
+    tunes α to maximize the spec LB. Comparison with the Taylor +
+    R-bound approach (`_div_decoupled`): the R+M bound is exact at the
+    corner where (a, b) minimizes `a/b`, while R-bound has slack
+    proportional to the (a, b) box width and Taylor expansion error.
+    """
+    import torch
+    # Reciprocal LB/UB for v = 1/b on [b_lo, b_hi]:
+    rs_lb, rc_lb, rs_ub, rc_ub = _reciprocal_linear_bounds(
+        b_lo, b_hi, alpha_norm=alpha_r)
+    # v's range over [b_lo, b_hi]: [1/b_hi, 1/b_lo] (1/b is decreasing).
+    v_min = 1.0 / b_hi
+    v_max = 1.0 / b_lo
+    # McCormick LB/UB for a·v on (a, v) box:
+    (s_a_lb_m, s_v_lb_m, c_lb_m,
+     s_a_ub_m, s_v_ub_m, c_ub_m) = _mccormick_linear_bounds(
+        a_lo, a_hi, v_min, v_max, r_l=r_l, r_u=r_u)
+    # Sign-aware substitution of v = 1/b. For LB(y), use Mul LB; for
+    # UB(y), use Mul UB. Within each, choose Recip LB or UB based on
+    # the sign of s_v in the Mul line (positive → use Recip LB → tighter LB).
+    pos_v_lb = (s_v_lb_m >= 0).to(s_v_lb_m.dtype)
+    neg_v_lb = 1.0 - pos_v_lb
+    pos_v_ub = (s_v_ub_m >= 0).to(s_v_ub_m.dtype)
+    neg_v_ub = 1.0 - pos_v_ub
+    sv_for_lb = pos_v_lb * rs_lb + neg_v_lb * rs_ub
+    cv_for_lb = pos_v_lb * rc_lb + neg_v_lb * rc_ub
+    sv_for_ub = neg_v_ub * rs_lb + pos_v_ub * rs_ub  # mirrored
+    cv_for_ub = neg_v_ub * rc_lb + pos_v_ub * rc_ub
+    # Substituted linear bounds in (a, b):
+    # LB_y(a, b) = s_a_lb_m·a + s_v_lb_m·(sv_for_lb·b + cv_for_lb) + c_lb_m
+    # UB_y(a, b) = s_a_ub_m·a + s_v_ub_m·(sv_for_ub·b + cv_for_ub) + c_ub_m
+    coef_a_lb = s_a_lb_m
+    coef_b_lb = s_v_lb_m * sv_for_lb
+    const_lb = s_v_lb_m * cv_for_lb + c_lb_m
+    coef_a_ub = s_a_ub_m
+    coef_b_ub = s_v_ub_m * sv_for_ub
+    const_ub = s_v_ub_m * cv_for_ub + c_ub_m
+    # Backward contribution: ew_pos·LB + ew_neg·UB
+    ep = ew.clamp(min=0)
+    en = ew.clamp(max=0)
+    ew_a = ep * coef_a_lb + en * coef_a_ub
+    ew_b = ep * coef_b_lb + en * coef_b_ub
+    acc_contrib = (ep * const_lb + en * const_ub).sum(dim=-1)
+    return acc_contrib, ew_a, ew_b
+
+
+def _pow_chord_coeffs(lo, hi, p):
+    """Per-element chord-tangent coefficients for x^p on [lo_i, hi_i].
+
+    Returns `(lam, mu, gamma, use_chord, box_lo, box_hi)`:
+      - lam, mu, gamma: chord-parallelogram coeffs such that
+          y = lam*x + mu + gamma*ε,  ε ∈ [-1, 1]
+        bounds x^p when `use_chord` is True (sign-stable interval).
+      - use_chord: bool mask where chord encoding is valid.
+      - box_lo, box_hi: element-wise box bounds for fallback elements
+        (used when `~use_chord`).
+
+    Soundness: ranges out of the chord-tangent band were verified empirically
+    for x^2, x^3 (see soundness test in tests/test_zonotope_pow.py).
+    """
+    f_lo = lo ** p
+    f_hi = hi ** p
+    diff = (hi - lo).clamp(min=1e-30)
+    lam = (f_hi - f_lo) / diff
+    lam_abs = lam.abs()
+    x_star_mag = (lam_abs / p).clamp(min=0).pow(1.0 / (p - 1))
+    x_star = torch.where(hi <= 0, -x_star_mag, x_star_mag)
+    x_star = torch.maximum(torch.minimum(x_star, hi), lo)
+    f_star = x_star ** p
+    chord_at_star = lam * (x_star - lo) + f_lo
+    gap_at_star = (chord_at_star - f_star).abs()
+    chord_intercept = f_lo - lam * lo
+    tangent_intercept = f_star - lam * x_star
+    mu = (chord_intercept + tangent_intercept) / 2
+    gamma = gap_at_star / 2
+    use_chord = (lo >= 0) | (hi <= 0)
+    if p % 2 == 0:
+        box_lo_v = torch.where((lo <= 0) & (hi >= 0),
+            torch.zeros_like(lo), torch.minimum(f_lo, f_hi))
+        box_hi_v = torch.maximum(f_lo, f_hi)
+    else:
+        box_lo_v = torch.minimum(f_lo, f_hi)
+        box_hi_v = torch.maximum(f_lo, f_hi)
+    return lam, mu, gamma, use_chord, box_lo_v, box_hi_v
+
+
+def _pow_two_line_coeffs(lo, hi, p, tangent_pos=None):
+    """Per-element two-linear CROWN bounds for x^p on [lo_i, hi_i].
+
+    Mirrors α,β-CROWN BoundPow's `bound_relax_branch`: separate LB and UB
+    LINES (no shared slope, no slack new-gen). Strictly tighter than
+    `_pow_chord_coeffs` parallelogram in CROWN backward because LB and
+    UB use independent slopes.
+
+    Returns `(lb_slope, lb_const, ub_slope, ub_const, use_two_line,
+    box_lo, box_hi)` where:
+      - For x in [lo_i, hi_i], `lb_slope·x + lb_const ≤ x^p ≤
+        ub_slope·x + ub_const` whenever `use_two_line[i]` is True.
+      - `box_lo, box_hi` are element-wise box bounds for fallback
+        elements (`~use_two_line`).
+
+    Convex case (lo >= 0 with any p≥2, OR hi <= 0 with even p):
+      UB = chord through (lo, lo^p) and (hi, hi^p)
+      LB = tangent at `tangent_pos` (defaults to midpoint of [lo, hi])
+    Concave case (hi <= 0 with odd p, function on neg reals is concave):
+      UB = tangent at `tangent_pos`
+      LB = chord
+    Otherwise (sign-mixed) → fallback to box (decorrelated).
+
+    Soundness: chord IS always on the convex side (≥ f for convex,
+    ≤ f for concave). Tangent at any interior point is on the opposite
+    side (≤ f for convex, ≥ f for concave). Soundness independent of
+    `tangent_pos` choice within [lo, hi].
+    """
+    f_lo = lo ** p
+    f_hi = hi ** p
+    diff = (hi - lo).clamp(min=1e-30)
+    chord_slope = (f_hi - f_lo) / diff
+    chord_intercept = f_lo - chord_slope * lo
+    # Default tangent location: midpoint of [lo, hi]. α-CROWN can
+    # later optimize this per-element.
+    if tangent_pos is None:
+        tangent_pos = (lo + hi) / 2
+    tan_pos_clipped = torch.maximum(torch.minimum(tangent_pos, hi), lo)
+    tan_slope = p * tan_pos_clipped.pow(p - 1)
+    tan_const = tan_pos_clipped.pow(p) - tan_slope * tan_pos_clipped
+    convex_regime = (lo >= 0) | ((hi <= 0) & (p % 2 == 0))
+    concave_regime = (hi <= 0) & (p % 2 == 1)
+    use_two_line = convex_regime | concave_regime
+    # Sound assignment per regime: convex → LB=tangent, UB=chord;
+    # concave → LB=chord, UB=tangent.
+    lb_slope = torch.where(convex_regime, tan_slope, chord_slope)
+    lb_const = torch.where(convex_regime, tan_const, chord_intercept)
+    ub_slope = torch.where(convex_regime, chord_slope, tan_slope)
+    ub_const = torch.where(convex_regime, chord_intercept, tan_const)
+    # Mixed-sign fallback (sign-crossing interval): just use box.
+    if p % 2 == 0:
+        box_lo_v = torch.where((lo <= 0) & (hi >= 0),
+            torch.zeros_like(lo), torch.minimum(f_lo, f_hi))
+        box_hi_v = torch.maximum(f_lo, f_hi)
+    else:
+        box_lo_v = torch.minimum(f_lo, f_hi)
+        box_hi_v = torch.maximum(f_lo, f_hi)
+    return (lb_slope, lb_const, ub_slope, ub_const,
+            use_two_line, box_lo_v, box_hi_v)
+
+
 def _sigmoid_tanh_linear_bounds(lo, hi, act_kind, n_iter=30):
     """Sound closed-form linear bounds for sigmoid/tanh on [lo, hi].
 
@@ -264,6 +511,11 @@ def _forward_batch_graph(x, gg):
                                      device=a.device)
             act[name] = a
 
+        elif t == 'sub_bilinear':
+            a = act[op['inputs'][0]]
+            b = act[op['inputs'][1]]
+            act[name] = a - b
+
         elif t == 'reshape':
             act[name] = act[op['inputs'][0]]
 
@@ -296,6 +548,45 @@ def _forward_batch_graph(x, gg):
             a4 = a.reshape(batch, *in_shape)
             a4 = F.interpolate(a4, scale_factor=(sH, sW), mode='nearest')
             act[name] = a4.reshape(batch, -1)
+
+        elif t == 'reduce_sum':
+            a = act[op['inputs'][0]]
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            axes = op.get('axes', ())
+            keep = op.get('keepdims', False)
+            a_nd = a.reshape(batch, *in_shape_nd)
+            # gg axes are relative to stripped-batch shape — add 1
+            # to skip the batch dim in PGD's batched tensor.
+            for ax in sorted(axes, reverse=True):
+                a_nd = a_nd.sum(dim=ax + 1, keepdim=bool(keep))
+            act[name] = a_nd.reshape(batch, -1)
+
+        elif t == 'mul_bilinear':
+            a = act[op['inputs'][0]]
+            b = act[op['inputs'][1]]
+            sh = op.get('in_shapes_nd', [None, None])
+            if sh[0] is not None and sh[1] is not None and sh[0] != sh[1]:
+                a_nd = a.reshape(batch, *sh[0])
+                b_nd = b.reshape(batch, *sh[1])
+                act[name] = (a_nd * b_nd).reshape(batch, -1)
+            else:
+                act[name] = a * b
+
+        elif t == 'div_bilinear':
+            a = act[op['inputs'][0]]
+            b = act[op['inputs'][1]]
+            sh = op.get('in_shapes_nd', [None, None])
+            if sh[0] is not None and sh[1] is not None and sh[0] != sh[1]:
+                a_nd = a.reshape(batch, *sh[0])
+                b_nd = b.reshape(batch, *sh[1])
+                act[name] = (a_nd / b_nd).reshape(batch, -1)
+            else:
+                act[name] = a / b
+
+        elif t == 'pow':
+            a = act[op['inputs'][0]]
+            exp = op.get('exponent', 2.0)
+            act[name] = a ** exp
 
         elif t == 'sigmoid':
             act[name] = torch.sigmoid(act[op['inputs'][0]])
@@ -663,8 +954,40 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
 
         elif t == 'fc':
             z = _get(op['inputs'][0])
-            z.propagate_fc(op['W'], op['bias'])
-            zono_state[name] = z
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            W = op['W']; bias = op['bias']
+            # Standard 1D case: input is flat (n_in,), W is (n_out, n_in).
+            # Batched MatMul case (nn4sys mscn, ≥2D in_shape): apply
+            # F.linear over the last dim by reshaping center/gens to
+            # (..., n_in_last). E.g., (3, 7) input with W=(128, 7) →
+            # output (3, 128).
+            if (in_shape_nd is not None and len(in_shape_nd) >= 2
+                    and W.shape[1] == in_shape_nd[-1]
+                    and z.center.numel() == int(np.prod(in_shape_nd))):
+                prefix = in_shape_nd[:-1]
+                n_last_in = in_shape_nd[-1]
+                n_last_out = W.shape[0]
+                K = z.generators.shape[1]
+                # Center: (prefix..., n_in) → linear → (prefix..., n_out)
+                c_nd = z.center.reshape(*prefix, n_last_in)
+                c_out_nd = F.linear(c_nd, W, bias)
+                new_c = c_out_nd.flatten()
+                if K > 0:
+                    # Generators: (prefix..., n_in, K) → linear (W on
+                    # the second-to-last axis) → (prefix..., n_out, K).
+                    # Use einsum to keep gen-axis intact.
+                    g_nd = z.generators.reshape(*prefix, n_last_in, K)
+                    # 'oi,...ik->...ok' but we need (...i k) → (...o k)
+                    # apply W (o, i) along the second-to-last axis
+                    # einsum with '...ik,oi->...ok'
+                    g_out_nd = torch.einsum('...ik,oi->...ok', g_nd, W)
+                    new_g = g_out_nd.reshape(-1, K)
+                else:
+                    new_g = z.generators.new_zeros(new_c.numel(), 0)
+                zono_state[name] = TorchZonotope(new_c, new_g)
+            else:
+                z.propagate_fc(op['W'], op['bias'])
+                zono_state[name] = z
 
         elif t == 'relu':
             z = _get(op['inputs'][0])
@@ -711,9 +1034,31 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                 z = _get(op['inputs'][0])
                 bias = op.get('bias')
                 if bias is not None:
-                    z = TorchZonotope(z.center + torch.tensor(
-                        bias.flatten(), dtype=dtype, device=device),
-                        z.generators.clone())
+                    bias_t = torch.as_tensor(
+                        bias, dtype=dtype, device=device)
+                    if bias_t.numel() == 1:
+                        # Scalar bias: broadcast to center shape.
+                        bias_flat = bias_t.flatten().expand(
+                            z.center.numel())
+                    elif bias_t.numel() == z.center.numel():
+                        bias_flat = bias_t.flatten()
+                    else:
+                        # Broadcast: bias shape (..., n_out) over center
+                        # reshaped to (prefix..., n_out). nn4sys mscn:
+                        # MatMul out (3, 128) + bias (128,) broadcasts.
+                        out_shape_nd = op.get('out_shape_nd')
+                        if (out_shape_nd is not None
+                                and len(out_shape_nd) >= 1
+                                and out_shape_nd[-1] == bias_t.numel()):
+                            c_nd = z.center.reshape(*out_shape_nd)
+                            bias_flat = (c_nd + bias_t).flatten() - z.center
+                        else:
+                            raise ValueError(
+                                f'add bias shape {bias_t.shape} '
+                                f'incompatible with center {z.center.shape} '
+                                f'(out_shape_nd={out_shape_nd})')
+                    z = TorchZonotope(z.center + bias_flat,
+                                       z.generators.clone())
                 zono_state[name] = z
 
         elif t == 'sub':
@@ -725,6 +1070,30 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                                             device=device),
                     z.generators.clone())
             zono_state[name] = z
+
+        elif t == 'sub_bilinear':
+            # Sub(a, b) with both computed (skip-merge style). Same
+            # shared-generator math as `add`'s skip-merge path, just
+            # with z_b negated. Loadbearing for nn4sys
+            # pensieve_*_parallel where output = MatMul1 - MatMul2.
+            z_a = _get(op['inputs'][0])
+            z_b = _get(op['inputs'][1])
+            ka = z_a.generators.shape[1]
+            kb = z_b.generators.shape[1]
+            shared = _find_shared_gens_count(
+                op['inputs'][0], op['inputs'][1], gg, gen_count)
+            # Layout: G_out = [G_a_shared - G_b_shared | G_a_extra | -G_b_extra]
+            g_a_shared = z_a.generators[:, :shared]
+            g_b_shared = z_b.generators[:, :shared]
+            g_a_extra = z_a.generators[:, shared:]
+            g_b_extra = z_b.generators[:, shared:]
+            g_out = torch.cat([
+                g_a_shared - g_b_shared,
+                g_a_extra,
+                -g_b_extra,
+            ], dim=1)
+            zono_state[name] = TorchZonotope(
+                z_a.center - z_b.center, g_out)
 
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
@@ -810,6 +1179,92 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                 new_g = z.generators * scale_4d.unsqueeze(-1)
             zono_state[name] = TorchZonotope(new_c, new_g)
 
+        elif t == 'mul_bilinear':
+            # Element-wise Mul. nn4sys mscn uses Mul(features, mask)
+            # where the mask side is constant per-disjunct (zero
+            # radius). When both vary, the product is bilinear — no
+            # sound zonotope; helper raises NotImplementedError.
+            from .zonotope import _torch_zono_mul_bilinear
+            z_a = _get(op['inputs'][0])
+            z_b = _get(op['inputs'][1])
+            in_shapes = op.get('in_shapes_nd', [None, None])
+            out_shape = op.get('out_shape_nd')
+            new_c, new_g = _torch_zono_mul_bilinear(
+                z_a.center, z_a.generators, z_b.center, z_b.generators,
+                shape_a=in_shapes[0], shape_b=in_shapes[1],
+                shape_out=out_shape)
+            zono_state[name] = TorchZonotope(new_c, new_g)
+
+        elif t == 'div_bilinear':
+            # Element-wise Div. Point denominator → exact. Non-point
+            # denominator → box fallback if settings.nonlin_div_fallback
+            # is 'box' AND denominator is sign-stable; otherwise raises.
+            # When fallback fires, stash on op so backward switches to
+            # the sound decorrelated bound (slope-to-input = 0, accum
+            # += ep·box_lo + en·box_hi).
+            from .zonotope import _torch_zono_div_bilinear
+            z_a = _get(op['inputs'][0])
+            z_b = _get(op['inputs'][1])
+            fb = (settings.nonlin_div_fallback
+                  if settings is not None and 'nonlin_div_fallback' in settings
+                  else 'raise')
+            b_is_point = (z_b.generators.numel() == 0
+                          or bool(z_b.generators.abs().max() < 1e-12))
+            op['_div_decoupled'] = not b_is_point
+            if not b_is_point:
+                # Forward zono will use box fallback; cache the input
+                # boxes so backward can return the sound decorrelated
+                # bound without recomputing.
+                rad_a = (z_a.generators.abs().sum(dim=1)
+                          if z_a.generators.numel() > 0
+                          else torch.zeros_like(z_a.center))
+                rad_b = z_b.generators.abs().sum(dim=1)
+                op['_div_a_lo'] = (z_a.center - rad_a).detach()
+                op['_div_a_hi'] = (z_a.center + rad_a).detach()
+                op['_div_b_lo'] = (z_b.center - rad_b).detach()
+                op['_div_b_hi'] = (z_b.center + rad_b).detach()
+            new_c, new_g = _torch_zono_div_bilinear(
+                z_a.center, z_a.generators, z_b.center, z_b.generators,
+                fallback=fb)
+            zono_state[name] = TorchZonotope(new_c, new_g)
+
+        elif t == 'reduce_sum':
+            # Linear reduction along given axes. Centers + gens both
+            # sum along the same axes.
+            from .zonotope import _torch_zono_reduce_sum
+            z = _get(op['inputs'][0])
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            if in_shape_nd is None:
+                raise ValueError(
+                    f'reduce_sum: missing in_shapes_nd for {name!r}')
+            new_c, new_g = _torch_zono_reduce_sum(
+                z.center, z.generators, in_shape_nd,
+                op.get('axes', ()), op.get('keepdims', False))
+            zono_state[name] = TorchZonotope(new_c, new_g)
+
+        elif t == 'pow':
+            # x^p as sound zonotope. Chord-tangent parallelogram per
+            # element preserves x-y correlation via slope λ. Box fallback
+            # used per-element when the [lo, hi] crosses curvature change.
+            from .zonotope import _torch_zono_pow_int
+            z = _get(op['inputs'][0])
+            exp = op.get('exponent', 2.0)
+            assert float(int(exp)) == float(exp), (
+                f'pow: only integer exponents supported, got {exp}')
+            # Cache pre-pow input bounds + chord coeffs on the op dict
+            # so backward can reuse them (no layer_idx → no `sb` slot).
+            in_rad = (z.generators.abs().sum(dim=1)
+                       if z.generators.numel() > 0
+                       else torch.zeros_like(z.center))
+            op['_pow_in_lo'] = (z.center - in_rad).detach()
+            op['_pow_in_hi'] = (z.center + in_rad).detach()
+            _relax = (settings.get('pow_relaxation', 'chord')
+                       if settings is not None else 'chord')
+            new_c, new_g = _torch_zono_pow_int(
+                z.center, z.generators, int(exp), relaxation=_relax)
+            op['_pow_relaxation'] = _relax
+            zono_state[name] = TorchZonotope(new_c, new_g)
+
         else:
             raise NotImplementedError(
                 f'_forward_zonotope_graph: unsupported op {t!r} '
@@ -883,6 +1338,8 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
         Used by `_input_split_fast_leaf`'s joint-AND infeasibility LP.
     """
     ops = gg['ops']
+    # Shared lazy cache for bilinear-op point-side centers (mscn).
+    point_centers_cache = [None]
 
     spec_lbs = {}
     all_ew_at_relu = {} if return_ew else None
@@ -917,8 +1374,21 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
             elif t == 'fc':
-                acc += float(ew @ op['bias'])
-                ew_back = ew @ op['W']
+                W = op['W']; bias = op['bias']
+                in_shape_nd = op.get('in_shapes_nd', [None])[0]
+                out_shape_nd = op.get('out_shape_nd')
+                if (in_shape_nd is not None and len(in_shape_nd) >= 2
+                        and out_shape_nd is not None
+                        and out_shape_nd[-1] == W.shape[0]
+                        and W.shape[1] == in_shape_nd[-1]):
+                    prefix = out_shape_nd[:-1]
+                    ew_nd = ew.reshape(*prefix, W.shape[0])
+                    acc += float((ew_nd * bias).sum())
+                    ew_back_nd = ew_nd @ W
+                    ew_back = ew_back_nd.reshape(-1)
+                else:
+                    acc += float(ew @ bias)
+                    ew_back = ew @ W
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
@@ -938,19 +1408,37 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
             elif t == 'add':
-                # Add backward: ew goes to both inputs unchanged
-                for inp in op['inputs']:
+                # Add backward: ew goes to both inputs unchanged.
+                # Non-merge bias-add contributes the bias-dot to acc.
+                if op.get('is_merge'):
+                    for inp in op['inputs']:
+                        ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+                else:
+                    bias = op.get('bias')
+                    if bias is not None:
+                        from .alpha_crown import _bias_dot_ew
+                        acc += float(_bias_dot_ew(
+                            ew, bias, ew.dtype, ew.device,
+                            out_shape=op.get('out_shape_nd')))
+                    inp = op['inputs'][0]
                     ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
             elif t == 'sub':
                 # Sub backward: ew passes through, bias contributes to acc
                 bias = op.get('bias')
                 if bias is not None:
-                    b_t = torch.tensor(bias.flatten(), dtype=ew.dtype,
-                                       device=ew.device)
-                    acc -= float((ew * b_t).sum())
+                    from .alpha_crown import _bias_dot_ew
+                    acc -= float(_bias_dot_ew(
+                        ew, bias, ew.dtype, ew.device,
+                        out_shape=op.get('out_shape_nd')))
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+
+            elif t == 'sub_bilinear':
+                # Sub(a, b) backward: y = a - b → ew_a = ew, ew_b = -ew.
+                ia, ib = op['inputs'][0], op['inputs'][1]
+                ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew)) + ew
+                ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew)) + (-ew)
 
             elif t == 'reshape':
                 inp = op['inputs'][0]
@@ -1004,6 +1492,131 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
+            elif t == 'reduce_sum':
+                from .alpha_crown import _reduce_sum_backward
+                in_shape_nd = op.get('in_shapes_nd', [None])[0]
+                out_shape_nd = op.get('out_shape_nd')
+                # ew is 1D (n_out,); _reduce_sum_backward expects lead
+                # dims. Add a dummy lead, then squeeze.
+                ew_back = _reduce_sum_backward(
+                    ew.unsqueeze(0), in_shape_nd, op.get('axes', ()),
+                    op.get('keepdims', False), out_shape_nd).squeeze(0)
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif t in ('mul_bilinear', 'div_bilinear'):
+                # Sound linearised backward for Div with non-point
+                # denominator. Uses analytic R-bounds at 4 corners +
+                # 2 edge criticals (where ∂R/∂b = 0 for a=a_lo, a=a_hi).
+                if t == 'div_bilinear' and op.get('_div_decoupled'):
+                    sh_in = op.get('in_shapes_nd', [None, None])
+                    sh_out = op.get('out_shape_nd')
+                    ia, ib = op['inputs'][0], op['inputs'][1]
+                    from .alpha_crown import _sum_to_shape
+                    a_lo = op['_div_a_lo'].to(device=ew.device, dtype=ew.dtype)
+                    a_hi = op['_div_a_hi'].to(device=ew.device, dtype=ew.dtype)
+                    b_lo = op['_div_b_lo'].to(device=ew.device, dtype=ew.dtype)
+                    b_hi = op['_div_b_hi'].to(device=ew.device, dtype=ew.dtype)
+                    assert bool((b_lo > 0).all()), (
+                        f'div_bilinear backward only supports b > 0; '
+                        f'got b_lo={b_lo}')
+                    c_a_loc = (a_lo + a_hi) / 2
+                    c_b_loc = (b_lo + b_hi) / 2
+                    inv_cb = 1.0 / c_b_loc
+                    neg_ca_over_cb2 = -c_a_loc / (c_b_loc * c_b_loc)
+                    L_const = c_a_loc / c_b_loc
+                    def _R_at(a_eval, b_eval):
+                        L_val = (a_eval * inv_cb + b_eval * neg_ca_over_cb2
+                                  + L_const)
+                        return a_eval / b_eval - L_val
+                    ones_out_pre = torch.ones(*sh_out, dtype=ew.dtype,
+                                                device=ew.device)
+                    a_lo_out = ones_out_pre * a_lo.reshape(*sh_in[0])
+                    a_hi_out = ones_out_pre * a_hi.reshape(*sh_in[0])
+                    b_lo_out = ones_out_pre * b_lo.reshape(*sh_in[1])
+                    b_hi_out = ones_out_pre * b_hi.reshape(*sh_in[1])
+                    c_a_out = (a_lo_out + a_hi_out) / 2
+                    pos_a_lo = (a_lo_out > 0) & (c_a_out > 1e-30)
+                    pos_a_hi = (a_hi_out > 0) & (c_a_out > 1e-30)
+                    b_crit_lo = torch.where(pos_a_lo,
+                        c_b_loc.reshape(*sh_in[1]) * ones_out_pre *
+                            torch.sqrt(torch.clamp(
+                                a_lo_out / c_a_out.clamp(min=1e-30), min=0)),
+                        b_lo_out)
+                    b_crit_hi = torch.where(pos_a_hi,
+                        c_b_loc.reshape(*sh_in[1]) * ones_out_pre *
+                            torch.sqrt(torch.clamp(
+                                a_hi_out / c_a_out.clamp(min=1e-30), min=0)),
+                        b_lo_out)
+                    b_crit_lo = torch.maximum(torch.minimum(b_crit_lo,
+                                                              b_hi_out), b_lo_out)
+                    b_crit_hi = torch.maximum(torch.minimum(b_crit_hi,
+                                                              b_hi_out), b_lo_out)
+                    R_pts = torch.stack([
+                        _R_at(a_lo_out, b_lo_out),
+                        _R_at(a_lo_out, b_hi_out),
+                        _R_at(a_hi_out, b_lo_out),
+                        _R_at(a_hi_out, b_hi_out),
+                        _R_at(a_lo_out, b_crit_lo),
+                        _R_at(a_hi_out, b_crit_hi),
+                    ])
+                    R_min = R_pts.min(dim=0).values
+                    R_max = R_pts.max(dim=0).values
+                    R_mid = (R_min + R_max) / 2
+                    R_half = (R_max - R_min) / 2
+                    ones_out = torch.ones(*sh_out, dtype=ew.dtype,
+                                            device=ew.device)
+                    inv_cb_out = ones_out * inv_cb.reshape(*sh_in[1])
+                    neg_grad_b_out = ones_out * neg_ca_over_cb2.reshape(*sh_out)
+                    L_const_out = L_const.reshape(*sh_out)
+                    R_mid_out = R_mid.reshape(*sh_out)
+                    R_half_out = R_half.reshape(*sh_out)
+                    ew_nd = ew.reshape(*sh_out)
+                    ew_a_nd = _sum_to_shape(ew_nd * inv_cb_out, (), sh_in[0])
+                    ew_b_nd = _sum_to_shape(ew_nd * neg_grad_b_out, (), sh_in[1])
+                    ew_a = ew_a_nd.reshape(-1)
+                    ew_b = ew_b_nd.reshape(-1)
+                    acc += float(
+                        (ew_nd * (L_const_out + R_mid_out)).reshape(-1).sum()
+                        - (ew_nd.abs() * R_half_out).reshape(-1).sum())
+                    ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+                    ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
+                else:
+                    # Sound linearization path: requires one side to be
+                    # point (zero radius) — assertion enforced here so
+                    # an accidental call on non-point inputs raises
+                    # rather than silently un-sound.
+                    from .alpha_crown import _compute_point_centers, _sum_to_shape
+                    if point_centers_cache[0] is None:
+                        x_center = ((xl + xh) / 2).to(
+                            device=ew.device, dtype=ew.dtype)
+                        point_centers_cache[0] = _compute_point_centers(
+                            gg, x_center, ew.device, ew.dtype)
+                    point_centers = point_centers_cache[0]
+                    sh_in = op.get('in_shapes_nd', [None, None])
+                    sh_out = op.get('out_shape_nd')
+                    c_a = point_centers[op['inputs'][0]]
+                    c_b = point_centers[op['inputs'][1]]
+                    ew_nd = ew.reshape(*sh_out)
+                    a_nd = c_a.reshape(*sh_in[0])
+                    b_nd = c_b.reshape(*sh_in[1])
+                    if t == 'mul_bilinear':
+                        ew_a_nd = _sum_to_shape(ew_nd * b_nd, (), sh_in[0])
+                        ew_b_nd = _sum_to_shape(ew_nd * a_nd, (), sh_in[1])
+                    else:
+                        if bool((b_nd == 0).any()):
+                            raise ZeroDivisionError(
+                                f'div_bilinear backward: denom zero at {name!r}')
+                        inv_b = b_nd.reciprocal()
+                        ew_a_nd = _sum_to_shape(ew_nd * inv_b, (), sh_in[0])
+                        ew_b_nd = _sum_to_shape(
+                            -ew_nd * a_nd * inv_b * inv_b, (), sh_in[1])
+                    ew_a = ew_a_nd.reshape(-1)
+                    ew_b = ew_b_nd.reshape(-1)
+                    ia, ib = op['inputs'][0], op['inputs'][1]
+                    ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+                    ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
+
             elif t in ('sigmoid', 'tanh'):
                 # CROWN backward: closed-form linear slopes via the
                 # same `_sigmoid_tanh_linear_bounds` helper used by the
@@ -1016,6 +1629,49 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 acc += float((ep * lo_t).sum() + (en * up_t).sum())
                 ew_back = ep * lo_s + en * up_s
                 inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif t == 'pow':
+                # Pow backward — two-line CROWN (separate LB & UB slopes,
+                # tighter than chord+slack). Matches α,β-CROWN BoundPow
+                # `bound_relax_branch`. The tangent point on the convex
+                # side defaults to the midpoint of [lo, hi]; an
+                # α-optimizable point can be passed in later for further
+                # tightening.
+                lo_pre = op.get('_pow_in_lo')
+                hi_pre = op.get('_pow_in_hi')
+                assert lo_pre is not None and hi_pre is not None, (
+                    f"pow backward: missing _pow_in_lo/_pow_in_hi for "
+                    f"{name!r} — forward must run before backward.")
+                lo_pre_t = lo_pre.to(device=ew.device, dtype=ew.dtype)
+                hi_pre_t = hi_pre.to(device=ew.device, dtype=ew.dtype)
+                p = int(op.get('exponent', 2))
+                inp = op['inputs'][0]
+                # Allow α-CROWN to inject a per-element tangent point.
+                tan_pos_alpha = op.get('_pow_tangent_alpha')
+                if tan_pos_alpha is not None:
+                    tan_pos_alpha = tan_pos_alpha.to(
+                        device=ew.device, dtype=ew.dtype)
+                (lb_slope, lb_const, ub_slope, ub_const,
+                 use_two_line, box_lo_v, box_hi_v) = _pow_two_line_coeffs(
+                    lo_pre_t, hi_pre_t, p, tangent_pos=tan_pos_alpha)
+                ep = ew.clamp(min=0); en = ew.clamp(max=0)
+                # For ew_pos: lower-bound the linear contribution → use LB.
+                # For ew_neg: lower-bound the linear contribution → use UB.
+                slope_back = ep * lb_slope + en * ub_slope
+                const_back = ep * lb_const + en * ub_const
+                # Where two_line isn't valid (sign-mixed): fall back to
+                # box (zero slope, ep·box_lo + en·box_hi).
+                not_tl = ~use_two_line
+                slope_back = torch.where(use_two_line, slope_back,
+                                          torch.zeros_like(slope_back))
+                const_back = torch.where(use_two_line, const_back,
+                                          torch.where(ep > 0, box_lo_v,
+                                              torch.zeros_like(box_lo_v))
+                                          + torch.where(en < 0, box_hi_v,
+                                              torch.zeros_like(box_hi_v)))
+                acc += float(const_back.sum())
+                ew_back = slope_back
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
             else:
@@ -1083,15 +1739,33 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
     B, n_in = xl.shape
     c = (xl + xh) / 2
     radii = (xh - xl) / 2
-    # G is (B, n_in, n_in): diagonal of radii. nonzero radii get an own
-    # gen column; zero-radius inputs contribute zero columns (still
-    # presented in the tensor for shape uniformity — they don't add
-    # spurious mass since the matrix entry is 0).
-    G = torch.diag_embed(radii)
+    # G is (B, n_in, K) where K = number of input dims with any
+    # non-zero radius across the batch. Dropping zero-radius columns
+    # is exact (a zero column contributes nothing to any bound) and
+    # for mscn dual where K=1 out of 308 it cuts gen-tensor memory by
+    # 308×, enabling B≥32 instead of B=8 on 2048d.
+    varying_mask = (radii.abs().max(dim=0).values > 0)  # (n_in,)
+    K = int(varying_mask.sum())
+    if K == n_in:
+        G = torch.diag_embed(radii)
+    else:
+        # Build (B, n_in, K) with one column per varying dim.
+        var_idx = varying_mask.nonzero(as_tuple=True)[0]  # (K,)
+        G = torch.zeros(B, n_in, K, dtype=dtype, device=device)
+        G[:, var_idx, torch.arange(K, device=device)] = radii[:, var_idx]
     state = {gg['input_name']: (c, G)}
     gen_count = {gg['input_name']: G.shape[2]}
     forks = gg['fork_points']
     sb = {}
+    # Stash (lo, hi) for ops that feed a mul/div_bilinear input, so
+    # backward CROWN can use proper McCormick envelopes instead of
+    # point linearization.
+    bilinear_input_names = set()
+    for op_ in gg['ops']:
+        if op_['type'] in ('mul_bilinear', 'div_bilinear'):
+            for inp_ in op_['inputs']:
+                bilinear_input_names.add(inp_)
+    op_bounds = {}
 
     last_use = {}
     for i, op2 in enumerate(gg['ops']):
@@ -1113,10 +1787,36 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
             c_in, G_in = _get(op['inputs'][0])
             W = op['W']  # (n_out, n_in_layer)
             bias = op['bias']  # (n_out,)
-            c_out = c_in @ W.T + bias  # (B, n_out)
-            # G_out[b, o, k] = sum_i W[o, i] * G_in[b, i, k]
-            G_out = torch.einsum('oi,bik->bok', W, G_in)
-            state[name] = (c_out, G_out)
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            # ND batched MatMul (nn4sys mscn: input (3, 7), W=(128, 7)
+            # → (3, 128)). Reshape (B, prod(prefix*n_in_last)) to
+            # (B, *prefix, n_in_last), apply F.linear (broadcasts bias
+            # over prefix), reshape back.
+            if (in_shape_nd is not None and len(in_shape_nd) >= 2
+                    and W.shape[1] == in_shape_nd[-1]
+                    and c_in.shape[1] == int(np.prod(in_shape_nd))):
+                prefix = in_shape_nd[:-1]
+                n_in_last = in_shape_nd[-1]
+                n_out_last = W.shape[0]
+                K = G_in.shape[2]
+                c_nd = c_in.reshape(B, *prefix, n_in_last)
+                c_out_nd = F.linear(c_nd, W, bias)
+                c_out = c_out_nd.reshape(B, -1)
+                # Gens: (B, *prefix, n_in_last, K) → contract n_in_last
+                # axis with W's input axis to get (B, *prefix, n_out, K).
+                if K > 0:
+                    G_nd = G_in.reshape(B, *prefix, n_in_last, K)
+                    G_out_nd = torch.einsum(
+                        '...ik,oi->...ok', G_nd, W)
+                    G_out = G_out_nd.reshape(B, -1, K)
+                else:
+                    G_out = G_in.new_zeros(B, c_out.shape[1], 0)
+                state[name] = (c_out, G_out)
+            else:
+                c_out = c_in @ W.T + bias  # (B, n_out)
+                # G_out[b, o, k] = sum_i W[o, i] * G_in[b, i, k]
+                G_out = torch.einsum('oi,bik->bok', W, G_in)
+                state[name] = (c_out, G_out)
 
         elif t == 'relu':
             c_in, G_in = _get(op['inputs'][0])
@@ -1182,9 +1882,22 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
                 c_in, G_in = _get(op['inputs'][0])
                 bias = op.get('bias')
                 if bias is not None:
-                    bt = torch.as_tensor(bias.flatten(),
+                    bt = torch.as_tensor(bias,
                                           dtype=dtype, device=device)
-                    c_in = c_in + bt  # broadcast across batch
+                    n = c_in.shape[1]
+                    if bt.numel() == n:
+                        c_in = c_in + bt.flatten()
+                    else:
+                        # ND broadcast (mscn: out (6, 128) + bias (128,))
+                        out_shape_nd = op.get('out_shape_nd')
+                        if (out_shape_nd is not None
+                                and out_shape_nd[-1] == bt.numel()):
+                            c_nd = c_in.reshape(B, *out_shape_nd)
+                            c_in = (c_nd + bt).reshape(B, -1)
+                        else:
+                            raise ValueError(
+                                f'batched add bias shape {bt.shape} '
+                                f'incompatible (out_shape={out_shape_nd})')
                 state[name] = (c_in, G_in)
 
         elif t == 'sub':
@@ -1195,6 +1908,27 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
                                       dtype=dtype, device=device)
                 c_in = c_in - bt
             state[name] = (c_in, G_in)
+
+        elif t == 'sub_bilinear':
+            c_a, G_a = _get(op['inputs'][0])
+            c_b, G_b = _get(op['inputs'][1])
+            # Batched skip-style sub. Generators are batched (B, n, K).
+            # Pad gen dims to max so they can be concat'd; subtract on
+            # the prefix that's shared, append non-shared (with -G_b for
+            # the b-side extras).
+            ka = G_a.shape[2] if G_a.numel() > 0 else 0
+            kb = G_b.shape[2] if G_b.numel() > 0 else 0
+            shared = min(ka, kb)
+            G_a_shared = G_a[:, :, :shared]
+            G_b_shared = G_b[:, :, :shared]
+            parts = [G_a_shared - G_b_shared]
+            if ka > shared:
+                parts.append(G_a[:, :, shared:])
+            if kb > shared:
+                parts.append(-G_b[:, :, shared:])
+            G_out = torch.cat(parts, dim=2) if parts else \
+                c_a.new_zeros(c_a.shape[0], c_a.shape[1], 0)
+            state[name] = (c_a - c_b, G_out)
 
         elif t == 'reshape':
             state[name] = _get(op['inputs'][0])
@@ -1464,13 +2198,72 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
             lo_a = c_a - abs_a; hi_a = c_a + abs_a
             if t == 'mul_bilinear':
                 c_b, G_b = _get(op['inputs'][1])
+                # Fast path: if one side has zero generator radius
+                # everywhere (point per-disjunct, e.g. nn4sys mscn mask),
+                # the result is linear in the other side. Skip the box
+                # collapse, preserve generator correlation.
+                a_pt = (G_a.numel() == 0
+                         or bool(G_a.abs().max() < 1e-12))
+                b_pt = (G_b.numel() == 0
+                         or bool(G_b.abs().max() < 1e-12))
+                if a_pt or b_pt:
+                    sh_in = op.get('in_shapes_nd', [None, None])
+                    sh_out = op.get('out_shape_nd')
+                    K = max(G_a.shape[2] if G_a.numel() > 0 else 0,
+                             G_b.shape[2] if G_b.numel() > 0 else 0)
+                    if sh_in[0] is not None and sh_in[1] is not None:
+                        a_nd = c_a.reshape(B, *sh_in[0])
+                        b_nd = c_b.reshape(B, *sh_in[1])
+                    else:
+                        a_nd = c_a; b_nd = c_b
+                    c_out_nd = a_nd * b_nd
+                    c_out_local = c_out_nd.reshape(B, -1)
+                    if K == 0:
+                        state[name] = (
+                            c_out_local,
+                            c_out_local.new_zeros(B, c_out_local.shape[1], 0))
+                    else:
+                        # Scale gens of the varying side by the point
+                        # side's center, broadcast to out shape.
+                        if b_pt and not a_pt:
+                            G_a_nd = G_a.reshape(B, *sh_in[0], K)
+                            G_out_nd = (G_a_nd * b_nd.unsqueeze(-1))
+                        else:
+                            G_b_nd = G_b.reshape(B, *sh_in[1], K)
+                            G_out_nd = (G_b_nd * a_nd.unsqueeze(-1))
+                        if sh_out is not None:
+                            G_out_nd = G_out_nd.expand(B, *sh_out, K)
+                        state[name] = (
+                            c_out_local,
+                            G_out_nd.contiguous().reshape(B, -1, K))
+                    gen_count[name] = state[name][1].shape[2]
+                    for inp in op['inputs']:
+                        if last_use.get(inp) == op_idx and inp in state:
+                            del state[inp]
+                    continue
+                # Slow path: both sides varying — box collapse with
+                # broadcast support via ND shapes.
                 abs_b = G_b.abs().sum(dim=2)
                 lo_b = c_b - abs_b; hi_b = c_b + abs_b
-                # Sound bound for x*y where x in [lo_a, hi_a], y in [lo_b, hi_b].
-                corners = torch.stack(
-                    [lo_a * lo_b, lo_a * hi_b, hi_a * lo_b, hi_a * hi_b], dim=-1)
-                lo_out = corners.min(dim=-1).values
-                hi_out = corners.max(dim=-1).values
+                sh_in = op.get('in_shapes_nd', [None, None])
+                sh_out = op.get('out_shape_nd')
+                if (sh_in[0] is not None and sh_in[1] is not None
+                        and sh_in[0] != sh_in[1]):
+                    lo_a_nd = lo_a.reshape(B, *sh_in[0])
+                    hi_a_nd = hi_a.reshape(B, *sh_in[0])
+                    lo_b_nd = lo_b.reshape(B, *sh_in[1])
+                    hi_b_nd = hi_b.reshape(B, *sh_in[1])
+                    corners = torch.stack(
+                        [lo_a_nd * lo_b_nd, lo_a_nd * hi_b_nd,
+                          hi_a_nd * lo_b_nd, hi_a_nd * hi_b_nd], dim=-1)
+                    lo_out = corners.min(dim=-1).values.reshape(B, -1)
+                    hi_out = corners.max(dim=-1).values.reshape(B, -1)
+                else:
+                    corners = torch.stack(
+                        [lo_a * lo_b, lo_a * hi_b,
+                          hi_a * lo_b, hi_a * hi_b], dim=-1)
+                    lo_out = corners.min(dim=-1).values
+                    hi_out = corners.max(dim=-1).values
             elif t == 'matmul_bilinear':
                 # (B, .., M, K) @ (B, .., K, N) -> (B, .., M, N).
                 # Reshape to N-D via op['in_shapes_nd'] and ['out_shape_nd'].
@@ -1589,22 +2382,329 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
             c_in, G_in = _get(op['inputs'][0])
             state[name] = (c_in, G_in)
 
+        elif t == 'reduce_sum':
+            # Linear sum along given axes. mscn uses axis=1 with
+            # keepdims=0 to sum (3, 7) → (3,) for masked-mean numerator.
+            c_in, G_in = _get(op['inputs'][0])
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            axes = op.get('axes', ())
+            keep = op.get('keepdims', False)
+            K = G_in.shape[2]
+            c_nd = c_in.reshape(B, *in_shape_nd)
+            # gg axes are relative to stripped-batch shape — add 1 to
+            # skip the batch dim in the batched tensor.
+            for ax in sorted(axes, reverse=True):
+                c_nd = c_nd.sum(dim=ax + 1, keepdim=bool(keep))
+            c_out = c_nd.reshape(B, -1)
+            if K > 0:
+                G_nd = G_in.reshape(B, *in_shape_nd, K)
+                for ax in sorted(axes, reverse=True):
+                    G_nd = G_nd.sum(dim=ax + 1, keepdim=bool(keep))
+                G_out = G_nd.reshape(B, -1, K)
+            else:
+                G_out = G_in.new_zeros(B, c_out.shape[1], 0)
+            state[name] = (c_out, G_out)
+
+        elif t == 'mul_bilinear':
+            # Element-wise Mul. mscn: Mul(features, mask) where mask is
+            # point per-disjunct (zero radius). Helper raises when both
+            # sides vary; ND broadcast supported.
+            from .zonotope import _torch_zono_mul_bilinear
+            c_a, G_a = _get(op['inputs'][0])
+            c_b, G_b = _get(op['inputs'][1])
+            sh = op.get('in_shapes_nd', [None, None])
+            sh_out = op.get('out_shape_nd')
+            # Process per batch element (broadcasting differs per side).
+            # Most mscn cases: G_b is zero everywhere (mask is point per
+            # subbox). Use the helper's check.
+            K = max(G_a.shape[2] if G_a.numel() > 0 else 0,
+                     G_b.shape[2] if G_b.numel() > 0 else 0)
+            a_pt = (G_a.numel() == 0 or bool(G_a.abs().max() < 1e-12))
+            b_pt = (G_b.numel() == 0 or bool(G_b.abs().max() < 1e-12))
+            if not (a_pt or b_pt):
+                raise NotImplementedError(
+                    'batched mul_bilinear: both sides varying')
+            # Reshape to ND and broadcast.
+            if sh[0] is not None and sh[1] is not None:
+                a_nd = c_a.reshape(B, *sh[0])
+                b_nd = c_b.reshape(B, *sh[1])
+                c_out_nd = a_nd * b_nd
+                c_out = c_out_nd.reshape(B, -1)
+                if K > 0 and b_pt:
+                    G_a_nd = G_a.reshape(B, *sh[0], K)
+                    G_out_nd = (G_a_nd * b_nd.unsqueeze(-1)).expand(
+                        B, *sh_out, K)
+                    G_out = G_out_nd.contiguous().reshape(B, -1, K)
+                elif K > 0:
+                    G_b_nd = G_b.reshape(B, *sh[1], K)
+                    G_out_nd = (G_b_nd * a_nd.unsqueeze(-1)).expand(
+                        B, *sh_out, K)
+                    G_out = G_out_nd.contiguous().reshape(B, -1, K)
+                else:
+                    G_out = G_a.new_zeros(B, c_out.shape[1], 0)
+            else:
+                c_out = c_a * c_b
+                if b_pt:
+                    G_out = G_a * c_b.unsqueeze(-1) if K > 0 else G_a
+                else:
+                    G_out = G_b * c_a.unsqueeze(-1) if K > 0 else G_b
+            state[name] = (c_out, G_out)
+
+        elif t == 'div_bilinear':
+            # Element-wise Div. Point denom → exact path. Non-point
+            # denom → box-decorrelated fallback (one new gen per output
+            # element) keyed off `_div_decoupled` so the backward
+            # uses the matching sound linearisation.
+            c_a, G_a = _get(op['inputs'][0])
+            c_b, G_b = _get(op['inputs'][1])
+            sh = op.get('in_shapes_nd', [None, None])
+            sh_out = op.get('out_shape_nd')
+            b_pt = (G_b.numel() == 0 or bool(G_b.abs().max() < 1e-12))
+            K = G_a.shape[2] if G_a.numel() > 0 else 0
+            op['_div_decoupled'] = not b_pt
+            if not b_pt:
+                # Compute per-batch-element box bounds; stash them so
+                # the backward can recompute its linearisation. Note
+                # these are PER-BATCH-ELEMENT tensors (B, n_a) / (B, n_b).
+                K_a = G_a.shape[2] if G_a.numel() > 0 else 0
+                K_b = G_b.shape[2] if G_b.numel() > 0 else 0
+                rad_a = G_a.abs().sum(dim=2) if K_a > 0 else torch.zeros_like(c_a)
+                rad_b = G_b.abs().sum(dim=2)
+                a_lo_b = c_a - rad_a
+                a_hi_b = c_a + rad_a
+                b_lo_b = c_b - rad_b
+                b_hi_b = c_b + rad_b
+                op['_div_a_lo'] = a_lo_b.detach()
+                op['_div_a_hi'] = a_hi_b.detach()
+                op['_div_b_lo'] = b_lo_b.detach()
+                op['_div_b_hi'] = b_hi_b.detach()
+                if not bool((b_lo_b > 0).all()):
+                    raise ZeroDivisionError(
+                        'batched div_bilinear: b not sign-stable > 0')
+                # Scalar-b path: shared-gen 1/b chord-tangent +
+                # bilinear product. Preserves a-correlations + a↔b
+                # correlation via shared eps cols. Tighter downstream
+                # than the decorrelated 4-corner box.
+                is_scalar_b = (c_b.shape[1] == 1)
+                if is_scalar_b:
+                    # (B, 1) tensors.
+                    c_b_s = c_b[:, :1]
+                    rad_b_s = rad_b[:, :1]
+                    b_lo_s = b_lo_b[:, :1]
+                    b_hi_s = b_hi_b[:, :1]
+                    f_lo = 1.0 / b_lo_s
+                    f_hi = 1.0 / b_hi_s
+                    diff_b = (b_hi_s - b_lo_s).clamp(min=1e-30)
+                    lam_s = (f_hi - f_lo) / diff_b  # (B, 1)
+                    bstar_mag = 1.0 / lam_s.abs().clamp(min=1e-30).sqrt()
+                    bstar = torch.where(b_hi_s < 0, -bstar_mag, bstar_mag)
+                    bstar = torch.maximum(torch.minimum(bstar, b_hi_s), b_lo_s)
+                    f_star = 1.0 / bstar
+                    chord_int = f_lo - lam_s * b_lo_s
+                    tan_int = f_star - lam_s * bstar
+                    mu_s = (chord_int + tan_int) / 2
+                    gamma_s = (chord_int - tan_int).abs() / 2  # (B, 1)
+                    c_v = lam_s * c_b_s + mu_s             # (B, 1)
+                    # Pad K_a and K_b to common K.
+                    K_a = G_a.shape[2] if G_a.numel() > 0 else 0
+                    K_b = G_b.shape[2] if G_b.numel() > 0 else 0
+                    K_max = max(K_a, K_b)
+                    if K_a < K_max:
+                        G_a = torch.cat([G_a, G_a.new_zeros(
+                            B, G_a.shape[1] if G_a.numel() > 0 else c_a.shape[1],
+                            K_max - K_a)], dim=2)
+                    if K_b < K_max:
+                        G_b = torch.cat([G_b, G_b.new_zeros(
+                            B, 1, K_max - K_b)], dim=2)
+                    # c_out = c_a · c_v (broadcast scalar over n).
+                    c_out = c_a * c_v  # (B, n)
+                    n_y = c_a.shape[1]
+                    if K_max > 0:
+                        # Shared linear gens: c_a · lam · g_b  +  c_v · g_a.
+                        # c_a:(B,n,1) · lam:(B,1,1) · g_b:(B,1,K)  + c_v:(B,1,1) · g_a:(B,n,K)
+                        g_y_lin = (c_a.unsqueeze(-1)
+                                   * (lam_s.unsqueeze(-1) * G_b)
+                                   + c_v.unsqueeze(-1) * G_a)  # (B, n, K_max)
+                    else:
+                        g_y_lin = G_a.new_zeros(B, n_y, 0)
+                    # 1 new shared eps col for gamma.
+                    g_y_slack = (c_a * gamma_s).unsqueeze(-1)  # (B, n, 1)
+                    # n diag cols for bilinear remainder.
+                    quad_mag = rad_a * (
+                        lam_s.abs() * rad_b_s + gamma_s)  # (B, n)
+                    g_y_quad = torch.zeros(
+                        B, n_y, n_y, dtype=dtype, device=device)
+                    idx = torch.arange(n_y, device=device)
+                    g_y_quad[:, idx, idx] = quad_mag
+                    G_new = torch.cat([g_y_lin, g_y_slack, g_y_quad], dim=2)
+                    # Softmax pattern detection + sound [0, 1] clamp.
+                    # See `_torch_zono_div_scalar_b` for rationale.
+                    a_lo_b_v = c_a - rad_a   # (B, n_y)
+                    is_softmax = (
+                        bool((a_lo_b_v >= -1e-9).all())
+                        and bool(((c_b_s.reshape(B) -
+                                    c_a.sum(dim=1)).abs() <
+                                   1e-6 * c_b_s.reshape(B).abs().clamp(min=1.0)
+                                  ).all()))
+                    if is_softmax and K_max > 0:
+                        # g_b shape (B, 1, K), g_a (B, n, K). sum gens.
+                        g_a_sum_b = G_a.sum(dim=1, keepdim=True)  # (B, 1, K)
+                        if bool(((G_b - g_a_sum_b).abs().max(dim=2).values.max(dim=1).values
+                                 < 1e-6 * G_b.abs().amax(dim=(1,2)).clamp(min=1.0)).all()):
+                            # Apply per-element [0, 1] clamp.
+                            y_lo_enc = c_out - G_new.abs().sum(dim=2)
+                            y_hi_enc = c_out + G_new.abs().sum(dim=2)
+                            y_lo_c = torch.maximum(y_lo_enc,
+                                                    torch.zeros_like(c_out))
+                            y_hi_c = torch.minimum(y_hi_enc,
+                                                    torch.ones_like(c_out))
+                            needs = ((y_lo_enc < y_lo_c - 1e-12)
+                                     | (y_hi_enc > y_hi_c + 1e-12))
+                            if bool(needs.any()):
+                                tight_mask = needs  # (B, n_y)
+                                new_rad = (y_hi_c - y_lo_c) / 2
+                                new_center = (y_lo_c + y_hi_c) / 2
+                                # Zero out existing gen rows for tight elements.
+                                G_new_keep = G_new.clone()
+                                # Mask shape: (B, n_y, 1)
+                                G_new_keep = torch.where(
+                                    tight_mask.unsqueeze(-1),
+                                    torch.zeros_like(G_new_keep),
+                                    G_new_keep)
+                                # Replace center for tight elements.
+                                c_out = torch.where(tight_mask, new_center, c_out)
+                                # New diag gens of new_rad for tight elements.
+                                new_diag = torch.zeros(B, n_y, n_y,
+                                                        dtype=dtype, device=device)
+                                idx_t = torch.arange(n_y, device=device)
+                                diag_mag = torch.where(tight_mask, new_rad,
+                                                        torch.zeros_like(new_rad))
+                                new_diag[:, idx_t, idx_t] = diag_mag
+                                G_new = torch.cat([G_new_keep, new_diag], dim=2)
+                    state[name] = (c_out, G_new)
+                    gen_count[name] = G_new.shape[2]
+                    # Free inputs early.
+                    for inp in op['inputs']:
+                        if last_use.get(inp) == op_idx and inp in state:
+                            del state[inp]
+                    continue
+                # Vector-b fallback: 4-corner decorrelated.
+                if sh[0] is not None and sh[1] is not None:
+                    a_lo_nd = a_lo_b.reshape(B, *sh[0])
+                    a_hi_nd = a_hi_b.reshape(B, *sh[0])
+                    b_lo_nd = b_lo_b.reshape(B, *sh[1])
+                    b_hi_nd = b_hi_b.reshape(B, *sh[1])
+                    inv_lo = 1.0 / b_hi_nd
+                    inv_hi = 1.0 / b_lo_nd
+                    corners = torch.stack([
+                        a_lo_nd * inv_lo, a_lo_nd * inv_hi,
+                        a_hi_nd * inv_lo, a_hi_nd * inv_hi])
+                    out_lo_nd = corners.min(dim=0).values
+                    out_hi_nd = corners.max(dim=0).values
+                    c_out = ((out_lo_nd + out_hi_nd) / 2).reshape(B, -1)
+                    rad_out = ((out_hi_nd - out_lo_nd) / 2).reshape(B, -1)
+                else:
+                    inv_lo = 1.0 / b_hi_b
+                    inv_hi = 1.0 / b_lo_b
+                    corners = torch.stack([
+                        c_a * inv_lo, c_a * inv_hi,  # placeholder
+                        c_a * inv_lo, c_a * inv_hi])
+                    out_lo_flat = (a_lo_b / b_hi_b).minimum(a_lo_b / b_lo_b
+                        ).minimum(a_hi_b / b_hi_b).minimum(a_hi_b / b_lo_b)
+                    out_hi_flat = (a_lo_b / b_hi_b).maximum(a_lo_b / b_lo_b
+                        ).maximum(a_hi_b / b_hi_b).maximum(a_hi_b / b_lo_b)
+                    c_out = (out_lo_flat + out_hi_flat) / 2
+                    rad_out = (out_hi_flat - out_lo_flat) / 2
+                # New decorrelated gen column per output element per
+                # batch (diagonal). Total K_new = c_out.shape[1].
+                n_out_per_b = c_out.shape[1]
+                G_new = torch.zeros(B, n_out_per_b, n_out_per_b,
+                                      dtype=dtype, device=device)
+                idx = torch.arange(n_out_per_b, device=device)
+                G_new[:, idx, idx] = rad_out
+                state[name] = (c_out, G_new)
+                gen_count[name] = G_new.shape[2]
+                # Free inputs early.
+                for inp in op['inputs']:
+                    if last_use.get(inp) == op_idx and inp in state:
+                        del state[inp]
+                continue
+            if bool((c_b == 0).any()):
+                raise ZeroDivisionError(
+                    'batched div_bilinear: denominator has zero element')
+            if sh[0] is not None and sh[1] is not None:
+                a_nd = c_a.reshape(B, *sh[0])
+                b_nd = c_b.reshape(B, *sh[1])
+                inv_b = b_nd.reciprocal()
+                c_out = (a_nd * inv_b).reshape(B, -1)
+                if K > 0:
+                    G_a_nd = G_a.reshape(B, *sh[0], K)
+                    G_out_nd = (G_a_nd * inv_b.unsqueeze(-1)).expand(
+                        B, *sh_out, K)
+                    G_out = G_out_nd.contiguous().reshape(B, -1, K)
+                else:
+                    G_out = G_a.new_zeros(B, c_out.shape[1], 0)
+            else:
+                inv_b = c_b.reciprocal()
+                c_out = c_a * inv_b
+                G_out = (G_a * inv_b.unsqueeze(-1)) if K > 0 else G_a
+            state[name] = (c_out, G_out)
+
+        elif t == 'pow':
+            # x^p batched. Stash batched pre-pow box bounds for the
+            # backward to use. Per-batch independent processing for the
+            # gen encoding (new gen count may differ per box).
+            from .zonotope import _torch_zono_pow_int
+            c_in, G_in = _get(op['inputs'][0])
+            exp = op.get('exponent', 2.0)
+            assert float(int(exp)) == float(exp), (
+                f'batched pow: integer exponent required, got {exp}')
+            p = int(exp)
+            # Batched pre-pow bounds: (B, n_in).
+            K_in = G_in.shape[2] if G_in.numel() > 0 else 0
+            rad_in = G_in.abs().sum(dim=2) if K_in > 0 else torch.zeros_like(c_in)
+            op['_pow_in_lo'] = (c_in - rad_in).detach()
+            op['_pow_in_hi'] = (c_in + rad_in).detach()
+            op['_pow_relaxation'] = 'chord'
+            outs = []
+            max_new_K = 0
+            for bi in range(B):
+                c_b = c_in[bi]
+                g_b = G_in[bi] if G_in.numel() > 0 else c_b.new_zeros(c_b.numel(), 0)
+                c_out_b, g_out_b = _torch_zono_pow_int(c_b, g_b, p)
+                outs.append((c_out_b, g_out_b))
+                max_new_K = max(max_new_K, g_out_b.shape[1])
+            n_out = outs[0][0].numel()
+            c_out = torch.stack([o[0] for o in outs], dim=0).reshape(B, -1)
+            G_out = c_in.new_zeros(B, n_out, max_new_K)
+            for bi, (_, g) in enumerate(outs):
+                G_out[bi, :, :g.shape[1]] = g
+            state[name] = (c_out, G_out)
+
         else:
             raise ValueError(
                 f'batched zono forward: unknown op type {t!r}')
 
         gen_count[name] = state[name][1].shape[2]
+        if name in bilinear_input_names:
+            c_o, G_o = state[name]
+            rad_o = G_o.abs().sum(dim=-1)
+            op_bounds[name] = (c_o - rad_o, c_o + rad_o)
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in state:
                 del state[inp]
 
     last_name = gg['ops'][-1]['name']
+    _forward_zonotope_graph_batched.last_bilinear_op_bounds = op_bounds
     return sb, state[last_name]
 
 
 def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                                    return_input_linear=False,
                                    alpha_at_layer=None,
+                                   alpha_mccormick=None,
+                                   alpha_recip=None,
+                                   bilinear_op_bounds=None,
                                    seed_ew_at=None, seed_acc=None):
     """Batched CROWN spec backward.
 
@@ -1634,14 +2734,15 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
     """
     ops = gg['ops']
     B, n_in = xl.shape
+    _pcs_batched = None  # lazy-built shared point-centers for bilinears
 
     if seed_ew_at is not None:
         # Caller-provided seed: used for intermediate-layer tightening
         # (start the backward at an arbitrary op rather than the spec).
         ew_at = {name: seed.clone() for name, seed in seed_ew_at.items()}
+        any_seed = next(iter(seed_ew_at.values()))
+        Q = any_seed.shape[1]
         if seed_acc is None:
-            any_seed = next(iter(seed_ew_at.values()))
-            Q = any_seed.shape[1]
             acc = torch.zeros(B, Q, dtype=dtype, device=device)
         else:
             acc = seed_acc.clone()
@@ -1666,8 +2767,29 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
         if t == 'fc':
             W = op['W']
             bias = op['bias']
-            acc = acc + ew @ bias  # (B, Q)
-            ew_back = ew @ W  # (B, Q, n_in_layer)
+            # ND-batched MatMul case (mscn dual: input (3, 7), W (128, 7),
+            # output (3, 128) → ew shape (B, Q, 3*128 = 384)).
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            out_shape_nd = op.get('out_shape_nd')
+            if (in_shape_nd is not None and len(in_shape_nd) >= 2
+                    and W.shape[1] == in_shape_nd[-1]
+                    and out_shape_nd is not None and len(out_shape_nd) >= 2):
+                prefix = out_shape_nd[:-1]
+                n_out_inner = out_shape_nd[-1]
+                n_in_inner = in_shape_nd[-1]
+                prefix_size = int(np.prod(prefix))
+                # ew: (B, Q, prefix_size * n_out_inner)
+                # Reshape to (B, Q, prefix_size, n_out_inner).
+                ew_nd = ew.reshape(*ew.shape[:-1], prefix_size, n_out_inner)
+                # bias (n_out_inner,) broadcasts over prefix.
+                acc = acc + (ew_nd * bias).sum(dim=(-2, -1))
+                # ew_back at input: (B, Q, prefix_size, n_in_inner) = ew_nd @ W
+                ew_back_nd = ew_nd @ W  # (B, Q, prefix_size, n_in_inner)
+                ew_back = ew_back_nd.reshape(
+                    *ew_back_nd.shape[:-2], prefix_size * n_in_inner)
+            else:
+                acc = acc + ew @ bias  # (B, Q)
+                ew_back = ew @ W  # (B, Q, n_in_layer)
             inp = op['inputs'][0]
             existing = ew_at.get(inp)
             ew_at[inp] = ew_back if existing is None else existing + ew_back
@@ -1726,7 +2848,24 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                 if bias is not None:
                     bt = torch.as_tensor(bias.flatten(),
                                           dtype=dtype, device=device)
-                    acc = acc + (ew * bt).sum(dim=-1)
+                    # Broadcast bias if smaller than ew's last dim
+                    # (mscn pattern: bias (128,) over ew (B, Q, 256=
+                    # 2 segments × 128) needs tile).
+                    if bt.numel() < ew.shape[-1] and ew.shape[-1] % bt.numel() == 0:
+                        out_shape_nd = op.get('out_shape_nd')
+                        if (out_shape_nd is not None
+                                and len(out_shape_nd) >= 1
+                                and out_shape_nd[-1] == bt.numel()):
+                            ew_nd = ew.reshape(*ew.shape[:-1], *out_shape_nd)
+                            acc = acc + (ew_nd * bt).reshape(
+                                *ew.shape[:-1], -1).sum(dim=-1)
+                        else:
+                            # Fallback: tile bt to match ew's last dim.
+                            tile = ew.shape[-1] // bt.numel()
+                            bt_tiled = bt.repeat(tile)
+                            acc = acc + (ew * bt_tiled).sum(dim=-1)
+                    else:
+                        acc = acc + (ew * bt).sum(dim=-1)
                 inp = op['inputs'][0]
                 existing = ew_at.get(inp)
                 ew_at[inp] = ew.clone() if existing is None else existing + ew
@@ -1741,6 +2880,14 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
             inp = op['inputs'][0]
             existing = ew_at.get(inp)
             ew_at[inp] = ew.clone() if existing is None else existing + ew
+
+        elif t == 'sub_bilinear':
+            # ew flows + to inp[0], - to inp[1]; no const.
+            ia, ib = op['inputs'][0], op['inputs'][1]
+            ea = ew_at.get(ia)
+            eb = ew_at.get(ib)
+            ew_at[ia] = ew.clone() if ea is None else ea + ew
+            ew_at[ib] = (-ew).clone() if eb is None else eb + (-ew)
 
         elif t == 'reshape':
             inp = op['inputs'][0]
@@ -1926,7 +3073,350 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
             existing = ew_at.get(inp)
             ew_at[inp] = ew_back if existing is None else existing + ew_back
 
-        elif t in ('max_pool', 'mul_bilinear', 'matmul_bilinear', 'softmax'):
+        elif t == 'reduce_sum':
+            # Linear reduction backward: ew at output broadcasts to input.
+            # ew has shape (B, Q, n_out). Reshape to (B, Q, *sh_out_nd),
+            # then expand into (B, Q, *sh_in_nd) via broadcast.
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            out_shape_nd = op.get('out_shape_nd')
+            axes = op.get('axes', ())
+            keepdims = op.get('keepdims', False)
+            n_in_layer = int(np.prod(in_shape_nd))
+            ew_nd = ew.reshape(B, Q, *out_shape_nd)
+            # Expand by un-summing the reduced axes.
+            for ax in sorted(axes):
+                if not keepdims:
+                    ew_nd = ew_nd.unsqueeze(2 + ax)
+                ew_nd = ew_nd.expand(*ew_nd.shape[:2 + ax],
+                                       in_shape_nd[ax],
+                                       *ew_nd.shape[3 + ax:])
+            ew_back = ew_nd.reshape(B, Q, n_in_layer).contiguous()
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t == 'div_bilinear' and op.get('_div_decoupled'):
+            # ABC-style Div backward: Mul(a, Reciprocal(b)) with α-tunable
+            # McCormick + α-tunable Recip tangent. Strictly tighter than
+            # single-point Taylor + R-bound (validated on pensieve test
+            # case: ~2.3x tighter LB on a representative (a, b) box).
+            # Mirrors α,β-CROWN's BoundDiv = BoundMul · BoundReciprocal.
+            from .alpha_crown import _sum_to_shape
+            sh_in = op.get('in_shapes_nd', [None, None])
+            sh_out = op.get('out_shape_nd')
+            ia, ib = op['inputs'][0], op['inputs'][1]
+            a_lo = op['_div_a_lo'].to(device=device, dtype=dtype)
+            a_hi = op['_div_a_hi'].to(device=device, dtype=dtype)
+            b_lo = op['_div_b_lo'].to(device=device, dtype=dtype)
+            b_hi = op['_div_b_hi'].to(device=device, dtype=dtype)
+            # Broadcast (a, b) bounds to (B, *sh_out) per batch element.
+            ones_out = torch.ones(B, *sh_out, dtype=dtype, device=device)
+            a_lo_o = ones_out * a_lo.reshape(B, *sh_in[0])
+            a_hi_o = ones_out * a_hi.reshape(B, *sh_in[0])
+            b_lo_o = ones_out * b_lo.reshape(B, *sh_in[1])
+            b_hi_o = ones_out * b_hi.reshape(B, *sh_in[1])
+            # α tunables (only used when shape matches the per-leaf box;
+            # otherwise fall back to default midpoint).
+            def _alpha_for(name, default_shape):
+                a_t = op.get(name)
+                if a_t is None:
+                    return None
+                a_t = a_t.to(device=device, dtype=dtype)
+                if a_t.shape == default_shape:
+                    return a_t
+                return None
+            alpha_r = _alpha_for('_div_recip_alpha', b_lo.shape)
+            r_l = _alpha_for('_div_mc_rl', a_lo.shape)
+            r_u = _alpha_for('_div_mc_ru', a_lo.shape)
+            # Broadcast α's to (B, *sh_out).
+            if alpha_r is not None:
+                alpha_r_o = ones_out * alpha_r.reshape(B, *sh_in[1])
+            else:
+                alpha_r_o = None
+            if r_l is not None:
+                r_l_o = ones_out * r_l.reshape(B, *sh_in[0])
+            else:
+                r_l_o = None
+            if r_u is not None:
+                r_u_o = ones_out * r_u.reshape(B, *sh_in[0])
+            else:
+                r_u_o = None
+            # ew shape (B, Q, n_out) → (B, Q, *sh_out)
+            ew_nd = ew.reshape(B, Q, *sh_out)
+            # Helper expects ew and (a_lo,...) to broadcast. Add Q dim
+            # to bounds by unsqueezing; helper acts per element.
+            acc_contrib, ew_a_nd, ew_b_nd = _div_backward_rm_mccormick(
+                a_lo_o.unsqueeze(1), a_hi_o.unsqueeze(1),
+                b_lo_o.unsqueeze(1), b_hi_o.unsqueeze(1),
+                ew_nd,
+                alpha_r=(alpha_r_o.unsqueeze(1) if alpha_r_o is not None else None),
+                r_l=(r_l_o.unsqueeze(1) if r_l_o is not None else None),
+                r_u=(r_u_o.unsqueeze(1) if r_u_o is not None else None))
+            # `acc_contrib` shape: (B, Q). Add directly.
+            acc = acc + acc_contrib
+            # `ew_a_nd`, `ew_b_nd` shape: (B, Q, *sh_out). Sum-to-shape
+            # back to (B, Q, *sh_in[*]) via broadcast adjoint.
+            ew_a_in_nd = _sum_to_shape(ew_a_nd, (B, Q), sh_in[0])
+            ew_b_in_nd = _sum_to_shape(ew_b_nd, (B, Q), sh_in[1])
+            ew_a = ew_a_in_nd.reshape(B, Q, -1)
+            ew_b = ew_b_in_nd.reshape(B, Q, -1)
+            ea = ew_at.get(ia)
+            eb = ew_at.get(ib)
+            ew_at[ia] = ew_a if ea is None else ea + ew_a
+            ew_at[ib] = ew_b if eb is None else eb + ew_b
+
+        elif t == 'div_bilinear' and not op.get('_div_decoupled'):
+            # Point-side linearization: b is point per-sub. Use exact
+            # 1/c_b slopes (b's variation is 0 → no slack needed).
+            # Forward: y = a · (1/c_b). Backward: ew_a = ew/c_b, ew_b = -ew·c_a/c_b².
+            # Need batched point centers — compute via single forward.
+            from .alpha_crown import (
+                _compute_point_centers_batched, _sum_to_shape)
+            # Use per-leaf input midpoint as the linearisation point.
+            x_centers = ((xl + xh) / 2)  # (B, n_in)
+            sh_in = op.get('in_shapes_nd', [None, None])
+            sh_out = op.get('out_shape_nd')
+            ia, ib = op['inputs'][0], op['inputs'][1]
+            # Cache: same x_centers across all bilinear ops in this
+            # backward. Compute once and reuse.
+            if '_pcs_batched' not in locals() or _pcs_batched is None:
+                _pcs_batched = _compute_point_centers_batched(
+                    gg, x_centers, device, dtype)
+            c_a_batched = _pcs_batched[ia]  # (B, n_a)
+            c_b_batched = _pcs_batched[ib]  # (B, n_b)
+            ew_nd = ew.reshape(B, Q, *sh_out)
+            a_nd = c_a_batched.reshape(B, *sh_in[0])
+            b_nd = c_b_batched.reshape(B, *sh_in[1])
+            if bool((b_nd == 0).any()):
+                raise ZeroDivisionError(
+                    f'batched div_bilinear backward: denom zero at {name!r}')
+            if (bilinear_op_bounds is not None
+                    and ia in bilinear_op_bounds
+                    and ib in bilinear_op_bounds):
+                # ABC-style: decompose y = a/b as a * (1/b).
+                # McCormick on (a, t=1/b) with bounds on (a, t),
+                # then substitute t with linear LB/UB in b (1/b is convex
+                # on positive reals — tangent for LB, secant for UB).
+                # Sign-conditional dispatch on McCormick β (coefficient
+                # on t) to pick LB vs UB linearization of 1/b.
+                a_lo_o, a_hi_o = bilinear_op_bounds[ia]
+                b_lo_o, b_hi_o = bilinear_op_bounds[ib]
+                a_lo_nd = a_lo_o.reshape(B, *sh_in[0])
+                a_hi_nd = a_hi_o.reshape(B, *sh_in[0])
+                b_lo_nd = b_lo_o.reshape(B, *sh_in[1])
+                b_hi_nd = b_hi_o.reshape(B, *sh_in[1])
+                # Require b > 0 (mscn softmax-style — denom is sum of
+                # positives + epsilon). If b_lo <= 0, fall through to
+                # point linearization below.
+                if not bool((b_lo_nd > 0).all()):
+                    raise NotImplementedError(
+                        'div_bilinear McCormick path requires b_lo > 0; '
+                        f'got min b_lo={b_lo_nd.min().item()}')
+                # 1/b bounds at INPUT (decreasing function):
+                t_lo_nd = 1.0 / b_hi_nd  # min of 1/b
+                t_hi_nd = 1.0 / b_lo_nd  # max of 1/b
+                # McCormick envelopes for product a*t with (a, t) bounds.
+                # r_l, r_u ∈ [0, 1] interpolate corners (ABC-style).
+                if (alpha_mccormick is not None
+                        and name in alpha_mccormick):
+                    r_l, r_u = alpha_mccormick[name]
+                else:
+                    r_l = torch.full(sh_out, 0.5, dtype=dtype, device=device)
+                    r_u = torch.full(sh_out, 0.5, dtype=dtype, device=device)
+                # Need shape (B, *sh_out) for broadcast with a/t bounds.
+                r_l_b = r_l.unsqueeze(0) if r_l.dim() == len(sh_out) else r_l
+                r_u_b = r_u.unsqueeze(0) if r_u.dim() == len(sh_out) else r_u
+                alpha_l = (t_lo_nd - t_hi_nd) * r_l_b + t_hi_nd
+                beta_l = (a_lo_nd - a_hi_nd) * r_l_b + a_hi_nd
+                gamma_l = ((t_hi_nd * a_hi_nd - t_lo_nd * a_lo_nd) * r_l_b
+                           - t_hi_nd * a_hi_nd)
+                alpha_u = (t_hi_nd - t_lo_nd) * r_u_b + t_lo_nd
+                beta_u = (a_lo_nd - a_hi_nd) * r_u_b + a_hi_nd
+                gamma_u = ((t_lo_nd * a_hi_nd - t_hi_nd * a_lo_nd) * r_u_b
+                           - t_lo_nd * a_hi_nd)
+                # Reciprocal LB tangent at b0 ∈ [b_lo, b_hi].
+                # ABC tunes b0 per spec output (alpha[start_node]); we
+                # parameterize b0 = b_lo + r_recip * (b_hi - b_lo)
+                # with r_recip ∈ [0, 1]. Default r_recip = 0.5 = midpoint.
+                if alpha_recip is not None and name in alpha_recip:
+                    r_recip = alpha_recip[name]
+                    r_recip_b = (r_recip.unsqueeze(0)
+                                 if r_recip.dim() == len(sh_in[1]) else r_recip)
+                    b0 = b_lo_nd + r_recip_b * (b_hi_nd - b_lo_nd)
+                else:
+                    b0 = (b_lo_nd + b_hi_nd) * 0.5
+                m_lb_inv = -1.0 / (b0 * b0)
+                c_lb_inv = 2.0 / b0
+                # UB_inv: 1/b <= m_u_inv * b + c_u_inv (secant b_lo → b_hi)
+                m_ub_inv = -1.0 / (b_lo_nd * b_hi_nd)
+                c_ub_inv = 1.0 / b_lo_nd + 1.0 / b_hi_nd
+                # For LB on y = a*t: substitute t.
+                #   if β_l >= 0: use LB_inv (smaller t → smaller LB,
+                #     still valid LB);
+                #   if β_l < 0: use UB_inv (smaller |β_l|*t → larger,
+                #     still valid LB).
+                beta_l_pos = (beta_l >= 0).to(dtype)
+                beta_l_neg = 1.0 - beta_l_pos
+                m_l_sub = beta_l_pos * m_lb_inv + beta_l_neg * m_ub_inv
+                c_l_sub = beta_l_pos * c_lb_inv + beta_l_neg * c_ub_inv
+                beta_y_l = beta_l * m_l_sub
+                gamma_y_l = beta_l * c_l_sub + gamma_l
+                # For UB on y: dual.
+                beta_u_pos = (beta_u >= 0).to(dtype)
+                beta_u_neg = 1.0 - beta_u_pos
+                m_u_sub = beta_u_pos * m_ub_inv + beta_u_neg * m_lb_inv
+                c_u_sub = beta_u_pos * c_ub_inv + beta_u_neg * c_lb_inv
+                beta_y_u = beta_u * m_u_sub
+                gamma_y_u = beta_u * c_u_sub + gamma_u
+                # Sign-conditional backward (per output element).
+                ew_nd_d = ew_nd
+                ew_pos = ew_nd_d.clamp(min=0)
+                ew_neg = ew_nd_d.clamp(max=0)
+                ew_a_full = (ew_pos * alpha_l.unsqueeze(1)
+                             + ew_neg * alpha_u.unsqueeze(1))
+                ew_b_full = (ew_pos * beta_y_l.unsqueeze(1)
+                             + ew_neg * beta_y_u.unsqueeze(1))
+                acc_contrib = (ew_pos * gamma_y_l.unsqueeze(1)
+                               + ew_neg * gamma_y_u.unsqueeze(1))
+                acc = acc + acc_contrib.reshape(B, Q, -1).sum(dim=-1)
+                ew_a_nd = _sum_to_shape(ew_a_full, (B, Q), sh_in[0])
+                ew_b_nd = _sum_to_shape(ew_b_full, (B, Q), sh_in[1])
+                ew_a = ew_a_nd.reshape(B, Q, -1)
+                ew_b = ew_b_nd.reshape(B, Q, -1)
+            else:
+                inv_b = b_nd.reciprocal()
+                # ew_a = ew * inv_b, broadcast (B, Q, *sh_out) by (B, *sh_in_b)
+                # Need to add Q dim to b_nd / a_nd for broadcasting.
+                ew_a_nd_full = ew_nd * inv_b.unsqueeze(1)
+                ew_b_nd_full = -ew_nd * a_nd.unsqueeze(1) * inv_b.unsqueeze(1) * inv_b.unsqueeze(1)
+                # Sum-to-shape per batch element (broadcast adjoint).
+                ew_a_nd = _sum_to_shape(ew_a_nd_full, (B, Q), sh_in[0])
+                ew_b_nd = _sum_to_shape(ew_b_nd_full, (B, Q), sh_in[1])
+                ew_a = ew_a_nd.reshape(B, Q, -1)
+                ew_b = ew_b_nd.reshape(B, Q, -1)
+            ea = ew_at.get(ia)
+            eb = ew_at.get(ib)
+            ew_at[ia] = ew_a.clone() if ea is None else ea + ew_a
+            ew_at[ib] = ew_b.clone() if eb is None else eb + ew_b
+
+        elif t == 'mul_bilinear' and t != 'mul_bilinear_box_relax':
+            # Will fall through to box-relax below if needed.
+            # For point-side, similar to div but multiplication.
+            from .alpha_crown import (
+                _compute_point_centers_batched, _sum_to_shape)
+            x_centers = ((xl + xh) / 2)
+            sh_in = op.get('in_shapes_nd', [None, None])
+            sh_out = op.get('out_shape_nd')
+            ia, ib = op['inputs'][0], op['inputs'][1]
+            if '_pcs_batched' not in locals() or _pcs_batched is None:
+                _pcs_batched = _compute_point_centers_batched(
+                    gg, x_centers, device, dtype)
+            c_a_batched = _pcs_batched[ia]
+            c_b_batched = _pcs_batched[ib]
+            if (bilinear_op_bounds is not None
+                    and ia in bilinear_op_bounds
+                    and ib in bilinear_op_bounds):
+                # ABC-style McCormick + α (sign-conditional envelope).
+                # LB: y >= α_l·a + β_l·b + γ_l  (used where ew > 0)
+                # UB: y <= α_u·a + β_u·b + γ_u  (used where ew < 0)
+                # r_l, r_u ∈ [0,1] interpolate between 2 McCormick
+                # corners (ABC's `interpolated_relaxation`).
+                a_lo, a_hi = bilinear_op_bounds[ia]
+                b_lo, b_hi = bilinear_op_bounds[ib]
+                a_lo_nd = a_lo.reshape(B, *sh_in[0])
+                a_hi_nd = a_hi.reshape(B, *sh_in[0])
+                b_lo_nd = b_lo.reshape(B, *sh_in[1])
+                b_hi_nd = b_hi.reshape(B, *sh_in[1])
+                if alpha_mccormick is not None and name in alpha_mccormick:
+                    r_l, r_u = alpha_mccormick[name]
+                else:
+                    r_l = torch.full(sh_out, 0.5, dtype=dtype, device=device)
+                    r_u = torch.full(sh_out, 0.5, dtype=dtype, device=device)
+                r_l_b = r_l.unsqueeze(0) if r_l.dim() == len(sh_out) else r_l
+                r_u_b = r_u.unsqueeze(0) if r_u.dim() == len(sh_out) else r_u
+                alpha_l = (b_lo_nd - b_hi_nd) * r_l_b + b_hi_nd
+                beta_l = (a_lo_nd - a_hi_nd) * r_l_b + a_hi_nd
+                gamma_l = ((b_hi_nd * a_hi_nd - b_lo_nd * a_lo_nd) * r_l_b
+                           - b_hi_nd * a_hi_nd)
+                alpha_u = (b_hi_nd - b_lo_nd) * r_u_b + b_lo_nd
+                beta_u = (a_lo_nd - a_hi_nd) * r_u_b + a_hi_nd
+                gamma_u = ((b_lo_nd * a_hi_nd - b_hi_nd * a_lo_nd) * r_u_b
+                           - b_lo_nd * a_hi_nd)
+                ew_nd = ew.reshape(B, Q, *sh_out)
+                ew_pos = ew_nd.clamp(min=0)
+                ew_neg = ew_nd.clamp(max=0)
+                ew_a_full = (ew_pos * alpha_l.unsqueeze(1)
+                             + ew_neg * alpha_u.unsqueeze(1))
+                ew_b_full = (ew_pos * beta_l.unsqueeze(1)
+                             + ew_neg * beta_u.unsqueeze(1))
+                acc_contrib = (ew_pos * gamma_l.unsqueeze(1)
+                               + ew_neg * gamma_u.unsqueeze(1))
+                acc = acc + acc_contrib.reshape(B, Q, -1).sum(dim=-1)
+                ew_a_nd = _sum_to_shape(ew_a_full, (B, Q), sh_in[0])
+                ew_b_nd = _sum_to_shape(ew_b_full, (B, Q), sh_in[1])
+                ew_a = ew_a_nd.reshape(B, Q, -1)
+                ew_b = ew_b_nd.reshape(B, Q, -1)
+            else:
+                # Legacy point-linearization (kept for back-compat).
+                ew_nd = ew.reshape(B, Q, *sh_out)
+                a_nd = c_a_batched.reshape(B, *sh_in[0])
+                b_nd = c_b_batched.reshape(B, *sh_in[1])
+                ew_a_nd_full = ew_nd * b_nd.unsqueeze(1)
+                ew_b_nd_full = ew_nd * a_nd.unsqueeze(1)
+                ew_a_nd = _sum_to_shape(ew_a_nd_full, (B, Q), sh_in[0])
+                ew_b_nd = _sum_to_shape(ew_b_nd_full, (B, Q), sh_in[1])
+                ew_a = ew_a_nd.reshape(B, Q, -1)
+                ew_b = ew_b_nd.reshape(B, Q, -1)
+            ea = ew_at.get(ia)
+            eb = ew_at.get(ib)
+            ew_at[ia] = ew_a.clone() if ea is None else ea + ew_a
+            ew_at[ib] = ew_b.clone() if eb is None else eb + ew_b
+
+        elif t == 'pow':
+            # Pow batched backward — two-line (LB tangent, UB chord)
+            # per element per batch. ew shape (B, Q, n). Uses
+            # α-optimized tangent position when present (set by the
+            # α-CROWN Adam loop in `_run_alpha_crown_inputsplit_batched`).
+            lo_pre = op.get('_pow_in_lo')
+            hi_pre = op.get('_pow_in_hi')
+            assert lo_pre is not None and hi_pre is not None, (
+                f"batched pow backward: missing pre-pow bounds")
+            lo_pre_t = lo_pre.to(device=device, dtype=dtype)
+            hi_pre_t = hi_pre.to(device=device, dtype=dtype)
+            p = int(op.get('exponent', 2))
+            tan_alpha = op.get('_pow_tangent_alpha')
+            # Phase 0.5's `_pow_tangent_alpha` may be shape (n,) — only
+            # valid at root box. Skip unless its shape matches lo_pre_t.
+            if tan_alpha is not None:
+                tan_alpha = tan_alpha.to(device=device, dtype=dtype)
+                if tan_alpha.shape != lo_pre_t.shape:
+                    tan_alpha = None
+            (lb_slope, lb_const, ub_slope, ub_const,
+             use_tl, box_lo_v, box_hi_v) = _pow_two_line_coeffs(
+                lo_pre_t, hi_pre_t, p, tangent_pos=tan_alpha)
+            # All these are (B, n_layer) shape.
+            ep = ew.clamp(min=0); en = ew.clamp(max=0)
+            slope_back = ep * lb_slope.unsqueeze(1) \
+                + en * ub_slope.unsqueeze(1)
+            const_back = ep * lb_const.unsqueeze(1) \
+                + en * ub_const.unsqueeze(1)
+            use_tl_u = use_tl.unsqueeze(1)
+            box_lo_u = box_lo_v.unsqueeze(1)
+            box_hi_u = box_hi_v.unsqueeze(1)
+            slope_back = torch.where(use_tl_u, slope_back,
+                                       torch.zeros_like(slope_back))
+            const_back = torch.where(use_tl_u, const_back,
+                                       torch.where(ep > 0, box_lo_u,
+                                           torch.zeros_like(box_lo_u))
+                                       + torch.where(en < 0, box_hi_u,
+                                           torch.zeros_like(box_hi_u)))
+            acc = acc + const_back.sum(dim=-1)
+            ew_back = slope_back
+            inp = op['inputs'][0]
+            existing = ew_at.get(inp)
+            ew_at[inp] = ew_back if existing is None else existing + ew_back
+
+        elif t in ('max_pool', 'matmul_bilinear', 'softmax'):
             # Box-relaxation CROWN: y has constant bounds (lo_out, hi_out)
             # stamped at forward time. Linear lower bound is the constant
             # lo_out (slope 0); the contribution to acc is
@@ -2031,8 +3521,47 @@ def _run_alpha_crown_inputsplit_batched(xl, xh, gg, spec_ew, device, dtype,
         _, up_s, _, active, dead, unstable = _make_slopes(lo, hi)
         init_alpha = ((up_s > 0.5).to(dtype) * unstable.to(dtype))
         alpha_at_layer[L] = init_alpha.detach().clone().requires_grad_(True)
-    optimizer = torch.optim.Adam(
-        [alpha_at_layer[L] for L in alpha_at_layer], lr=lr)
+    # α-Pow: NORMALIZED α ∈ [0, 1]; tangent_pos = lo + α·(hi - lo).
+    # Reparam makes Adam's per-param step lr=0.25 cover ~25% of [lo,hi]
+    # regardless of absolute magnitude (Pow ranges from O(1) to O(1e8)
+    # across the chain — uniform [0,1] avoids per-op lr tuning).
+    alpha_pow_norm = {}  # op_name -> (norm_alpha_tensor in [0,1], lo, hi)
+    for op in gg['ops']:
+        if op['type'] == 'pow':
+            lo_pre = op.get('_pow_in_lo')
+            hi_pre = op.get('_pow_in_hi')
+            if lo_pre is not None and hi_pre is not None:
+                lo_t = lo_pre.to(device=device, dtype=dtype)
+                hi_t = hi_pre.to(device=device, dtype=dtype)
+                a = torch.full_like(lo_t, 0.5).requires_grad_(True)
+                alpha_pow_norm[op['name']] = (a, lo_t, hi_t)
+    # α-Div: NORMALIZED α ∈ [0, 1]; cb = b_lo + α·(b_hi - b_lo).
+    alpha_div_norm = {}
+    for op in gg['ops']:
+        if op['type'] == 'div_bilinear' and op.get('_div_decoupled'):
+            b_lo = op.get('_div_b_lo')
+            b_hi = op.get('_div_b_hi')
+            if b_lo is not None and b_hi is not None:
+                b_lo_t = b_lo.to(device=device, dtype=dtype)
+                b_hi_t = b_hi.to(device=device, dtype=dtype)
+                a = torch.full_like(b_lo_t, 0.5).requires_grad_(True)
+                alpha_div_norm[op['name']] = (a, b_lo_t, b_hi_t)
+    # Push initial values into ops.
+    for op_name, (a, lo_t, hi_t) in alpha_pow_norm.items():
+        for op in gg['ops']:
+            if op['name'] == op_name:
+                op['_pow_tangent_alpha'] = lo_t + a * (hi_t - lo_t)
+    for op_name, (a, blo, bhi) in alpha_div_norm.items():
+        for op in gg['ops']:
+            if op['name'] == op_name:
+                op['_div_cb_alpha'] = blo + a * (bhi - blo)
+    optimizer_params = [alpha_at_layer[L] for L in alpha_at_layer]
+    optimizer_params += [a for (a, _, _) in alpha_pow_norm.values()]
+    optimizer_params += [a for (a, _, _) in alpha_div_norm.values()]
+    optimizer = torch.optim.Adam(optimizer_params, lr=lr)
+    # Backward compat for legacy variable names used in clamp loop below
+    alpha_pow = alpha_pow_norm
+    alpha_div = alpha_div_norm
     best_spec_lbs = None
     prev_max = -float('inf')
     for it in range(n_iters):
@@ -2054,6 +3583,22 @@ def _run_alpha_crown_inputsplit_batched(xl, xh, gg, spec_ew, device, dtype,
         with torch.no_grad():
             for L in alpha_at_layer:
                 alpha_at_layer[L].clamp_(0.0, 1.0)
+            # Clamp normalized α ∈ [0, 1]; recompute consumed values.
+            for op_name, (a, lo_t, hi_t) in alpha_pow.items():
+                a.data.clamp_(0.0, 1.0)
+            for op_name, (a, blo, bhi) in alpha_div.items():
+                a.data.clamp_(0.0, 1.0)
+        # Refresh op refs to use NEW α values (after step). Build a
+        # fresh tensor with current α (still requires_grad via mul chain).
+        for op in gg['ops']:
+            if op['type'] == 'pow' and op['name'] in alpha_pow:
+                a, lo_t, hi_t = alpha_pow[op['name']]
+                op['_pow_tangent_alpha'] = lo_t + a * (hi_t - lo_t)
+            if op['type'] == 'div_bilinear' and op['name'] in alpha_div:
+                a, blo, bhi = alpha_div[op['name']]
+                op['_div_cb_alpha'] = blo + a * (bhi - blo)
+        with torch.no_grad():
+            pass
         if it > 0 and curr_max - prev_max < early_stop_eps:
             break
         prev_max = curr_max

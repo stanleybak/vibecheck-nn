@@ -1,27 +1,37 @@
-"""Integration tests for nn4sys (partial — 121/194 covered).
+"""Integration tests for nn4sys.
 
-VNNCOMP regular track. 12 ML-for-systems models. 121 verified via:
+VNNCOMP regular track. 12 ML-for-systems models verified via:
   - Per-disjunct sub-verification for `lindex` family (10000 X subboxes
     decomposed into batched-CROWN fast path)
   - Gather op support for `pensieve_*_simple` family
   - ONNX input-shape loader fix (keep all-concrete dims) for
-    `pensieve_big_parallel` family
+    `pensieve_*_parallel` family
+  - Pow / Div / ReduceSum / MulBilinear handlers (chord-tangent Pow,
+    box-fallback Div) for `mscn_*` and `pensieve_*_parallel` families
+  - Auto-routing: graphs with non-LP ops force
+    `tighten_formulation=skip`, `phase2_crown_enabled=False`, and lift
+    `input_split_max_dims` based on varying-dim count
 
-Two critical soundness bugs caught + fixed during this benchmark:
+Soundness bugs caught + fixed during this benchmark:
   - milp_verify Gurobi FeasibilityTol vs float32-zono 1 ulp gap
   - vnnlib parser dropped X constraints from mixed X/Y conjuncts
+  - **Silent op-skip in gg builder for Pow/Div/ReduceSum/MulBilinear**:
+    pensieve_*_parallel verification was passing pre-fix because the
+    gg op-emit fell through to `alias[name] = src` on these ops,
+    effectively computing on a network with Pow/Div stripped — the
+    "verified" lb of ~167069 didn't reflect the real network (whose
+    Y_0 ranges ~5.55-5.59). The Pow/Div/ReduceSum handlers added in
+    this branch produce correct (but looser) bounds.
 
-8 pensieve_small_parallel cases blocked on Gather/Slice topology
-quirk; 65 mscn cases blocked on Div + ReduceSum dispatchers (each
-Div is masked-mean `Div(ReduceSum(feat*mask), ReduceSum(mask))`).
-
-Three representative cases:
-  - lindex_10000 (UNSAT, ~0.5 s) — fast batched CROWN over 10000
-    unique X subboxes. Regression for both soundness fixes.
-  - pensieve_simple_0 on pensieve_small_simple (UNSAT, ~2 s) — Gather
-    op + per-disjunct.
-  - pensieve_parallel_1 on pensieve_big_parallel (UNSAT, ~2 s) —
-    fixed-shape `[12, 8]` input loader regression.
+Cases:
+  - lindex_10000 — fast batched CROWN over 10000 unique X subboxes
+  - pensieve_simple_0 — Gather op + per-disjunct, no Pow/Div
+  - mscn_128d cardinality_0_1 — per-disjunct + Pow/Div/ReduceSum
+    correct bound (chord-tangent Pow + box-fallback Div), verifies via
+    Phase 0.5 α-CROWN since `phase2_crown_enabled=False` is auto-set
+  - mscn_2048d cardinality_0_1 — same path on 2048-dim variant,
+    verifies through input-split fast-leaf (lifted from 20 → 154 dims
+    because n_varying=1)
 """
 import pytest
 from ._runner import run_case
@@ -44,10 +54,47 @@ CASES = [
         expected='verified', timeout=30, max_wall_s=10.0,
     ),
     dict(
-        desc='nn4sys pensieve_parallel_1 (UNSAT, fixed-shape input loader)',
+        desc='nn4sys mscn_128d cardinality_0_1 '
+             '(UNSAT, Pow/Div/ReduceSum + phase2_crown auto-off)',
+        net='onnx/mscn_128d.onnx',
+        vnnlib='vnnlib/cardinality_0_1_128.vnnlib',
+        expected='verified', timeout=30, max_wall_s=5.0,
+    ),
+    dict(
+        desc='nn4sys mscn_2048d cardinality_0_1 '
+             '(UNSAT, input-split max_dims auto-lifted to 154)',
+        net='onnx/mscn_2048d.onnx',
+        vnnlib='vnnlib/cardinality_0_1_2048.vnnlib',
+        expected='verified', timeout=30, max_wall_s=5.0,
+    ),
+    dict(
+        desc='nn4sys pensieve_parallel_1 '
+             '(UNSAT, Sub-bilinear + sound Div Lagrange-remainder)',
         net='onnx/pensieve_big_parallel.onnx',
         vnnlib='vnnlib/pensieve_parallel_1.vnnlib',
-        expected='verified', timeout=30, max_wall_s=10.0,
+        expected='verified', timeout=30, max_wall_s=5.0,
+    ),
+    dict(
+        desc='nn4sys pensieve_small_parallel_1 '
+             '(UNSAT, Gather shape-inference fix + Sub-bilinear)',
+        net='onnx/pensieve_small_parallel.onnx',
+        vnnlib='vnnlib/pensieve_parallel_1.vnnlib',
+        expected='verified', timeout=30, max_wall_s=5.0,
+    ),
+    dict(
+        desc='nn4sys pensieve_big_parallel_32 '
+             '(UNSAT, auto-routed input-split + α-Pow/Div + shared-gen Div)',
+        net='onnx/pensieve_big_parallel.onnx',
+        vnnlib='vnnlib/pensieve_parallel_32.vnnlib',
+        expected='verified', timeout=30, max_wall_s=5.0,
+    ),
+    dict(
+        desc='nn4sys pensieve_big_parallel_83 '
+             '(UNSAT, hard case: needs ABC-style Recip+McCormick Div + '
+             'softmax-clamp + input-split)',
+        net='onnx/pensieve_big_parallel.onnx',
+        vnnlib='vnnlib/pensieve_parallel_83.vnnlib',
+        expected='verified', timeout=140, max_wall_s=140.0,
     ),
 ]
 

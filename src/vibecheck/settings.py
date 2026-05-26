@@ -775,6 +775,38 @@ def default_settings(**overrides):
         # `skip_sat_validation=True` opts out (e.g. for ORT-free envs).
         sat_validate_atol=1e-4,
         skip_sat_validation=False,
+        # ONNXRuntime VERIFIED-witness validation (defense-in-depth).
+        # When a verdict comes back 'verified', sample N points from the
+        # input box, forward them through the ORIGINAL ONNX model, and
+        # check that NONE counterexamples the spec. If any does, the
+        # verified verdict was unsound — downgrade to 'unknown' with
+        # `details['spurious_verified']` set. Finite sampling is NOT a
+        # soundness proof of UNSAT (we may miss adversarial inputs), but
+        # ANY counterexample found is a true counterexample. Catches
+        # Class-1 unsoundness (verifier silently certified a SAT spec)
+        # at near-zero cost. `skip_verified_validation=True` opts out
+        # (e.g. for ORT-free envs or speed-critical sweeps).
+        verified_validation_samples=32,
+        skip_verified_validation=False,
+        # Fallback policy for nonlinear bilinear ops (mul_bilinear with
+        # both sides varying; div_bilinear with non-point denominator).
+        # 'raise' = strict (NotImplementedError if no exact handling).
+        # 'box'   = sound decorrelated box-enclosure: new error generator
+        #            per output element, no x-y correlation preserved.
+        #            Looses tightness but unblocks pensieve_*_parallel
+        #            (Pow→ReduceSum→Div softmax-style normalization) and
+        #            mscn cases with non-point masks. Defaults to 'box'
+        #            since a sound looser bound is strictly better than
+        #            an unhandled-op error verdict.
+        nonlin_div_fallback='box',
+        nonlin_mul_fallback='box',
+        # Pow relaxation form. 'chord' = chord-tangent parallelogram
+        # per element (tighter; preserves input-output correlation via
+        # the chord slope; sound on uniform-curvature intervals).
+        # 'box' = box-decorrelated (sound, simpler, loose). Defaults to
+        # chord since it's tighter on the common case (post-ReLU input
+        # is non-negative so chord is uniformly valid).
+        pow_relaxation='chord',
         # Phase 1 gen-LP conv chunking. Default 256 = chunked with safe
         # block size + OOM-halve-retry fallback. The chunk loop itself
         # is ~0.3% overhead vs un-chunked; OOM halving costs ~0.2% per

@@ -1040,10 +1040,26 @@ class SliceNode(GraphNode):
 class GatherNode(GraphNode):
     def infer_shape(self, input_shapes):
         indices = self.params.get('indices', None)
-        if indices is not None:
-            self.output_shape = (len(indices.flatten()),)
-        elif self.inputs and self.inputs[0] in input_shapes:
-            self.output_shape = input_shapes[self.inputs[0]]
+        inp_shape = (input_shapes.get(self.inputs[0])
+                     if self.inputs else None)
+        if indices is None:
+            if inp_shape is not None:
+                self.output_shape = inp_shape
+            return
+        axis = int(self.params.get('axis', 0))
+        if inp_shape is not None:
+            # ONNX semantics: output = input.shape[:axis] +
+            # indices.shape + input.shape[axis+1:]. 0-D indices drop
+            # the gather axis.
+            a = axis if axis >= 0 else len(inp_shape) + axis
+            if 0 <= a < len(inp_shape):
+                idx_shape = tuple(indices.shape) if indices.ndim > 0 else ()
+                out = list(inp_shape[:a]) + list(idx_shape) + \
+                    list(inp_shape[a + 1:])
+                self.output_shape = tuple(out) if out else (1,)
+                return
+        # Fallback (input shape unknown): flat indices count.
+        self.output_shape = (len(indices.flatten()),)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -1695,13 +1711,36 @@ class ComputeGraph:
                 computed.add(name)
 
             elif node.op_type == 'Sub':
-                inp_names = [node.inputs[0] if node.inputs[0] in computed
-                             else self.input_name]
+                # Sub(a, b). Three sub-cases:
+                #   1. b is constant ('bias' in params): emit `sub` op
+                #      with one input; bias subtracted in forward.
+                #   2. a is constant ('negate' set, with 'bias'): emit
+                #      `sub` op negating the live input then adding bias.
+                #   3. both inputs computed (skip-connection-style): emit
+                #      `sub_bilinear` so forward subtracts y_b from y_a.
+                # nn4sys pensieve_*_parallel: output = MatMul1 - MatMul2,
+                # both computed → case 3. Previously this fell through
+                # case 1 silently and dropped MatMul2, producing wildly
+                # wrong final outputs (101.5 vs correct 5.57).
+                inp0_computed = (node.inputs[0] in computed
+                                  or node.inputs[0] == self.input_name)
+                inp1_computed = (len(node.inputs) > 1
+                                  and (node.inputs[1] in computed
+                                        or node.inputs[1] == self.input_name))
                 bias = node.params.get('bias')
-                ops.append({
-                    'name': name, 'type': 'sub', 'inputs': inp_names,
-                    'bias': bias,
-                })
+                if inp0_computed and inp1_computed:
+                    ops.append({
+                        'name': name, 'type': 'sub_bilinear',
+                        'inputs': [node.inputs[0], node.inputs[1]],
+                    })
+                else:
+                    inp_names = [node.inputs[0] if inp0_computed
+                                  else self.input_name]
+                    ops.append({
+                        'name': name, 'type': 'sub', 'inputs': inp_names,
+                        'bias': bias,
+                        'negate': node.params.get('negate', False),
+                    })
                 computed.add(name)
 
             elif node.op_type in ('AveragePool', 'MaxPool'):
@@ -1827,6 +1866,132 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
+            elif node.op_type in ('Split', 'SplitOutput'):
+                # Emit each Split chunk as an explicit Slice op. The
+                # primary Split output is chunk 0, SplitOutput nodes
+                # carry an `index` (1, 2, ...) selecting later chunks.
+                # nn4sys mscn uses Split along axis=-1 to separate
+                # features (chunk 0, size N) from mask (chunk 1, size 1).
+                if node.op_type == 'Split':
+                    src_input = node.inputs[0]
+                    split = node.params.get('split')
+                    axis = int(node.params.get('axis', 0))
+                    chunk_idx = 0
+                else:
+                    # SplitOutput's `inputs[0]` is the parent Split node.
+                    split_node = self.nodes.get(node.inputs[0])
+                    if split_node is None:
+                        chunk_idx = node.params.get('index', 0)
+                        split = None
+                        axis = 0
+                        src_input = node.inputs[0]
+                    else:
+                        src_input = split_node.inputs[0]
+                        split = split_node.params.get('split')
+                        axis = int(split_node.params.get('axis', 0))
+                        chunk_idx = int(node.params.get('index', 0))
+                inp_names = [src_input if src_input in computed
+                              else '__input__']
+                # Resolve to flat indices into the input.
+                src_shape = (self.nodes[src_input].output_shape
+                              if src_input in self.nodes
+                              else self.input_shape)
+                if split is None or src_shape is None:
+                    flat_idx = None
+                else:
+                    a = axis if axis >= 0 else len(src_shape) + axis
+                    if a >= len(src_shape):
+                        flat_idx = None
+                    else:
+                        start = sum(split[:chunk_idx])
+                        end = start + split[chunk_idx]
+                        slicer = [slice(None)] * len(src_shape)
+                        slicer[a] = slice(start, end)
+                        full = np.arange(int(np.prod(src_shape))).reshape(
+                            src_shape)
+                        flat_idx = full[tuple(slicer)].reshape(-1).astype(
+                            np.int64)
+                ops.append({
+                    'name': name, 'type': 'slice',
+                    'inputs': inp_names,
+                    'flat_idx': flat_idx,
+                })
+                computed.add(name)
+
+            elif node.op_type == 'ReduceSum':
+                # Linear reduction along given axes. Used in nn4sys
+                # mscn_* (sum features * mask along axis=1 for masked
+                # mean). ONNX axes are relative to the WITH-batch shape;
+                # our in_shapes_nd strips the leading 1-dim, so decrement
+                # positive axes by 1 when batch was stripped.
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed
+                              else '__input__']
+                raw_axes = list(node.params.get('axes', []))
+                inp_shape = (self.nodes[node.inputs[0]].output_shape
+                              if node.inputs[0] in self.nodes
+                              else self.input_shape)
+                if inp_shape and inp_shape[0] == 1:
+                    # Batch will be stripped; shift axes.
+                    adj_axes = tuple(
+                        (a - 1) if (isinstance(a, int) and a > 0) else
+                        (a + len(inp_shape) - 1 if a < 0 else a)
+                        for a in raw_axes
+                    )
+                else:
+                    adj_axes = tuple(raw_axes)
+                keepdims = int(node.params.get('keepdims', 1))
+                ops.append({
+                    'name': name, 'type': 'reduce_sum',
+                    'inputs': inp_names,
+                    'axes': adj_axes, 'keepdims': bool(keepdims),
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Div':
+                # Bilinear Div. The const-divisor case is already
+                # rewritten to `mul` by `onnx_loader.py` (sets
+                # `params['scale'] = 1/c`); the bilinear case (both
+                # inputs computed) emits `div_bilinear` and is handled
+                # only when the denominator is a point zonotope per
+                # disjunct (nn4sys mscn pattern).
+                inp_names = []
+                for inp in node.inputs[:2]:
+                    if inp in computed or inp == self.input_name:
+                        inp_names.append(inp)
+                if 'scale' in node.params:
+                    # Const-divisor: same as a mul by reciprocal.
+                    ops.append({
+                        'name': name, 'type': 'mul',
+                        'inputs': [inp_names[0]],
+                        'scale': node.params['scale'],
+                    })
+                else:
+                    ops.append({
+                        'name': name, 'type': 'div_bilinear',
+                        'inputs': inp_names,
+                    })
+                computed.add(name)
+
+            elif node.op_type == 'Pow':
+                # Pow(x, exponent) with constant integer exponent.
+                # Used in pensieve_*_parallel (cubic softmax-style
+                # normalization: x^3 / sum(x^3)). x^p is monotonic for
+                # odd p, convex for even p, with closed-form box bounds
+                # on [lo, hi]. The forward zono dispatches to a chord
+                # linearization that returns (c_out, g_out) with a new
+                # error generator per output element.
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed
+                              else '__input__']
+                exp_raw = node.params.get('exponent', 2.0)
+                ops.append({
+                    'name': name, 'type': 'pow',
+                    'inputs': inp_names,
+                    'exponent': float(exp_raw),
+                })
+                computed.add(name)
+
             elif node.op_type == 'Gather':
                 # Constant-index Gather: output = input.flatten()[flat_idx]
                 # for indices resolved against the named axis. Used in
@@ -1867,13 +2032,28 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
-            # Skip other ops (Identity, Dropout, etc.) — pass through to
-            # the real producer via the alias map.
-            else:
+            # Known-safe passthrough ops (Identity / Dropout / Cast /
+            # Shape / Unsqueeze) get aliased to their input. Any OTHER
+            # op silently aliased here is a soundness hazard: e.g. Pow
+            # silently skipped would let an `x^3` activation be treated
+            # as `x`, and any α-CROWN/zono bound computed downstream is
+            # vacuously wrong (observed on nn4sys pensieve_*_parallel
+            # before the Pow handler was added — false "verified" lb of
+            # ~167000 on a network whose actual Y_0 is 5.55). Raise
+            # NotImplementedError so missing ops surface loudly.
+            elif node.op_type in (
+                    'Identity', 'Dropout', 'Cast', 'Shape',
+                    'Unsqueeze', 'Squeeze'):
                 if node.inputs:
                     src = node.inputs[0]
                     alias[name] = alias.get(src, src)
                 computed.add(name)
+            else:
+                raise NotImplementedError(
+                    f'gpu_graph: unsupported op {node.op_type!r} '
+                    f'(name={name!r}). Silent passthrough would alias '
+                    f'output to input and produce unsound zono / CROWN '
+                    f'bounds. Add an explicit handler before using.')
 
         # Rewrite all emitted ops' inputs through the alias map so
         # references to skipped passthrough nodes (Dropout, Identity)

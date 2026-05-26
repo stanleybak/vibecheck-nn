@@ -71,13 +71,17 @@ def _mul_scale_zono(op, center, generators, dtype, device):
     return center * sflat, generators * sflat.unsqueeze(-1)
 
 
-def _bias_dot_ew(ew, bias_np, dtype, device):
+def _bias_dot_ew(ew, bias_np, dtype, device, out_shape=None):
     """Compute the bias contribution to `acc` for an Add backward.
 
-    Returns the tensor to ADD to `acc`. Handles scalar / per-channel
-    broadcast against ew's last dim (the layer width):
-      - scalar bias (numel=1) → scalar * ew.sum(dim=-1)
+    Returns the tensor to ADD to `acc`. Handles three cases:
       - matching-size bias    → ew @ bias_vec
+      - scalar bias (numel=1) → scalar * ew.sum(dim=-1)
+      - ND-broadcast bias     → reshape ew to (..., *out_shape), multiply
+        by broadcast bias, sum over all reduced axes. Used when the
+        forward Add is `y[..., j] = x[..., j] + bias[j]` with
+        `out_shape = (..., n_inner)` and `bias.numel() == n_inner`.
+        Caller passes `out_shape` (typically from `op['out_shape_nd']`).
     """
     bt_full = torch.as_tensor(np.asarray(bias_np).flatten(),
                                  dtype=dtype, device=device)
@@ -86,9 +90,374 @@ def _bias_dot_ew(ew, bias_np, dtype, device):
         return ew @ bt_full
     if bt_full.numel() == 1:
         return ew.sum(dim=-1) * bt_full
+    if (out_shape is not None
+            and out_shape[-1] == bt_full.numel()
+            and n == int(np.prod(out_shape))):
+        # Broadcast: reshape ew to (lead..., *out_shape), broadcast
+        # bias over the inner dim, sum across all axes except the
+        # leading (batch, query) dims.
+        lead = ew.shape[:-1]
+        ew_nd = ew.reshape(*lead, *out_shape)
+        # Multiply by bias along last axis, then sum all axes >= len(lead).
+        prod = ew_nd * bt_full  # broadcasts over the trailing dim
+        return prod.reshape(*lead, -1).sum(dim=-1)
     raise ValueError(
         f'_bias_dot_ew: bias size {bt_full.numel()} incompatible with '
-        f'ew last dim {n}')
+        f'ew last dim {n} (out_shape={out_shape})')
+
+
+def _reduce_sum_backward(ew_out, in_shape_nd, axes, keepdims, out_shape_nd):
+    """Adjoint of `y = x.sum(axis=axes)`. Broadcasts ew_out across the
+    reduced axes back to the input nd-shape.
+
+    `ew_out` is (lead..., prod(out_shape_nd)). Result is
+    (lead..., prod(in_shape_nd)).
+    """
+    if isinstance(in_shape_nd, tuple):
+        in_shape_nd = list(in_shape_nd)
+    if isinstance(out_shape_nd, tuple):
+        out_shape_nd = list(out_shape_nd)
+    lead = ew_out.shape[:-1]
+    n_lead = len(lead)
+    # Reshape ew_out to (lead..., *out_shape_nd_or_keepdim_shape).
+    # If not keepdims, output axes are missing — re-insert size-1 dims
+    # at the reduced positions so the expand is a simple broadcast.
+    if not keepdims:
+        target_shape = list(in_shape_nd)
+        for ax in axes:
+            target_shape[ax] = 1
+        ew_nd = ew_out.reshape(*lead, *target_shape)
+    else:
+        ew_nd = ew_out.reshape(*lead, *out_shape_nd)
+    # Expand to in_shape_nd along the broadcast (size-1) axes.
+    expand_shape = list(lead) + list(in_shape_nd)
+    ew_in_nd = ew_nd.expand(*expand_shape).contiguous()
+    return ew_in_nd.reshape(*lead, -1)
+
+
+def _mul_bilinear_backward(ew_out, c_a, g_a, c_b, g_b,
+                            sh_a, sh_b, sh_out):
+    """Adjoint of `y = a * b` (element-wise, with broadcasting). Returns
+    (ew_a, ew_b). When one side is a point zonotope (zero gens), its
+    grad is implicit (the point contributes nothing varying), so we
+    return None for that side. The varying side's grad is
+    `ew_y * (other_center)` reshaped/summed back to that side's shape.
+
+    `ew_out` is (lead..., prod(sh_out)).
+    """
+    a_is_point = (g_a is None or g_a.numel() == 0
+                  or bool(g_a.abs().max() < 1e-12))
+    b_is_point = (g_b is None or g_b.numel() == 0
+                  or bool(g_b.abs().max() < 1e-12))
+    if not (a_is_point or b_is_point):
+        raise NotImplementedError(
+            'mul_bilinear_backward: both sides have varying generators')
+    lead = ew_out.shape[:-1]
+    ew_nd = ew_out.reshape(*lead, *sh_out)
+    if b_is_point:
+        # grad_a = ew * c_b (broadcast c_b to sh_out, then sum back to sh_a)
+        b_nd = c_b.reshape(*sh_b)
+        prod_nd = ew_nd * b_nd
+        # Sum over axes where sh_a is broadcast-smaller than sh_out.
+        ew_a_nd = _sum_to_shape(prod_nd, lead, sh_a)
+        return ew_a_nd.reshape(*lead, -1), None
+    # a is point
+    a_nd = c_a.reshape(*sh_a)
+    prod_nd = ew_nd * a_nd
+    ew_b_nd = _sum_to_shape(prod_nd, lead, sh_b)
+    return None, ew_b_nd.reshape(*lead, -1)
+
+
+def _div_bilinear_backward(ew_out, c_a, g_a, c_b, g_b,
+                            sh_a, sh_b, sh_out):
+    """Adjoint of `y = a / b` when b is a point zonotope. Returns
+    (ew_a, ew_b). `ew_a = ew_y / c_b` (broadcast); `ew_b = None`."""
+    b_is_point = (g_b is None or g_b.numel() == 0
+                  or bool(g_b.abs().max() < 1e-12))
+    if not b_is_point:
+        raise NotImplementedError(
+            'div_bilinear_backward: non-point denominator (1/x nonlinear)')
+    if bool((c_b == 0).any()):
+        raise ZeroDivisionError(
+            'div_bilinear_backward: denominator has a zero element')
+    lead = ew_out.shape[:-1]
+    ew_nd = ew_out.reshape(*lead, *sh_out)
+    inv_b = c_b.reciprocal().reshape(*sh_b)
+    ew_a_nd = _sum_to_shape(ew_nd * inv_b, lead, sh_a)
+    return ew_a_nd.reshape(*lead, -1), None
+
+
+def _compute_point_centers(gg, x_point, device, dtype):
+    """Run a single point forward through `gg` at x=x_point and return
+    a dict `{op_name: tensor}` of each op's output flat center value.
+
+    Used by CROWN backward through `mul_bilinear` / `div_bilinear` ops
+    to look up the "constant" side's value: when one operand of a
+    bilinear has zero generator radius per-disjunct (nn4sys mscn mask),
+    its forward zono center IS the point-forward output at that op.
+    Doing this in a single dedicated forward pass is much cheaper than
+    plumbing zono state through CROWN's batched / autograd-aware backward.
+    """
+    from .verify_zono_bnb import _forward_batch_graph
+    x = x_point.to(device=device, dtype=dtype).reshape(1, -1)
+    centers = {gg['input_name']: x.flatten()}
+    # Re-implement a simple op-by-op forward that captures intermediate
+    # values. We can't use `_forward_batch_graph` directly because it
+    # only returns the LAST op's value, not all intermediates.
+    import torch.nn.functional as F
+    for op in gg['ops']:
+        name = op['name']; t = op['type']; ins = op['inputs']
+        if t == 'conv':
+            a = centers[ins[0]].reshape(1, *op['in_shape'])
+            a = F.conv2d(a, op['kernel'], bias=op['bias'],
+                          stride=op['stride'], padding=op['padding']).flatten()
+            centers[name] = a
+        elif t == 'fc':
+            a = centers[ins[0]]
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            W = op['W']; bias = op['bias']
+            if (in_shape_nd is not None and len(in_shape_nd) >= 2
+                    and W.shape[1] == in_shape_nd[-1]):
+                a = F.linear(a.reshape(*in_shape_nd), W, bias).flatten()
+            else:
+                a = F.linear(a, W, bias)
+            centers[name] = a
+        elif t == 'relu':
+            centers[name] = F.relu(centers[ins[0]])
+        elif t == 'sigmoid':
+            centers[name] = torch.sigmoid(centers[ins[0]])
+        elif t == 'tanh':
+            centers[name] = torch.tanh(centers[ins[0]])
+        elif t == 'add':
+            a = centers[ins[0]]
+            if op.get('is_merge'):
+                centers[name] = a + centers[ins[1]]
+            else:
+                bias = op.get('bias')
+                if bias is not None:
+                    bt = torch.as_tensor(bias, dtype=dtype, device=device)
+                    out_shape = op.get('out_shape_nd')
+                    if bt.numel() == a.numel():
+                        a = a + bt.flatten()
+                    elif out_shape is not None:
+                        a_nd = a.reshape(*out_shape)
+                        a = (a_nd + bt).flatten()
+                    else:
+                        a = a + bt
+                centers[name] = a
+        elif t == 'sub':
+            a = centers[ins[0]]; bias = op.get('bias')
+            if bias is not None:
+                bt = torch.as_tensor(bias, dtype=dtype, device=device)
+                a = a - bt.flatten()
+            centers[name] = a
+        elif t == 'sub_bilinear':
+            a = centers[ins[0]]; b = centers[ins[1]]
+            centers[name] = a - b
+        elif t == 'reshape':
+            centers[name] = centers[ins[0]]
+        elif t in ('slice', 'gather'):
+            flat_idx = op.get('flat_idx')
+            a = centers[ins[0]]
+            if flat_idx is not None:
+                idx_t = torch.as_tensor(flat_idx, dtype=torch.long,
+                                          device=device)
+                centers[name] = a.index_select(0, idx_t)
+            else:
+                centers[name] = a
+        elif t == 'concat':
+            parts = [centers[i] for i in ins]
+            centers[name] = torch.cat([p.flatten() for p in parts], dim=0)
+        elif t == 'mul':
+            a = centers[ins[0]]; scale = op.get('scale')
+            if scale is not None:
+                s = torch.as_tensor(np.asarray(scale).flatten(),
+                                       dtype=dtype, device=device)
+                centers[name] = a * s
+            else:
+                centers[name] = a
+        elif t == 'mul_bilinear':
+            a = centers[ins[0]]; b = centers[ins[1]]
+            sh = op.get('in_shapes_nd', [None, None])
+            if sh[0] is not None and sh[1] is not None and sh[0] != sh[1]:
+                a_nd = a.reshape(*sh[0]); b_nd = b.reshape(*sh[1])
+                centers[name] = (a_nd * b_nd).flatten()
+            else:
+                centers[name] = a * b
+        elif t == 'div_bilinear':
+            a = centers[ins[0]]; b = centers[ins[1]]
+            sh = op.get('in_shapes_nd', [None, None])
+            if sh[0] is not None and sh[1] is not None and sh[0] != sh[1]:
+                a_nd = a.reshape(*sh[0]); b_nd = b.reshape(*sh[1])
+                centers[name] = (a_nd / b_nd).flatten()
+            else:
+                centers[name] = a / b
+        elif t == 'reduce_sum':
+            a = centers[ins[0]]
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            axes = op.get('axes', ())
+            keep = op.get('keepdims', False)
+            a_nd = a.reshape(*in_shape_nd)
+            for ax in sorted(axes, reverse=True):
+                a_nd = a_nd.sum(dim=ax, keepdim=bool(keep))
+            centers[name] = a_nd.flatten()
+        elif t == 'pow':
+            a = centers[ins[0]]
+            exp = op.get('exponent', 2.0)
+            centers[name] = a ** exp
+        else:
+            raise NotImplementedError(
+                f'_compute_point_centers: unsupported op {t!r} ({name!r})')
+    return centers
+
+
+def _compute_point_centers_batched(gg, x_points, device, dtype):
+    """Batched variant of `_compute_point_centers`.
+
+    Runs ONE forward pass through `gg` for B points at once and returns
+    a dict `{op_name: (B, n_op) tensor}`. Replaces the
+    `for bi in range(B)` loop pattern in batched CROWN backward — for
+    mscn this drops backward time from O(B) to O(1).
+
+    Why: each bilinear/div op needs the "constant" side's value per
+    leaf; previously we re-ran the entire forward graph B times. Now
+    one batched forward suffices.
+    """
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+    B = x_points.shape[0]
+    centers = {gg['input_name']: x_points.to(device=device, dtype=dtype)
+                                          .reshape(B, -1)}
+    for op in gg['ops']:
+        name = op['name']; t = op['type']; ins = op['inputs']
+        if t == 'conv':
+            a = centers[ins[0]].reshape(B, *op['in_shape'])
+            a = F.conv2d(a, op['kernel'], bias=op['bias'],
+                          stride=op['stride'], padding=op['padding']).reshape(B, -1)
+            centers[name] = a
+        elif t == 'fc':
+            a = centers[ins[0]]
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            W = op['W']; bias = op['bias']
+            if (in_shape_nd is not None and len(in_shape_nd) >= 2
+                    and W.shape[1] == in_shape_nd[-1]):
+                a = F.linear(a.reshape(B, *in_shape_nd), W, bias).reshape(B, -1)
+            else:
+                a = F.linear(a, W, bias)
+            centers[name] = a
+        elif t == 'relu':
+            centers[name] = F.relu(centers[ins[0]])
+        elif t == 'sigmoid':
+            centers[name] = torch.sigmoid(centers[ins[0]])
+        elif t == 'tanh':
+            centers[name] = torch.tanh(centers[ins[0]])
+        elif t == 'add':
+            a = centers[ins[0]]
+            if op.get('is_merge'):
+                centers[name] = a + centers[ins[1]]
+            else:
+                bias = op.get('bias')
+                if bias is not None:
+                    bt = torch.as_tensor(bias, dtype=dtype, device=device)
+                    out_shape = op.get('out_shape_nd')
+                    if bt.numel() == a.shape[1]:
+                        a = a + bt.flatten().unsqueeze(0)
+                    elif out_shape is not None:
+                        a_nd = a.reshape(B, *out_shape)
+                        a = (a_nd + bt).reshape(B, -1)
+                    else:
+                        a = a + bt
+                centers[name] = a
+        elif t == 'sub':
+            a = centers[ins[0]]; bias = op.get('bias')
+            if bias is not None:
+                bt = torch.as_tensor(bias, dtype=dtype, device=device)
+                a = a - bt.flatten().unsqueeze(0)
+            centers[name] = a
+        elif t == 'sub_bilinear':
+            a = centers[ins[0]]; b = centers[ins[1]]
+            centers[name] = a - b
+        elif t == 'reshape':
+            centers[name] = centers[ins[0]]
+        elif t in ('slice', 'gather'):
+            flat_idx = op.get('flat_idx')
+            a = centers[ins[0]]
+            if flat_idx is not None:
+                idx_t = torch.as_tensor(flat_idx, dtype=torch.long,
+                                          device=device)
+                centers[name] = a.index_select(1, idx_t)
+            else:
+                centers[name] = a
+        elif t == 'concat':
+            parts = [centers[i] for i in ins]
+            centers[name] = torch.cat([p.reshape(B, -1) for p in parts], dim=1)
+        elif t == 'mul':
+            a = centers[ins[0]]; scale = op.get('scale')
+            if scale is not None:
+                s = torch.as_tensor(np.asarray(scale).flatten(),
+                                       dtype=dtype, device=device)
+                centers[name] = a * s.unsqueeze(0)
+            else:
+                centers[name] = a
+        elif t == 'mul_bilinear':
+            a = centers[ins[0]]; b = centers[ins[1]]
+            sh = op.get('in_shapes_nd', [None, None])
+            if sh[0] is not None and sh[1] is not None and sh[0] != sh[1]:
+                a_nd = a.reshape(B, *sh[0]); b_nd = b.reshape(B, *sh[1])
+                centers[name] = (a_nd * b_nd).reshape(B, -1)
+            else:
+                centers[name] = a * b
+        elif t == 'div_bilinear':
+            a = centers[ins[0]]; b = centers[ins[1]]
+            sh = op.get('in_shapes_nd', [None, None])
+            if sh[0] is not None and sh[1] is not None and sh[0] != sh[1]:
+                a_nd = a.reshape(B, *sh[0]); b_nd = b.reshape(B, *sh[1])
+                centers[name] = (a_nd / b_nd).reshape(B, -1)
+            else:
+                centers[name] = a / b
+        elif t == 'reduce_sum':
+            a = centers[ins[0]]
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            axes = op.get('axes', ())
+            keep = op.get('keepdims', False)
+            a_nd = a.reshape(B, *in_shape_nd)
+            # axes are in INPUT coords (excluding batch); shift by +1
+            for ax in sorted(axes, reverse=True):
+                a_nd = a_nd.sum(dim=ax + 1, keepdim=bool(keep))
+            centers[name] = a_nd.reshape(B, -1)
+        elif t == 'pow':
+            a = centers[ins[0]]
+            exp = op.get('exponent', 2.0)
+            centers[name] = a ** exp
+        else:
+            raise NotImplementedError(
+                f'_compute_point_centers_batched: unsupported op {t!r} ({name!r})')
+    return centers
+
+
+def _sum_to_shape(t_nd, lead, target_inner_shape):
+    """Sum `t_nd` of shape (lead..., *some_shape) down to
+    (lead..., *target_inner_shape) by summing across axes where
+    `target_inner_shape` is 1 and `some_shape` is >1 (broadcast adjoint)."""
+    n_lead = len(lead)
+    # Pad target with leading 1s to match rank.
+    cur_shape = t_nd.shape[n_lead:]
+    if len(target_inner_shape) < len(cur_shape):
+        target = (1,) * (len(cur_shape) - len(target_inner_shape)) + tuple(
+            target_inner_shape)
+    else:
+        target = tuple(target_inner_shape)
+    for ax_offset, (cur, tgt) in enumerate(zip(cur_shape, target)):
+        if tgt == 1 and cur > 1:
+            t_nd = t_nd.sum(dim=n_lead + ax_offset, keepdim=True)
+    # Now t_nd has shape (lead..., *target). If target had fewer dims,
+    # squeeze leading 1s.
+    if len(target_inner_shape) < len(cur_shape):
+        n_extra = len(cur_shape) - len(target_inner_shape)
+        for _ in range(n_extra):
+            t_nd = t_nd.squeeze(n_lead)
+    return t_nd
 
 
 # ---------------------------------------------------------------------------
@@ -97,9 +466,15 @@ def _bias_dot_ew(ew, bias_np, dtype, device):
 
 def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
                             start_op_name, ew_init, device, dtype,
-                            unstable_at_layer=None):
+                            unstable_at_layer=None, point_centers=None):
     """Batched CROWN backward from `start_op_name`'s output back to the
     network input. Returns `(lb_per_batch, ew_at_input)`.
+
+    `point_centers`: optional dict `{op_name: tensor}` of per-op
+    output centers from a single forward at the subbox center. Required
+    when the graph contains `mul_bilinear` / `div_bilinear` ops whose
+    "constant" side's value is needed for the backward (nn4sys mscn).
+    Build via `_compute_point_centers(gg, x_point, device, dtype)`.
 
     At each ReLU with `layer_idx == L`, uses `alpha_at_layer[L]` as the
     lower slope (falls back to min-area if absent). `bbr_tensors[L]`
@@ -137,8 +512,29 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
         elif t == 'fc':
             W = op['W'].to(dtype=dtype, device=device)
             bias = op['bias'].to(dtype=dtype, device=device)
-            acc = acc + ew @ bias
-            ew_back = ew @ W
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            out_shape_nd = op.get('out_shape_nd')
+            # ND-aware backward: when the forward was a batched MatMul
+            # over the last dim (nn4sys mscn: input (3, 7) × W=(128, 7)
+            # → (3, 128)), ew_y has shape (B, ..., prod(out_shape_nd))
+            # = (B, ..., n_outer * n_out_last). Reshape, apply W^T over
+            # the last axis to get back to in_shape, and broadcast bias
+            # across the n_outer axis.
+            if (in_shape_nd is not None and len(in_shape_nd) >= 2
+                    and out_shape_nd is not None
+                    and out_shape_nd[-1] == W.shape[0]
+                    and W.shape[1] == in_shape_nd[-1]):
+                prefix = out_shape_nd[:-1]
+                lead = ew.shape[:-1]
+                ew_nd = ew.reshape(*lead, *prefix, W.shape[0])
+                # bias contribution: sum over prefix and last axis
+                acc = acc + (ew_nd * bias).reshape(*lead, -1).sum(dim=-1)
+                # Backward: apply W^T (i.e., ew_y @ W) per (prefix...) row
+                ew_back_nd = ew_nd @ W
+                ew_back = ew_back_nd.reshape(*lead, -1)
+            else:
+                acc = acc + ew @ bias
+                ew_back = ew @ W
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
         elif t == 'relu':
@@ -192,15 +588,23 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             else:
                 bias = op.get('bias')
                 if bias is not None:
-                    acc = acc + _bias_dot_ew(ew, bias, dtype, device)
+                    acc = acc + _bias_dot_ew(
+                        ew, bias, dtype, device,
+                        out_shape=op.get('out_shape_nd'))
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
         elif t == 'sub':
             bias = op.get('bias')
             if bias is not None:
-                acc = acc - _bias_dot_ew(ew, bias, dtype, device)
+                acc = acc - _bias_dot_ew(
+                    ew, bias, dtype, device,
+                    out_shape=op.get('out_shape_nd'))
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+        elif t == 'sub_bilinear':
+            ia, ib = op['inputs'][0], op['inputs'][1]
+            ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew)) + ew
+            ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew)) + (-ew)
         elif t == 'reshape':
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
@@ -232,6 +636,181 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
+        elif t == 'reduce_sum':
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            out_shape_nd = op.get('out_shape_nd')
+            axes = op.get('axes', ())
+            keepdims = op.get('keepdims', False)
+            ew_back = _reduce_sum_backward(
+                ew, in_shape_nd, axes, keepdims, out_shape_nd)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t in ('mul_bilinear', 'div_bilinear'):
+            sh_in = op.get('in_shapes_nd', [None, None])
+            sh_out = op.get('out_shape_nd', None)
+            lead = ew.shape[:-1]
+            ia, ib = op['inputs'][0], op['inputs'][1]
+            # Sound linearised CROWN bound for Div(a, b) on b > 0. Use
+            # 1st-order Taylor at (c_a, c_b) + R-bound at 4 corners +
+            # 2 edge criticals (a=a_lo / a=a_hi where ∂R/∂b = 0). This
+            # is the TIGHT sound R bound; corners alone are UNSOUND in
+            # general. Empirically beats McCormick on pensieve cases.
+            if t == 'div_bilinear' and op.get('_div_decoupled'):
+                a_lo = op['_div_a_lo'].to(device=device, dtype=dtype)
+                a_hi = op['_div_a_hi'].to(device=device, dtype=dtype)
+                b_lo = op['_div_b_lo'].to(device=device, dtype=dtype)
+                b_hi = op['_div_b_hi'].to(device=device, dtype=dtype)
+                assert bool((b_lo > 0).all()), (
+                    f'div_bilinear backward only supports b > 0; '
+                    f'got b_lo={b_lo}')
+                # ABC-style: Mul(a, Recip(b)) with α-tunable McCormick
+                # + α-tunable Recip tangent. Strictly tighter than the
+                # single-point Taylor + R-bound (validated on pensieve:
+                # ~2.3x tighter LB on representative (a, b) box).
+                from .verify_zono_bnb import _div_backward_rm_mccormick
+                # Broadcast inputs to (B?, *sh_out) for per-output bounds.
+                ones_out = torch.ones(*sh_out, dtype=dtype, device=device)
+                a_lo_o = ones_out * a_lo.reshape(*sh_in[0])
+                a_hi_o = ones_out * a_hi.reshape(*sh_in[0])
+                b_lo_o = ones_out * b_lo.reshape(*sh_in[1])
+                b_hi_o = ones_out * b_hi.reshape(*sh_in[1])
+                alpha_r = op.get('_div_recip_alpha')
+                r_l = op.get('_div_mc_rl')
+                r_u = op.get('_div_mc_ru')
+                if alpha_r is not None:
+                    alpha_r = ones_out * alpha_r.to(
+                        device=device, dtype=dtype).reshape(*sh_in[1])
+                if r_l is not None:
+                    r_l = ones_out * r_l.to(
+                        device=device, dtype=dtype).reshape(*sh_in[0])
+                if r_u is not None:
+                    r_u = ones_out * r_u.to(
+                        device=device, dtype=dtype).reshape(*sh_in[0])
+                # ew has shape (*lead, *sh_out). Helper expects matching
+                # broadcast shape between ew and bounds.
+                # Lead can be empty () or (n_q,). Broadcast bounds by
+                # unsqueezing front dims as needed.
+                while a_lo_o.dim() < ew.reshape(*lead, *sh_out).dim():
+                    a_lo_o = a_lo_o.unsqueeze(0)
+                    a_hi_o = a_hi_o.unsqueeze(0)
+                    b_lo_o = b_lo_o.unsqueeze(0)
+                    b_hi_o = b_hi_o.unsqueeze(0)
+                    if alpha_r is not None:
+                        alpha_r = alpha_r.unsqueeze(0)
+                    if r_l is not None:
+                        r_l = r_l.unsqueeze(0)
+                    if r_u is not None:
+                        r_u = r_u.unsqueeze(0)
+                ew_nd = ew.reshape(*lead, *sh_out)
+                acc_contrib, ew_a_nd, ew_b_nd = (
+                    _div_backward_rm_mccormick(
+                        a_lo_o, a_hi_o, b_lo_o, b_hi_o, ew_nd,
+                        alpha_r=alpha_r, r_l=r_l, r_u=r_u))
+                acc = acc + acc_contrib
+                ew_a_in_nd = _sum_to_shape(ew_a_nd, lead, sh_in[0])
+                ew_b_in_nd = _sum_to_shape(ew_b_nd, lead, sh_in[1])
+                ew_a = ew_a_in_nd.reshape(*lead, -1)
+                ew_b = ew_b_in_nd.reshape(*lead, -1)
+                ew_at[ia] = (ew_a if ia not in ew_at
+                              else ew_at[ia] + ew_a)
+                ew_at[ib] = (ew_b if ib not in ew_at
+                              else ew_at[ib] + ew_b)
+                continue
+                # Original Taylor + R-bound path (kept for reference;
+                # the `continue` above skips it).
+                c_a_loc = (a_lo + a_hi) / 2
+                _cb_alpha_t = op.get('_div_cb_alpha')
+                if _cb_alpha_t is not None:
+                    c_b_loc = _cb_alpha_t.to(device=device, dtype=dtype)
+                else:
+                    c_b_loc = (b_lo + b_hi) / 2
+                inv_cb = 1.0 / c_b_loc
+                neg_ca_over_cb2 = -c_a_loc / (c_b_loc * c_b_loc)
+                L_const = c_a_loc / c_b_loc
+                def _R_at(a_eval, b_eval):
+                    L_val = a_eval * inv_cb + b_eval * neg_ca_over_cb2 + L_const
+                    return a_eval / b_eval - L_val
+                ones_out_pre = torch.ones(*sh_out, dtype=dtype, device=device)
+                a_lo_out = ones_out_pre * a_lo.reshape(*sh_in[0])
+                a_hi_out = ones_out_pre * a_hi.reshape(*sh_in[0])
+                b_lo_out = ones_out_pre * b_lo.reshape(*sh_in[1])
+                b_hi_out = ones_out_pre * b_hi.reshape(*sh_in[1])
+                c_a_out = (a_lo_out + a_hi_out) / 2
+                pos_a_lo = (a_lo_out > 0) & (c_a_out > 1e-30)
+                pos_a_hi = (a_hi_out > 0) & (c_a_out > 1e-30)
+                b_crit_lo = torch.where(pos_a_lo,
+                    c_b_loc.reshape(*sh_in[1]) * ones_out_pre *
+                        torch.sqrt(torch.clamp(
+                            a_lo_out / c_a_out.clamp(min=1e-30), min=0)),
+                    b_lo_out)
+                b_crit_hi = torch.where(pos_a_hi,
+                    c_b_loc.reshape(*sh_in[1]) * ones_out_pre *
+                        torch.sqrt(torch.clamp(
+                            a_hi_out / c_a_out.clamp(min=1e-30), min=0)),
+                    b_lo_out)
+                b_crit_lo = torch.maximum(torch.minimum(b_crit_lo, b_hi_out), b_lo_out)
+                b_crit_hi = torch.maximum(torch.minimum(b_crit_hi, b_hi_out), b_lo_out)
+                R_pts = torch.stack([
+                    _R_at(a_lo_out, b_lo_out),
+                    _R_at(a_lo_out, b_hi_out),
+                    _R_at(a_hi_out, b_lo_out),
+                    _R_at(a_hi_out, b_hi_out),
+                    _R_at(a_lo_out, b_crit_lo),
+                    _R_at(a_hi_out, b_crit_hi),
+                ])
+                R_min = R_pts.min(dim=0).values
+                R_max = R_pts.max(dim=0).values
+                R_mid = (R_min + R_max) / 2
+                R_half = (R_max - R_min) / 2
+                ones_out = torch.ones(*sh_out, dtype=dtype, device=device)
+                inv_cb_out = ones_out * inv_cb.reshape(*sh_in[1])
+                neg_grad_b_out = ones_out * neg_ca_over_cb2.reshape(*sh_out)
+                L_const_out = L_const.reshape(*sh_out)
+                R_mid_out = R_mid.reshape(*sh_out)
+                R_half_out = R_half.reshape(*sh_out)
+                ew_nd = ew.reshape(*lead, *sh_out)
+                ew_a_nd = _sum_to_shape(ew_nd * inv_cb_out, lead, sh_in[0])
+                ew_b_nd = _sum_to_shape(ew_nd * neg_grad_b_out, lead,
+                                         sh_in[1])
+                ew_a = ew_a_nd.reshape(*lead, -1)
+                ew_b = ew_b_nd.reshape(*lead, -1)
+                acc = acc + (ew_nd * (L_const_out + R_mid_out)).reshape(
+                    *lead, -1).sum(dim=-1) \
+                    - (ew_nd.abs() * R_half_out).reshape(
+                    *lead, -1).sum(dim=-1)
+                ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+                ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
+            else:
+                # Point-side linearisation path (sound when one operand
+                # has zero radius — common for mscn mask): linearise
+                # at center, propagate ew_a + ew_b without slack.
+                if point_centers is None:
+                    x_center = ((xl + xh) / 2).to(device=device, dtype=dtype)
+                    point_centers = _compute_point_centers(
+                        gg, x_center, device, dtype)
+                c_a = point_centers[op['inputs'][0]]
+                c_b = point_centers[op['inputs'][1]]
+                ew_nd = ew.reshape(*lead, *sh_out)
+                a_nd = c_a.reshape(*sh_in[0])
+                b_nd = c_b.reshape(*sh_in[1])
+                if t == 'mul_bilinear':
+                    ew_a_nd = _sum_to_shape(ew_nd * b_nd, lead, sh_in[0])
+                    ew_b_nd = _sum_to_shape(ew_nd * a_nd, lead, sh_in[1])
+                else:
+                    if bool((b_nd == 0).any()):
+                        raise ZeroDivisionError(
+                            f'div_bilinear backward: denominator zero at '
+                            f'{op["name"]!r}')
+                    inv_b = b_nd.reciprocal()
+                    ew_a_nd = _sum_to_shape(ew_nd * inv_b, lead, sh_in[0])
+                    ew_b_nd = _sum_to_shape(
+                        -ew_nd * a_nd * inv_b * inv_b, lead, sh_in[1])
+                ew_a = ew_a_nd.reshape(*lead, -1)
+                ew_b = ew_b_nd.reshape(*lead, -1)
+                ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+                ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
+
         elif t in ('sigmoid', 'tanh'):
             L = op.get('layer_idx')
             lo_pre, hi_pre = bbr_tensors[L][0], bbr_tensors[L][1]
@@ -241,6 +820,39 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             acc = acc + (ep * lo_t).sum(dim=-1) + (en * up_t).sum(dim=-1)
             ew_back = ep * lo_s + en * up_s
             inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t == 'pow':
+            # Pow backward — two-line CROWN (LB = tangent, UB = chord
+            # for convex case; mirrored for concave). Strictly tighter
+            # than chord+slack. α-optimizable tangent point.
+            from .verify_zono_bnb import _pow_two_line_coeffs
+            lo_pre = op.get('_pow_in_lo')
+            hi_pre = op.get('_pow_in_hi')
+            assert lo_pre is not None and hi_pre is not None, (
+                f"pow backward: missing _pow_in_lo/_pow_in_hi for {name!r}")
+            lo_pre_t = lo_pre.to(device=device, dtype=dtype)
+            hi_pre_t = hi_pre.to(device=device, dtype=dtype)
+            p = int(op.get('exponent', 2))
+            inp = op['inputs'][0]
+            tan_pos_alpha = op.get('_pow_tangent_alpha')
+            if tan_pos_alpha is not None:
+                tan_pos_alpha = tan_pos_alpha.to(device=device, dtype=dtype)
+            (lb_slope, lb_const, ub_slope, ub_const,
+             use_two_line, box_lo_v, box_hi_v) = _pow_two_line_coeffs(
+                lo_pre_t, hi_pre_t, p, tangent_pos=tan_pos_alpha)
+            ep = ew.clamp(min=0); en = ew.clamp(max=0)
+            slope_back = ep * lb_slope + en * ub_slope
+            const_back = ep * lb_const + en * ub_const
+            slope_back = torch.where(use_two_line, slope_back,
+                                      torch.zeros_like(slope_back))
+            const_back = torch.where(use_two_line, const_back,
+                                      torch.where(ep > 0, box_lo_v,
+                                          torch.zeros_like(box_lo_v))
+                                      + torch.where(en < 0, box_hi_v,
+                                          torch.zeros_like(box_hi_v)))
+            acc = acc + const_back.sum(dim=-1)
+            ew_back = slope_back
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
         else:
@@ -675,7 +1287,55 @@ def run_alpha_crown_fixed_intermediate_batched(
             alpha = alpha.requires_grad_(True)
             spec_alpha[L] = alpha
 
-    opt = torch.optim.Adam(list(spec_alpha.values()), lr=lr)
+    # α-tunable Pow tangent + Div linearization center. Stored as
+    # NORMALIZED [0, 1] tensors; each iter we push the consumed value
+    # into op['_pow_tangent_alpha'] / op['_div_recip_alpha'] / etc.
+    # so the backward picks them up. Initialized to midpoint (α = 0.5).
+    # The Div uses 3 α tensors: Reciprocal tangent + McCormick r_l/r_u
+    # (mirrors α,β-CROWN's `BoundDiv = BoundMul · BoundReciprocal`).
+    alpha_pow_norm = {}      # op_name → (α_tensor, lo_t, hi_t)
+    alpha_div_recip = {}     # op_name → (α_tensor, b_lo, b_hi)
+    alpha_div_mc_rl = {}     # op_name → (α_tensor for r_l)
+    alpha_div_mc_ru = {}     # op_name → (α_tensor for r_u)
+    for op in gg['ops']:
+        if op['type'] == 'pow':
+            lo_p = op.get('_pow_in_lo')
+            hi_p = op.get('_pow_in_hi')
+            if lo_p is None or hi_p is None:
+                continue
+            lo_t = lo_p.to(device=device, dtype=dtype)
+            hi_t = hi_p.to(device=device, dtype=dtype)
+            a = torch.full_like(lo_t, 0.5).requires_grad_(True)
+            alpha_pow_norm[op['name']] = (a, lo_t, hi_t)
+            op['_pow_tangent_alpha'] = lo_t + a * (hi_t - lo_t)
+        elif op['type'] == 'div_bilinear' and op.get('_div_decoupled'):
+            b_lo_p = op.get('_div_b_lo')
+            b_hi_p = op.get('_div_b_hi')
+            a_lo_p = op.get('_div_a_lo')
+            a_hi_p = op.get('_div_a_hi')
+            if (b_lo_p is None or b_hi_p is None
+                    or a_lo_p is None or a_hi_p is None):
+                continue
+            blo = b_lo_p.to(device=device, dtype=dtype)
+            bhi = b_hi_p.to(device=device, dtype=dtype)
+            alo = a_lo_p.to(device=device, dtype=dtype)
+            ahi = a_hi_p.to(device=device, dtype=dtype)
+            ar = torch.full_like(blo, 0.5).requires_grad_(True)
+            alpha_div_recip[op['name']] = (ar, blo, bhi)
+            op['_div_recip_alpha'] = blo + ar * (bhi - blo)
+            rl = torch.full_like(alo, 0.5).requires_grad_(True)
+            alpha_div_mc_rl[op['name']] = (rl, alo, ahi)
+            op['_div_mc_rl'] = rl
+            ru = torch.full_like(alo, 0.5).requires_grad_(True)
+            alpha_div_mc_ru[op['name']] = (ru, alo, ahi)
+            op['_div_mc_ru'] = ru
+
+    opt_params = list(spec_alpha.values())
+    opt_params += [a for (a, _, _) in alpha_pow_norm.values()]
+    opt_params += [a for (a, _, _) in alpha_div_recip.values()]
+    opt_params += [a for (a, _, _) in alpha_div_mc_rl.values()]
+    opt_params += [a for (a, _, _) in alpha_div_mc_ru.values()]
+    opt = torch.optim.Adam(opt_params, lr=lr)
     if lr_decay != 1.0:
         scheduler = torch.optim.lr_scheduler.ExponentialLR(opt, lr_decay)
     else:
@@ -693,6 +1353,22 @@ def run_alpha_crown_fixed_intermediate_batched(
         if time_left_fn is not None and time_left_fn() <= 0:
             break
         opt.zero_grad()
+        # Refresh op dict references to current normalized α (preserves
+        # gradient flow into α tensors).
+        for op in gg['ops']:
+            if op['type'] == 'pow' and op['name'] in alpha_pow_norm:
+                a, lo_t, hi_t = alpha_pow_norm[op['name']]
+                op['_pow_tangent_alpha'] = lo_t + a * (hi_t - lo_t)
+            elif op['type'] == 'div_bilinear':
+                if op['name'] in alpha_div_recip:
+                    ar, blo, bhi = alpha_div_recip[op['name']]
+                    op['_div_recip_alpha'] = blo + ar * (bhi - blo)
+                if op['name'] in alpha_div_mc_rl:
+                    rl, _, _ = alpha_div_mc_rl[op['name']]
+                    op['_div_mc_rl'] = rl
+                if op['name'] in alpha_div_mc_ru:
+                    ru, _, _ = alpha_div_mc_ru[op['name']]
+                    op['_div_mc_ru'] = ru
         lb_batch, _ = _crown_backward_matrix(
             gg, xl, xh, spec_alpha, bbr_tensors_fixed,
             last_op['name'], w_ts, device, dtype,
@@ -725,6 +1401,15 @@ def run_alpha_crown_fixed_intermediate_batched(
                     else:
                         alpha[active] = 1.0
                         alpha[dead] = 0.0
+            # Clamp normalized α for Pow tangent + Div R+M.
+            for (a, _, _) in alpha_pow_norm.values():
+                a.clamp_(0.0, 1.0)
+            for (a, _, _) in alpha_div_recip.values():
+                a.clamp_(0.0, 1.0)
+            for (a, _, _) in alpha_div_mc_rl.values():
+                a.clamp_(0.0, 1.0)
+            for (a, _, _) in alpha_div_mc_ru.values():
+                a.clamp_(0.0, 1.0)
 
         vals = spec_lb_batch.detach().cpu().numpy().astype(np.float64)
         for q in range(n_q):
@@ -837,6 +1522,18 @@ def run_alpha_crown_batched(
     w_ts = torch.as_tensor(w_qs, dtype=dtype, device=device)  # (n_q, n_out)
     b_ts = torch.as_tensor(b_qs, dtype=dtype, device=device)  # (n_q,)
 
+    # Point-centers cache for bilinear-op backward (mscn). Computed
+    # once at the subbox center; reused across all α-CROWN iterations.
+    # Only needed when the graph contains bilinear ops; otherwise None
+    # so the call is cheap (a single trivial forward through the net).
+    _bilinear_present = any(
+        op['type'] in ('mul_bilinear', 'div_bilinear') for op in gg['ops'])
+    if _bilinear_present:
+        x_center = ((xl + xh) / 2).to(device=device, dtype=dtype)
+        _point_centers = _compute_point_centers(gg, x_center, device, dtype)
+    else:
+        _point_centers = None
+
     best_lbs = np.full(n_q, -np.inf, dtype=np.float64)
     histories = [[] for _ in range(n_q)]
     best_bounds = {
@@ -896,13 +1593,15 @@ def run_alpha_crown_batched(
                         lb_part, _ = _crown_backward_matrix(
                             gg, xl, xh, alpha_for_S, bbr_tensors,
                             start_op, ew_init_lb, device, dtype,
-                            unstable_at_layer=sparse_at)
+                            unstable_at_layer=sparse_at,
+                            point_centers=_point_centers)
                         lb_parts.append(lb_part)
                     if direction in ('both', 'ub'):
                         neg_ub_part, _ = _crown_backward_matrix(
                             gg, xl, xh, alpha_for_S, bbr_tensors,
                             start_op, -ew_init_lb, device, dtype,
-                            unstable_at_layer=sparse_at)
+                            unstable_at_layer=sparse_at,
+                            point_centers=_point_centers)
                         ub_parts.append(-neg_ub_part)
                 un_t = torch.as_tensor(un_S, device=device, dtype=torch.long)
                 if lb_parts:
@@ -923,7 +1622,8 @@ def run_alpha_crown_batched(
             lb_b, _ = _crown_backward_matrix(
                 gg, xl, xh, spec_alpha, bbr_tensors,
                 last_op['name'], w_ts, device, dtype,
-                unstable_at_layer=sparse_at)
+                unstable_at_layer=sparse_at,
+                point_centers=_point_centers)
             spec_lb_batch_g = lb_b + b_ts
             with torch.no_grad():
                 closed_mask = torch.as_tensor(
@@ -1164,15 +1864,23 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
             else:
                 bias = op.get('bias')
                 if bias is not None:
-                    acc = acc + _bias_dot_ew(ew, bias, dtype, device)
+                    acc = acc + _bias_dot_ew(
+                        ew, bias, dtype, device,
+                        out_shape=op.get('out_shape_nd'))
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
         elif t == 'sub':
             bias = op.get('bias')
             if bias is not None:
-                acc = acc - _bias_dot_ew(ew, bias, dtype, device)
+                acc = acc - _bias_dot_ew(
+                    ew, bias, dtype, device,
+                    out_shape=op.get('out_shape_nd'))
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+        elif t == 'sub_bilinear':
+            ia, ib = op['inputs'][0], op['inputs'][1]
+            ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew)) + ew
+            ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew)) + (-ew)
         elif t == 'reshape':
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
@@ -1213,6 +1921,73 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
             acc = acc + float((ep * lo_t_b).sum() + (en * up_t_b).sum())
             ew_back = ep * lo_s + en * up_s
             inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t == 'reduce_sum':
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            out_shape_nd = op.get('out_shape_nd')
+            ew_back = _reduce_sum_backward(
+                ew, in_shape_nd, op.get('axes', ()),
+                op.get('keepdims', False), out_shape_nd)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t in ('mul_bilinear', 'div_bilinear'):
+            x_center = ((xl + xh) / 2).to(device=device, dtype=dtype)
+            pcs = _compute_point_centers(gg, x_center, device, dtype)
+            sh_in = op.get('in_shapes_nd', [None, None])
+            sh_out = op.get('out_shape_nd')
+            c_a = pcs[op['inputs'][0]]
+            c_b = pcs[op['inputs'][1]]
+            ew_nd = ew.reshape(*sh_out)
+            a_nd = c_a.reshape(*sh_in[0])
+            b_nd = c_b.reshape(*sh_in[1])
+            if t == 'mul_bilinear':
+                ew_a_nd = _sum_to_shape(ew_nd * b_nd, (), sh_in[0])
+                ew_b_nd = _sum_to_shape(ew_nd * a_nd, (), sh_in[1])
+            else:
+                if bool((b_nd == 0).any()):
+                    raise ZeroDivisionError(
+                        f'div_bilinear backward: denom zero at {name!r}')
+                inv_b = b_nd.reciprocal()
+                ew_a_nd = _sum_to_shape(ew_nd * inv_b, (), sh_in[0])
+                ew_b_nd = _sum_to_shape(
+                    -ew_nd * a_nd * inv_b * inv_b, (), sh_in[1])
+            ew_a = ew_a_nd.reshape(-1)
+            ew_b = ew_b_nd.reshape(-1)
+            ia, ib = op['inputs'][0], op['inputs'][1]
+            ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+            ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
+
+        elif t == 'pow':
+            from .verify_zono_bnb import _pow_two_line_coeffs
+            lo_pre_op = op.get('_pow_in_lo')
+            hi_pre_op = op.get('_pow_in_hi')
+            assert lo_pre_op is not None and hi_pre_op is not None, (
+                f"pow backward: missing pre-pow bounds for {name!r}")
+            lo_pre_t = lo_pre_op.to(device=device, dtype=dtype)
+            hi_pre_t = hi_pre_op.to(device=device, dtype=dtype)
+            p = int(op.get('exponent', 2))
+            inp = op['inputs'][0]
+            tan_pos_alpha = op.get('_pow_tangent_alpha')
+            if tan_pos_alpha is not None:
+                tan_pos_alpha = tan_pos_alpha.to(
+                    device=device, dtype=dtype)
+            (lb_slope, lb_const, ub_slope, ub_const,
+             use_two_line, box_lo_v, box_hi_v) = _pow_two_line_coeffs(
+                lo_pre_t, hi_pre_t, p, tangent_pos=tan_pos_alpha)
+            ep = ew.clamp(min=0); en = ew.clamp(max=0)
+            slope_back = ep * lb_slope + en * ub_slope
+            const_back = ep * lb_const + en * ub_const
+            slope_back = torch.where(use_two_line, slope_back,
+                                      torch.zeros_like(slope_back))
+            const_back = torch.where(use_two_line, const_back,
+                                      torch.where(ep > 0, box_lo_v,
+                                          torch.zeros_like(box_lo_v))
+                                      + torch.where(en < 0, box_hi_v,
+                                          torch.zeros_like(box_hi_v)))
+            acc = acc + float(const_back.sum())
+            ew_back = slope_back
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
         else:
@@ -1379,6 +2154,20 @@ def forward_zono_dir_adaptive(xl, xh, gg, alpha_per_layer, bbr,
                 z = z.copy()
                 z.center = z.center - bt
             zono_state[name] = z
+        elif t == 'sub_bilinear':
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            z_a = _get(op['inputs'][0]); z_b = _get(op['inputs'][1])
+            shared = _find_shared_gens_count(
+                op['inputs'][0], op['inputs'][1], gg, gen_count)
+            ka = z_a.generators.shape[1]; kb = z_b.generators.shape[1]
+            g_a_shared = z_a.generators[:, :shared]
+            g_b_shared = z_b.generators[:, :shared]
+            g_a_extra = z_a.generators[:, shared:]
+            g_b_extra = z_b.generators[:, shared:]
+            g_out = torch.cat([
+                g_a_shared - g_b_shared, g_a_extra, -g_b_extra,
+            ], dim=1)
+            zono_state[name] = _TZ(z_a.center - z_b.center, g_out)
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
         elif t in ('slice', 'gather'):
@@ -1437,6 +2226,47 @@ def forward_zono_dir_adaptive(xl, xh, gg, alpha_per_layer, bbr,
             if L is not None and pre_relu_gpu is not None:
                 pre_relu_gpu[L] = (z.center.clone(), z.generators.clone())
             zono_state[name] = _TZ(c_out, new_g)
+        elif t == 'reduce_sum':
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            from .zonotope import _torch_zono_reduce_sum
+            z = _get(op['inputs'][0])
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            new_c, new_g = _torch_zono_reduce_sum(
+                z.center, z.generators, in_shape_nd,
+                op.get('axes', ()), op.get('keepdims', False))
+            zono_state[name] = _TZ(new_c, new_g)
+        elif t == 'mul_bilinear':
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            from .zonotope import _torch_zono_mul_bilinear
+            z_a = _get(op['inputs'][0]); z_b = _get(op['inputs'][1])
+            sh = op.get('in_shapes_nd', [None, None])
+            new_c, new_g = _torch_zono_mul_bilinear(
+                z_a.center, z_a.generators, z_b.center, z_b.generators,
+                shape_a=sh[0], shape_b=sh[1],
+                shape_out=op.get('out_shape_nd'))
+            zono_state[name] = _TZ(new_c, new_g)
+        elif t == 'div_bilinear':
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            from .zonotope import _torch_zono_div_bilinear
+            z_a = _get(op['inputs'][0]); z_b = _get(op['inputs'][1])
+            new_c, new_g = _torch_zono_div_bilinear(
+                z_a.center, z_a.generators, z_b.center, z_b.generators,
+                fallback='box')
+            zono_state[name] = _TZ(new_c, new_g)
+        elif t == 'pow':
+            from .verify_zono_bnb import TorchZonotope as _TZ
+            from .zonotope import _torch_zono_pow_int
+            z = _get(op['inputs'][0])
+            exp = op.get('exponent', 2.0)
+            in_rad = (z.generators.abs().sum(dim=1)
+                       if z.generators.numel() > 0
+                       else torch.zeros_like(z.center))
+            op['_pow_in_lo'] = (z.center - in_rad).detach()
+            op['_pow_in_hi'] = (z.center + in_rad).detach()
+            op['_pow_relaxation'] = 'chord'
+            new_c, new_g = _torch_zono_pow_int(
+                z.center, z.generators, int(exp), relaxation='chord')
+            zono_state[name] = _TZ(new_c, new_g)
         else:
             raise NotImplementedError(
                 f'forward_zono_dir_adaptive: unsupported op {t!r} '

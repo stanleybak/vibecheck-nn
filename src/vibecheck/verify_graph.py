@@ -3932,6 +3932,12 @@ def _phase1_bab_refine(
             break
         if print_progress and n_passes > 1:
             print(f'  [bab_refine] pass {pass_idx+1}/{n_passes}', flush=True)
+        # Skip the per-layer gen-LP MILP block entirely when settings
+        # force `tighten_formulation='skip'` (e.g. graphs with Pow,
+        # ReduceSum, mul/div_bilinear ops the gen-LP state builder
+        # doesn't support).
+        if str(getattr(settings, 'tighten_formulation', 'gen_cone')) == 'skip':
+            break
         # Skip L=0: zonotope forward is exact at the first hidden layer
         # (z_0 = W_0 x + b_0 over a box-shaped input has tight closed-form
         # interval bounds), so per-neuron MILP at L=0 has no binaries to
@@ -5025,6 +5031,94 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
     return False, info
 
 
+def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
+                                     atol=1e-4, rng_seed=0):
+    """Defense-in-depth for VERIFIED verdicts.
+
+    Sample N points from the input box, forward through the original ONNX,
+    and check that NONE of them counterexamples the spec. If any sample
+    is a real counterexample, our 'verified' verdict is unsound — return
+    (ok=False, info) so the caller downgrades to 'unknown'.
+
+    Soundness rationale: a true UNSAT property has no counterexample
+    anywhere in the input box; finite sampling is NOT a soundness proof
+    of UNSAT (we miss adversarial inputs), but ANY counterexample
+    discovered is a true counterexample. This catches Class-1 unsoundness
+    (verifier silently certified a spec that's actually SAT) at near-zero
+    cost.
+
+    For specs with per-disjunct X-subranges, sample uniformly from each
+    disjunct's subbox so every disjunct gets coverage.
+    """
+    info = {'ok': True, 'reason': None, 'n_samples': n_samples,
+             'n_checked': 0}
+    if onnx_path is None:
+        info['reason'] = 'no onnx_path stashed on graph; skipping'
+        return True, info
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        info['reason'] = 'onnxruntime not installed; skipping'
+        return True, info
+    try:
+        if onnx_path.endswith('.gz'):
+            import gzip
+            with gzip.open(onnx_path, 'rb') as _f:
+                _model_bytes = _f.read()
+            sess = ort.InferenceSession(
+                _model_bytes, providers=['CPUExecutionProvider'])
+        else:
+            sess = ort.InferenceSession(
+                onnx_path, providers=['CPUExecutionProvider'])
+    except Exception as e:
+        info['reason'] = f'ORT session failed: {type(e).__name__}: {e}'
+        return True, info
+    in_meta = sess.get_inputs()[0]
+    in_shape = [d if isinstance(d, int) and d > 0 else 1
+                for d in in_meta.shape]
+    rng = np.random.default_rng(rng_seed)
+    # Per-disjunct subboxes if present, else global x_lo/x_hi.
+    subboxes = []
+    for ci, conj in enumerate(spec.disjuncts):
+        lo = conj.input_lo if conj.input_lo is not None else spec.x_lo
+        hi = conj.input_hi if conj.input_hi is not None else spec.x_hi
+        subboxes.append((np.asarray(lo, dtype=np.float64),
+                          np.asarray(hi, dtype=np.float64)))
+    # Distribute samples roughly evenly across subboxes; always at least 1.
+    n_per = max(1, n_samples // max(1, len(subboxes)))
+    for (lo, hi) in subboxes:
+        # 4 corners + (n_per - 4) interior uniform; small subboxes
+        # benefit from corner coverage (extremes), interior from
+        # uniform coverage.
+        n_corner = min(4, n_per)
+        samples = []
+        for k in range(n_corner):
+            mask = (rng.random(lo.shape) < 0.5)
+            samples.append(np.where(mask, lo, hi))
+        for _ in range(n_per - n_corner):
+            samples.append(lo + (hi - lo) * rng.random(lo.shape))
+        for x in samples:
+            x32 = x.reshape(in_shape).astype(np.float32)
+            try:
+                out = sess.run(None, {in_meta.name: x32})[0]
+            except Exception as e:
+                info['reason'] = (f'ORT forward failed: '
+                                    f'{type(e).__name__}: {e}')
+                return True, info
+            out_flat = np.asarray(out).flatten().astype(np.float64)
+            info['n_checked'] += 1
+            is_ce, _ = spec.check_witness(
+                x.flatten().astype(np.float64), out_flat)
+            if is_ce:
+                info['ok'] = False
+                info['reason'] = ('sample is a real counterexample '
+                                    '(VERIFIED is unsound)')
+                info['witness'] = x.flatten().astype(np.float64)
+                info['witness_out'] = out_flat
+                return False, info
+    return True, info
+
+
 def _run_pipeline(graph, spec, settings, build_fn, impl):
     """Run the 9-phase graph verification pipeline.
 
@@ -5114,6 +5208,34 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 extra['original_phase'] = phase
                 result_str = 'unknown'
                 phase = f'spurious_sat_{phase}'
+        # Defense-in-depth: every VERIFIED verdict gets a sample-based
+        # independent check. ORT forwards N input samples; if any
+        # falsifies the spec, that's a real counterexample → the case
+        # is actually SAT, and our verifier was unsound. Return 'sat'
+        # with the witness (not 'unknown' — a witness is strictly more
+        # informative than unknown, and matches what PGD would return).
+        if (result_str == 'verified'
+                and not bool(getattr(
+                    settings, 'skip_verified_validation', False))):
+            _n = int(getattr(settings, 'verified_validation_samples', 0)
+                      or 0)
+            _atol = float(settings.sat_validate_atol
+                           if 'sat_validate_atol' in settings else 1e-4)
+            _onnx_path = getattr(graph, 'onnx_path', None)
+            if _n > 0:
+                _ok_v, _info_v = _validate_verified_with_samples(
+                    _onnx_path, spec, n_samples=_n, atol=_atol)
+                if not _ok_v:
+                    if print_progress:
+                        print(f'  [validate] SPURIOUS VERIFIED from '
+                              f'{phase}: counterexample found → '
+                              f'flipping to SAT', flush=True)
+                    extra = dict(extra)
+                    extra['spurious_verified'] = _info_v
+                    extra['original_phase'] = phase
+                    extra['witness'] = _info_v.get('witness')
+                    result_str = 'sat'
+                    phase = f'spurious_verified_{phase}'
         details['result'] = result_str
         details['phase'] = phase
         details['time'] = time.perf_counter() - t_start
@@ -5685,7 +5807,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     gen_lp_state = None
     # Always precompute gen_lp_state if spec_impl is 'gen_lp' — Phase 8 needs it.
     # Phase 7 LP (per-query) is optional if skip_phase7_lp=True.
-    if remaining_qids and time_left() > 2:
+    # Skip entirely when caller already disabled Phase 8 MILP (e.g. graphs
+    # with Pow / Div / ReduceSum / MulBilinear that the gen-LP state
+    # builder can't represent) — there's no consumer for the state.
+    _skip_gen_lp_state = bool(getattr(settings, 'skip_phase8_milp', False))
+    if remaining_qids and time_left() > 2 and not _skip_gen_lp_state:
         if spec_impl == 'gen_lp':
             # Precompute the gen LP state once — G matrices and centers as
             # numpy arrays — reused across all Phase 7 and Phase 8 solves.
@@ -6578,6 +6704,42 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
 
     fast_results = {}
     fast_wall = 0.0
+    # STRUCTURAL fast-pass: detect per-sub disjunctions of pairwise
+    # overlapping halfspaces, where the OR-coverage is all of R
+    # regardless of network output. Mirrors the mscn cardinality_X_Y
+    # pattern: each sub is `(Y_i ≥ thr_lo) ∨ (Y_i ≤ thr_hi)` with
+    # thr_lo ≤ thr_hi. For these, the disjunction is trivially TRUE
+    # for any Y — no verification needed.
+    for ki, key in enumerate(order):
+        _, _, conjs = groups[key]
+        if len(conjs) < 2:
+            continue
+        per_dim = {}  # dim_idx -> list of (sign, threshold)
+        ok = True
+        for d in conjs:
+            if len(d.constraints) != 1:
+                ok = False; break
+            c = d.constraints[0]
+            sign = +1 if c.op == '>=' else -1 if c.op == '<=' else 0
+            if sign == 0:
+                ok = False; break
+            per_dim.setdefault(c.index, []).append((sign, c.value))
+        if not ok:
+            continue
+        # For each dim, if it has BOTH a `>= thr_lo` and `<= thr_hi`
+        # with thr_lo ≤ thr_hi, that dim's disjunction covers all R.
+        if any(
+            any(s == +1 for s, _ in entries)
+            and any(s == -1 for s, _ in entries)
+            and max(t for s, t in entries if s == +1)
+                <= min(t for s, t in entries if s == -1)
+            for entries in per_dim.values()
+        ):
+            fast_results[ki] = 'verified'
+    if (fast_results and getattr(settings, 'print_progress', False)):
+        print(f'[per-disjunct] structural OR-coverage closed '
+              f'{len(fast_results)}/{n_sub} subs',
+              flush=True)
     if gg_fast is not None:
         try:
             xls = np.stack([groups[k][0] for k in order]).astype(
@@ -6587,8 +6749,58 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
             xl_t = torch.as_tensor(xls, dtype=dt, device=dev)
             xh_t = torch.as_tensor(xhs, dtype=dt, device=dev)
             t_fast = time.perf_counter()
-            sb_b, (c_b, G_b) = _forward_zonotope_graph_batched(
-                xl_t, xh_t, gg_fast, dev, dt)
+            # OOM-safe chunked forward: try full batch first; on OOM,
+            # halve. The full-batch path is much faster than chunked
+            # (no kernel-launch overhead, better cache utilization), so
+            # only halve when actually needed.
+            _bs_full = xl_t.shape[0]
+            _chunk = _bs_full
+            while _chunk >= 1:
+                try:
+                    if _chunk >= _bs_full:
+                        sb_b, (c_b, G_b) = _forward_zonotope_graph_batched(
+                            xl_t, xh_t, gg_fast, dev, dt)
+                    else:
+                        sb_parts = None; c_parts = []; G_parts = []
+                        for ci0 in range(0, _bs_full, _chunk):
+                            ci1 = min(ci0 + _chunk, _bs_full)
+                            sb_c, (cc, GG) = _forward_zonotope_graph_batched(
+                                xl_t[ci0:ci1], xh_t[ci0:ci1], gg_fast, dev, dt)
+                            if sb_parts is None:
+                                sb_parts = {L: ([sb_c[L][0]], [sb_c[L][1]])
+                                             for L in sb_c}
+                            else:
+                                for L in sb_c:
+                                    sb_parts[L][0].append(sb_c[L][0])
+                                    sb_parts[L][1].append(sb_c[L][1])
+                            c_parts.append(cc); G_parts.append(GG)
+                        sb_b = {L: (torch.cat(sb_parts[L][0], dim=0),
+                                     torch.cat(sb_parts[L][1], dim=0))
+                                 for L in sb_parts}
+                        # G shape: (B, n, K). K may differ per chunk
+                        # (Sigmoid/Tanh/Pow add new gens proportional to
+                        # the unstable count, which varies per batch).
+                        # Pad to common K with zeros (sound — zero gens
+                        # add 0 to bounds).
+                        max_K = max(G.shape[2] for G in G_parts)
+                        G_padded = []
+                        for G in G_parts:
+                            if G.shape[2] < max_K:
+                                pad = G.new_zeros(G.shape[0], G.shape[1],
+                                                   max_K - G.shape[2])
+                                G_padded.append(torch.cat([G, pad], dim=2))
+                            else:
+                                G_padded.append(G)
+                        c_b = torch.cat(c_parts, dim=0)
+                        G_b = torch.cat(G_padded, dim=0)
+                    break  # success
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    if _chunk == 1:
+                        raise  # truly cannot fit
+                    _chunk = max(1, _chunk // 2)
+            # Stash chunk size for downstream chunked CROWN calls.
+            _fb_chunk = _chunk
             n_out = c_b.shape[1]
             # For each sub-box index b, check all its Y conjuncts.
             for ki, key in enumerate(order):
@@ -6604,6 +6816,259 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                 if ck_res == 'verified':
                     fast_results[ki] = 'verified'
             fast_wall = time.perf_counter() - t_fast
+            # Batched CROWN backward for sub-boxes that forward bounds
+            # didn't close. Build all per-sub spec queries, run a single
+            # batched backward, check per-sub verdicts. For mscn
+            # (1-input per disjunct, simple Y-constraints), this closes
+            # most of what forward leaves open.
+            from .verify_zono_bnb import _spec_backward_graph_batched
+            t_crown = time.perf_counter()
+            n_crown_closed = 0
+            try:
+                # For each unclosed sub-box, build (w, b) per query.
+                # All sub-boxes share the same Y dim n_out, so we can
+                # batch all queries across all unclosed subs as (Q_total, n_out).
+                unclosed = [ki for ki in range(n_sub) if ki not in fast_results]
+                if unclosed:
+                    # Try TRULY batched CROWN backward across all
+                    # unclosed subs. This works when every sub's spec
+                    # has the same `w` vector (typical for mscn:
+                    # "Y_0 <= per_sub_threshold" — w = e_0 shared,
+                    # bias varies per sub). One batched _spec_backward
+                    # call per UNIQUE w computes spec_lbs of shape
+                    # (B, 1); we then compare per-sub spec_lb > -bias.
+                    #
+                    # When ws differ across subs, fall back to per-sub
+                    # loop below.
+                    sub_queries = []
+                    all_w_sub = []
+                    for ki in unclosed:
+                        _, _, conjs = groups[order[ki]]
+                        sub_sp = VNNSpec(
+                            groups[order[ki]][0], groups[order[ki]][1], conjs)
+                        qs = sub_sp.as_linear_queries(n_out)
+                        sub_queries.append(qs)
+                        if len(qs) >= 1:
+                            all_w_sub.append(np.asarray(qs[0][1],
+                                                          dtype=np.float64))
+                    same_w = (len(all_w_sub) > 0 and all(
+                        np.array_equal(w, all_w_sub[0]) for w in all_w_sub))
+                    one_q_per_sub = all(len(q) == 1 for q in sub_queries
+                                         if len(q) > 0)
+                    if same_w and one_q_per_sub:
+                        try:
+                            w_shared = torch.as_tensor(
+                                all_w_sub[0], dtype=dt, device=dev)
+                            tight_all = {L: (sb_b[L][0], sb_b[L][1])
+                                          for L in sb_b}
+                            spec_ew_shared = {0: (w_shared, 0.0)}
+                            spec_lbs_all = _spec_backward_graph_batched(
+                                tight_all, xl_t, xh_t, gg_fast,
+                                spec_ew_shared, dev, dt)
+                            lbs_np_all = spec_lbs_all[:, 0].detach().cpu().numpy()
+                            biases = np.array([float(sub_queries[idx][0][2])
+                                                if sub_queries[idx] else -1e9
+                                                for idx in range(len(unclosed))])
+                            margins = lbs_np_all + biases
+                            for idx, ki in enumerate(unclosed):
+                                if margins[idx] > 0:
+                                    fast_results[ki] = 'verified'
+                                    n_crown_closed += 1
+                            # α-CROWN escalation: widened threshold —
+                            # on mscn many-disjunct cases, basic CROWN's
+                            # unclosed subs have margins in (-0.5, 0]
+                            # and α-CROWN closes ~63% of those. The
+                            # batched α-CROWN cost scales linearly with
+                            # the candidate count and is GPU-batched
+                            # (~1-2s for 500 subs × 20 iters).
+                            close_idx = [idx for idx, ki in enumerate(unclosed)
+                                            if ki not in fast_results
+                                            and margins[idx] > -1.0]
+                            if (close_idx and
+                                time.perf_counter() - t_start <
+                                    total - 5.0):
+                                from .verify_zono_bnb import (
+                                    _run_alpha_crown_inputsplit_batched)
+                                idx_t_tensor = torch.as_tensor(
+                                    close_idx, dtype=torch.long, device=dev)
+                                xl_open = xl_t.index_select(0, idx_t_tensor)
+                                xh_open = xh_t.index_select(0, idx_t_tensor)
+                                spec_lbs_alpha = _run_alpha_crown_inputsplit_batched(
+                                    xl_open, xh_open, gg_fast,
+                                    spec_ew_shared, dev, dt, n_iters=30)
+                                lbs_alpha_np = spec_lbs_alpha[:, 0].detach().cpu().numpy()
+                                for i_open, idx in enumerate(close_idx):
+                                    ki = unclosed[idx]
+                                    bias = float(sub_queries[idx][0][2])
+                                    if lbs_alpha_np[i_open] + bias > 0:
+                                        fast_results[ki] = 'verified'
+                                        n_crown_closed += 1
+                        except Exception:
+                            pass
+                    else:
+                        # Mixed-q-per-sub path. mscn cardinality_X_Y_DIM
+                        # has 2 disjuncts per sub (OR semantics) with
+                        # SAME w per query INDEX across subs (q0: w=[1],
+                        # q1: w=[-1]). Sub safe iff ANY query verifies.
+                        per_sub_q_count = [len(q) for q in sub_queries]
+                        all_w = []; all_b = []
+                        for qs in sub_queries:
+                            for _, w, b in qs:
+                                all_w.append(np.asarray(w, dtype=np.float64))
+                                all_b.append(float(b))
+                        # Detect: ALL subs have SAME q_count AND for each
+                        # query-index, all subs share the same w. If yes,
+                        # run BATCHED basic+α-CROWN per query index.
+                        max_q = max(per_sub_q_count) if per_sub_q_count else 0
+                        uniform_q = all(c == max_q for c in per_sub_q_count)
+                        per_qi_same_w = uniform_q
+                        if uniform_q:
+                            for qi in range(max_q):
+                                w_per_sub = []
+                                for sub_idx, qs in enumerate(sub_queries):
+                                    w_per_sub.append(np.asarray(
+                                        qs[qi][1], dtype=np.float64))
+                                if not all(np.array_equal(w_per_sub[0], w)
+                                           for w in w_per_sub):
+                                    per_qi_same_w = False
+                                    break
+                        if uniform_q and per_qi_same_w and max_q >= 1:
+                            # Per-q-index batched CROWN + α-CROWN.
+                            try:
+                                if getattr(settings, 'print_progress', False):
+                                    print(f'[per-disjunct] per-q batched CROWN '
+                                          f'on {len(unclosed)} subs × {max_q} q',
+                                          flush=True)
+                                # Track which subs are verified by ANY q.
+                                sub_verified_by_q = np.zeros(
+                                    len(unclosed), dtype=bool)
+                                # Bias per (sub, q_idx).
+                                bias_per_sub_q = np.zeros((len(unclosed), max_q))
+                                for sub_idx, qs in enumerate(sub_queries):
+                                    for qi in range(max_q):
+                                        bias_per_sub_q[sub_idx, qi] = float(
+                                            qs[qi][2])
+                                # Build per-unclosed-sub xl/xh + sb.
+                                ki_t = torch.as_tensor(
+                                    unclosed, dtype=torch.long, device=dev)
+                                xl_unc = xl_t.index_select(0, ki_t)
+                                xh_unc = xh_t.index_select(0, ki_t)
+                                sb_unc = {L: (sb_b[L][0].index_select(0, ki_t),
+                                               sb_b[L][1].index_select(0, ki_t))
+                                           for L in sb_b}
+                                for qi in range(max_q):
+                                    w_q = torch.as_tensor(
+                                        np.asarray(sub_queries[0][qi][1],
+                                                    dtype=np.float64),
+                                        dtype=dt, device=dev)
+                                    spec_ew_q = {0: (w_q, 0.0)}
+                                    lbs_basic_q = _spec_backward_graph_batched(
+                                        sb_unc, xl_unc, xh_unc, gg_fast,
+                                        spec_ew_q, dev, dt)
+                                    lbs_np_q = (
+                                        lbs_basic_q[:, 0].detach().cpu().numpy())
+                                    margins_basic_q = (lbs_np_q
+                                                       + bias_per_sub_q[:, qi])
+                                    sub_verified_by_q |= (margins_basic_q > 0)
+                                    # α-CROWN escalation on subs still
+                                    # unverified by ANY q so far AND
+                                    # close to verified by THIS q.
+                                    close_for_q = (
+                                        (~sub_verified_by_q)
+                                        & (margins_basic_q > -1.0))
+                                    close_idx = np.where(close_for_q)[0]
+                                    if (len(close_idx) > 0
+                                            and time.perf_counter() - t_start
+                                                < total - 5.0):
+                                        from .verify_zono_bnb import (
+                                            _run_alpha_crown_inputsplit_batched)
+                                        idx_t = torch.as_tensor(
+                                            close_idx, dtype=torch.long,
+                                            device=dev)
+                                        xl_open = xl_unc.index_select(0, idx_t)
+                                        xh_open = xh_unc.index_select(0, idx_t)
+                                        spec_lbs_alpha = (
+                                            _run_alpha_crown_inputsplit_batched(
+                                                xl_open, xh_open, gg_fast,
+                                                spec_ew_q, dev, dt,
+                                                n_iters=100, lr=0.25,
+                                                lr_decay=0.99))
+                                        lbs_alpha_np = (
+                                            spec_lbs_alpha[:, 0].detach()
+                                            .cpu().numpy())
+                                        for i_open, sub_idx in enumerate(
+                                                close_idx):
+                                            margin_alpha = (
+                                                lbs_alpha_np[i_open]
+                                                + bias_per_sub_q[sub_idx, qi])
+                                            if margin_alpha > 0:
+                                                sub_verified_by_q[sub_idx] = True
+                                # Now mark sub as verified if ANY q verified.
+                                for sub_idx, ki in enumerate(unclosed):
+                                    if sub_verified_by_q[sub_idx]:
+                                        fast_results[ki] = 'verified'
+                                        n_crown_closed += 1
+                                if getattr(settings, 'print_progress', False):
+                                    print(f'[per-disjunct] per-q closed '
+                                          f'{int(sub_verified_by_q.sum())}/'
+                                          f'{len(unclosed)} subs',
+                                          flush=True)
+                            except Exception as _e:
+                                if getattr(settings, 'print_progress', False):
+                                    import traceback
+                                    print(f'[per-disjunct] per-q EXC: {_e}',
+                                          flush=True)
+                                    traceback.print_exc()
+                        # Per-sub fallback loop. Skip already-closed
+                        # subs (from batched per-q path above).
+                        # CAPPED to small count — downstream multi-sub
+                        # BAB handles big-sub-count cases faster via
+                        # batched LiRPA. This loop was eating 130+s on
+                        # mscn_5410_dual at 50ms per call * 2500 subs.
+                        _per_sub_cap = 20
+                        for _pos, (ki, q_count) in enumerate(zip(unclosed, per_sub_q_count)):
+                            if _pos >= _per_sub_cap:
+                                break
+                            if ki in fast_results:
+                                continue
+                            elapsed = time.perf_counter() - t_start
+                            if elapsed > total: break
+                            if q_count == 0:
+                                continue
+                            tight_sub = {L: (sb_b[L][0][ki:ki+1],
+                                              sb_b[L][1][ki:ki+1])
+                                          for L in sb_b}
+                            offset = sum(per_sub_q_count[:unclosed.index(ki)])
+                            w_q_sub = np.stack(all_w[offset:offset+q_count])
+                            b_q_sub = np.array(all_b[offset:offset+q_count])
+                            spec_ew_sub = {qi: (
+                                torch.as_tensor(w_q_sub[qi], dtype=dt, device=dev),
+                                float(b_q_sub[qi]))
+                                for qi in range(q_count)}
+                            xl_sub = xl_t[ki:ki+1]
+                            xh_sub = xh_t[ki:ki+1]
+                            try:
+                                spec_lbs = _spec_backward_graph_batched(
+                                    tight_sub, xl_sub, xh_sub, gg_fast,
+                                    spec_ew_sub, dev, dt)
+                                lbs_np = spec_lbs[0].detach().cpu().numpy()
+                                _, _, conjs_sub = groups[order[ki]]
+                                sub_sp = VNNSpec(
+                                    groups[order[ki]][0],
+                                    groups[order[ki]][1], conjs_sub)
+                                queries = sub_sp.as_linear_queries(n_out)
+                                disj_qs = {}
+                                for qi, (di, _, _) in enumerate(queries):
+                                    disj_qs.setdefault(di, []).append(qi)
+                                if all(any(lbs_np[qi] > 0 for qi in qis)
+                                       for qis in disj_qs.values()):
+                                    fast_results[ki] = 'verified'
+                                    n_crown_closed += 1
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            crown_wall = time.perf_counter() - t_crown
             del c_b, G_b
         except Exception:
             pass
@@ -6613,26 +7078,187 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
               f'{len(fast_results)}/{n_sub} subs in {fast_wall:.2f}s',
               flush=True)
 
-    # Sub-budget for remaining (un-closed) sub-boxes
+    # Fallback: per-sub UNBATCHED forward zono + (if open) spec CROWN
+    # backward. The batched forward doesn't yet handle nn4sys mscn ops
+    # (mul_bilinear, div_bilinear, reduce_sum, ND fc); the unbatched
+    # forward does. Loop over remaining subs:
+    #   1. forward zono → check bounds (closes ~35% of mscn subs)
+    #   2. if open, spec CROWN backward → tighter spec lb (closes more)
+    # Both are 10-50ms each, much cheaper than full verify_graph.
+    # Skip the per-sub unbatched-forward+CROWN fallback when many subs
+    # remain — the downstream multi-sub BAB closes the same subs ~10x
+    # faster via batched GPU operations. The unbatched loop here was
+    # ~22s wasted on mscn_3800 (closed 0 subs in 22s).
+    _unb_threshold = 30
+    if (gg_fast is not None
+            and (n_sub - len(fast_results)) <= _unb_threshold):
+        from .verify_zono_bnb import (
+            _forward_zonotope_graph, _spec_backward_graph)
+        t_unbatched = time.perf_counter()
+        n_fwd_closed = 0
+        n_crown_closed = 0
+        for ki, key in enumerate(order):
+            if ki in fast_results:
+                continue
+            elapsed = time.perf_counter() - t_start
+            if elapsed > total:
+                break
+            x_lo_np, x_hi_np, conjs = groups[key]
+            xl_one = torch.as_tensor(x_lo_np, dtype=dt, device=dev)
+            xh_one = torch.as_tensor(x_hi_np, dtype=dt, device=dev)
+            try:
+                sb_u, z_one = _forward_zonotope_graph(
+                    xl_one, xh_one, gg_fast, dev, dt)
+                lo_y, hi_y = z_one.bounds()
+                lo_np = lo_y.detach().cpu().numpy()
+                hi_np = hi_y.detach().cpu().numpy()
+                sub_spec_ck = VNNSpec(x_lo_np, x_hi_np, conjs)
+                ck_res, _ = sub_spec_ck.check(lo_np, hi_np)
+                if ck_res == 'verified':
+                    fast_results[ki] = 'verified'
+                    n_fwd_closed += 1
+                    continue
+                # Spec CROWN backward (cheap, ~10ms): tighter than
+                # raw forward bounds. Use as_linear_queries to get
+                # per-conjunct (w, b); verified iff all queries lb > 0.
+                n_out = z_one.center.numel()
+                queries = sub_spec_ck.as_linear_queries(n_out)
+                if not queries:
+                    continue
+                # Build spec_ew dict {qi: (w, b)}
+                spec_ew = {qi: (torch.as_tensor(w, dtype=dt, device=dev),
+                                  float(b))
+                            for qi, (di, w, b) in enumerate(queries)}
+                spec_lbs, _open = _spec_backward_graph(
+                    sb_u, xl_one, xh_one, gg_fast, spec_ew,
+                    list(range(len(queries))), len(sb_u), dev, dt)
+                # AND semantics: per-disjunct safe iff ANY query lb > 0.
+                disj_queries = {}
+                for qi, (di, w, b) in enumerate(queries):
+                    disj_queries.setdefault(di, []).append(qi)
+                all_disj_safe = all(
+                    any(spec_lbs.get(qi, -1.0) > 0 for qi in qis)
+                    for qis in disj_queries.values())
+                if all_disj_safe:
+                    fast_results[ki] = 'verified'
+                    n_crown_closed += 1
+            except Exception:
+                pass
+        if getattr(settings, 'print_progress', False):
+            print(f'[per-disjunct] unbatched forward closed '
+                  f'{n_fwd_closed} + CROWN closed {n_crown_closed} '
+                  f'more subs in {time.perf_counter() - t_unbatched:.2f}s',
+                  flush=True)
+
+    # Sub-budget for remaining (un-closed) sub-boxes — DYNAMIC so a
+    # fast-closing sub frees its unused budget for subsequent harder
+    # subs. Recomputed at each iter in the loop below.
     remaining_sub_idx = [ki for ki in range(n_sub) if ki not in fast_results]
+    if getattr(settings, 'print_progress', False):
+        print(f'[per-disjunct] before multi-sub gate: '
+              f'gg_fast={gg_fast is not None} '
+              f'remaining={len(remaining_sub_idx)} '
+              f'time_left={total - (time.perf_counter() - t_start):.1f}s',
+              flush=True)
+    # MULTI-SUB INPUT-SPLIT BAB: when many subs remain (mscn 1000+),
+    # batch all their leaves into a single GPU worklist (ABC-style:
+    # single "domains" list, batched bounding per iter). Each domain is
+    # (sub_idx, xl_leaf, xh_leaf); sub safe iff ALL its leaves verified
+    # by ANY query. Each iter:
+    #   1. Pop batch of B leaves.
+    #   2. Batched forward zono → spec_lb per (leaf, query).
+    #   3. Per leaf, mark as safe if ANY query margin > 0.
+    #   4. Unsafe leaves split on widest dim → 2 child leaves, push back.
+    if (gg_fast is not None and len(remaining_sub_idx) > 0
+            and total - (time.perf_counter() - t_start) > 1.0):
+        # Partition remaining subs by their per-q w-tuple so each
+        # group has shared w (multi-sub BAB requirement). mscn dual
+        # cases have 2 groups (Y ≥ thr vs Y ≤ thr).
+        from .spec import VNNSpec
+        groups_by_w = {}  # tuple(w_q_tuples) → list of sub_idx
+        for ki in remaining_sub_idx:
+            _, _, conjs = groups[order[ki]]
+            sp = VNNSpec(groups[order[ki]][0], groups[order[ki]][1], conjs)
+            qs = sp.as_linear_queries(n_out)
+            # Key: tuple of (w_tuple) per query.
+            key = tuple(tuple(np.asarray(q[1]).tolist()) for q in qs)
+            groups_by_w.setdefault(key, []).append(ki)
+        total_msb_closed = 0
+        # Mini-group multi-sub BAB: large w-groups (>60 subs) are split
+        # into mini-groups of ~60 subs each. FIFO leaf processing in a
+        # 300+ sub group means stubborn subs only get ~10 leaves
+        # processed before time runs out — not enough to close subs
+        # that need 40+ leaves. Mini-groups give each sub the focused
+        # processing it needs.
+        # Mini-group only when w-group is small enough that focused
+        # processing helps. For huge w-groups (1000+), process as a
+        # single multi-sub BAB call with the full budget — batched
+        # LiRPA is throughput-bound and mini-groups waste time.
+        mini_group_size = 60
+        if getattr(settings, 'print_progress', False):
+            print(f'[per-disjunct] entering multi-sub BAB on '
+                  f'{len(groups_by_w)} w-groups '
+                  f'(sizes: {[len(g) for g in groups_by_w.values()][:5]})',
+                  flush=True)
+        for w_key, sub_group in groups_by_w.items():
+            # Subdivide large-but-not-huge w-group into mini-groups.
+            if len(sub_group) <= mini_group_size:
+                mini_groups = [sub_group]
+            elif len(sub_group) > 1000:
+                mini_groups = [sub_group]  # huge: one big call
+            else:
+                mini_groups = [sub_group[i:i+mini_group_size]
+                                for i in range(0, len(sub_group),
+                                                mini_group_size)]
+            for mg in mini_groups:
+                rem_for_msb = total - (time.perf_counter() - t_start) - 1.0
+                if rem_for_msb <= 0:
+                    break
+                # Per mini-group budget = (rem time) / (remaining mini-groups)
+                mg_rem = (len(mini_groups)
+                          - mini_groups.index(mg))
+                mg_budget = max(2.0, rem_for_msb / max(1, mg_rem))
+                msb_closed = _multi_sub_input_split_bab(
+                    mg, groups, order, gg_fast, dev, dt,
+                    mg_budget, n_out, settings)
+                for ki in msb_closed:
+                    fast_results[ki] = 'verified'
+                total_msb_closed += len(msb_closed)
+        if (total_msb_closed > 0
+                and getattr(settings, 'print_progress', False)):
+            print(f'[per-disjunct] multi-sub BAB total closed '
+                  f'{total_msb_closed}/{len(remaining_sub_idx)} subs '
+                  f'across {len(groups_by_w)} w-groups',
+                  flush=True)
+        remaining_sub_idx = [ki for ki in range(n_sub) if ki not in fast_results]
     rem_budget = total - (time.perf_counter() - t_start)
     per_sub_budget = max(0.2, rem_budget / max(1, len(remaining_sub_idx)))
 
-    all_verified = (len(fast_results) == n_sub)
+    # Track verified status per sub-box.
+    verified_subs = set(fast_results)
     sub_details = [{'idx': ki, 'verdict': 'verified', 'phase': 'fast_crown'}
                     for ki in fast_results]
-    for ki in remaining_sub_idx:
+    for sub_pos, ki in enumerate(remaining_sub_idx):
         elapsed = time.perf_counter() - t_start
         if elapsed > total:
             sub_details.append({'idx': ki, 'verdict': 'unknown',
                                 'reason': 'total_timeout'})
-            all_verified = False
             continue
+        # Dynamic per-sub budget: recompute based on remaining time
+        # and remaining subs. Lets fast-closing subs free their unused
+        # budget for harder subs later in the list.
+        n_left = len(remaining_sub_idx) - sub_pos
+        rem_now = total - elapsed
+        # min 3s/sub — recursive verify_graph has setup overhead
+        # (forward zono + per-q + fast batched ~1s) before BAB starts;
+        # the BAB itself needs 1-2s on mscn 128d_dual subs. 3s lets
+        # most close.
+        per_sub_budget_dyn = max(3.0, rem_now / max(1, n_left))
         key = order[ki]
         x_lo, x_hi, conjs = groups[key]
         sub_spec = VNNSpec(x_lo, x_hi, conjs)
         sub_settings = copy.copy(settings)
-        sub_settings.total_timeout = min(per_sub_budget, max(0.05,
+        sub_settings.total_timeout = min(per_sub_budget_dyn, max(0.05,
                                                               total - elapsed))
         sub_settings.print_progress = False
         try:
@@ -6640,6 +7266,11 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
         except Exception as e:
             sub_v = f'err:{type(e).__name__}'
             sub_d = {'reason': str(e)[:200]}
+        if getattr(settings, 'print_progress', False):
+            print(f'[per-disjunct] sub {ki}: {sub_v} '
+                  f'(phase={sub_d.get("phase")}, '
+                  f'reason={sub_d.get("reason", "")[:80]})',
+                  flush=True)
         sub_details.append({'idx': ki, 'verdict': sub_v,
                             'phase': sub_d.get('phase')})
         if sub_v == 'sat':
@@ -6649,9 +7280,10 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                 'witness': sub_d.get('witness'),
                 'sub_details': sub_details,
             }
-        if sub_v != 'verified':
-            all_verified = False
+        if sub_v == 'verified':
+            verified_subs.add(ki)
 
+    all_verified = (len(verified_subs) == n_sub)
     verdict = 'verified' if all_verified else 'unknown'
     return verdict, {
         'phase': 'per_disjunct_split',
@@ -6690,6 +7322,84 @@ def verify_graph(graph, spec, settings):
     _x_constrained = [c for c in spec.disjuncts if c.input_lo is not None]
     if _x_constrained and len(_x_constrained) == len(spec.disjuncts):
         return _verify_per_disjunct_subboxes(graph, spec, settings)
+    # Force gen-LP / Phase 8 MILP off for graphs containing ops the
+    # generator-LP state builder doesn't support (Pow, mul_bilinear,
+    # div_bilinear, ReduceSum on the activation path). Otherwise
+    # `precompute_gen_state` raises NotImplementedError mid-pipeline.
+    # Sound: the CROWN backward + α-CROWN path still verifies these
+    # cases (pensieve_*_parallel, mscn_*). Settings the user explicitly
+    # set are preserved unless they collide with this routing.
+    _unsupported_ops = {'pow', 'mul_bilinear', 'div_bilinear',
+                         'reduce_sum'}
+    _has_unsupported = any(
+        getattr(n, 'op_type', '') in (
+            'Pow', 'ReduceSum', 'Div') or
+        (getattr(n, 'op_type', '') == 'Mul'
+            and len([i for i in n.inputs
+                      if i in graph.nodes
+                      or i == graph.input_name]) == 2)
+        for n in graph.nodes.values())
+    if _has_unsupported:
+        if getattr(settings, 'tighten_formulation', 'gen_cone') != 'skip':
+            # Count VARYING input dims (mscn / pensieve specs typically
+            # have a handful varying out of 100s of total dims). If that
+            # count is small, lift `input_split_max_dims` to the TOTAL
+            # input dim so the input-split fast-leaf path triggers
+            # (the gate compares TOTAL `n_in = np.prod(x_lo.shape)`
+            # against `input_split_max_dims`, not varying count). It
+            # closes mscn cardinality_0_1_2048 with spec_lb≈+1e-4 in
+            # 1.4s where the no-split α-CROWN plateaus at -0.06.
+            n_var = int(((spec.x_hi - spec.x_lo) > 1e-9).sum())
+            n_in_total = int(spec.x_lo.size)
+            # Lift the split cap when input-split BAB is tractable.
+            # Two regimes:
+            #  - n_var ≤ 8: small varying-dim count, BAB splits along
+            #    those few dims, exponentially small tree depth.
+            #  - n_var > 8 AND n_in_total ≤ 100: pensieve_*_parallel
+            #    (32 varying / 96 total). The structural tightness
+            #    fixes (α-Pow + α-Div tangent in Phase 0.5, shared-gen
+            #    Div for scalar denominator) make per-leaf bounds tight
+            #    enough that BAB converges within benchmark timeout
+            #    (e.g. pensieve_parallel_100 closes in 128s vs 14s
+            #    timeout pre-fix).
+            if n_var <= 8 or n_in_total <= 100:
+                new_split_cap = max(int(getattr(
+                    settings, 'input_split_max_dims', 20)), n_in_total)
+            else:
+                new_split_cap = int(getattr(
+                    settings, 'input_split_max_dims', 20))
+            if getattr(settings, 'print_progress', False):
+                print('[verify_graph] graph has non-LP ops '
+                      '(Pow/Div/ReduceSum/MulBilinear); forcing '
+                      'tighten_formulation=skip + skip_phase8_milp=True '
+                      '+ zono_lift_enabled=False + phase2_crown_enabled=False '
+                      f'+ input_split_max_dims={new_split_cap} '
+                      f'(was {getattr(settings, "input_split_max_dims", 20)}; '
+                      f'varying dim count={n_var})', flush=True)
+            settings.tighten_formulation = 'skip'
+            settings.tighten_solver = 'lp'  # placeholder; skip path ignores
+            settings.skip_phase8_milp = True
+            settings.zono_lift_enabled = False
+            # Enable batched input-split for many-disjunct decomposed
+            # graphs (mscn cardinality_X_Y has 1000+ disjuncts → 500+
+            # X subboxes; each sub has 1-2 varying dims). Batched =
+            # GPU-parallel leaves at ~100x throughput vs non-batched.
+            # For SINGLE-DISJUNCT graphs (pensieve_parallel: 1 disjunct,
+            # 32 varying dims), non-batched performs better — the
+            # batched driver's leaf-throughput advantage doesn't
+            # outweigh non-batched's smarter sb-branching for wide
+            # input boxes. n_var ≤ 8 ≈ narrow-input regime.
+            if n_var <= 8:
+                settings.input_split_batched_enabled = True
+            # Critical: without this, Phase 2's basic CROWN OVERWRITES
+            # Phase 0.5's α-CROWN spec_lb with a looser value (e.g. on
+            # nn4sys mscn cardinality_0_1_128: α-CROWN closes the spec
+            # at lb≈+0.001, Phase 2 CROWN reports lb≈-0.003, verdict
+            # flips verified→unknown). With tighten_formulation=skip
+            # there's no MILP tightening between Phase 0.5 and Phase 2,
+            # so Phase 0.5's bound is strictly tighter.
+            settings.phase2_crown_enabled = False
+            settings.input_split_max_dims = new_split_cap
     # Route conv-heavy nets (e.g. oval21 cifar_base/deep/wide_kw) to
     # the historical milp_verify pipeline. The bab_refine cascade +
     # alpha-zono Phase 8 are tuned for FC nets like mnist_fc and
@@ -7166,6 +7876,250 @@ def _joint_and_infeasible_zono(z_center_np, z_gens_np, qlists_disj):
             m.dispose()
     finally:
         env.dispose()
+    return closed
+
+
+def _multi_sub_input_split_bab(
+        sub_idx_list, groups, order, gg, device, dtype, total_budget,
+        n_out, settings):
+    """Multi-sub batched input-split BAB (ABC-style).
+
+    Single shared GPU worklist of (sub_idx, xl_leaf, xh_leaf) leaves
+    across ALL unclosed sub-boxes. Each iter batches up to
+    `input_split_batch_size` leaves: forward zono + backward CROWN per
+    query, mark leaves verified by ANY query, split unverified on
+    widest dim. Sub safe iff all its leaves verified.
+
+    Mirrors α,β-CROWN's `BABReWeighted`/`input_split` driver which
+    visits ~10k batched leaves in ~6s on mscn_3240 (12881 leaves total
+    for 3240 unique X-subboxes).
+
+    Returns: set of `sub_idx` (subset of `sub_idx_list`) marked safe.
+    """
+    import time, copy
+    from .verify_zono_bnb import (
+        _forward_zonotope_graph_batched, _spec_backward_graph_batched,
+        _run_alpha_crown_inputsplit_batched)
+    t0 = time.perf_counter()
+    closed = set()
+    if not sub_idx_list:
+        return closed
+    # Build per-sub spec data (queries: list of (w, b)).
+    from .spec import VNNSpec
+    sub_specs = {}
+    for ki in sub_idx_list:
+        _, _, conjs = groups[order[ki]]
+        sp = VNNSpec(groups[order[ki]][0], groups[order[ki]][1], conjs)
+        qs = sp.as_linear_queries(n_out)
+        sub_specs[ki] = qs
+    # Detect uniform-q-per-sub same-w pattern (mscn cardinality typical:
+    # each sub has 2 queries, w shared across subs per q-index).
+    q_counts = [len(sub_specs[ki]) for ki in sub_idx_list]
+    if not q_counts or max(q_counts) == 0:
+        return closed
+    uniform_q = all(c == q_counts[0] for c in q_counts)
+    max_q = q_counts[0]
+    same_w_per_qi = uniform_q and all(
+        all(np.array_equal(np.asarray(sub_specs[ki][qi][1]),
+                            np.asarray(sub_specs[sub_idx_list[0]][qi][1]))
+            for ki in sub_idx_list)
+        for qi in range(max_q))
+    if not (uniform_q and same_w_per_qi):
+        # Fallback: cannot batch cleanly; skip multi-sub BAB.
+        if getattr(settings, 'print_progress', False):
+            # Find a sub with mismatched w to report.
+            ref_w = np.asarray(sub_specs[sub_idx_list[0]][0][1])
+            mismatch_ki = None
+            for ki in sub_idx_list[:50]:
+                for qi in range(max_q):
+                    w_k = np.asarray(sub_specs[ki][qi][1])
+                    if not np.array_equal(w_k, ref_w):
+                        mismatch_ki = (ki, qi, w_k.tolist(), ref_w.tolist())
+                        break
+                if mismatch_ki: break
+            print(f'[multi-sub BAB] skipped: uniform_q={uniform_q} '
+                  f'same_w={same_w_per_qi} q_counts={q_counts[:5]} '
+                  f'mismatch={mismatch_ki}', flush=True)
+        return closed
+    w_per_q = [torch.as_tensor(np.asarray(sub_specs[sub_idx_list[0]][qi][1],
+                                             dtype=np.float64),
+                                  dtype=dtype, device=device)
+                for qi in range(max_q)]
+    # Bias per (sub, q).
+    bias_per_sub_q = {ki: [float(sub_specs[ki][qi][2]) for qi in range(max_q)]
+                       for ki in sub_idx_list}
+    # Initial worklist: one leaf per sub.
+    xls_all = np.stack([groups[order[ki]][0] for ki in sub_idx_list]).astype(np.float64)
+    xhs_all = np.stack([groups[order[ki]][1] for ki in sub_idx_list]).astype(np.float64)
+    xl_t = torch.as_tensor(xls_all, dtype=dtype, device=device)
+    xh_t = torch.as_tensor(xhs_all, dtype=dtype, device=device)
+    sub_idx_t = torch.as_tensor(sub_idx_list, dtype=torch.long, device=device)
+    # Number of varying axes shared across subs (mscn: every sub has
+    # same X box shape; varying dims are the same indices but values
+    # differ). Use width to pick the split axis per leaf.
+    # Lift initial batch_size to 1024 — batched LiRPA now chunks
+    # internally on OOM, so we benefit from larger initial batches when
+    # memory allows (mscn 128d fits B=1024 easily). On 2048d_dual where
+    # B=128 is the cap, chunked LiRPA auto-degrades. No iter cap.
+    batch_size = int(getattr(settings, 'input_split_batch_size', 1024))
+    max_iters = 10**9
+    # Per-sub: count of LIVE leaves (not yet verified). Sub closed iff 0.
+    live_leaves_per_sub = {int(ki): 1 for ki in sub_idx_list}
+    n_iters = 0
+    n_leaves_visited = 0
+    while xl_t.shape[0] > 0 and n_iters < max_iters:
+        if time.perf_counter() - t0 > total_budget:
+            break
+        # Pick batch.
+        B = min(batch_size, xl_t.shape[0])
+        # Drop already-closed sub leaves first.
+        keep_mask = torch.tensor(
+            [live_leaves_per_sub.get(int(s.item()), 0) > 0
+             for s in sub_idx_t], device=device)
+        if not keep_mask.all():
+            xl_t = xl_t[keep_mask]
+            xh_t = xh_t[keep_mask]
+            sub_idx_t = sub_idx_t[keep_mask]
+            B = min(batch_size, xl_t.shape[0])
+            if B == 0:
+                break
+        # Routing: prefer zono+backward CROWN — after the batched
+        # point-centers fix in alpha_crown.py, backward CROWN is both
+        # tighter than forward LiRPA AND ~3× faster per batch on mscn
+        # (0.34ms/leaf vs 1.04ms/leaf at B=256). LiRPA only kicks in
+        # when backward CROWN hits OOM/NotImplemented (e.g., unsupported
+        # op). Cache key kept for back-compat with old routing logic.
+        if not hasattr(_multi_sub_input_split_bab, '_softmax_pattern_cache'):
+            _multi_sub_input_split_bab._softmax_pattern_cache = {}
+        gg_id = id(gg)
+        if gg_id not in _multi_sub_input_split_bab._softmax_pattern_cache:
+            _multi_sub_input_split_bab._softmax_pattern_cache[gg_id] = True
+        use_lirpa = False
+        xl_b = xl_t[:B]; xh_b = xh_t[:B]; si_b = sub_idx_t[:B]
+        bb = None
+        if use_lirpa:
+            try:
+                from .forward_lirpa import (
+                    chunked_batched_forward_linear_bounds)
+                # Chunked + streaming: OOM-resilient (chunked) AND
+                # per-op A matrices freed after last consumer
+                # (streaming). Best throughput on mscn dual.
+                bb = chunked_batched_forward_linear_bounds(
+                    gg, xl_b, xh_b, device, dtype, max_chunk=B,
+                    free_states=True)
+            except (torch.cuda.OutOfMemoryError, RuntimeError, NotImplementedError):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                bb = None
+        leaf_safe_by_any_q = torch.zeros(B, dtype=torch.bool, device=device)
+        if bb is not None:
+            # LiRPA-only path (faster + tighter on mscn-style graphs).
+            for qi in range(max_q):
+                w_q = w_per_q[qi]
+                w_pos = w_q.clamp(min=0); w_neg = w_q.clamp(max=0)
+                spec_A = (w_pos.unsqueeze(0).unsqueeze(-1) * bb.A_lo
+                          + w_neg.unsqueeze(0).unsqueeze(-1) * bb.A_up).sum(dim=1)
+                spec_b_const = ((w_pos.unsqueeze(0) * bb.b_lo
+                                 + w_neg.unsqueeze(0) * bb.b_up).sum(dim=1))
+                spec_A_pos = spec_A.clamp(min=0); spec_A_neg = spec_A.clamp(max=0)
+                lbs_q_flat = ((spec_A_pos * xl_b + spec_A_neg * xh_b).sum(dim=1)
+                              + spec_b_const)
+                biases_for_q = torch.tensor(
+                    [bias_per_sub_q[int(s.item())][qi] for s in si_b],
+                    dtype=dtype, device=device)
+                margins_q = lbs_q_flat + biases_for_q
+                leaf_safe_by_any_q |= (margins_q > 0)
+        else:
+            # Zono path (used for softmax-pattern graphs OR LiRPA OOM).
+            try:
+                sb_b, (c_out_b, G_out_b) = _forward_zonotope_graph_batched(
+                    xl_b, xh_b, gg, device, dtype)
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                new_bs = max(1, batch_size // 2)
+                if new_bs == batch_size:
+                    break
+                batch_size = new_bs
+                continue
+            for qi in range(max_q):
+                spec_ew_q = {0: (w_per_q[qi], 0.0)}
+                try:
+                    lbs_z = _spec_backward_graph_batched(
+                        sb_b, xl_b, xh_b, gg, spec_ew_q, device, dtype)
+                except (torch.cuda.OutOfMemoryError, RuntimeError):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    new_bs = max(1, batch_size // 2)
+                    if new_bs == batch_size:
+                        lbs_z = 'OOM_PERM'
+                        break
+                    batch_size = new_bs
+                    lbs_z = None
+                    break
+                lbs_q_flat = lbs_z[:, 0]
+                biases_for_q = torch.tensor(
+                    [bias_per_sub_q[int(s.item())][qi] for s in si_b],
+                    dtype=dtype, device=device)
+                margins_q = lbs_q_flat + biases_for_q
+                leaf_safe_by_any_q |= (margins_q > 0)
+            if isinstance(lbs_z, str) and lbs_z == 'OOM_PERM':
+                break
+            if lbs_z is None:
+                continue
+        n_leaves_visited += B
+        # Update live counts: each verified leaf decrements its sub's
+        # live count. When count hits 0, sub closed.
+        for i in range(B):
+            if leaf_safe_by_any_q[i].item():
+                sk = int(si_b[i].item())
+                live_leaves_per_sub[sk] -= 1
+                if live_leaves_per_sub[sk] == 0:
+                    closed.add(sk)
+        # Unsafe leaves: split on widest-dim → 2 child leaves.
+        # (sb score-based branching gave mixed results on mscn — slight
+        # speedup on small cases but lost closures on large ones; the
+        # widest-dim heuristic empirically wins for this workload.)
+        unsafe_idx = (~leaf_safe_by_any_q).nonzero(as_tuple=True)[0]
+        rest_xl = xl_t[B:]; rest_xh = xh_t[B:]; rest_si = sub_idx_t[B:]
+        if unsafe_idx.numel() > 0:
+            # Note: tried sb-style smart branching (score axis by
+            # |w_spec · A_lo[k]| × width[k]); on mscn cardinality dual
+            # cases it regressed by ~15% vs widest-dim because varying
+            # dims have similar sb scores but different empirical
+            # closure rates. Sticking with widest-dim.
+            new_xls = []; new_xhs = []; new_sis = []
+            for li in unsafe_idx.tolist():
+                xl_i = xl_b[li]
+                xh_i = xh_b[li]
+                widths = xh_i - xl_i
+                a = int(widths.argmax().item())
+                if float(widths[a]) < 1e-12:
+                    continue
+                mid = (xl_i[a] + xh_i[a]) / 2
+                xh_a = xh_i.clone(); xh_a[a] = mid
+                xl_b_v = xl_i.clone(); xl_b_v[a] = mid
+                new_xls.append(xl_i); new_xhs.append(xh_a)
+                new_sis.append(si_b[li])
+                new_xls.append(xl_b_v); new_xhs.append(xh_i)
+                new_sis.append(si_b[li])
+                live_leaves_per_sub[int(si_b[li].item())] += 1
+            if new_xls:
+                new_xl = torch.stack(new_xls)
+                new_xh = torch.stack(new_xhs)
+                new_si = torch.stack(new_sis)
+                xl_t = torch.cat([rest_xl, new_xl], dim=0)
+                xh_t = torch.cat([rest_xh, new_xh], dim=0)
+                sub_idx_t = torch.cat([rest_si, new_si], dim=0)
+            else:
+                xl_t = rest_xl; xh_t = rest_xh; sub_idx_t = rest_si
+        else:
+            xl_t = rest_xl; xh_t = rest_xh; sub_idx_t = rest_si
+        n_iters += 1
+    if getattr(settings, 'print_progress', False):
+        print(f'[multi-sub BAB] {n_iters} iters, {n_leaves_visited} leaves, '
+              f'{len(closed)}/{len(sub_idx_list)} closed, '
+              f'{time.perf_counter()-t0:.1f}s', flush=True)
     return closed
 
 
