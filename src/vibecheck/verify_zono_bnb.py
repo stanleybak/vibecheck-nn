@@ -2690,6 +2690,15 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
             c_o, G_o = state[name]
             rad_o = G_o.abs().sum(dim=-1)
             op_bounds[name] = (c_o - rad_o, c_o + rad_o)
+        import os as _os_dwl
+        if _os_dwl.environ.get('DUMP_WIDTHS_LEAF', '') != '':
+            _li = int(_os_dwl.environ['DUMP_WIDTHS_LEAF'])
+            _c, _G = state[name]
+            if _li < _c.shape[0]:
+                _lo = (_c[_li] - _G[_li].abs().sum(dim=-1)).flatten()
+                _hi = (_c[_li] + _G[_li].abs().sum(dim=-1)).flatten()
+                _w = (_hi - _lo)
+                print(f"[ZONO] leaf{_li} op {name} ({t}) shape={list(_c[_li].shape)} K={_G.shape[2]} w_max={_w.max().item():.4f} w_mean={_w.mean().item():.4f}")
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in state:
                 del state[inp]

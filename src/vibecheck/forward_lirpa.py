@@ -472,8 +472,12 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             diff = (hi - lo).clamp(min=1e-12)
             up_slope = hi / diff
             up_int = -up_slope * lo
+            # MIN-AREA lower-slope (matches ABC's `adaptive` default):
+            # lower_k = 1 if up_slope > 0.5 else 0  (= min triangle area)
+            min_area_lb = (up_slope > 0.5).to(dtype)
             lb_slope = torch.where(active, torch.ones_like(lo),
-                          torch.where(dead, torch.zeros_like(lo), up_slope))
+                          torch.where(dead, torch.zeros_like(lo),
+                                       min_area_lb))
             lb_int_v = torch.zeros_like(lo)
             ub_slope = torch.where(active, torch.ones_like(lo),
                           torch.where(dead, torch.zeros_like(lo), up_slope))
@@ -643,14 +647,48 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 A_up_o = a_pos.unsqueeze(-1) * A_up_b_o + a_neg.unsqueeze(-1) * A_lo_b_o
                 b_up_o = a_pos * b_up_b_o + a_neg * b_lo_b_o
             else:
-                # Both perturbed: box fallback.
-                corners = torch.stack([a_lo_o * b_lo_o2, a_lo_o * b_hi_o2,
-                                         a_hi_o * b_lo_o2, a_hi_o * b_hi_o2])
-                y_box_lo = corners.min(dim=0).values
-                y_box_hi = corners.max(dim=0).values
-                A_zero = torch.zeros_like(A_lo_a_o)
-                A_lo_o = A_zero; b_lo_o = y_box_lo
-                A_up_o = A_zero; b_up_o = y_box_hi
+                # ABC-style McCormick + sign-conditional substitution
+                # (matches BoundMul.bound_forward_both_perturbed exactly
+                # with r_l = r_u = 0.5 ('middle' option in
+                # MulHelper.interpolated_relaxation). This is the LOAD-
+                # BEARING DIFFERENCE for tight forward bounds — earlier
+                # box fallback dropped linear coefficients entirely and
+                # blew up width through downstream FC layers.
+                # LB envelope: y >= alpha_l*a + beta_l*b + gamma_l
+                # UB envelope: y <= alpha_u*a + beta_u*b + gamma_u
+                r_l = 0.5
+                r_u = 0.5
+                alpha_l = (b_lo_o2 - b_hi_o2) * r_l + b_hi_o2
+                beta_l = (a_lo_o - a_hi_o) * r_l + a_hi_o
+                gamma_l = (b_hi_o2 * a_hi_o - b_lo_o2 * a_lo_o) * r_l - b_hi_o2 * a_hi_o
+                alpha_u = (b_hi_o2 - b_lo_o2) * r_u + b_lo_o2
+                beta_u = (a_lo_o - a_hi_o) * r_u + a_hi_o
+                gamma_u = (b_lo_o2 * a_hi_o - b_hi_o2 * a_lo_o) * r_u - b_lo_o2 * a_hi_o
+                # Substitute a's and b's linear bounds into envelopes.
+                # For alpha_l*a contrib to LB: when alpha_l>0 use a.A_lo
+                # (lower bound on a); when alpha_l<0 use a.A_up.
+                alpha_l_p = alpha_l.clamp(min=0).unsqueeze(-1)
+                alpha_l_n = alpha_l.clamp(max=0).unsqueeze(-1)
+                beta_l_p = beta_l.clamp(min=0).unsqueeze(-1)
+                beta_l_n = beta_l.clamp(max=0).unsqueeze(-1)
+                alpha_u_p = alpha_u.clamp(min=0).unsqueeze(-1)
+                alpha_u_n = alpha_u.clamp(max=0).unsqueeze(-1)
+                beta_u_p = beta_u.clamp(min=0).unsqueeze(-1)
+                beta_u_n = beta_u.clamp(max=0).unsqueeze(-1)
+                A_lo_o = (alpha_l_p * A_lo_a_o + alpha_l_n * A_up_a_o
+                          + beta_l_p * A_lo_b_o + beta_l_n * A_up_b_o)
+                b_lo_o = (alpha_l.clamp(min=0) * b_lo_a_o
+                          + alpha_l.clamp(max=0) * b_up_a_o
+                          + beta_l.clamp(min=0) * b_lo_b_o
+                          + beta_l.clamp(max=0) * b_up_b_o
+                          + gamma_l)
+                A_up_o = (alpha_u_n * A_lo_a_o + alpha_u_p * A_up_a_o
+                          + beta_u_n * A_lo_b_o + beta_u_p * A_up_b_o)
+                b_up_o = (alpha_u.clamp(max=0) * b_lo_a_o
+                          + alpha_u.clamp(min=0) * b_up_a_o
+                          + beta_u.clamp(max=0) * b_lo_b_o
+                          + beta_u.clamp(min=0) * b_up_b_o
+                          + gamma_u)
             lo_box, hi_box = _batched_eval_box(
                 A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
@@ -685,6 +723,28 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             b_lo_b_o = (ones_out * bound_b.b_lo.reshape(B, *sh_in[1])).reshape(B, -1)
             b_up_b_o = (ones_out * bound_b.b_up.reshape(B, *sh_in[1])).reshape(B, -1)
             assert bool((b_lo_o2 > 0).all()), 'div needs b > 0'
+            # Fast path: b is a point (per-leaf constant). Then 1/b is
+            # exact, and y = a/b is just a*(1/b) — linear in a's bound.
+            # No McCormick slack needed. ABC's BoundReciprocal+BoundMul
+            # naturally handles this since Reciprocal of a point is a
+            # point and BoundMul falls into the constant-side path.
+            b_is_pt = ((b_hi_o2 - b_lo_o2).abs() < 1e-12).all().item()
+            import os as _opfp
+            if _opfp.environ.get('DUMP_DIV_FAST', '') == '1':
+                print(f"[DIV_FAST] op {name}: b_is_pt={b_is_pt} b_lo_min={b_lo_o2.min().item():.4f} b_hi_max={b_hi_o2.max().item():.4f}")
+            if b_is_pt:
+                inv_b_const = 1.0 / b_lo_o2  # exact
+                inv_b_pos = inv_b_const.clamp(min=0).unsqueeze(-1)
+                inv_b_neg = inv_b_const.clamp(max=0).unsqueeze(-1)
+                A_lo_o = inv_b_pos * A_lo_a_o + inv_b_neg * A_up_a_o
+                A_up_o = inv_b_pos * A_up_a_o + inv_b_neg * A_lo_a_o
+                b_lo_o = inv_b_const.clamp(min=0) * b_lo_a_o + inv_b_const.clamp(max=0) * b_up_a_o
+                b_up_o = inv_b_const.clamp(min=0) * b_up_a_o + inv_b_const.clamp(max=0) * b_lo_a_o
+                lo_box, hi_box = _batched_eval_box(
+                    A_lo_o, b_lo_o, A_up_o, b_up_o, xl_b, xh_b)
+                state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
+                _maybe_free(ins)
+                continue
             rs_lb, rc_lb, rs_ub, rc_ub = _reciprocal_linear_bounds(
                 b_lo_o2, b_hi_o2)
             v_min_o = 1.0 / b_hi_o2; v_max_o = 1.0 / b_lo_o2
