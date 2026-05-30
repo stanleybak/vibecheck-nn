@@ -97,10 +97,10 @@ Two GPU machines available. Pick based on availability — neither is preferred 
 
 ### server1 (RTX 3080, 10 GB)
 
-Connection details live in env vars (NOT here — keeps Tailscale/private IPs out of git):
-- `$SERVER1_HOST` — e.g. `stan@100.83.x.x`
-
-Connect: `ssh "$SERVER1_HOST"` (RTX 3080 / 10 GB, 64 GB RAM, 16-thread i9). Steady-state α-CROWN throughput ~1 s/freeze when healthy.
+Connect: `ssh stan@100.107.254.48` (RTX 3080 / 10 GB, 64 GB RAM, 16-thread i9;
+hostname `reliablesystems-ubuntu`). This is a Tailscale IP — only reachable
+inside the owner's tailnet, so it's fine to keep in git. `$SERVER1_HOST` also
+works if set. Steady-state α-CROWN throughput ~1 s/freeze when healthy.
 
 **Sometimes overheats / GPU "falls off the bus" (Xid 79)** under sustained load — `nvidia-smi` returns "No devices were found", verdicts go from `verified` → `error_no_result` near sweep end. Recovery requires either `sudo modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia` (asks user to run) or full reboot. Xid 154 ("Node Reboot Required") means modprobe won't help — reboot only.
 
