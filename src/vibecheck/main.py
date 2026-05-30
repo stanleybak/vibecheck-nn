@@ -40,8 +40,32 @@ def main():
                              'precedence over CLI knobs; when omitted, '
                              'default_settings_for(graph, spec) auto-detects '
                              'a profile.')
+    parser.add_argument('--results-file', default=None,
+                        help='If set, write a single VNNCOMP-style line to '
+                             "this file: 'unsat' (verified), 'sat' "
+                             "(counterexample), 'unknown', or 'timeout'. "
+                             'Sweep scripts MUST check this file rather than '
+                             'inferring from exit code, so a no-op invocation '
+                             "cannot masquerade as 'verified'.")
     args = parser.parse_args()
 
+    try:
+        _verify(args)
+    except SystemExit:
+        raise
+    except BaseException:
+        # Sweep aggregator requires a results-file on every run; a crash
+        # without one shows up as NO_FILE and breaks the verdict count.
+        # Record 'unknown' so the sweep still has a valid verdict to read.
+        import traceback
+        traceback.print_exc()
+        if args.results_file:
+            with open(args.results_file, 'w') as f:
+                f.write('unknown\n')
+        sys.exit(2)
+
+
+def _verify(args):
     dtype = _DTYPES[args.dtype]
     t_start = time.time()
 
@@ -159,4 +183,22 @@ def main():
                       f'→lp={wl:.3f}→final={wf:.3f}')
     print(f'  Time: {t_total:.2f}s')
 
+    if args.results_file:
+        # VNNCOMP convention: file contents are the authoritative verdict.
+        # 'unsat' = property holds (no counterexample exists in the unsafe
+        # region); 'sat' = counterexample found; 'unknown' otherwise.
+        verdict_map = {
+            'verified': 'unsat',
+            'sat': 'sat',
+            'unknown': 'unknown',
+            'timeout': 'timeout',
+        }
+        line = verdict_map.get(result, f'unknown ({result})')
+        with open(args.results_file, 'w') as f:
+            f.write(line + '\n')
+
     sys.exit(0 if result == 'verified' else 1)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,147 @@
+AWS GPU instance setup runbook
+==============================
+
+Generic — uses env vars so hostname/keyfile aren't committed. Tested on
+g5.8xlarge (A10G 24 GB GPU, Ubuntu 26.04). Same steps work on other g5/g6.
+
+Env vars assumed (set in ~/.profile so they survive shell restart):
+  export AWS_GPU_HOST="ubuntu@ec2-XXX-XXX-XXX-XXX.compute-1.amazonaws.com"
+  export AWS_GPU_PEM="$HOME/.ssh/yourkey.pem"
+
+Shorthand alias used below: `gpussh` = `ssh -i "$AWS_GPU_PEM" "$AWS_GPU_HOST"`.
+
+
+0. One-time on local
+--------------------
+chmod 400 "$AWS_GPU_PEM"   # ssh requires private-key perms
+echo 'export AWS_GPU_HOST="..."' >> ~/.profile
+echo 'export AWS_GPU_PEM="$HOME/.ssh/..."' >> ~/.profile
+source ~/.profile
+
+# Sanity:
+ssh -i "$AWS_GPU_PEM" "$AWS_GPU_HOST" 'echo connected; uname -a'
+
+
+1. NVIDIA driver
+----------------
+# Verify whether already installed:
+gpussh 'nvidia-smi 2>&1 | head -3'
+
+# If "couldn't communicate with the NVIDIA driver", install:
+gpussh 'sudo apt update'
+gpussh 'apt-cache search "^nvidia-driver-[0-9]" | sort -V | tail -10'
+# Pick most recent -server variant (headless, less display cruft). Currently 580:
+gpussh 'sudo DEBIAN_FRONTEND=noninteractive apt install -y nvidia-driver-580-server'
+gpussh 'sudo reboot'
+# Wait ~60 s, reconnect, verify:
+gpussh 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader'
+# Expected: "NVIDIA A10G, 580.xxx, 23028 MiB"
+
+
+2. Python + venv
+----------------
+# Ubuntu 26.04's system Python is 3.14 (too new for torch wheels).
+# deadsnakes PPA is incomplete on resolute. Use uv — single binary,
+# pulls a prebuilt python-build-standalone, produces a normal venv.
+gpussh 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+gpussh '~/.local/bin/uv python install 3.12'
+gpussh '~/.local/bin/uv venv --python 3.12 ~/vibe'
+# Use ~/vibe/bin/python for vibecheck. ABC env created similarly later.
+
+# Verify:
+gpussh '~/vibe/bin/python --version'  # Python 3.12.X
+
+
+3. Sync repos from local
+------------------------
+# vibecheck (editable install on the server, .venv-free):
+rsync -az --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
+    /home/stan/repositories/vibecheck/ "$AWS_GPU_HOST":~/vibecheck/
+
+# Install vibecheck editably into the venv (uv venv has no pip by default;
+# use `uv pip install` with VIRTUAL_ENV pointing at the target venv):
+gpussh 'VIRTUAL_ENV=$HOME/vibe ~/.local/bin/uv pip install -e ~/vibecheck'
+
+# AB-CROWN (for side-by-side comparisons) — from server1, copy across:
+ssh "$SERVER1_HOST" \
+    "rsync -az --exclude '.venv' --exclude '__pycache__' \
+     ~/Desktop/temp/abcrown/alpha-beta-CROWN_vnncomp2025/ \
+     $AWS_GPU_HOST:~/abcrown/"
+# Or rsync from local if available there.
+# Create a separate venv for ABC (different deps):
+gpussh '~/.local/bin/uv venv --python 3.11 ~/abc'
+gpussh 'cd ~/abcrown && VIRTUAL_ENV=$HOME/abc ~/.local/bin/uv pip install -r requirements.txt'
+
+# Benchmarks (large .onnx + .vnnlib files):
+ssh "$SERVER1_HOST" \
+    "rsync -az ~/repositories/vnncomp2025_benchmarks/ \
+     $AWS_GPU_HOST:~/vnncomp2025_benchmarks/"
+# Optional: reference results CSVs for the published ABC verdicts/times:
+ssh "$SERVER1_HOST" \
+    "rsync -az ~/repositories/vnncomp2025_results/ \
+     $AWS_GPU_HOST:~/vnncomp2025_results/"
+
+
+4. Validation run
+-----------------
+# Quick smoke test that vibecheck works on GPU:
+gpussh '~/vibe/bin/python -m vibecheck.main \
+    --net ~/vnncomp2025_benchmarks/benchmarks/nn4sys/onnx/mscn_128d_dual.onnx \
+    --spec ~/vnncomp2025_benchmarks/benchmarks/nn4sys/vnnlib/cardinality_1_240_128_dual.vnnlib \
+    --timeout 30 --results-file /tmp/smoke.txt'
+gpussh 'cat /tmp/smoke.txt'   # expect: unsat
+
+
+5. Idle-shutdown cron
+---------------------
+# Critical for cost control — A10G g5.8xl is ~$2.45/hr. An overnight forget = ~$30.
+# Script: shut down if GPU util < 5% AND no SSH sessions for 30+ min.
+gpussh 'cat | sudo tee /usr/local/bin/idle-shutdown.sh > /dev/null' << "EOF"
+#!/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+IDLE_FILE=/tmp/idle_since
+LOG=/var/log/idle-shutdown.log
+UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -1)
+SSH_COUNT=$(who | wc -l)
+echo "$(date) GPU=$UTIL SSH=$SSH_COUNT" >> "$LOG"
+if [ "$UTIL" -lt 5 ] && [ "$SSH_COUNT" -eq 0 ]; then
+    [ ! -f "$IDLE_FILE" ] && date +%s > "$IDLE_FILE"
+    IDLE_S=$(($(date +%s) - $(cat "$IDLE_FILE")))
+    echo "  idle for ${IDLE_S}s" >> "$LOG"
+    if [ "$IDLE_S" -gt 1800 ]; then       # 30 min idle
+        echo "  SHUTTING DOWN" >> "$LOG"
+        /sbin/shutdown -h now
+    fi
+else
+    rm -f "$IDLE_FILE"
+fi
+EOF
+gpussh 'sudo chmod +x /usr/local/bin/idle-shutdown.sh'
+# Cron line every 5 min as root:
+gpussh 'echo "*/5 * * * * /usr/local/bin/idle-shutdown.sh" | sudo tee /etc/cron.d/idle-shutdown'
+# Verify cron daemon is enabled:
+gpussh 'systemctl is-enabled cron'   # should print "enabled"
+
+# Test:
+gpussh 'sudo /usr/local/bin/idle-shutdown.sh; tail -5 /var/log/idle-shutdown.log'
+
+
+6. Set up tmux for long sweeps
+------------------------------
+# So a dropped SSH doesn't kill your sweep:
+gpussh 'sudo apt install -y tmux'
+# Run sweeps inside: `tmux new -s sweep`, then `Ctrl-B D` to detach,
+# `tmux attach -t sweep` to resume.
+
+
+Notes
+-----
+- Stop ≠ Terminate. `aws ec2 stop-instances ...` pauses billing for compute but
+  EBS still costs ~$5/mo. Terminate wipes everything.
+- AMI snapshot once everything's working: lets you launch fresh instances with
+  the same drivers + repos + cron in <2 min. Worth it before competition.
+- If `nvidia-smi` returns "No devices were found" mid-sweep, GPU has "fallen
+  off the bus" (Xid 79). Same failure mode as server1. Recovery = reboot.
+- For competition: keep `~/vibecheck`, `~/abcrown`, `~/vnncomp2025_benchmarks`,
+  `~/vibe` (and `~/abc`) layout consistent across machines so the same sweep
+  scripts work everywhere.

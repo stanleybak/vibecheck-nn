@@ -41,8 +41,13 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
             model_sim, ok = onnxsim.simplify(model)
             if ok:
                 model = model_sim
-        except Exception:
-            pass  # onnxsim missing or failed → use unsimplified model
+        except (ImportError, RuntimeError):
+            # ImportError: onnxsim not installed (optional dependency).
+            # RuntimeError: onnxsim choked on this model (rare; happens on
+            # some unsupported op combinations). In both cases, falling back
+            # to the unsimplified model is sound — simplification is a perf
+            # nicety, not a soundness requirement.
+            pass
 
     graph = ComputeGraph(dtype=dtype)
     inits = {init.name: numpy_helper.to_array(init).astype(np.float64)

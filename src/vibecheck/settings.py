@@ -1,7 +1,79 @@
-"""BnB verification settings."""
+"""BnB verification settings.
 
-from dotmap import DotMap
+Uses a `Settings` dict-with-attr-access class that RAISES AttributeError on
+missing keys (instead of DotMap's silent empty-DotMap return). DotMap's
+falsy-default footgun has bitten this project at least 4 times — every
+`getattr(settings, 'flag', True)` silently returned False when the flag
+wasn't set, because DotMap() is falsy but exists. See CLAUDE.md.
+"""
+
 import torch
+
+
+class Settings:
+    """Strict dict-with-attr-access for verification settings.
+
+    Differences from DotMap:
+      * Missing attribute raises AttributeError (not returns empty DotMap).
+        This means `getattr(s, 'flag', True)` correctly falls back to True.
+      * `'flag' in s` works.
+      * `s.get('flag', default)` works.
+      * Assignment with any name allowed (no schema enforcement) so
+        downstream code can stash run-state on the object.
+      * No nested DotMap auto-creation on missing — `s.foo.bar` raises
+        AttributeError on `.foo` rather than silently building `s.foo`.
+    """
+
+    __slots__ = ('_d',)
+
+    def __init__(self, **kwargs):
+        object.__setattr__(self, '_d', dict(kwargs))
+
+    def __getattr__(self, name):
+        # Note: __getattr__ is only called when normal lookup fails (i.e.
+        # name is not in __slots__ or any class attribute), so this only
+        # hits user-data attrs.
+        if name.startswith('__') and name.endswith('__'):
+            raise AttributeError(name)
+        d = object.__getattribute__(self, '_d')
+        if name in d:
+            return d[name]
+        raise AttributeError(
+            f'Settings has no attribute {name!r}. '
+            f'Available: {sorted(d)[:10]}...')
+
+    def __setattr__(self, name, value):
+        if name == '_d':
+            object.__setattr__(self, name, value)
+        else:
+            self._d[name] = value
+
+    def __contains__(self, key):
+        return key in self._d
+
+    def __getitem__(self, key):
+        return self._d[key]
+
+    def __setitem__(self, key, value):
+        self._d[key] = value
+
+    def __repr__(self):
+        return f'Settings({self._d!r})'
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
+    def keys(self):
+        return self._d.keys()
+
+    def items(self):
+        return self._d.items()
+
+    def update(self, *args, **kwargs):
+        self._d.update(*args, **kwargs)
+
+    def to_dict(self):
+        return dict(self._d)
 
 
 # Phase-1 per-layer tightening is two orthogonal axes:
@@ -33,7 +105,7 @@ def default_settings(**overrides):
         overrides.setdefault('tighten_formulation', f)
         overrides.setdefault('tighten_solver', sv)
 
-    s = DotMap(
+    s = Settings(
         device='gpu',
         bits=64,
         # PGD — matched to α,β-CROWN vnncomp25 defaults. Deep-ResNet loss
@@ -194,6 +266,18 @@ def default_settings(**overrides):
         input_split_batched_alpha_boundary_eps=0.0,
         input_split_batched_alpha_iters=10,
         input_split_batched_alpha_max_leaves=200,
+        # Exponent on the (1+n_unstable_in_dominant_shallow_layer) split-
+        # selection boost. >1 sharpens the preference for bound-critical
+        # unstable-branch dims. The non-LP forcing block raises this to
+        # 2.0 for the pensieve signature (n_var>8), where it cut leaves
+        # 10–198× (see docs/benchmarks/nn4sys.md). 1.0 = linear (no-op
+        # exponent), the default elsewhere. Env BRANCH_BOOST_EXP overrides.
+        input_split_batched_branch_boost_exp=1.0,
+        # Per-phase profiler for the batched input-split BaB: prints a
+        # [vc-phase] line with bound/clip/split time split + leaf/closure
+        # counts. Off by default and fully short-circuited when off (no
+        # perf_counter / cuda sync); env VC_PHASE_TIMING also forces it on.
+        input_split_batched_phase_timing=False,
         # PGD optimizer choice. Three modes:
         #   'adam_sign'    — bias-corrected Adam moment, sign-clipped step
         #                    (current vibecheck behavior, kept as default
@@ -605,6 +689,28 @@ def default_settings(**overrides):
         # zono enclosure is too loose. No effect when input dim is large.
         input_split_enabled=True,
         input_split_max_dims=20,
+        # In `_verify_per_disjunct_subboxes` (batched per-disjunct subbox
+        # path for many-disjunct specs like mscn cardinality), use forward
+        # LiRPA instead of forward zonotope. LiRPA gives tighter
+        # intermediate bounds for sigmoid/tanh/mul_bilinear (mscn uses
+        # all three). Same caller signature via
+        # `forward_lirpa_compat_zono_batched` adapter.
+        use_forward_lirpa_subboxes=True,
+        # Mini-group size for `_multi_sub_input_split_bab`. 60 is the safe
+        # default; `default_settings_for` overrides to 120/200 for instances
+        # with many disjuncts (see `_adapt_per_disjunct`). Env MINI_GROUP_SIZE
+        # wins over both.
+        mini_group_size=60,
+        # Multi-dim simultaneous split in input-split BaB. K=1 = single
+        # widest-dim split (2 children, matches ABC's runtime behavior
+        # when queue ≥ min_batch_size=25.6 — see ABC's
+        # `input_split/split.py:get_split_depth`). Tried K>1 on mscn_240
+        # and it REGRESSED because most leaves have 1 varying dim of 8
+        # total → K>1 picks zero-width dims and produces duplicate
+        # children that compound exponentially. The right fix is
+        # ABC-style ADAPTIVE depth (small queue → high K, large queue →
+        # K=1); not implementing that yet.
+        bab_split_depth=1,
         # Time is the budget; no depth cap by default (was 8 — too
         # aggressive; on cersyve UNSAT cases the BaB needs ~1k nodes
         # per leaf-verification path). Set to a positive int to opt

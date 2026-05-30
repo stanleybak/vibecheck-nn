@@ -677,7 +677,8 @@ def _tighten_neuron_graph(args):
             lb = max(lb, b)
         else:
             ub = min(ub, b)
-    except Exception:
+    except (grb.GurobiError, AttributeError):
+        # ObjBound unavailable (no LP relaxation produced); keep prior bound.
         pass
 
     if lb < 0 and ub > 0:
@@ -700,7 +701,7 @@ def _tighten_neuron_graph(args):
                 lb = max(lb, b)
             else:
                 ub = min(ub, b)
-        except Exception:
+        except (grb.GurobiError, AttributeError):
             pass
 
     m.dispose()
@@ -1070,7 +1071,7 @@ def _solve_spec_worker_graph(args):
         lb = None
         try:
             lb = float(m.ObjBound)
-        except Exception:
+        except (grb.GurobiError, AttributeError):
             pass
         n_sol = m.SolCount
         dt = time.perf_counter() - t0
@@ -1093,7 +1094,7 @@ def _solve_spec_worker_graph(args):
                    grb.GRB.USER_OBJ_LIMIT, grb.GRB.SUBOPTIMAL):
         try:
             lb = float(m.ObjBound)
-        except Exception:
+        except (grb.GurobiError, AttributeError):
             pass
         # Read fractional a/z values at each unstable ReLU
         if m.SolCount > 0:
@@ -1114,7 +1115,8 @@ def _solve_spec_worker_graph(args):
                         z_val = prev[j].X if prev[j] is not None else 0.0
                         frac = abs(a_val - max(0.0, z_val))
                         scores[(li, j)] = frac
-                    except Exception:
+                    except (grb.GurobiError, AttributeError):
+                        # .X unavailable without integer solution; skip.
                         pass
     dt = time.perf_counter() - t0
     info = {**model_info, 'status': status, 'lb': lb, 'scores': scores}
@@ -1945,7 +1947,7 @@ def _solve_sparse_neuron_graph_worker(args):
         any_timeout = True
     try:
         _record(m.ObjBound, first)
-    except Exception:
+    except (grb.GurobiError, AttributeError):
         pass
 
     if lb < 0 and ub > 0:
@@ -1958,7 +1960,7 @@ def _solve_sparse_neuron_graph_worker(args):
             any_timeout = True
         try:
             _record(m.ObjBound, second)
-        except Exception:
+        except (grb.GurobiError, AttributeError):
             pass
 
     m.dispose()
@@ -4057,8 +4059,13 @@ def _phase1_bab_refine(
                     bounds_by_relu[Lk] = (
                         np.maximum(lo_k, new_lo),
                         np.minimum(hi_k, new_hi))
-                except Exception:
-                    pass
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as _e:
+                    # Cascade tightening failure (GPU OOM or runtime). Log
+                    # and keep prior bounds for this layer — the cascade is
+                    # an opportunistic tightener, not load-bearing for soundness.
+                    if getattr(settings, 'print_progress', False):
+                        print(f'  [cascade] layer {Lk} tighten failed: '
+                              f'{type(_e).__name__}', flush=True)
             # (b) Joint α-CROWN refresh (only if we still have time).
             if time_left() > 0.5:
                 intermediate_start_nodes = [
@@ -4127,8 +4134,13 @@ def _phase1_bab_refine(
             spec_alpha_phase1 = alpha_dict_p1.get('spec')
             if spec_alpha_phase1 is not None:
                 tb['spec_alpha_phase05'] = spec_alpha_phase1
-        except Exception:
-            pass
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as _e:
+            # Spec α-CROWN refresh: GPU runtime/OOM. Falling back to the
+            # warm-start α is sound but loses tightening. Log so we notice
+            # when this is happening at scale.
+            if getattr(settings, 'print_progress', False):
+                print(f'  [phase0.5] spec α-CROWN refresh failed: '
+                      f'{type(_e).__name__}', flush=True)
         tb['phase1_alpha_total'] += time.perf_counter() - t_a
     # If rec_zono was requested, redo the forward with the cascade-
     # tightened bounds_by_relu fed into apply_relu via tight_lo/tight_hi.
@@ -4993,7 +5005,10 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
         x = w.reshape(in_shape).astype(np.float32)
         out = sess.run(None, {in_meta.name: x})[0]
         out_flat = np.asarray(out).flatten().astype(np.float64)
-    except Exception as e:
+    except (RuntimeError, OSError, ValueError) as e:
+        # ORT InferenceSession / run failures: malformed onnx, missing op,
+        # shape mismatch. Witness validation falls back to 'failed-to-check'
+        # which the caller treats as a failed witness (no false SAT).
         info['reason'] = f'ORT forward failed: {type(e).__name__}: {e}'
         return False, info
     info['out'] = out_flat
@@ -5070,7 +5085,9 @@ def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
         else:
             sess = ort.InferenceSession(
                 onnx_path, providers=['CPUExecutionProvider'])
-    except Exception as e:
+    except (RuntimeError, OSError) as e:
+        # ORT session-load: bad onnx file or unsupported op. Sampling
+        # validation is best-effort; skip and report ok=True (no extra info).
         info['reason'] = f'ORT session failed: {type(e).__name__}: {e}'
         return True, info
     in_meta = sess.get_inputs()[0]
@@ -5101,7 +5118,9 @@ def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
             x32 = x.reshape(in_shape).astype(np.float32)
             try:
                 out = sess.run(None, {in_meta.name: x32})[0]
-            except Exception as e:
+            except (RuntimeError, ValueError) as e:
+                # Sample-time ORT run failure (rare; shape mismatch).
+                # Treat as inconclusive ok=True (sampling is best-effort).
                 info['reason'] = (f'ORT forward failed: '
                                     f'{type(e).__name__}: {e}')
                 return True, info
@@ -5245,7 +5264,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         # even on 'unknown' verdicts (closer-to-0 = better strategy).
         try:
             details['spec_lbs'] = dict(spec_lbs)
-        except Exception:
+        except (TypeError, NameError):
+            # spec_lbs may not exist on some early-exit paths; diagnostic only.
             pass
         # Surface intermediate pre-ReLU bounds for diagnostic comparisons
         # against reference verifiers (e.g. α,β-CROWN's per-layer widths).
@@ -5256,7 +5276,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 hi_np = hi.cpu().numpy() if hasattr(hi, 'cpu') else np.asarray(hi)
                 bbr_out[L] = (lo_np, hi_np)
             details['bounds_by_relu'] = bbr_out
-        except Exception:
+        except (AttributeError, ValueError, RuntimeError):
+            # Diagnostic surfacing only — tensor → numpy can fail on odd
+            # device/dtype combos; not worth crashing the run for diag output.
             pass
         if verbose:
             details['avg_layer_width'] = _compute_avg_layer_width(
@@ -6379,7 +6401,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                         x_real, _xl, _xh, spec, gg_pgd, settings,
                         n_iter=20)
                     if is_sat: return w
-                except Exception:
+                except (RuntimeError, torch.cuda.OutOfMemoryError):
+                    # PGD attack on GPU: runtime/OOM. SAT-finding fallback
+                    # is best-effort; return None so the LP path continues.
                     pass
                 return None
             if torch.cuda.is_available():
@@ -6593,10 +6617,12 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 fb_status = m_fb.Status
                 try:
                     fb_obj_bound = float(m_fb.ObjBound)
-                except Exception:
+                except (_grb.GurobiError, AttributeError):
                     fb_obj_bound = None
                 m_fb.dispose(); env_fb.dispose()
-            except Exception:
+            except (_grb.GurobiError, GurobiNumericTrouble):
+                # Outer wrapper: the fallback model build/solve itself
+                # raised. Skip this query and continue with the next.
                 continue
             if fb_status == _grb.GRB.INFEASIBLE:
                 # Sound: relaxation∩{qw·y+qb≤0}=∅ ⇔ relaxation min > 0.
@@ -6695,12 +6721,21 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
     # per-sub, and emit verdicts inline. Falls back to per-sub
     # verify_graph for any sub the cheap path can't close.
     from .verify_zono_bnb import _forward_zonotope_graph_batched
+    from .forward_lirpa import forward_lirpa_compat_zono_batched
     from .settings import resolve_torch
     dev, dt = resolve_torch(settings)
     try:
         gg_fast = graph.gpu_graph(dev, dt)
-    except Exception:
+    except (RuntimeError, NotImplementedError, KeyError):
+        # gpu_graph can't represent this model (unsupported op or shape).
+        # Fall back to per-sub verify_graph which handles more op types.
         gg_fast = None
+    # Forward LiRPA gives tighter intermediate bounds than zonotope
+    # (especially for sigmoid/tanh/mul_bilinear), so basic CROWN closes
+    # more subs without needing α-CROWN escalation. Same caller signature.
+    _use_lirpa = bool(getattr(settings, 'use_forward_lirpa_subboxes', True))
+    _fwd_fn = (forward_lirpa_compat_zono_batched
+               if _use_lirpa else _forward_zonotope_graph_batched)
 
     fast_results = {}
     fast_wall = 0.0
@@ -6749,6 +6784,10 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
             xl_t = torch.as_tensor(xls, dtype=dt, device=dev)
             xh_t = torch.as_tensor(xhs, dtype=dt, device=dev)
             t_fast = time.perf_counter()
+            import os as _os_dbg_fp
+            if _os_dbg_fp.environ.get('DEBUG_PER_DISJ_PATH', '') == '1':
+                print(f'[per-disj-path] _fwd_fn={_fwd_fn.__name__} '
+                      f'use_lirpa={_use_lirpa}', flush=True)
             # OOM-safe chunked forward: try full batch first; on OOM,
             # halve. The full-batch path is much faster than chunked
             # (no kernel-launch overhead, better cache utilization), so
@@ -6758,13 +6797,13 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
             while _chunk >= 1:
                 try:
                     if _chunk >= _bs_full:
-                        sb_b, (c_b, G_b) = _forward_zonotope_graph_batched(
+                        sb_b, (c_b, G_b) = _fwd_fn(
                             xl_t, xh_t, gg_fast, dev, dt)
                     else:
                         sb_parts = None; c_parts = []; G_parts = []
                         for ci0 in range(0, _bs_full, _chunk):
                             ci1 = min(ci0 + _chunk, _bs_full)
-                            sb_c, (cc, GG) = _forward_zonotope_graph_batched(
+                            sb_c, (cc, GG) = _fwd_fn(
                                 xl_t[ci0:ci1], xh_t[ci0:ci1], gg_fast, dev, dt)
                             if sb_parts is None:
                                 sb_parts = {L: ([sb_c[L][0]], [sb_c[L][1]])
@@ -6862,6 +6901,7 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                             tight_all = {L: (sb_b[L][0], sb_b[L][1])
                                           for L in sb_b}
                             spec_ew_shared = {0: (w_shared, 0.0)}
+                            import os as _osd0
                             spec_lbs_all = _spec_backward_graph_batched(
                                 tight_all, xl_t, xh_t, gg_fast,
                                 spec_ew_shared, dev, dt)
@@ -6870,6 +6910,8 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                                                 if sub_queries[idx] else -1e9
                                                 for idx in range(len(unclosed))])
                             margins = lbs_np_all + biases
+                            if _osd0.environ.get('VIB_DUMP_INIT_LB', '') == '1':
+                                print(f"  [VIB] batched_per_q first 5: lbs={lbs_np_all[:5].tolist()}, biases={biases[:5].tolist()}, margins={margins[:5].tolist()}", flush=True)
                             for idx, ki in enumerate(unclosed):
                                 if margins[idx] > 0:
                                     fast_results[ki] = 'verified'
@@ -6903,7 +6945,11 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                                     if lbs_alpha_np[i_open] + bias > 0:
                                         fast_results[ki] = 'verified'
                                         n_crown_closed += 1
-                        except Exception:
+                        except (RuntimeError, torch.cuda.OutOfMemoryError):
+                            # α-CROWN inputsplit on GPU: RuntimeError covers
+                            # CUBLAS / shape errors, OOM is the dominant
+                            # failure on dense LiRPA matrices. Skip this
+                            # batch and let the per-sub fallback try.
                             pass
                     else:
                         # Mixed-q-per-sub path. mscn cardinality_X_Y_DIM
@@ -7013,7 +7059,12 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                                           f'{int(sub_verified_by_q.sum())}/'
                                           f'{len(unclosed)} subs',
                                           flush=True)
-                            except Exception as _e:
+                            except (RuntimeError, torch.cuda.OutOfMemoryError,
+                                    ValueError, KeyError) as _e:
+                                # Per-q batched CROWN: GPU runtime/OOM or
+                                # shape/key mismatch from sparse selectors.
+                                # Already prints traceback under print_progress;
+                                # fall through to per-sub fallback path.
                                 if getattr(settings, 'print_progress', False):
                                     import traceback
                                     print(f'[per-disjunct] per-q EXC: {_e}',
@@ -7052,6 +7103,9 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                                     tight_sub, xl_sub, xh_sub, gg_fast,
                                     spec_ew_sub, dev, dt)
                                 lbs_np = spec_lbs[0].detach().cpu().numpy()
+                                import os as _os_dump
+                                if _os_dump.environ.get('VIB_DUMP_INIT_LB', '') == '1':
+                                    print(f"  [VIB] fast_crown ki={ki} lbs={lbs_np[:5]}", flush=True)
                                 _, _, conjs_sub = groups[order[ki]]
                                 sub_sp = VNNSpec(
                                     groups[order[ki]][0],
@@ -7064,14 +7118,21 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                                        for qis in disj_qs.values()):
                                     fast_results[ki] = 'verified'
                                     n_crown_closed += 1
-                            except Exception:
+                            except (RuntimeError, ValueError, KeyError):
+                                # Per-sub spec backward: torch/shape/key
+                                # failures fall back silently (this sub stays
+                                # unverified and downstream BAB will retry).
                                 pass
-            except Exception:
+            except (RuntimeError, torch.cuda.OutOfMemoryError):
+                # Outer wrapper of the CROWN-closed loop; GPU runtime issues
+                # fall through to the per-sub verify_graph fallback below.
                 pass
             crown_wall = time.perf_counter() - t_crown
             del c_b, G_b
-        except Exception:
-            pass
+        except torch.cuda.OutOfMemoryError:
+            # OOM is the only expected failure mode of the batched fast
+            # path — let it fall through to per-sub verify_graph below.
+            torch.cuda.empty_cache()
 
     if getattr(settings, 'print_progress', False):
         print(f'[per-disjunct] fast batched CROWN closed '
@@ -7142,7 +7203,9 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                 if all_disj_safe:
                     fast_results[ki] = 'verified'
                     n_crown_closed += 1
-            except Exception:
+            except (RuntimeError, KeyError, ValueError):
+                # Per-sub CROWN backward: torch runtime/shape/key issues
+                # leave the sub unverified for the BAB fallback to handle.
                 pass
         if getattr(settings, 'print_progress', False):
             print(f'[per-disjunct] unbatched forward closed '
@@ -7194,7 +7257,18 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
         # processing helps. For huge w-groups (1000+), process as a
         # single multi-sub BAB call with the full budget — batched
         # LiRPA is throughput-bound and mini-groups waste time.
-        mini_group_size = 60
+        # mini_group_size resolution order:
+        #   1. env MINI_GROUP_SIZE (for ad-hoc A/B testing)
+        #   2. settings.mini_group_size (auto-routed by `_adapt_per_disjunct`
+        #      in config_profiles.py — uses n_disjuncts to pick 60/120/200)
+        #   3. hard default 60 (matches legacy behavior)
+        # Per-disjunct routing was added after observing that a flat
+        # default=120 regressed pensieve_big_parallel (small n_disjuncts)
+        # by 10 cases while only winning +2 mscn_2048d_dual cases.
+        import os as _os_mg
+        mini_group_size = int(_os_mg.environ.get(
+            'MINI_GROUP_SIZE',
+            str(int(getattr(settings, 'mini_group_size', 60)))))
         if getattr(settings, 'print_progress', False):
             print(f'[per-disjunct] entering multi-sub BAB on '
                   f'{len(groups_by_w)} w-groups '
@@ -7202,10 +7276,21 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                   flush=True)
         for w_key, sub_group in groups_by_w.items():
             # Subdivide large-but-not-huge w-group into mini-groups.
+            # Mini-grouping helps BAB throughput (smaller batches fit GPU
+            # cache better, ~26× more iters/s on mscn) — it's not purely
+            # a memory bound. Tried single-call per w-group: regressed
+            # 915→772 closed on cardinality_1_960 because per-iter cost
+            # of huge batches dwarfs any iteration-allocation gain.
             if len(sub_group) <= mini_group_size:
                 mini_groups = [sub_group]
-            elif len(sub_group) > 1000:
-                mini_groups = [sub_group]  # huge: one big call
+            elif len(sub_group) > 10000:
+                # Memory bound: at huge sub counts, mini-grouping bookkeeping
+                # itself overflows GPU memory. Old threshold was 1000 which
+                # is too aggressive — it caused cardinality_1_2260's group-1
+                # (1930 subs) to fall into a single 57s call that finished
+                # only 11 BAB iters. Mini-grouping to 120 gives ~17 calls
+                # with clip on each, which closes far more subs per second.
+                mini_groups = [sub_group]
             else:
                 mini_groups = [sub_group[i:i+mini_group_size]
                                 for i in range(0, len(sub_group),
@@ -7217,7 +7302,13 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                 # Per mini-group budget = (rem time) / (remaining mini-groups)
                 mg_rem = (len(mini_groups)
                           - mini_groups.index(mg))
-                mg_budget = max(2.0, rem_for_msb / max(1, mg_rem))
+                # Cap by remaining outer budget too — without this cap, the
+                # 2s floor lets multi-sub BAB run past `total_timeout` when
+                # only a few seconds remain (mscn_2048d_dual >_5000 cases
+                # would overshoot by 30s and get SIGKILL'd by the sweep
+                # harness at 90s, producing NO_FILE rows).
+                mg_budget = min(rem_for_msb,
+                                 max(2.0, rem_for_msb / max(1, mg_rem)))
                 msb_closed = _multi_sub_input_split_bab(
                     mg, groups, order, gg_fast, dev, dt,
                     mg_budget, n_out, settings)
@@ -7263,7 +7354,12 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
         sub_settings.print_progress = False
         try:
             sub_v, sub_d = verify_graph(graph, sub_spec, sub_settings)
-        except Exception as e:
+        except (RuntimeError, NotImplementedError, KeyError,
+                ValueError, torch.cuda.OutOfMemoryError) as e:
+            # Per-sub recursive verify failures: torch runtime/OOM, missing
+            # op support, or shape/key bugs in a single sub. Record as
+            # err:<Type> verdict so the sub fails open (counted as unknown
+            # in the verifier's aggregate), and continue to next sub.
             sub_v = f'err:{type(e).__name__}'
             sub_d = {'reason': str(e)[:200]}
         if getattr(settings, 'print_progress', False):
@@ -7341,27 +7437,24 @@ def verify_graph(graph, spec, settings):
         for n in graph.nodes.values())
     if _has_unsupported:
         if getattr(settings, 'tighten_formulation', 'gen_cone') != 'skip':
-            # Count VARYING input dims (mscn / pensieve specs typically
-            # have a handful varying out of 100s of total dims). If that
-            # count is small, lift `input_split_max_dims` to the TOTAL
-            # input dim so the input-split fast-leaf path triggers
-            # (the gate compares TOTAL `n_in = np.prod(x_lo.shape)`
-            # against `input_split_max_dims`, not varying count). It
-            # closes mscn cardinality_0_1_2048 with spec_lb≈+1e-4 in
-            # 1.4s where the no-split α-CROWN plateaus at -0.06.
+            # Count VARYING input dims (these specs typically have a handful
+            # varying out of 100s of total dims). If that count is small,
+            # lift `input_split_max_dims` to the TOTAL input dim so the
+            # input-split fast-leaf path triggers (the gate compares TOTAL
+            # `n_in = np.prod(x_lo.shape)` against `input_split_max_dims`,
+            # not varying count) — it closes specs where the no-split
+            # α-CROWN plateaus just below 0.
             n_var = int(((spec.x_hi - spec.x_lo) > 1e-9).sum())
             n_in_total = int(spec.x_lo.size)
             # Lift the split cap when input-split BAB is tractable.
-            # Two regimes:
-            #  - n_var ≤ 8: small varying-dim count, BAB splits along
-            #    those few dims, exponentially small tree depth.
-            #  - n_var > 8 AND n_in_total ≤ 100: pensieve_*_parallel
-            #    (32 varying / 96 total). The structural tightness
-            #    fixes (α-Pow + α-Div tangent in Phase 0.5, shared-gen
-            #    Div for scalar denominator) make per-leaf bounds tight
-            #    enough that BAB converges within benchmark timeout
-            #    (e.g. pensieve_parallel_100 closes in 128s vs 14s
-            #    timeout pre-fix).
+            # Two regimes by varying-dim count:
+            #  - n_var ≤ 8: few varying dims, BAB splits along those few
+            #    dims, exponentially small tree depth.
+            #  - n_var > 8 AND n_in_total ≤ 100: many varying dims out of a
+            #    small total (parallel-branch predictors). The structural
+            #    tightness fixes (α-Pow + α-Div tangent in Phase 0.5,
+            #    shared-gen Div for scalar denominator) make per-leaf bounds
+            #    tight enough that BAB converges within the timeout.
             if n_var <= 8 or n_in_total <= 100:
                 new_split_cap = max(int(getattr(
                     settings, 'input_split_max_dims', 20)), n_in_total)
@@ -7380,26 +7473,63 @@ def verify_graph(graph, spec, settings):
             settings.tighten_solver = 'lp'  # placeholder; skip path ignores
             settings.skip_phase8_milp = True
             settings.zono_lift_enabled = False
-            # Enable batched input-split for many-disjunct decomposed
-            # graphs (mscn cardinality_X_Y has 1000+ disjuncts → 500+
-            # X subboxes; each sub has 1-2 varying dims). Batched =
-            # GPU-parallel leaves at ~100x throughput vs non-batched.
-            # For SINGLE-DISJUNCT graphs (pensieve_parallel: 1 disjunct,
-            # 32 varying dims), non-batched performs better — the
-            # batched driver's leaf-throughput advantage doesn't
-            # outweigh non-batched's smarter sb-branching for wide
-            # input boxes. n_var ≤ 8 ≈ narrow-input regime.
-            if n_var <= 8:
-                settings.input_split_batched_enabled = True
+            # Enable batched input-split + K-dim split + branch-aware SB for
+            # these non-LP graphs. Batched = GPU-parallel leaves at ~100×
+            # throughput vs non-batched. For single-disjunct graphs with many
+            # varying dims and a parallel-branch (bilinear) architecture, the
+            # batched split with branch-boost SB closes cases the old
+            # non-batched single-dim path timed out on. The branch boost
+            # compensates for backward CROWN underestimating lA at dims
+            # feeding pow/div_bilinear branches, so SB correctly picks the
+            # most-unstable branch.
+            settings.input_split_batched_enabled = True
+            settings.input_split_batched_branch_sb = True
+            settings.input_split_batched_branch_boost = True
+            import os as _os_ksd
+            # The two input-split-branching knobs below are chosen from a
+            # graph/spec property, not a benchmark name: the count of VARYING
+            # input dims `n_var`. This block already requires bilinear/
+            # nonlinear LAYER TYPES (Pow/Div/Mul — `_has_unsupported`), which
+            # route to the batched input-split BaB. With many varying dims the
+            # BaB has real split-dim *choice*, so arity and dim-selection
+            # matter; with few, they're inert.
+            _many_varying_dims = n_var > 8
+            # Split arity. K=2 (4-way) is the sweet spot when n_var is large:
+            # K=4 (16-way) over-splits high-dim boxes (measured 56k leaves/39s
+            # at K=4 → 9.8k/11s at K=2, 5.7× fewer leaves), while K=1 (2-way)
+            # is too slow (per-iter overhead × hundreds of iters). When
+            # n_var ≤ 8 the arity is irrelevant (K=2 == K=4, measured) → K=4.
+            _default_K = 2 if _many_varying_dims else 4
+            settings.bab_split_depth = int(
+                _os_ksd.environ.get('BAB_SPLIT_DEPTH', str(_default_K)))
+            # Split-dim boost EXPONENT. The boost
+            # = (1 + n_unstable_in_dominant_shallow_ReLU_layer)^exp sharpens
+            # dim selection toward dims feeding the most-unstable shallow
+            # branch. exp=2.0 (with K=2) cuts leaves 10–198× when n_var is
+            # large AND the net has heavy SHALLOW ReLU instability. It is
+            # SELF-LIMITING by topology: a graph with no shallow unstable
+            # ReLUs gets boost ≈ 1 regardless of exp, so a higher exp is
+            # harmless where it doesn't fit. exp only changes WHICH dims split
+            # (efficiency) — never the bounds or the verdict. Linear (exp=1)
+            # under-weights the unstable-branch dims; kept for n_var ≤ 8 where
+            # there is no dim choice to sharpen.
+            settings.input_split_batched_branch_boost_exp = (
+                2.0 if _many_varying_dims else 1.0)
             # Critical: without this, Phase 2's basic CROWN OVERWRITES
-            # Phase 0.5's α-CROWN spec_lb with a looser value (e.g. on
-            # nn4sys mscn cardinality_0_1_128: α-CROWN closes the spec
-            # at lb≈+0.001, Phase 2 CROWN reports lb≈-0.003, verdict
-            # flips verified→unknown). With tighten_formulation=skip
-            # there's no MILP tightening between Phase 0.5 and Phase 2,
-            # so Phase 0.5's bound is strictly tighter.
+            # Phase 0.5's α-CROWN spec_lb with a looser value (observed on
+            # small cardinality-estimation specs: α-CROWN closes the spec at
+            # lb≈+0.001, Phase 2 CROWN reports lb≈-0.003, flipping the verdict
+            # verified→unknown). With tighten_formulation=skip there's no MILP
+            # tightening between Phase 0.5 and Phase 2, so Phase 0.5's bound
+            # is strictly tighter.
             settings.phase2_crown_enabled = False
             settings.input_split_max_dims = new_split_cap
+            # NOTE: α-CROWN-on-boundary (input_split_batched_alpha_iters) is
+            # left OFF here — measured ineffective on these graphs (open
+            # leaves plateau at spec_lb≈-0.3, far past the ~-0.02 boundary
+            # where slope-only α flips a leaf; 0 closures). The leaf-count gap
+            # was a branching, not a bounding, problem — closed by the arity
+            # and boost-exponent settings above.
     # Route conv-heavy nets (e.g. oval21 cifar_base/deep/wide_kw) to
     # the historical milp_verify pipeline. The bab_refine cascade +
     # alpha-zono Phase 8 are tuned for FC nets like mnist_fc and
@@ -7440,6 +7570,12 @@ def verify_graph(graph, spec, settings):
     n_in = int(np.prod(spec.x_lo.shape)) if hasattr(spec, 'x_lo') else 10**9
     if (getattr(settings, 'input_split_enabled', True)
             and n_in <= int(getattr(settings, 'input_split_max_dims', 20))):
+        import os as _os_isd
+        if _os_isd.environ.get('DEBUG_INPUT_SPLIT_PATH', '') == '1':
+            print(f'[is-path] enabled, n_in={n_in} max_dims='
+                  f'{getattr(settings, "input_split_max_dims", 20)} '
+                  f'batched={bool(getattr(settings, "input_split_batched_enabled", False))}',
+                  flush=True)
         if bool(getattr(settings, 'input_split_batched_enabled', False)):
             # Build the GPU graph once at the top — the batched driver
             # reuses it across all iterations.
@@ -7468,7 +7604,11 @@ def verify_graph(graph, spec, settings):
                             return 'sat', {
                                 'phase': 'onnx_pgd_unsupported_gpu_graph',
                                 'witness': _w}
-                    except Exception as _pe:
+                    except (RuntimeError, ImportError, OSError, ValueError) as _pe:
+                        # PGD via raw ONNX: RuntimeError from torch / onnxruntime,
+                        # ImportError if optional deps missing, OSError on bad
+                        # path, ValueError on shape mismatch. All non-fatal —
+                        # we report unknown rather than crash.
                         if getattr(settings, 'print_progress', False):
                             print(f'  [onnx-pgd] failed: {type(_pe).__name__}: '
                                   f'{_pe}', flush=True)
@@ -7499,7 +7639,11 @@ def verify_graph(graph, spec, settings):
                             return 'sat', {
                                 'phase': 'onnx_pgd_unsupported_batched',
                                 'witness': _w}
-                    except Exception as _pe:
+                    except (RuntimeError, ImportError, OSError, ValueError) as _pe:
+                        # PGD via raw ONNX: RuntimeError from torch / onnxruntime,
+                        # ImportError if optional deps missing, OSError on bad
+                        # path, ValueError on shape mismatch. All non-fatal —
+                        # we report unknown rather than crash.
                         if getattr(settings, 'print_progress', False):
                             print(f'  [onnx-pgd] failed: {type(_pe).__name__}: '
                                   f'{_pe}', flush=True)
@@ -7879,6 +8023,65 @@ def _joint_and_infeasible_zono(z_center_np, z_gens_np, qlists_disj):
     return closed
 
 
+def _clip_input_domain(x_L, x_U, lA, lbias, num_iters=1):
+    """ABC-style closed-form input-domain shrinking.
+
+    Given a CROWN linear lower bound `dm_lb(x) = lA·x + lbias` ≥ threshold=0
+    (after merging per-sub bias into lbias), shrink (x_L, x_U) to keep ONLY
+    the unverified region. For each input dim k and spec j: the value of
+    x[k] where the bound crosses zero (other dims at worst-case) is
+        curr_x[k] = -concrete_minus_one / lA[j,k]
+    where concrete_minus_one = dm_lb - lA[j,:]·xhat + |lA[j,:]|·eps. Values
+    of x[k] with lA[j,k] > 0 above curr_x make the bound positive
+    (verified) so we drop x_U[k] to curr_x[k]; symmetrically for lA<0.
+    Taking the MIN across specs (= disjunctive verification) is correct:
+    if any spec verifies a region, we can drop it.
+
+    Sound: removes only regions where SOME spec proves bound ≥ 0.
+    Cost: ~10 lines of tensor math, O(batch · num_spec · input_dim). Per
+    auto_LiRPA `input_split/clip.py`:`_clip_main_fn`, observed <1% of BAB
+    iter time but lets each iter shrink 80%+ of unverified domains.
+
+    Args:
+      x_L, x_U: (B, K) input box (lower/upper) per leaf.
+      lA:       (B, S, K) CROWN linear coefficients (S = num specs).
+      lbias:    (B, S) constant offset, ALREADY including per-sub query bias.
+      num_iters: clip iterations (refining after each shrink).
+    Returns: (x_L', x_U') (B, K) shrunken box.
+    """
+    x_L = x_L.clone()
+    x_U = x_U.clone()
+    for _ in range(num_iters):
+        xhat = (x_U + x_L) / 2     # (B, K)
+        eps  = (x_U - x_L) / 2     # (B, K)
+        # concretize dm_lb_per_spec: (B, S) = lA_pos·x_L + lA_neg·x_U + lbias
+        lA_pos = lA.clamp(min=0); lA_neg = lA.clamp(max=0)
+        dm_lb = (lA_pos * x_L.unsqueeze(1)
+                  + lA_neg * x_U.unsqueeze(1)).sum(dim=2) + lbias  # (B, S)
+        # contribution to dm_lb if x[k] were arbitrary in current box,
+        # other dims at worst case: dm_lb - lA[j,:]·xhat + |lA[j,:]|·eps
+        # (this is dm_lb minus the actual contribution of x[k] plus the
+        #  worst-case contribution of all other dims).
+        # Shape: (B, S, K).
+        contrib_per_dim = (lA * xhat.unsqueeze(1)
+                            - lA.abs() * eps.unsqueeze(1))   # what x[k] contributes worst-case if it sweeps box
+        # concrete_minus_one[j,k] = dm_lb[j] - contrib_per_dim[j,k]
+        concrete_minus_one = dm_lb.unsqueeze(2) - contrib_per_dim  # (B, S, K)
+        # curr_x[j,k] = (threshold=0 - concrete_minus_one) / lA[j,k]
+        # Guard div-by-zero (lA[j,k] = 0 → no constraint on x[k]).
+        denom = torch.where(lA.abs() > 1e-30, lA,
+                             torch.ones_like(lA))
+        curr_x = -concrete_minus_one / denom
+        # For lA > 0: x[k] > curr_x means bound ≥ 0 (verified). Drop x_U.
+        # For lA < 0: x[k] < curr_x means bound ≥ 0 (verified). Drop x_L.
+        x_U_cand = torch.where(lA > 0, curr_x, torch.full_like(curr_x, float('inf')))
+        x_L_cand = torch.where(lA < 0, curr_x, torch.full_like(curr_x, float('-inf')))
+        # Take MIN over specs (disjunctive: if ANY spec verifies x>curr_x, drop it).
+        x_U = torch.min(x_U_cand.amin(dim=1), x_U)
+        x_L = torch.max(x_L_cand.amax(dim=1), x_L)
+    return x_L, x_U
+
+
 def _multi_sub_input_split_bab(
         sub_idx_list, groups, order, gg, device, dtype, total_budget,
         n_out, settings):
@@ -7900,6 +8103,7 @@ def _multi_sub_input_split_bab(
     from .verify_zono_bnb import (
         _forward_zonotope_graph_batched, _spec_backward_graph_batched,
         _run_alpha_crown_inputsplit_batched)
+    from .forward_lirpa import forward_lirpa_compat_zono_batched
     t0 = time.perf_counter()
     closed = set()
     if not sub_idx_list:
@@ -7926,8 +8130,9 @@ def _multi_sub_input_split_bab(
         for qi in range(max_q))
     if not (uniform_q and same_w_per_qi):
         # Fallback: cannot batch cleanly; skip multi-sub BAB.
+        # Upstream w-grouping ensures shared w within each group, so this
+        # path is only hit if a future caller bypasses that.
         if getattr(settings, 'print_progress', False):
-            # Find a sub with mismatched w to report.
             ref_w = np.asarray(sub_specs[sub_idx_list[0]][0][1])
             mismatch_ki = None
             for ki in sub_idx_list[:50]:
@@ -7936,7 +8141,8 @@ def _multi_sub_input_split_bab(
                     if not np.array_equal(w_k, ref_w):
                         mismatch_ki = (ki, qi, w_k.tolist(), ref_w.tolist())
                         break
-                if mismatch_ki: break
+                if mismatch_ki:
+                    break
             print(f'[multi-sub BAB] skipped: uniform_q={uniform_q} '
                   f'same_w={same_w_per_qi} q_counts={q_counts[:5]} '
                   f'mismatch={mismatch_ki}', flush=True)
@@ -7948,6 +8154,15 @@ def _multi_sub_input_split_bab(
     # Bias per (sub, q).
     bias_per_sub_q = {ki: [float(sub_specs[ki][qi][2]) for qi in range(max_q)]
                        for ki in sub_idx_list}
+    # Vectorized lookup table for biases — keyed by sub_idx → (max_q,)
+    # tensor. Avoids the per-leaf .item() syncs in the BAB iter loop
+    # (was 70+ ms per 4096-leaf iter). Maps sub_idx → row in this table.
+    _bias_table_np = np.zeros((max(sub_idx_list) + 1, max_q),
+                               dtype=np.float32)
+    for _ki, _bs in bias_per_sub_q.items():
+        _bias_table_np[_ki] = _bs
+    bias_table_t = torch.as_tensor(_bias_table_np,
+                                    dtype=dtype, device=device)
     # Initial worklist: one leaf per sub.
     xls_all = np.stack([groups[order[ki]][0] for ki in sub_idx_list]).astype(np.float64)
     xhs_all = np.stack([groups[order[ki]][1] for ki in sub_idx_list]).astype(np.float64)
@@ -7962,14 +8177,114 @@ def _multi_sub_input_split_bab(
     # memory allows (mscn 128d fits B=1024 easily). On 2048d_dual where
     # B=128 is the cap, chunked LiRPA auto-degrades. No iter cap.
     batch_size = int(getattr(settings, 'input_split_batch_size', 1024))
+    import os as _os_bsz
+    if _os_bsz.environ.get('DEBUG_BAB_QUEUE', '') == '1':
+        print(f'[bab-init] input_split_batch_size={batch_size} '
+              f'n_subs={len(sub_idx_list)} budget={total_budget:.1f}s',
+              flush=True)
     max_iters = 10**9
     # Per-sub: count of LIVE leaves (not yet verified). Sub closed iff 0.
     live_leaves_per_sub = {int(ki): 1 for ki in sub_idx_list}
+    # Optional ABC-style ROOT PRESPLIT (diagnostic / experimental, default
+    # OFF). ABC presplits each disjunct's root box to 2^storage_depth boxes
+    # before the first bounding, so it only ever drains; VC seeds 1 box and
+    # ramps. Set BAB_ROOT_PRESPLIT=K to bisect each box's widest dim K times
+    # up front (→ 2^K children/sub). Changes nothing when unset.
+    import os as _os_psplit
+    _root_presplit = int(_os_psplit.environ.get('BAB_ROOT_PRESPLIT', '0'))
+    if _root_presplit > 0:
+        for _ps in range(_root_presplit):
+            w_ps = xh_t - xl_t
+            if float(w_ps.max()) <= 1e-12:
+                break  # all boxes fully fixed; nothing to split
+            n_ps = xl_t.shape[0]
+            rows_ps = torch.arange(n_ps, device=device)
+            didx_ps = torch.argmax(w_ps, dim=1)        # widest dim per box
+            mid_ps = (xl_t[rows_ps, didx_ps] + xh_t[rows_ps, didx_ps]) * 0.5
+            xl_lo = xl_t.clone(); xh_lo = xh_t.clone()
+            xh_lo[rows_ps, didx_ps] = mid_ps           # lower child
+            xl_hi = xl_t.clone(); xh_hi = xh_t.clone()
+            xl_hi[rows_ps, didx_ps] = mid_ps           # upper child
+            xl_t = torch.cat([xl_lo, xl_hi], dim=0)
+            xh_t = torch.cat([xh_lo, xh_hi], dim=0)
+            sub_idx_t = torch.cat([sub_idx_t, sub_idx_t], dim=0)
+        from collections import Counter as _Counter_ps
+        _cnt_ps = _Counter_ps(int(s) for s in sub_idx_t.tolist())
+        for _ki_ps in live_leaves_per_sub:
+            live_leaves_per_sub[_ki_ps] = _cnt_ps.get(_ki_ps, 1)
+        if _os_psplit.environ.get('DEBUG_BAB_QUEUE', '') == '1':
+            print(f'[bab-presplit] depth={_root_presplit} '
+                  f'boxes={xl_t.shape[0]} (was {len(sub_idx_list)})',
+                  flush=True)
+    _dump_boxes = _os_psplit.environ.get('BAB_DUMP_BOXES', '')
+    if _dump_boxes:
+        import json as _json_db
+        _w = (xh_t - xl_t)
+        _vd = (_w.max(dim=0).values > 1e-9).nonzero(as_tuple=True)[0].tolist()
+        _boxes = []
+        for _bi in range(xl_t.shape[0]):
+            _boxes.append([[round(float(xl_t[_bi, d]), 6),
+                            round(float(xh_t[_bi, d]), 6)] for d in _vd])
+        # canonical-sort the box set for order-independent comparison
+        _boxes_sorted = sorted(_boxes)
+        _json_db.dump({'varying_dims': _vd, 'n_boxes': len(_boxes),
+                       'boxes_sorted': _boxes_sorted},
+                      open(_dump_boxes, 'w'), indent=1)
+    # --- ABC-MATCH gated mode (diagnostic) -------------------------------
+    # When ABC_MATCH=1, faithfully mirror α,β-CROWN's reorder_bab input-split
+    # logic for box-for-box comparison: (1) backward-CROWN margin (≈ ABC
+    # forward+crown), (2) dynamic split arity via get_split_depth over
+    # storage_depth SB dims keeping degenerate duplicate children, (3) clip
+    # children AFTER split (num_iters=1) instead of parents before. This is
+    # NOT a production path — purely to confirm we understand ABC's algorithm.
+    _abc_match = _os_psplit.environ.get('ABC_MATCH', '0') != '0'
+    # ABC_DEDUP=1: filter redundant (bit-identical) boxes from the worklist
+    # each iter. ABC's storage_depth split bisects degenerate (zero-width)
+    # dims too, producing duplicate children it wastefully re-bounds (4× on
+    # card_1_1). Deduping bounds each DISTINCT box once → strictly less work
+    # than ABC, same verdict. (Only used with ABC_MATCH.)
+    _abc_dedup = _os_psplit.environ.get('ABC_DEDUP', '0') != '0'
+    import math as _math_abc
+    # ABC: min_batch_size = min_batch_size_ratio(0.1) * batch_size(256) = 25.6
+    _abc_min_batch = float(_os_psplit.environ.get('ABC_MIN_BATCH', '25.6'))
+    _abc_storage_depth = min(
+        max(int(_math_abc.log(max(_abc_min_batch, 1.0)) // _math_abc.log(2.0)), 1),
+        int(xl_t.shape[1]))
+
+    def _abc_get_split_depth(n_dom):
+        # mirrors input_split/split.py:get_split_depth
+        if n_dom == 0:
+            return 1
+        if n_dom < _abc_min_batch:
+            return max(int(_math_abc.log(_abc_min_batch // n_dom)
+                           // _math_abc.log(2.0)), 1)
+        return 1
+    if _abc_match:
+        # Pickout batch. Bigger batches → fewer BAB iters → better GPU
+        # utilization (mirrors ABC's auto_enlarge_batch_size). 2048 cut
+        # card_1_2260 from 65→33 iters / 20.3→17.9s with identical leaves
+        # (pickout doesn't affect split_depth → leaf count unchanged). The
+        # backward-CROWN path below is OOM-halving-guarded so 2048 degrades
+        # gracefully on the largest instances (e.g. card_1_11080) instead of
+        # crashing. Override with ABC_PICKOUT.
+        batch_size = int(_os_psplit.environ.get('ABC_PICKOUT', '2048'))
+    if _abc_match and _os_psplit.environ.get('DEBUG_BAB_QUEUE', '') == '1':
+        print(f'[abc-match] storage_depth={_abc_storage_depth} '
+              f'min_batch={_abc_min_batch}', flush=True)
     n_iters = 0
     n_leaves_visited = 0
+    # Per-iter phase timings (matches ABC's "pickout/bounding/filtering/clip/split" labels).
+    # Enable via VIB_BAB_PHASE_TIMING=1 for side-by-side comparison with ABC.
+    import os as _os_pt
+    _phase_timing = _os_pt.environ.get('VIB_BAB_PHASE_TIMING', '') == '1'
     while xl_t.shape[0] > 0 and n_iters < max_iters:
         if time.perf_counter() - t0 > total_budget:
             break
+        if _phase_timing:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            _pt_iter_start = time.perf_counter()
+            _pt_pickout = _pt_iter_start
         # Pick batch.
         B = min(batch_size, xl_t.shape[0])
         # Drop already-closed sub leaves first.
@@ -7983,6 +8298,31 @@ def _multi_sub_input_split_bab(
             B = min(batch_size, xl_t.shape[0])
             if B == 0:
                 break
+        # ABC_DEDUP: collapse bit-identical (sub_idx, xl, xh) worklist rows so
+        # each distinct box is bounded ONCE. Duplicates are bound- and verify-
+        # identical, so this is sound; it strips the wasted work ABC does on
+        # storage_depth degenerate duplicates. Recompute live counts / closed
+        # from the deduped worklist (a sub with 0 unverified boxes is closed).
+        if _abc_dedup and xl_t.shape[0] > 0:
+            _keyt = torch.cat(
+                [sub_idx_t.unsqueeze(1).to(dtype), xl_t, xh_t], dim=1)
+            _uniq, _inv = torch.unique(_keyt, dim=0, return_inverse=True)
+            _perm = torch.arange(_inv.numel(), device=device)
+            _first = torch.full((_uniq.shape[0],), _inv.numel(),
+                                 device=device, dtype=torch.long)
+            _first = _first.scatter_reduce(0, _inv, _perm, reduce='amin',
+                                            include_self=True)
+            _first = _first.sort().values
+            if _first.numel() < xl_t.shape[0]:
+                xl_t = xl_t[_first]; xh_t = xh_t[_first]
+                sub_idx_t = sub_idx_t[_first]
+                from collections import Counter as _Cdedup
+                _cnt = _Cdedup(int(s) for s in sub_idx_t.tolist())
+                for _s in live_leaves_per_sub:
+                    live_leaves_per_sub[_s] = _cnt.get(_s, 0)
+                    if live_leaves_per_sub[_s] == 0:
+                        closed.add(_s)
+                B = min(batch_size, xl_t.shape[0])
         # Routing: prefer zono+backward CROWN — after the batched
         # point-centers fix in alpha_crown.py, backward CROWN is both
         # tighter than forward LiRPA AND ~3× faster per batch on mscn
@@ -7994,7 +8334,14 @@ def _multi_sub_input_split_bab(
         gg_id = id(gg)
         if gg_id not in _multi_sub_input_split_bab._softmax_pattern_cache:
             _multi_sub_input_split_bab._softmax_pattern_cache[gg_id] = True
-        use_lirpa = False
+        # LiRPA forward inside BaB avoids the zonotope-generator memory
+        # explosion that drives the old zono path to OOM-halve batch_size
+        # from 4096 → 16 on mscn (~8 OOMs per w-group). With LiRPA we
+        # keep B=4096, process the entire queue in 1 iter, and finish 2×
+        # faster on cardinality_1_240 (33.2s → 16.1s). Disable via
+        # BAB_USE_LIRPA=0 to fall back to the zono path.
+        import os as _os_bab_lirpa
+        use_lirpa = (_os_bab_lirpa.environ.get('BAB_USE_LIRPA', '1') != '0')
         xl_b = xl_t[:B]; xh_b = xh_t[:B]; si_b = sub_idx_t[:B]
         bb = None
         if use_lirpa:
@@ -8004,31 +8351,145 @@ def _multi_sub_input_split_bab(
                 # Chunked + streaming: OOM-resilient (chunked) AND
                 # per-op A matrices freed after last consumer
                 # (streaming). Best throughput on mscn dual.
+                import os as _os_jt
+                _use_jit_trace = _os_jt.environ.get(
+                    'BAB_USE_JIT_TRACE', '0') == '1'
+                _use_bwd_crown_env = _os_jt.environ.get(
+                    'BAB_USE_BWD_CROWN', '0') != '0'
                 bb = chunked_batched_forward_linear_bounds(
                     gg, xl_b, xh_b, device, dtype, max_chunk=B,
-                    free_states=True)
+                    free_states=True, use_jit_trace=_use_jit_trace,
+                    track_interm=_use_bwd_crown_env or _abc_match)
             except (torch.cuda.OutOfMemoryError, RuntimeError, NotImplementedError):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 bb = None
+        if _phase_timing:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            _pt_bounding = time.perf_counter()
         leaf_safe_by_any_q = torch.zeros(B, dtype=torch.bool, device=device)
+        # Accumulate per-query (spec_A, lbias_with_bias) so we can apply
+        # ABC-style input-domain clipping on unsafe leaves before splitting.
+        # Also stash per-q margin (dm_lb after bias) for SB score.
+        clip_lA_list = []        # each (B, K)
+        clip_lbias_list = []     # each (B,)
+        clip_margin_list = []    # each (B,) — spec lb (= dm_lb - threshold)
+        _oom_iter = False        # set if backward CROWN OOMs → halve & retry
         if bb is not None:
-            # LiRPA-only path (faster + tighter on mscn-style graphs).
-            for qi in range(max_q):
-                w_q = w_per_q[qi]
-                w_pos = w_q.clamp(min=0); w_neg = w_q.clamp(max=0)
-                spec_A = (w_pos.unsqueeze(0).unsqueeze(-1) * bb.A_lo
-                          + w_neg.unsqueeze(0).unsqueeze(-1) * bb.A_up).sum(dim=1)
-                spec_b_const = ((w_pos.unsqueeze(0) * bb.b_lo
-                                 + w_neg.unsqueeze(0) * bb.b_up).sum(dim=1))
-                spec_A_pos = spec_A.clamp(min=0); spec_A_neg = spec_A.clamp(max=0)
-                lbs_q_flat = ((spec_A_pos * xl_b + spec_A_neg * xh_b).sum(dim=1)
-                              + spec_b_const)
-                biases_for_q = torch.tensor(
-                    [bias_per_sub_q[int(s.item())][qi] for s in si_b],
-                    dtype=dtype, device=device)
-                margins_q = lbs_q_flat + biases_for_q
-                leaf_safe_by_any_q |= (margins_q > 0)
+            # LiRPA path: bb.A_lo/A_up are on the COMPRESSED input subspace
+            # (varying dims only). Use the stashed mask to compress xl_b/xh_b
+            # so dimensions match. Without this the spec eval silently
+            # broadcasts wrong (shape K vs n_in).
+            varying_mask = chunked_batched_forward_linear_bounds.last_varying_mask
+            xl_b_c = xl_b[:, varying_mask]   # (B, K)
+            xh_b_c = xh_b[:, varying_mask]
+            # Bound-quality fix: forward LiRPA → spec via direct A·W multiply
+            # gives 69% LOOSER spec lb than backward CROWN (mscn card_1_240
+            # disj 0 microbench: -0.477 vs -0.148 — matches ABC exactly).
+            # Looser per-leaf bound → more BAB splits needed. Backward CROWN
+            # now reuses the forward pass's interm_box (no second forward),
+            # so per-iter cost is only +47ms over default. Net is a win on
+            # small/medium cases (card_1_240: 15.7s→14.1s, card_1_960:
+            # 46s→37s) but a loss on cases with many BAB iters (card_1_5410:
+            # 234s verified→timeout) where the +47ms × 100+ iters dominates.
+            # Opt-in via BAB_USE_BWD_CROWN=1.
+            import os as _os_bwc
+            use_bwd_crown = (_os_bwc.environ.get('BAB_USE_BWD_CROWN', '0') != '0'
+                             or _abc_match)
+            if use_bwd_crown:
+                # Build sb (per-layer pre-act bounds) from the ALREADY-RUN
+                # forward pass's interm_box (no second forward pass — was
+                # the dominant cost in old BWD_CROWN path: 3.8× per-iter).
+                from .forward_lirpa import (
+                    _build_sb_from_interm,
+                    chunked_batched_forward_linear_bounds as _cbflb)
+                _interm = getattr(_cbflb, 'last_interm_box', None)
+                if _interm is None:
+                    sb_b_full, _ = forward_lirpa_compat_zono_batched(
+                        xl_b, xh_b, gg, device, dtype)
+                else:
+                    sb_b_full, _bilinear_bounds = _build_sb_from_interm(
+                        gg, _interm)
+                _fixed_mask = ~varying_mask
+                for qi in range(max_q):
+                    w_q = w_per_q[qi]
+                    spec_ew_q = {0: (w_q, 0.0)}
+                    biases_for_q = bias_table_t[si_b, qi]
+                    if _abc_match:
+                        # ABC's clip/SB use the SAME (tight) bound as the
+                        # margin (forward+crown). Use backward CROWN's
+                        # input-space linear bound A·x + acc (return_input_
+                        # linear) for clip_lA, compressed to varying dims with
+                        # the fixed dims' constant contribution folded into the
+                        # bias. The forward A·W lA below is far looser and
+                        # produced ZERO clip shrinkage (split2 mismatch).
+                        try:
+                            lbs_z, A_in, acc_in = _spec_backward_graph_batched(
+                                sb_b_full, xl_b, xh_b, gg, spec_ew_q, device,
+                                dtype, return_input_linear=True)
+                        except torch.cuda.OutOfMemoryError:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            _oom_iter = True
+                            break   # halve batch_size & retry this iter
+                        lbs_q_flat = lbs_z[:, 0]
+                        margins_q = lbs_q_flat + biases_for_q
+                        leaf_safe_by_any_q |= (margins_q > 0)
+                        spec_A = A_in[:, 0, :][:, varying_mask]          # (B, K)
+                        fixed_const = (A_in[:, 0, :][:, _fixed_mask]
+                                       * xl_b[:, _fixed_mask]).sum(dim=1)  # (B,)
+                        clip_lA_list.append(spec_A)
+                        clip_lbias_list.append(acc_in[:, 0] + fixed_const
+                                               + biases_for_q)
+                        clip_margin_list.append(margins_q)
+                        continue
+                    lbs_z = _spec_backward_graph_batched(
+                        sb_b_full, xl_b, xh_b, gg, spec_ew_q, device, dtype)
+                    lbs_q_flat = lbs_z[:, 0]
+                    # Vectorized lookup (was per-leaf .item() loop, 70+ms).
+                    margins_q = lbs_q_flat + biases_for_q
+                    leaf_safe_by_any_q |= (margins_q > 0)
+                    # For clip + SB, we still need lA on the compressed input
+                    # subspace. Compute it from forward A·W as before (these
+                    # are LOOSER than backward but available cheaply).
+                    w_pos = w_q.clamp(min=0); w_neg = w_q.clamp(max=0)
+                    spec_A = (w_pos.unsqueeze(0).unsqueeze(-1) * bb.A_lo
+                              + w_neg.unsqueeze(0).unsqueeze(-1) * bb.A_up).sum(dim=1)
+                    spec_b_const = ((w_pos.unsqueeze(0) * bb.b_lo
+                                     + w_neg.unsqueeze(0) * bb.b_up).sum(dim=1))
+                    clip_lA_list.append(spec_A)
+                    clip_lbias_list.append(spec_b_const + biases_for_q)
+                    clip_margin_list.append(margins_q)
+            else:
+                # Vectorized over all queries (was a Python for-loop over qi —
+                # 27ms × max_q per BAB iter on 4096-leaf batch). Stack once,
+                # compute all queries' spec_A/lbias/margins in one pass.
+                # w_per_q: list of max_q tensors (n_out,). Stack: (Q, n_out).
+                W_qs = torch.stack(w_per_q, dim=0)              # (Q, n_out)
+                W_pos = W_qs.clamp(min=0)                       # (Q, n_out)
+                W_neg = W_qs.clamp(max=0)
+                # bb.A_lo/A_up: (B, n_out, K). einsum to (B, Q, K).
+                spec_A_all = (torch.einsum('qn,bnk->bqk', W_pos, bb.A_lo)
+                              + torch.einsum('qn,bnk->bqk', W_neg, bb.A_up))
+                spec_b_const_all = (torch.einsum('qn,bn->bq', W_pos, bb.b_lo)
+                                    + torch.einsum('qn,bn->bq', W_neg, bb.b_up))
+                # Concretize lbs over current box: (B, Q, K) sign-split → (B, Q).
+                spec_A_pos_all = spec_A_all.clamp(min=0)
+                spec_A_neg_all = spec_A_all.clamp(max=0)
+                lbs_qs_flat = ((spec_A_pos_all * xl_b_c.unsqueeze(1)
+                                + spec_A_neg_all * xh_b_c.unsqueeze(1)).sum(dim=2)
+                               + spec_b_const_all)               # (B, Q)
+                # Bias lookup over all queries: (B, Q) from (n_sub, Q) table.
+                biases_all = bias_table_t[si_b]                  # (B, Q)
+                margins_all = lbs_qs_flat + biases_all           # (B, Q)
+                leaf_safe_by_any_q = (margins_all > 0).any(dim=1)
+                # Stash per-q for clip/SB (matches prior list semantics).
+                for qi in range(max_q):
+                    clip_lA_list.append(spec_A_all[:, qi])
+                    clip_lbias_list.append(spec_b_const_all[:, qi]
+                                            + biases_all[:, qi])
+                    clip_margin_list.append(margins_all[:, qi])
         else:
             # Zono path (used for softmax-pattern graphs OR LiRPA OOM).
             try:
@@ -8040,6 +8501,10 @@ def _multi_sub_input_split_bab(
                 new_bs = max(1, batch_size // 2)
                 if new_bs == batch_size:
                     break
+                import os as _os_oom2
+                if _os_oom2.environ.get('DEBUG_BAB_QUEUE', '') == '1':
+                    print(f'[bab-oom] forward OOM, halving batch_size '
+                          f'{batch_size} -> {new_bs}', flush=True)
                 batch_size = new_bs
                 continue
             for qi in range(max_q):
@@ -8054,20 +8519,40 @@ def _multi_sub_input_split_bab(
                     if new_bs == batch_size:
                         lbs_z = 'OOM_PERM'
                         break
+                    import os as _os_oom
+                    if _os_oom.environ.get('DEBUG_BAB_QUEUE', '') == '1':
+                        print(f'[bab-oom] backward OOM, halving batch_size '
+                              f'{batch_size} -> {new_bs}', flush=True)
                     batch_size = new_bs
                     lbs_z = None
                     break
                 lbs_q_flat = lbs_z[:, 0]
-                biases_for_q = torch.tensor(
-                    [bias_per_sub_q[int(s.item())][qi] for s in si_b],
-                    dtype=dtype, device=device)
+                # Vectorized GPU lookup (was per-leaf .item() list comp —
+                # B GPU syncs per qi per iter; B=300 → 300 syncs).
+                biases_for_q = bias_table_t[si_b, qi]
                 margins_q = lbs_q_flat + biases_for_q
                 leaf_safe_by_any_q |= (margins_q > 0)
             if isinstance(lbs_z, str) and lbs_z == 'OOM_PERM':
                 break
             if lbs_z is None:
                 continue
+        if _oom_iter:
+            # Backward CROWN OOM'd at this batch size → halve pickout and
+            # retry the iter (worklist xl_t is untouched until split/add at
+            # end, so retry is safe). Mirrors ABC's auto_enlarge shrink.
+            new_bs = max(1, batch_size // 2)
+            if new_bs == batch_size:
+                break    # cannot reduce further; give up this group
+            batch_size = new_bs
+            continue
         n_leaves_visited += B
+        import os as _os_qd
+        if _os_qd.environ.get('DEBUG_BAB_QUEUE', '') == '1' and n_iters < 30:
+            n_open_subs = sum(1 for v in live_leaves_per_sub.values() if v > 0)
+            print(f'[bab-queue] iter={n_iters} B={B} batch_size={batch_size} '
+                  f'queue_size={xl_t.shape[0]} '
+                  f'open_subs={n_open_subs} closed={len(closed)}',
+                  flush=True)
         # Update live counts: each verified leaf decrements its sub's
         # live count. When count hits 0, sub closed.
         for i in range(B):
@@ -8076,45 +8561,264 @@ def _multi_sub_input_split_bab(
                 live_leaves_per_sub[sk] -= 1
                 if live_leaves_per_sub[sk] == 0:
                     closed.add(sk)
-        # Unsafe leaves: split on widest-dim → 2 child leaves.
-        # (sb score-based branching gave mixed results on mscn — slight
-        # speedup on small cases but lost closures on large ones; the
-        # widest-dim heuristic empirically wins for this workload.)
+        # Unsafe leaves: split on top-K widest dims SIMULTANEOUSLY →
+        # 2^K child leaves per unsafe leaf. Matches ABC's strategy
+        # (`storage_depth = floor(log2(min_batch_size_ratio * batch_size))`
+        # in `input_split/batch_branch_and_bound.py`). K=4 for nn4sys at
+        # batch_size=256 (= log2(25.6)). With single-dim splits the queue
+        # grows 2x/iter (only ~16 leaves visited/iter on mscn_240);
+        # K-dim splits grow it 2^K and amortize bound-call overhead.
+        if _phase_timing:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            _pt_filtering = time.perf_counter()
         unsafe_idx = (~leaf_safe_by_any_q).nonzero(as_tuple=True)[0]
         rest_xl = xl_t[B:]; rest_xh = xh_t[B:]; rest_si = sub_idx_t[B:]
+        # Build the per-iter (B,S,K) clip lA / (B,S) clip lbias once so the
+        # SB picker, pre-split clip, and post-split child clip all share it
+        # (the SB block references clip_lA even when pre-split clip is off,
+        # e.g. under ABC_MATCH).
+        clip_lA = clip_lbias = None
+        if clip_lA_list:
+            clip_lA = torch.stack(clip_lA_list, dim=1)        # (B, S, K)
+            clip_lbias = torch.stack(clip_lbias_list, dim=1)  # (B, S)
+        # ABC-style input-domain clipping on unsafe leaves: shrink the
+        # input box using CROWN lA/lbias to drop regions where ANY spec
+        # proves bound ≥ 0 (verified). Reduces split count on hard
+        # clusters where bounds are tight but BAB can't close in budget.
+        # Only on LiRPA path (clip_lA_list populated); zono path is a
+        # rare OOM fallback. Disable via env CLIP_INPUT_DOMAIN=0.
+        import os as _os_clip
+        clip_enabled = (clip_lA_list
+                         and _os_clip.environ.get('CLIP_INPUT_DOMAIN', '1') != '0'
+                         and unsafe_idx.numel() > 0
+                         # ABC reorder_bab clips CHILDREN after split, not
+                         # parents before. Under ABC_MATCH, suppress the
+                         # pre-split parent clip (the post-split child clip
+                         # below is force-enabled instead).
+                         and not _abc_match)
+        if clip_enabled:
+            xl_b_c_u = xl_b_c[unsafe_idx]
+            xh_b_c_u = xh_b_c[unsafe_idx]
+            # num_iters=2: each clip iter refines after the prior shrink
+            # (per ABC's `_clip_main_fn`). 2 iters is the sweet spot —
+            # diminishing returns past that, but the second iter often
+            # closes 10-20% more on hard clusters.
+            xl_clipped, xh_clipped = _clip_input_domain(
+                xl_b_c_u, xh_b_c_u,
+                clip_lA[unsafe_idx], clip_lbias[unsafe_idx],
+                num_iters=2)
+            # Scatter shrunken box back into full (B, n_in) tensors by
+            # writing only at varying-mask positions. VECTORIZED — the
+            # prior Python loop over unsafe_idx (one .item() per leaf, then
+            # masked-assign) was 100+ ms per BAB iter for 2000-leaf batches,
+            # the actual clip bottleneck (not the clip math itself).
+            varying_full_idx = varying_mask.nonzero(as_tuple=True)[0]
+            # Build 2D index: rows = unsafe leaf indices (n_unsafe, K),
+            # cols = varying-dim positions (n_unsafe, K).
+            n_unsafe_clip = unsafe_idx.numel()
+            row_idx = unsafe_idx.unsqueeze(1).expand(-1, varying_full_idx.numel())
+            col_idx = varying_full_idx.unsqueeze(0).expand(n_unsafe_clip, -1)
+            xl_b[row_idx, col_idx] = xl_clipped
+            xh_b[row_idx, col_idx] = xh_clipped
+            # Drop boxes that became empty (any dim where xl > xh): the
+            # spec is verified on the whole original box for those leaves.
+            # We treat these as additionally verified here.
+            newly_verified = ((xl_b[unsafe_idx] > xh_b[unsafe_idx]).any(dim=1))
+            if newly_verified.any():
+                add_safe = unsafe_idx[newly_verified]
+                leaf_safe_by_any_q[add_safe] = True
+                for ai in add_safe.tolist():
+                    sk = int(si_b[int(ai)].item())
+                    live_leaves_per_sub[sk] -= 1
+                    if live_leaves_per_sub[sk] == 0:
+                        closed.add(sk)
+                # Refresh unsafe_idx after marking new verifieds.
+                unsafe_idx = (~leaf_safe_by_any_q).nonzero(as_tuple=True)[0]
+        if _phase_timing:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            _pt_clip = time.perf_counter()
         if unsafe_idx.numel() > 0:
-            # Note: tried sb-style smart branching (score axis by
-            # |w_spec · A_lo[k]| × width[k]); on mscn cardinality dual
-            # cases it regressed by ~15% vs widest-dim because varying
-            # dims have similar sb scores but different empirical
-            # closure rates. Sticking with widest-dim.
-            new_xls = []; new_xhs = []; new_sis = []
-            for li in unsafe_idx.tolist():
-                xl_i = xl_b[li]
-                xh_i = xh_b[li]
-                widths = xh_i - xl_i
-                a = int(widths.argmax().item())
-                if float(widths[a]) < 1e-12:
-                    continue
-                mid = (xl_i[a] + xh_i[a]) / 2
-                xh_a = xh_i.clone(); xh_a[a] = mid
-                xl_b_v = xl_i.clone(); xl_b_v[a] = mid
-                new_xls.append(xl_i); new_xhs.append(xh_a)
-                new_sis.append(si_b[li])
-                new_xls.append(xl_b_v); new_xhs.append(xh_i)
-                new_sis.append(si_b[li])
-                live_leaves_per_sub[int(si_b[li].item())] += 1
-            if new_xls:
-                new_xl = torch.stack(new_xls)
-                new_xh = torch.stack(new_xhs)
-                new_si = torch.stack(new_sis)
-                xl_t = torch.cat([rest_xl, new_xl], dim=0)
-                xh_t = torch.cat([rest_xh, new_xh], dim=0)
-                sub_idx_t = torch.cat([rest_si, new_si], dim=0)
+            K_max = int(getattr(settings, 'bab_split_depth', 4))
+            n_in_dim = xl_b.shape[1]
+            xl_u = xl_b[unsafe_idx]   # (n_unsafe, n_in)
+            xh_u = xh_b[unsafe_idx]
+            si_u = si_b[unsafe_idx]
+            widths_u = xh_u - xl_u
+            n_unsafe = xl_u.shape[0]
+            # Per-leaf effective K = min(K_max, # dims with nonzero width).
+            # When K_max exceeds the number of varying dims, top-K picks
+            # zero-width dims whose splits produce duplicate children — sound
+            # but wasteful. To keep the batched code uniform, pick the
+            # SMALLER of K_max and the median nonzero-dim count, then drop
+            # children identical to siblings (degenerate splits) post-hoc.
+            nz_per_leaf = (widths_u > 1e-12).sum(dim=1)  # (n_unsafe,)
+            if _abc_match:
+                # ABC: one split_depth for the whole batch from get_split_depth
+                # over storage_depth SB dims. Do NOT cap at #nonzero dims —
+                # degenerate (zero-width) dims are split too, producing the
+                # duplicate children that inflate ABC's visited-domain count.
+                K_eff = int(min(_abc_get_split_depth(n_unsafe),
+                                 _abc_storage_depth, n_in_dim))
+                K_eff = max(K_eff, 1)
             else:
-                xl_t = rest_xl; xh_t = rest_xh; sub_idx_t = rest_si
+                K_eff = int(min(K_max,
+                                 int(nz_per_leaf.max().item()) if n_unsafe > 0 else 1,
+                                 n_in_dim))
+                K_eff = max(K_eff, 1)
+            # Smart Branching (SB) dim picker: rank dims by max-over-spec
+            # |lA[:,s,k]| · width[k]. SB picks the dim that contributes most
+            # to bound uncertainty — splitting it shrinks the bound the
+            # most, leading to faster verification. ABC uses this by default
+            # (branching.method=sb, sb_coeff_thresh=0.1). Width-only was a
+            # weaker fallback. lA is available on LiRPA path (clip_lA_list);
+            # falls back to width on zono path.
+            # Disable via env SB_BRANCHING=0.
+            import os as _os_sb
+            use_sb = (clip_lA_list and
+                      _os_sb.environ.get('SB_BRANCHING', '1') != '0')
+            if use_sb:
+                # ABC's SB score (input_split/branching_heuristics.py:88):
+                #   score[b,s,k] = max(|lA[b,s,k]|, 0.1) * width[k]/2 +
+                #                  (margin[b,s] - threshold(=0)) * sb_margin_weight
+                # Then amax over spec dim (s). The clamp(min=0.1) ensures
+                # wide dims with tiny lA still get scored; the margin term
+                # favors the spec CLOSEST to verification (largest margin).
+                lA_u = clip_lA[unsafe_idx]                         # (n_unsafe, S, K)
+                widths_in_K = (xh_b_c[unsafe_idx] - xl_b_c[unsafe_idx])  # (n_unsafe, K)
+                clip_margin = torch.stack(clip_margin_list, dim=1) # (B, S)
+                margin_u = clip_margin[unsafe_idx]                 # (n_unsafe, S)
+                lA_clamping_thresh = 0.1   # ABC default
+                sb_margin_weight = 1.0     # ABC default
+                # Per (leaf, spec, dim) score; broadcast margin across dims.
+                score_per_spec = (
+                    lA_u.abs().clamp(min=lA_clamping_thresh)
+                    * widths_in_K.unsqueeze(1) * 0.5
+                    + margin_u.unsqueeze(-1) * sb_margin_weight)   # (n_unsafe, S, K)
+                sb_score = score_per_spec.amax(dim=1)              # (n_unsafe, K)
+                # Map compressed-K → full n_in_dim via varying_mask.
+                varying_full_idx = varying_mask.nonzero(as_tuple=True)[0]
+                sb_full = torch.full((n_unsafe, n_in_dim), float('-inf'),
+                                      dtype=dtype, device=device)
+                sb_full[:, varying_full_idx] = sb_score
+                # Final zero-width mask (already -inf if outside varying).
+                sb_full = torch.where(widths_u > 1e-12, sb_full,
+                                       torch.full_like(sb_full, float('-inf')))
+                if _abc_match:
+                    # ABC ranks dims with topk(score, storage_depth) ONCE, then
+                    # the dynamic split uses the first get_split_depth(=K_eff)
+                    # of them. torch.topk's tie order depends on k, so ranking
+                    # at storage_depth (not K_eff) is required to reproduce
+                    # ABC's split_idx exactly (e.g. CUDA topk(.,4)=[249,235,..]
+                    # but topk(.,1)=[235] on a tie).
+                    _rank_k = min(_abc_storage_depth, sb_full.shape[1])
+                    top_k_dims = torch.topk(
+                        sb_full, _rank_k, dim=1).indices[:, :K_eff]
+                else:
+                    top_k_dims = torch.topk(sb_full, K_eff, dim=1).indices
+            else:
+                top_k_dims = torch.topk(widths_u, K_eff, dim=1).indices
+            xl_top = xl_u.gather(1, top_k_dims)
+            xh_top = xh_u.gather(1, top_k_dims)
+            mids = (xl_top + xh_top) * 0.5  # (n_unsafe, K)
+            # Mask: for each (leaf, k), True iff width is non-trivial.
+            usable = (xh_top - xl_top) > 1e-12  # (n_unsafe, K)
+            n_children = 1 << K_eff
+            combos = torch.arange(n_children, device=device)
+            bits = ((combos.unsqueeze(-1)
+                     >> torch.arange(K_eff, device=device)) & 1)  # (n_children, K)
+            xl_exp = xl_u.unsqueeze(1).expand(-1, n_children, -1).contiguous()
+            xh_exp = xh_u.unsqueeze(1).expand(-1, n_children, -1).contiguous()
+            leaf_ax = torch.arange(n_unsafe, device=device).unsqueeze(1).expand(
+                -1, n_children)
+            child_ax = combos.unsqueeze(0).expand(n_unsafe, -1)
+            for k in range(K_eff):
+                dim_idx_k = top_k_dims[:, k:k+1].expand(-1, n_children)
+                mid_k = mids[:, k:k+1].expand(-1, n_children)
+                usable_k = usable[:, k:k+1].expand(-1, n_children)
+                bit_k_2d = bits[:, k].unsqueeze(0).expand(n_unsafe, -1).bool()
+                # Only update where dim k is usable for this leaf.
+                hi_mask = bit_k_2d & usable_k
+                lo_mask = (~bit_k_2d) & usable_k
+                if hi_mask.any():
+                    xl_exp[leaf_ax[hi_mask], child_ax[hi_mask],
+                           dim_idx_k[hi_mask]] = mid_k[hi_mask]
+                if lo_mask.any():
+                    xh_exp[leaf_ax[lo_mask], child_ax[lo_mask],
+                           dim_idx_k[lo_mask]] = mid_k[lo_mask]
+            xl_new = xl_exp.reshape(-1, n_in_dim)
+            xh_new = xh_exp.reshape(-1, n_in_dim)
+            si_new = si_u.unsqueeze(1).expand(-1, n_children).reshape(-1)
+            # Post-split clip (ABC-style): apply clip to CHILDREN using
+            # parent's lA/lbias. Children's smaller box means clip's
+            # axis-aligned shrink can extract regions that didn't shrink
+            # on the parent's larger box. Per ABC's
+            # `batch_branch_and_bound.py:175` clip step happens AFTER split.
+            # Disable via env CLIP_AFTER_SPLIT=0.
+            import os as _os_cas
+            n_dropped_per_parent = torch.zeros(n_unsafe, dtype=torch.long,
+                                                device=device)
+            # Default off — tested on mscn_2048d_dual misses: net wash
+            # (+44 on 2890, -24 on 2260). The pre-split clip already
+            # captures most shrinking, and per-child clip just doubles
+            # clip work for similar bounds.
+            if (clip_lA_list and
+                    (_os_cas.environ.get('CLIP_AFTER_SPLIT', '0') != '0'
+                     or _abc_match)):
+                # Child clip uses the PARENT's lA/lbias repeated to children
+                # (clip_lA/clip_lbias built once above) — mirrors ABC reorder.
+                parent_idx_per_child = unsafe_idx[leaf_ax.reshape(-1)]
+                child_lA = clip_lA[parent_idx_per_child]
+                child_lbias = clip_lbias[parent_idx_per_child]
+                xl_new_c = xl_new[:, varying_mask]
+                xh_new_c = xh_new[:, varying_mask]
+                # ABC clip_iterations default = 1 (VC production uses 2).
+                _clip_iters = 1 if _abc_match else 2
+                xl_new_clipped, xh_new_clipped = _clip_input_domain(
+                    xl_new_c, xh_new_c, child_lA, child_lbias,
+                    num_iters=_clip_iters)
+                # Empty child = some dim has xl > xh after clipping = box
+                # is empty in that dim = whole region was provably verified.
+                child_empty = (xl_new_clipped > xh_new_clipped).any(dim=1)
+                xl_new[:, varying_mask] = xl_new_clipped
+                xh_new[:, varying_mask] = xh_new_clipped
+                # Count empty children per parent (used to adjust live count).
+                n_dropped_per_parent = (
+                    child_empty.reshape(n_unsafe, n_children).sum(dim=1))
+                # Filter out empty children from the next-iter queue.
+                if child_empty.any():
+                    keep_mask = ~child_empty
+                    xl_new = xl_new[keep_mask]
+                    xh_new = xh_new[keep_mask]
+                    si_new = si_new[keep_mask]
+            # Live-leaf accounting:
+            # Parent leaf was 1 entry, now becomes (n_children - n_dropped).
+            # Net change per parent: (n_children - n_dropped) - 1.
+            n_dropped_cpu = n_dropped_per_parent.cpu().tolist()
+            for pi, s_val in enumerate(si_u.tolist()):
+                net_delta = n_children - n_dropped_cpu[pi] - 1
+                live_leaves_per_sub[int(s_val)] += net_delta
+                if live_leaves_per_sub[int(s_val)] <= 0:
+                    live_leaves_per_sub[int(s_val)] = 0
+                    closed.add(int(s_val))
+            xl_t = torch.cat([rest_xl, xl_new], dim=0)
+            xh_t = torch.cat([rest_xh, xh_new], dim=0)
+            sub_idx_t = torch.cat([rest_si, si_new], dim=0)
         else:
             xl_t = rest_xl; xh_t = rest_xh; sub_idx_t = rest_si
+        if _phase_timing:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            _pt_end = time.perf_counter()
+            n_safe = int(leaf_safe_by_any_q.sum().item())
+            n_unsafe = B - n_safe
+            print(f'[bab-phase] iter={n_iters} B={B} verified={n_safe} unsafe={n_unsafe}  '
+                  f'bounding={(_pt_bounding-_pt_pickout)*1000:.1f}  '
+                  f'filtering={(_pt_filtering-_pt_bounding)*1000:.2f}  '
+                  f'clip={(_pt_clip-_pt_filtering)*1000:.2f}  '
+                  f'split={(_pt_end-_pt_clip)*1000:.2f}  '
+                  f'TOTAL={(_pt_end-_pt_iter_start)*1000:.1f}ms', flush=True)
         n_iters += 1
     if getattr(settings, 'print_progress', False):
         print(f'[multi-sub BAB] {n_iters} iters, {n_leaves_visited} leaves, '
@@ -8273,11 +8977,16 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
                     di: [(w_qs[qi], float(b_qs[qi]))
                           for qi, _, _ in disj_queries[di]]
                     for di in remaining_tri}
+                import gurobipy as _grb_jt
                 try:
                     closed_via_joint |= _joint_and_infeasible_triangle_lp(
                         gg['ops'], spec.x_lo, spec.x_hi, bbr,
                         qlists_for_tri)
-                except Exception:
+                except (RuntimeError, GurobiNumericTrouble,
+                        _grb_jt.GurobiError):
+                    # Joint triangle-LP failure: Gurobi numerical trouble
+                    # or builder runtime issue. Skip — opt-in pass, not
+                    # required for soundness.
                     pass
         if closed_via_joint:
             # Mark first query of each closed disjunct as positive
@@ -8442,8 +9151,11 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
                 score_per_col = score_per_col + (w @ G_in).abs()
             score_per_axis = np.zeros(xl.numel())
             score_per_axis[nz.cpu().numpy()] = score_per_col.cpu().numpy()
-    except Exception:
-        score_per_axis = None  # caller falls back to width-based score
+    except (RuntimeError, ValueError, IndexError):
+        # Sensitivity-score computation: torch runtime on degenerate
+        # tensors, ValueError on bad shape, IndexError if generators are
+        # empty. Caller falls back to width-based scoring (sound).
+        score_per_axis = None
 
     # Release GPU tensors held by sb / spec_ew before next leaf.
     # On deep BaB trees (15+ leaves on cifar_biasfield) the cached
@@ -8645,6 +9357,7 @@ def _milp_escalate_worker(args):
                 milp_set.add((L, int(j)))
     for ordered_queries in per_disj_queries:
         disj_closed = False
+        import gurobipy as _grb_sp
         for qw_np, qb_v in ordered_queries:
             try:
                 res, _, _ = _glp.solve_spec(
@@ -8655,7 +9368,9 @@ def _milp_escalate_worker(args):
                 if res == 'UNSAT':
                     disj_closed = True
                     break
-            except Exception:
+            except (_grb_sp.GurobiError, GurobiNumericTrouble):
+                # Gen-LP solve failure (numeric trouble or Gurobi internal
+                # error). Try next query; if all fail, disjunct stays open.
                 pass
         if not disj_closed:
             return (ci, False)
@@ -8746,7 +9461,9 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 xl_pgd, xh_pgd, spec, gg, settings, time_budget=pgd_budget)
             if pgd_sat and pgd_witness is not None:
                 return 'sat', {'phase': 'batched_pgd', 'witness': pgd_witness}
-        except Exception:
+        except (RuntimeError, torch.cuda.OutOfMemoryError):
+            # Phase-0 PGD: GPU runtime or OOM. SAT-finding is best-effort;
+            # fall through to the simpler PGD path below.
             pass
         # Also try the simpler multi-disjunct-aware PGD (verify_hybrid_acasxu
         # `_simple_pgd`): straight sign-gradient over the input box, no
@@ -8770,7 +9487,8 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 if sat_simple:
                     return 'sat', {'phase': 'batched_simple_pgd',
                                     'witness': w_simple}
-        except Exception:
+        except (RuntimeError, torch.cuda.OutOfMemoryError, ImportError):
+            # Simple-PGD: GPU runtime/OOM or missing hybrid_acasxu deps.
             pass
         # Last-resort: PGD via raw-ONNX interpreter. Catches models the
         # gpu_graph forward can't handle (transformer attention, etc.).
@@ -8787,7 +9505,9 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 if sat_or:
                     return 'sat', {'phase': 'batched_onnx_pgd',
                                     'witness': w_or}
-        except Exception:
+        except (RuntimeError, ImportError, OSError):
+            # ONNX PGD: ORT failure, missing deps, or bad path. Fall
+            # through to the regular BAB pipeline.
             pass
 
     # Find n_output (mirror `_input_split_fast_leaf`).
@@ -8835,17 +9555,112 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
     n_in = xl0.numel()
     worklist_xl = [xl0]
     worklist_xh = [xh0]
+    # Branch-aware SB precomputation: for parallel architectures
+    # (pensieve_big_parallel), our backward-CROWN lA underestimates the
+    # impact of input dims feeding parallel branches with non-linear
+    # downstream ops (pow, div_bilinear). ABC's SB picks ALL K splits in
+    # the single most-unstable branch; ours picks across branches and
+    # misses the high-impact one. Pre-compute a one-time dim → dominant-
+    # shallow-ReLU mapping (by halving each varying dim once at root and
+    # seeing which shallow ReLU's pre-activation width drops most). Then
+    # boost SB scores by `n_unstable_in_dominant_branch` so dims feeding
+    # the unstable-heavy branch outrank dims feeding stable branches.
+    _branch_boost = None  # (n_in,) per-dim multiplier; None disables
+    import os as _os_bb
+    # Exponent on the (1+n_unstable) boost. Default from settings (2.0 for
+    # the pensieve signature, 1.0 elsewhere); BRANCH_BOOST_EXP overrides.
+    _bb_exp = float(_os_bb.environ.get(
+        'BRANCH_BOOST_EXP',
+        str(getattr(settings, 'input_split_batched_branch_boost_exp', 1.0))))
+    if (bool(getattr(settings, 'input_split_batched_branch_boost', True))
+            and int(getattr(settings, 'bab_split_depth', 1)) > 1):
+        try:
+            _root_widths_per_var = (xh0 - xl0)
+            _varying_mask = _root_widths_per_var > 1e-9
+            _vary_idx = _varying_mask.nonzero(as_tuple=True)[0]
+            # Forward zono once at root (already cheap).
+            with torch.no_grad():
+                _sb_root, _ = _forward_zonotope_graph_batched(
+                    xl0.unsqueeze(0), xh0.unsqueeze(0), gg, device, dtype)
+                # Restrict to "shallow" relu layers (closer to input).
+                # Heuristic: layers with layer_idx in first half of relus.
+                _all_Ls = sorted(_sb_root.keys())
+                _shallow_cutoff = max(1, len(_all_Ls) // 2)
+                _shallow_Ls = _all_Ls[:_shallow_cutoff]
+                _root_w = {L: ((_sb_root[L][1][0] - _sb_root[L][0][0])
+                                 .mean().item())
+                            for L in _shallow_Ls}
+                # Per varying dim, find dominant shallow L.
+                _dim_to_L = {}
+                for _d_t in _vary_idx:
+                    _d = int(_d_t.item())
+                    _xh_h = xh0.clone()
+                    _xh_h[_d] = xl0[_d] + 0.5 * (xh0[_d] - xl0[_d])
+                    _sb_h, _ = _forward_zonotope_graph_batched(
+                        xl0.unsqueeze(0), _xh_h.unsqueeze(0), gg, device, dtype)
+                    _best_L = None; _best_delta = 1e-5
+                    for _L in _shallow_Ls:
+                        _new_w = ((_sb_h[_L][1][0] - _sb_h[_L][0][0])
+                                   .mean().item())
+                        _delta = _root_w[_L] - _new_w
+                        if _delta > _best_delta:
+                            _best_delta = _delta; _best_L = _L
+                    if _best_L is not None:
+                        _dim_to_L[_d] = _best_L
+                # n_unstable per shallow L at root.
+                _n_unst_per_L = {
+                    L: int(((_sb_root[L][0][0] < 0)
+                             & (_sb_root[L][1][0] > 0)).sum().item())
+                    for L in _shallow_Ls}
+                # Boost factor per dim: 1 + n_unstable_in_dominant_branch.
+                _branch_boost = torch.ones(n_in, dtype=dtype, device=device)
+                for _d, _L in _dim_to_L.items():
+                    _branch_boost[_d] = (
+                        1.0 + float(_n_unst_per_L.get(_L, 0))) ** _bb_exp
+                if bool(getattr(settings, 'print_progress', False)):
+                    print(f'[branch-boost] n_unstable per shallow L: '
+                          f'{_n_unst_per_L}', flush=True)
+                del _sb_root
+        except (RuntimeError, NotImplementedError):
+            _branch_boost = None
 
     n_leaves_visited = 0
     n_iters = 0
     n_open_at_timeout = 0
 
+    import os as _os_isb_dbg
+    _dbg_isb = (_os_isb_dbg.environ.get('DEBUG_INPUT_SPLIT_BATCHED', '') == '1')
+    # Per-phase profiler (bound / clip / split timing + closure counts).
+    # Gated by `settings.input_split_batched_phase_timing` (env
+    # VC_PHASE_TIMING forces it on for ad-hoc profiling). Every timing site
+    # is wrapped in `if _phase_timing`, so when OFF the only added cost is
+    # one boolean test per iteration — no perf_counter, sync, or dict work.
+    _phase_timing = (
+        bool(getattr(settings, 'input_split_batched_phase_timing', False))
+        or _os_isb_dbg.environ.get('VC_PHASE_TIMING', '') == '1')
+    _pt = ({'bound': 0.0, 'clip': 0.0, 'split': 0.0,
+            'crown_closed': 0, 'clip_closed': 0,
+            'clip_shrink_sum': 0.0, 'clip_shrink_n': 0}
+           if _phase_timing else None)
+    _pt_t0 = time.perf_counter() if _phase_timing else 0.0
+
+    def _pt_mark(key, t_ref):
+        # Only invoked from inside `if _phase_timing` guards.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _pt[key] += time.perf_counter() - t_ref
+        return time.perf_counter()
     while worklist_xl:
         if time.perf_counter() - t_start > total_budget - 0.5:
             n_open_at_timeout = len(worklist_xl)
             break
         # Pop a batch (LIFO — depth-first; cheap as Python list ops).
         B = min(batch_size, len(worklist_xl))
+        if _dbg_isb and (n_iters < 20 or n_iters % 50 == 0):
+            print(f'[is-batched] iter={n_iters} worklist={len(worklist_xl)} '
+                  f'B={B} leaves_visited={n_leaves_visited} '
+                  f't_elapsed={time.perf_counter()-t_start:.2f}s',
+                  flush=True)
         xl_list = worklist_xl[-B:]
         xh_list = worklist_xh[-B:]
         del worklist_xl[-B:]; del worklist_xh[-B:]
@@ -8853,6 +9668,10 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         xh_batch = torch.stack(xh_list)
 
         # Batched bound.
+        if _phase_timing:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _pt_tb = time.perf_counter()
         try:
             sb_b, _ = _forward_zonotope_graph_batched(
                 xl_batch, xh_batch, gg, device, dtype)
@@ -8930,7 +9749,10 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                     # Scatter back: spec_lbs_b[close_idx] = max(old, new)
                     spec_lbs_b[close_idx] = torch.maximum(
                         spec_lbs_b[close_idx], new_lbs_batch)
-                except Exception:
+                except (RuntimeError, torch.cuda.OutOfMemoryError):
+                    # α-CROWN inputsplit on boundary leaves: GPU runtime
+                    # or OOM. Keep prior spec_lbs_b — α-CROWN is an
+                    # opportunistic tightener, not load-bearing.
                     pass
                 disj_closed_masks = []
                 for di, q_idxs in disj_q_idx.items():
@@ -8939,6 +9761,8 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 all_disj_closed = torch.stack(
                     disj_closed_masks, dim=1).all(dim=1)
 
+        if _phase_timing:
+            _pt_ts = _pt_mark('bound', _pt_tb)
         unclosed = (~all_disj_closed).nonzero(as_tuple=True)[0]
         n_leaves_visited += B
         n_verified_by_crown_iter = int(all_disj_closed.sum().item())
@@ -9030,6 +9854,12 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                     inf_global = surviving[inf_s]
                     feasible_c[inf_global] = False
             n_verified_by_clip_iter = int((~feasible_c).sum().item())
+            if _phase_timing:
+                _wb = (xh_u - xl_u).clamp(min=0).sum()
+                _wa = (xh_c - xl_c).clamp(min=0).sum()
+                _pt['clip_shrink_sum'] += float(
+                    (_wa / _wb.clamp(min=1e-12)).item())
+                _pt['clip_shrink_n'] += 1
             # Only feasible-after-clip leaves continue to split.
             feasible_idx = feasible_c.nonzero(as_tuple=True)[0]
             if feasible_idx.numel() > 0:
@@ -9198,6 +10028,8 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                     if A_lin is not None and clip_enabled and feasible_idx.numel() > 0:
                         A_u = A_u[keep] if A_u.shape[0] == keep.shape[0] else A_u
 
+        if _phase_timing:
+            _pt_ts = _pt_mark('clip', _pt_ts)
         # SB (smart branching) axis selection — pick the dim that most
         # tightens the worst CROWN bound when split. Score_i = width_i ×
         # |A_q*[i]| where q* is the worst query (closest-to-zero lb).
@@ -9217,36 +10049,103 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                     A_split = A_u[feasible_idx]
                 else:
                     A_split = A_lin[unclosed]
-                # Per-leaf sensitivity: sum_q |A_q[i]| × width_i
+                # Per-leaf sensitivity: sum_q |A_q[i]| × width_i.
+                # Optional branch_boost (computed at init): boosts dims
+                # feeding the most-unstable shallow ReLU branch. Without
+                # this, backward-CROWN through pow/div_bilinear can
+                # underestimate L2-branch lA on pensieve_big_parallel and
+                # pick all 4 splits in less-unstable L0/L1/L3 branches,
+                # missing the bound improvement (mean -7.42 vs +0.16).
                 sens = A_split.abs().sum(dim=1).cpu()  # (B, n_in)
                 scores = widths * sens
+                if _branch_boost is not None:
+                    scores = scores * _branch_boost.cpu().unsqueeze(0)
                 ax = scores.argmax(dim=1)
             else:
                 ax = widths.argmax(dim=1)
+            import os as _os_split_dbg
+            if _os_split_dbg.environ.get('DEBUG_BAB_SPLIT', '') == '1':
+                for _i in range(min(xl_split.shape[0], 5)):
+                    _a = int(ax[_i].item())
+                    _xl = float(xl_split[_i, _a])
+                    _xh = float(xh_split[_i, _a])
+                    print(f'[bab-split] leaf={_i} split dim X_{_a} '
+                          f'(width={_xh-_xl:.4f}) at mid={(_xl+_xh)/2:.4f}',
+                          flush=True)
+            # K-dim simultaneous split — ABC-style. When the queue is
+            # small (< min_batch_size), grow it by splitting on top-K
+            # widest×sensitive dims per leaf at once → 2^K children.
+            # K=1 reproduces the historical single-widest-dim behavior.
+            # Adaptive K like ABC's `get_split_depth` would be better,
+            # but a fixed `bab_split_depth` is enough to test the
+            # hypothesis on pensieve_big_parallel (32 free dims → K=4
+            # gives 16 children per leaf, reaching depth-24 box volume
+            # in 6 iters instead of 24).
+            K_max = int(getattr(settings, 'bab_split_depth', 1))
+            # Pick top-K dims per leaf via the same width×sens score.
+            if K_max > 1 and sb_enabled and A_lin is not None:
+                top_k_dims = torch.topk(scores, K_max, dim=1).indices  # (B,K)
+            else:
+                top_k_dims = ax.unsqueeze(1)  # (B, 1)
+            K_eff = top_k_dims.shape[1]
+            top_k_dims_cpu = top_k_dims.cpu()
             xl_cpu = xl_split.cpu()
             xh_cpu = xh_split.cpu()
             n = xl_split.shape[0]
+            n_children = 1 << K_eff
             for i in range(n):
                 xl_i = xl_cpu[i]
                 xh_i = xh_cpu[i]
-                a = int(ax[i].item())
-                if float(widths[i, a]) < 1e-12:
+                # Which of the K dims actually have width > 0?
+                usable_k = []
+                mids_k = []
+                for k in range(K_eff):
+                    dk = int(top_k_dims_cpu[i, k].item())
+                    if float(xh_i[dk] - xl_i[dk]) > 1e-12:
+                        usable_k.append(dk)
+                        mids_k.append(float((xl_i[dk] + xh_i[dk]) / 2))
+                if not usable_k:
                     n_open_at_timeout += 1
                     continue
-                mid = float((xl_i[a] + xh_i[a]) / 2)
-                xh_a = xh_i.clone(); xh_a[a] = mid
-                xl_b_v = xl_i.clone(); xl_b_v[a] = mid
-                worklist_xl.append(xl_i.to(device, dtype=dtype))
-                worklist_xh.append(xh_a.to(device, dtype=dtype))
-                worklist_xl.append(xl_b_v.to(device, dtype=dtype))
-                worklist_xh.append(xh_i.to(device, dtype=dtype))
+                K_u = len(usable_k)
+                # Enumerate 2^K_u children.
+                for combo in range(1 << K_u):
+                    xl_c = xl_i.clone()
+                    xh_c = xh_i.clone()
+                    for k_idx, dk in enumerate(usable_k):
+                        if (combo >> k_idx) & 1:
+                            xl_c[dk] = mids_k[k_idx]  # high half
+                        else:
+                            xh_c[dk] = mids_k[k_idx]  # low half
+                    worklist_xl.append(xl_c.to(device, dtype=dtype))
+                    worklist_xh.append(xh_c.to(device, dtype=dtype))
             if len(worklist_xl) > max_worklist:
                 return 'unknown', {
                     'phase': 'batched_worklist_overflow',
                     'batched_n_leaves': n_leaves_visited,
                     'batched_n_iters': n_iters,
                     'worklist_size': len(worklist_xl)}
+        if _phase_timing:
+            _pt['crown_closed'] += n_verified_by_crown_iter
+            _pt['clip_closed'] += n_verified_by_clip_iter
+            _pt_ts = _pt_mark('split', _pt_ts)
         n_iters += 1
+
+    if _phase_timing:
+        _tot = time.perf_counter() - _pt_t0
+        _acct = _pt['bound'] + _pt['clip'] + _pt['split']
+        _shrink = (_pt['clip_shrink_sum'] / _pt['clip_shrink_n']
+                   if _pt['clip_shrink_n'] else float('nan'))
+        print(f'[vc-phase] BAB total={_tot:.2f}s | '
+              f"bound={_pt['bound']:.2f}s ({100*_pt['bound']/_tot:.0f}%) "
+              f"clip={_pt['clip']:.2f}s ({100*_pt['clip']/_tot:.0f}%) "
+              f"split={_pt['split']:.2f}s ({100*_pt['split']/_tot:.0f}%) "
+              f"other={_tot-_acct:.2f}s ({100*(_tot-_acct)/_tot:.0f}%) | "
+              f'iters={n_iters} leaves={n_leaves_visited}', flush=True)
+        print(f'[vc-phase] closures: crown={_pt["crown_closed"]} '
+              f'clip={_pt["clip_closed"]} | clip avg post/pre box-width '
+              f'ratio={_shrink:.4f} (1.0=no shrink) over '
+              f'{_pt["clip_shrink_n"]} clip-iters', flush=True)
 
     if not worklist_xl and n_open_at_timeout == 0:
         return 'verified', {
@@ -9335,8 +10234,10 @@ def _input_split_verify(graph, spec, settings, build_fn, impl):
             if pgd_sat and pgd_witness is not None:
                 return 'sat', {'phase': 'fast_leaf_pgd',
                                 'witness': pgd_witness}
-        except Exception:
-            pass  # PGD failure is non-fatal
+        except (RuntimeError, torch.cuda.OutOfMemoryError):
+            # Fast-leaf phase-0 PGD: GPU runtime/OOM. Non-fatal —
+            # falls through to per-leaf split.
+            pass
 
     def _run_node(s):
         remaining = total_budget - (time.perf_counter() - t_start)
@@ -9384,10 +10285,21 @@ def _input_split_verify(graph, spec, settings, build_fn, impl):
         return _run_pipeline(graph, s, sub, build_fn, impl)
 
     n_nodes = [0]
+    import os as _os_bab_dbg
+    _dbg_bab = (_os_bab_dbg.environ.get('DEBUG_INPUT_SPLIT_BAB', '') == '1')
+    _node_times = []  # (depth, wall, verdict)
+    _t0_bab = time.perf_counter()
 
     def _bab(s, depth):
         n_nodes[0] += 1
+        _t_node = time.perf_counter()
         r, d = _run_node(s)
+        _node_times.append((depth, time.perf_counter() - _t_node, r))
+        if _dbg_bab and (n_nodes[0] <= 30 or n_nodes[0] % 10 == 0):
+            print(f'[is-bab] node {n_nodes[0]} depth={depth} '
+                  f'wall={_node_times[-1][1]*1000:.0f}ms '
+                  f'r={r} t_elapsed={time.perf_counter()-_t0_bab:.1f}s',
+                  flush=True)
         if r in ('verified', 'sat'):
             return r, d
         # Per-leaf PGD on unknown sub-domains — sub-box is now localized,
@@ -9425,7 +10337,10 @@ def _input_split_verify(graph, spec, settings, build_fn, impl):
             try:
                 scores, _ = _score_input_axes(
                     graph, s, gg=fast_gg, device=fast_device, dtype=fast_dtype)
-            except Exception:
+            except (RuntimeError, KeyError, ValueError):
+                # Score-input-axes failure: GPU runtime, missing key in
+                # gpu_graph, or shape issue. Fall back to width-based
+                # axis picking (always correct, just less informed).
                 scores = (s.x_hi - s.x_lo).astype(float).flatten()
         widths = (s.x_hi - s.x_lo).astype(float).flatten()
         # Don't split an axis that has effectively zero width (avoids

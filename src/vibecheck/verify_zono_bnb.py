@@ -85,7 +85,8 @@ def _sigmoid_tanh_chord_parallelogram(lo, hi, act_kind):
     return alpha, beta, gamma
 
 
-def _reciprocal_linear_bounds(b_lo, b_hi, alpha_norm=None):
+def _reciprocal_linear_bounds(b_lo, b_hi, alpha_norm=None,
+                                skip_positivity_check=False):
     """Sound linear bounds for 1/b on [b_lo, b_hi] (b > 0).
 
     Returns `(slope_lb, const_lb, slope_ub, const_ub)` such that for
@@ -103,8 +104,13 @@ def _reciprocal_linear_bounds(b_lo, b_hi, alpha_norm=None):
         mid = b_lo + alpha_norm·(b_hi - b_lo). If None: midpoint.
     """
     import torch
-    assert bool((b_lo > 0).all()), (
-        f'_reciprocal_linear_bounds requires b > 0; got b_lo={b_lo}')
+    # `skip_positivity_check=True` skips the bool().item() GPU sync;
+    # caller is responsible for graph-static b > 0 invariant (e.g., mscn
+    # softmax denominators are always positive by construction). Needed
+    # for jit.trace / sync-free paths.
+    if not skip_positivity_check:
+        assert bool((b_lo > 0).all()), (
+            f'_reciprocal_linear_bounds requires b > 0; got b_lo={b_lo}')
     # Upper: chord with slope -1/(b_lo·b_hi).
     slope_ub = -1.0 / (b_lo * b_hi)
     const_ub = 1.0 / b_lo + 1.0 / b_hi  # since chord through (b_lo, 1/b_lo)
@@ -2785,13 +2791,40 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
         ew_at = {last_name: W_q.unsqueeze(0).expand(B, -1, -1).clone()}
         acc = b_q.unsqueeze(0).expand(B, -1).clone()  # (B, Q)
 
+    import os as _os_gdbg
+    _grad_dbg = _os_gdbg.environ.get('DEBUG_GRAD_FLOW', '') == '1'
+    _trace_dbg = _os_gdbg.environ.get('VIB_TRACE_BWD', '') == '1'
+    def _spec_lb_now(_ew_at, _acc):
+        """Compute current spec_lb assuming chain stops here: lb = acc +
+        sum over remaining ew_at of ew@x_bound. Concretize via worst-case
+        per-element box bound."""
+        tot = _acc.clone()
+        for _nm, _ev in _ew_at.items():
+            if _ev is None:
+                continue
+            # The bound on ew_at[input] @ x is computed at input dim
+            # for unprocessed ops. For arbitrary intermediate names we
+            # can't directly concretize (would need tight[L] for that op).
+            # Skip — only report acc here for trace.
+        return tot
     for op in reversed(ops):
         name = op['name']
         if name not in ew_at:
             continue
         ew = ew_at[name]  # (B, Q, n)
         t = op['type']
-
+        if _grad_dbg:
+            print(f'[grad] op={name} type={t} ew.requires_grad={ew.requires_grad} '
+                  f'acc.requires_grad={acc.requires_grad if isinstance(acc, torch.Tensor) else "N/A"}',
+                  flush=True)
+        if _trace_dbg:
+            # Sum |ew| over ew_at - rough measure of "remaining work"
+            _ew_total = sum(float(v.abs().sum()) for v in ew_at.values() if v is not None)
+            _ew_max = max(float(v.abs().max()) for v in ew_at.values() if v is not None)
+            print(f'[vib-trace] BEFORE op={name} type={t} '
+                  f'acc[0,0]={float(acc[0,0]):.6f} '
+                  f'ew_total={_ew_total:.4f} ew_max={_ew_max:.4f} '
+                  f'ew_at_name_shape={tuple(ew.shape)}', flush=True)
         if t == 'fc':
             W = op['W']
             bias = op['bias']
@@ -2874,8 +2907,14 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                 # bias-drop bugs fixed in `verify_milp.py`.
                 bias = op.get('bias')
                 if bias is not None:
-                    bt = torch.as_tensor(bias.flatten(),
-                                          dtype=dtype, device=device)
+                    # Lazy-cache torch conversion on op dict. Without this
+                    # we re-convert numpy → torch every BAB iter (76 calls
+                    # × 0.17ms = 13ms per spec_backward, biggest hotspot).
+                    bt = op.get('_bias_t_cached')
+                    if bt is None or bt.dtype != dtype or bt.device != device:
+                        bt = torch.as_tensor(bias.flatten(),
+                                              dtype=dtype, device=device)
+                        op['_bias_t_cached'] = bt
                     # Broadcast bias if smaller than ew's last dim
                     # (mscn pattern: bias (128,) over ew (B, Q, 256=
                     # 2 segments × 128) needs tile).
@@ -2901,8 +2940,11 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
         elif t == 'sub':
             bias = op.get('bias')
             if bias is not None:
-                bt = torch.as_tensor(bias.flatten(),
-                                      dtype=dtype, device=device)
+                bt = op.get('_bias_t_cached')
+                if bt is None or bt.dtype != dtype or bt.device != device:
+                    bt = torch.as_tensor(bias.flatten(),
+                                          dtype=dtype, device=device)
+                    op['_bias_t_cached'] = bt
                 # acc -= (ew * bt).sum over n
                 acc = acc - (ew * bt).sum(dim=-1)
             inp = op['inputs'][0]
@@ -2928,7 +2970,10 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
             if flat_idx is None or in_shape_nd is None:
                 raise ValueError("slice backward (batched) missing flat_idx/in_shape")
             n_in_layer = int(np.prod(in_shape_nd))
-            idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+            idx_t = op.get('_flat_idx_t_cached')
+            if idx_t is None or idx_t.device != device:
+                idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+                op['_flat_idx_t_cached'] = idx_t
             ew_back = torch.zeros(B, ew.shape[1], n_in_layer, dtype=dtype, device=device)
             ew_back.index_copy_(-1, idx_t, ew)
             inp = op['inputs'][0]
@@ -3574,6 +3619,27 @@ def _run_alpha_crown_inputsplit_batched(xl, xh, gg, spec_ew, device, dtype,
                 b_hi_t = b_hi.to(device=device, dtype=dtype)
                 a = torch.full_like(b_lo_t, 0.5).requires_grad_(True)
                 alpha_div_norm[op['name']] = (a, b_lo_t, b_hi_t)
+    # α-Mul (McCormick r_l, r_u) and α-Recip (b0 tangent point) for
+    # div_bilinear ops. Matches ABC's BoundReciprocal + BoundMul
+    # structural split (their MulHelper has 4-channel alpha; we use
+    # r_l, r_u — 2-channel — for our LB-only spec). Adam tunes per leaf
+    # per neuron. Default r=0.5 = "middle" interpolation == current
+    # static behavior.
+    # α-Mul (McCormick r_l, r_u) and α-Recip (b0 tangent point) were
+    # tried in this session — NO EFFECT for mscn. Measured grid sweep
+    # over r_l, r_u ∈ {0, 0.3, 0.5, 0.7, 1} on card_1_1 16-leaf split:
+    # all give same spec_lb to 1e-6 ulp. Reason: 5 of 6 div_bilinear ops
+    # in mscn have CONSTANT denominator (sum of constant-branch ReLUs);
+    # when b is constant McCormick degenerates to a single linear bound
+    # regardless of r. Only div 163 has perturbed b — its α gives ~1e-6
+    # spec movement. Adam can't escape the local optimum because
+    # gradient is effectively zero. The actual ABC mechanism that
+    # tightens to -0.053 is `compute_bounds(method='forward+crown')`:
+    # joint forward+backward α-opt that REFRESHES INTERMEDIATE BOUNDS
+    # per Adam iter. Vibe's α-CROWN uses static intermediates → caps at
+    # -0.082. Real fix needs joint-opt rewrite of _run_alpha_crown.
+    alpha_mccormick = {}
+    alpha_recip = {}
     # Push initial values into ops.
     for op_name, (a, lo_t, hi_t) in alpha_pow_norm.items():
         for op in gg['ops']:
@@ -3634,202 +3700,6 @@ def _run_alpha_crown_inputsplit_batched(xl, xh, gg, spec_ew, device, dtype,
             g['lr'] *= lr_decay
     return best_spec_lbs
 
-
-def _alpha_crown_layerwise_tighten(xl, xh, gg, device, dtype,
-                                     n_iters_per_layer=50, lr=0.25,
-                                     lr_decay=0.98, early_stop_eps=1e-6,
-                                     per_query_alpha=True, verbose=False):
-    """Per-layer α-CROWN intermediate-bound tightening.
-
-    For each ReLU layer L (in order), solve α-CROWN to tighten the
-    pre-ReLU bounds of layer L's neurons, using α optimization over the
-    UPSTREAM ReLU layers k < L. Update `tight[L]` with the elementwise
-    max/min of the previous and the newly computed bounds.
-
-    The tightened bounds at layer k cascade into layer k+1's
-    optimization (via `tight[k]` used for ReLU slopes in the backward).
-
-    Args:
-        xl, xh: (B, n_in) input bounds (B=1 for root use).
-        gg: gpu_graph dict.
-        n_iters_per_layer: Adam iters per layer.
-        lr, lr_decay: optimizer schedule (reset per layer).
-        verbose: if True, return a per-layer log.
-
-    Returns:
-        tight: {layer_idx: (lo, hi)} dict, each (B, n_layer), tightened.
-        log: list of dicts (only if verbose); one per layer.
-    """
-    B, n_in = xl.shape
-    with torch.no_grad():
-        sb_init, _ = _forward_zonotope_graph_batched(
-            xl, xh, gg, device, dtype)
-    tight = {L: (lo.clone(), hi.clone()) for L, (lo, hi) in sb_init.items()}
-    layer_order = sorted(tight.keys())
-
-    # Map layer_idx → ReLU op and its feed op (the linear/add producing
-    # pre-activations consumed by this ReLU).
-    relu_op_by_L = {}
-    for op in gg['ops']:
-        if op['type'] == 'relu' and 'layer_idx' in op:
-            relu_op_by_L[op['layer_idx']] = op
-
-    log = []
-    for L in layer_order:
-        relu_op = relu_op_by_L[L]
-        feed_name = relu_op['inputs'][0]
-        lo_old, hi_old = tight[L]
-        n_layer = lo_old.shape[1]
-        ust_before = ((lo_old < 0) & (hi_old > 0)).sum().item()
-
-        # Seed: 2*n_layer queries with W rows = +I (rows 0..n-1) and -I
-        # (rows n..2n-1). lb of +e_k gives new lb of y_L[k]; lb of -e_k
-        # gives -new_ub of y_L[k].
-        I = torch.eye(n_layer, dtype=dtype, device=device)
-        W_q = torch.cat([I, -I], dim=0)  # (2n, n_layer)
-        seed_ew = {feed_name: W_q.unsqueeze(0).expand(B, -1, -1)}
-        seed_acc = torch.zeros(B, 2 * n_layer, dtype=dtype, device=device)
-
-        # α params for layers k < L only (downstream layers not touched
-        # by this backward). Init to min-area slope. When per_query_alpha
-        # is True, α has shape (B, 2*n_layer, n_k) so each query gets
-        # its own α (closes the dual gap of shared-α; per-neuron α can
-        # reach the LP triangle bound).
-        Q = 2 * n_layer
-        alpha_at_layer = {}
-        for k in layer_order:
-            if k >= L:
-                break
-            lo_k, hi_k = tight[k]
-            _, up_s_k, _, _, _, unstable_k = _make_slopes(lo_k, hi_k)
-            init_alpha = ((up_s_k > 0.5).to(dtype) * unstable_k.to(dtype))
-            if per_query_alpha:
-                # broadcast (B, n_k) → (B, Q, n_k)
-                init_alpha = init_alpha.unsqueeze(1).expand(-1, Q, -1).contiguous()
-            alpha_at_layer[k] = (init_alpha.detach().clone()
-                                  .requires_grad_(True))
-
-        if alpha_at_layer:
-            optimizer = torch.optim.Adam(
-                [alpha_at_layer[k] for k in alpha_at_layer], lr=lr)
-        else:
-            optimizer = None
-
-        best_lbs = None
-        prev_max = -float('inf')
-        for it in range(max(1, n_iters_per_layer)):
-            if optimizer is not None:
-                optimizer.zero_grad()
-            spec_lbs = _spec_backward_graph_batched(
-                tight, xl, xh, gg, None, device, dtype,
-                alpha_at_layer=alpha_at_layer if alpha_at_layer else None,
-                seed_ew_at=seed_ew, seed_acc=seed_acc)
-            with torch.no_grad():
-                if best_lbs is None:
-                    best_lbs = spec_lbs.detach().clone()
-                else:
-                    best_lbs = torch.maximum(best_lbs, spec_lbs.detach())
-                # Sum-of-best — captures progress on ANY query, not
-                # just the worst. Using best.max saturates instantly
-                # when there are many independent queries (per-layer
-                # tightening = 2*n_layer queries).
-                curr_sig = float(best_lbs.sum().item())
-            if optimizer is None:
-                break
-            loss = -spec_lbs.sum()
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                for k in alpha_at_layer:
-                    alpha_at_layer[k].clamp_(0.0, 1.0)
-            if it > 0 and curr_sig - prev_max < early_stop_eps:
-                break
-            prev_max = curr_sig
-            for g in optimizer.param_groups:
-                g['lr'] *= lr_decay
-
-        # best_lbs[:, :n_layer] = new_lo; best_lbs[:, n_layer:] = -new_hi.
-        with torch.no_grad():
-            new_lo = best_lbs[:, :n_layer]
-            new_hi = -best_lbs[:, n_layer:]
-            lo_t = torch.maximum(lo_old, new_lo)
-            hi_t = torch.minimum(hi_old, new_hi)
-            # Numerical safety: keep lo <= hi.
-            lo_t = torch.minimum(lo_t, hi_t)
-        tight[L] = (lo_t, hi_t)
-
-        if verbose:
-            ust_after = ((lo_t < 0) & (hi_t > 0)).sum().item()
-            log.append({
-                'layer': L,
-                'n_layer': n_layer,
-                'ust_before': ust_before,
-                'ust_after': ust_after,
-                'iters': it + 1,
-            })
-
-    if verbose:
-        return tight, log
-    return tight
-
-
-def _alpha_crown_layerwise_tighten_chunked(xl, xh, gg, device, dtype,
-                                              chunk_size=512,
-                                              min_chunk_size=8,
-                                              **kwargs):
-    """OOM-resilient chunked wrapper around
-    `_alpha_crown_layerwise_tighten`.
-
-    Splits the input batch into chunks of `chunk_size`, runs the tighten
-    on each chunk separately, and concatenates results. On
-    `torch.cuda.OutOfMemoryError`, halves `chunk_size` and retries until
-    either the chunk succeeds or `min_chunk_size` is reached.
-
-    Empirically (acasxu 6×50, RTX 3080 10 GB): peak throughput at
-    chunk≈512 (~168 leaves/sec) with per-query α; larger chunks add no
-    throughput but consume memory. Default 512.
-
-    Args:
-        xl, xh: (B, n_in) input bounds — any B.
-        chunk_size: target chunk size; auto-halves on OOM.
-        min_chunk_size: floor; raises if reached without success.
-        **kwargs: forwarded to `_alpha_crown_layerwise_tighten`.
-
-    Returns:
-        tight: {layer_idx: (lo, hi)} concatenated along batch dim.
-        (No `verbose` log return — inner verbose is ignored.)
-    """
-    kwargs.pop('verbose', None)  # log doesn't compose across chunks
-    B = xl.shape[0]
-    out_tight = None
-    i = 0
-    cur_chunk = max(1, min(int(chunk_size), B))
-    while i < B:
-        end = min(i + cur_chunk, B)
-        chunk_xl = xl[i:end]
-        chunk_xh = xh[i:end]
-        try:
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-            t = _alpha_crown_layerwise_tighten(
-                chunk_xl, chunk_xh, gg, device, dtype, **kwargs)
-            # accumulate
-            if out_tight is None:
-                out_tight = {L: ([lo], [hi]) for L, (lo, hi) in t.items()}
-            else:
-                for L, (lo, hi) in t.items():
-                    out_tight[L][0].append(lo)
-                    out_tight[L][1].append(hi)
-            i = end
-        except torch.cuda.OutOfMemoryError:
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-            if cur_chunk <= min_chunk_size:
-                raise
-            cur_chunk = max(min_chunk_size, cur_chunk // 2)
-    # concat
-    return {L: (torch.cat(los, dim=0), torch.cat(his, dim=0))
-             for L, (los, his) in out_tight.items()}
 
 
 @torch.no_grad()

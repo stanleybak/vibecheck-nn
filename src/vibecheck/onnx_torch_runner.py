@@ -237,7 +237,8 @@ def pgd_via_onnx(onnx_path, spec, n_restarts=256, n_iter=100, lr=0.1,
             model_s, ok = onnxsim.simplify(model)
             if ok:
                 model = model_s
-        except Exception:
+        except (ImportError, RuntimeError):
+            # onnxsim absent or failed; fall back to unsimplified model.
             pass
     device = device or (torch.device('cuda') if torch.cuda.is_available()
                         else torch.device('cpu'))
@@ -257,7 +258,12 @@ def pgd_via_onnx(onnx_path, spec, n_restarts=256, n_iter=100, lr=0.1,
                 try:
                     y0 = onnx_forward(model, xl.reshape(1, *_infer_input_shape(model)),
                                        device=device, dtype=dtype)
-                except Exception:
+                except (RuntimeError, ValueError):
+                    # RuntimeError: shape inferred from ONNX metadata didn't
+                    # match the runtime input (e.g. dynamic batch dim).
+                    # ValueError: reshape size mismatch. Both indicate the
+                    # input shape probe failed — fall back to flat-vector
+                    # shape which works for fully-connected nets.
                     y0 = onnx_forward(model, xl.unsqueeze(0), device=device, dtype=dtype)
                 n_out = int(y0.numel())
         W = torch.zeros(n_c, n_out, dtype=dtype, device=device)

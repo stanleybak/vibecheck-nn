@@ -836,7 +836,9 @@ def _solve_neuron(args):
     bound = None
     try:
         bound = model.ObjBound
-    except Exception:
+    except (grb.GurobiError, AttributeError):
+        # ObjBound is unavailable when no LP root relaxation has produced
+        # a bound (e.g. infeasible or pre-solve abort); fall back to incumbent.
         if model.SolCount > 0:
             bound = model.ObjVal
 
@@ -996,7 +998,7 @@ def _solve_neuron_both(args):
         any_timeout = True
     try:
         b = model.ObjBound
-    except Exception:
+    except (grb.GurobiError, AttributeError):
         b = model.ObjVal if model.SolCount > 0 else None
     if b is not None:
         if first == grb.GRB.MINIMIZE:
@@ -1022,7 +1024,7 @@ def _solve_neuron_both(args):
         any_timeout = True
     try:
         b = model.ObjBound
-    except Exception:
+    except (grb.GurobiError, AttributeError):
         b = model.ObjVal if model.SolCount > 0 else None
     if b is not None:
         if second == grb.GRB.MINIMIZE:
@@ -1947,7 +1949,7 @@ def _tighten_neuron_graph(args):
         optimize_checked(m)
         try:
             b = m.ObjBound
-        except Exception:
+        except (grb.GurobiError, AttributeError):
             b = None
         if b is not None:
             if m.ModelSense == 1:
@@ -1966,7 +1968,7 @@ def _tighten_neuron_graph(args):
             optimize_checked(m)
             try:
                 b = m.ObjBound
-            except Exception:
+            except (grb.GurobiError, AttributeError):
                 b = None
             if b is not None:
                 if m.ModelSense == 1:
@@ -2258,7 +2260,9 @@ def _solve_spec_graph_worker(args):
                         z_val = prev[j].X if prev[j] is not None else 0
                         frac = abs(a_val - max(0.0, z_val))
                         scores[(li, j)] = frac
-                    except Exception:
+                    except (grb.GurobiError, AttributeError):
+                        # .X unavailable when no MIP feasible solution exists;
+                        # skip scoring this unstable ReLU.
                         pass
         m.dispose(); env.dispose()
         return 'SCORED', dt, scores

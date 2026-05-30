@@ -94,7 +94,18 @@ CASES = [
              'softmax-clamp + input-split)',
         net='onnx/pensieve_big_parallel.onnx',
         vnnlib='vnnlib/pensieve_parallel_83.vnnlib',
-        expected='verified', timeout=140, max_wall_s=140.0,
+        # Was 140s pre branching-fix; ~4.8s with K=2 + branch_boost_exp=2.0.
+        # Tightened so a revert of either knob (→ ~90s) is caught.
+        expected='verified', timeout=140, max_wall_s=20.0,
+    ),
+    dict(
+        desc='nn4sys pensieve_big_parallel_56 '
+             '(UNSAT, regression guard for the branching fix: K=2 + '
+             'branch_boost_exp=2.0 → 169 leaves / ~4s; reverting either knob '
+             'blows up to 33k-56k leaves / 27-42s, tripping max_wall_s)',
+        net='onnx/pensieve_big_parallel.onnx',
+        vnnlib='vnnlib/pensieve_parallel_56.vnnlib',
+        expected='verified', timeout=60, max_wall_s=15.0,
     ),
 ]
 

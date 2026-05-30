@@ -337,12 +337,28 @@ def _batched_eval_box(A_lo, b_lo, A_up, b_up, xl_b, xh_b):
 
     A_lo: (B, n_out, n_in), b_lo: (B, n_out), xl_b/xh_b: (B, n_in).
     Returns (out_lo, out_hi) each shape (B, n_out).
+
+    Uses Mid/Halfdiff identity to do 2 matmuls instead of 4:
+      A @ Mid - |A| @ Halfdiff = A_pos @ xl + A_neg @ xh
+      A @ Mid + |A| @ Halfdiff = A_pos @ xh + A_neg @ xl
+    When A_lo and A_up share storage (tight upstream bound), 2 matmuls suffice
+    for BOTH out_lo and out_hi.
     """
-    A_lo_pos = A_lo.clamp(min=0); A_lo_neg = A_lo.clamp(max=0)
-    A_up_pos = A_up.clamp(min=0); A_up_neg = A_up.clamp(max=0)
-    xl_e = xl_b.unsqueeze(-1); xh_e = xh_b.unsqueeze(-1)
-    out_lo = (A_lo_pos @ xl_e + A_lo_neg @ xh_e).squeeze(-1) + b_lo
-    out_hi = (A_up_pos @ xh_e + A_up_neg @ xl_e).squeeze(-1) + b_up
+    xmid = (xl_b + xh_b) * 0.5
+    xhalf = (xh_b - xl_b) * 0.5
+    xmid_e = xmid.unsqueeze(-1); xhalf_e = xhalf.unsqueeze(-1)
+    if A_lo is A_up and b_lo is b_up:
+        A_mid_v = (A_lo @ xmid_e).squeeze(-1)
+        A_amp_v = (A_lo.abs() @ xhalf_e).squeeze(-1)
+        out_lo = A_mid_v - A_amp_v + b_lo
+        out_hi = A_mid_v + A_amp_v + b_lo
+        return out_lo, out_hi
+    lo_mid = (A_lo @ xmid_e).squeeze(-1)
+    lo_amp = (A_lo.abs() @ xhalf_e).squeeze(-1)
+    up_mid = (A_up @ xmid_e).squeeze(-1)
+    up_amp = (A_up.abs() @ xhalf_e).squeeze(-1)
+    out_lo = lo_mid - lo_amp + b_lo
+    out_hi = up_mid + up_amp + b_up
     return out_lo, out_hi
 
 
@@ -355,8 +371,41 @@ class _BBound:
         self.lo_box = lo_box; self.hi_box = hi_box
 
 
+def _bpki_gemm(W, A):
+    """Compute einsum('jk,bpki->bpji', W, A) as a SINGLE GEMM.
+
+    W is (j, k); A is (B, P, k, i). The contraction is over k, and W is shared
+    across the (B, P, i) "batch" — so the natural `torch.einsum`/`W @ A` lowers
+    to a broadcast `bmm` (B*P skinny matmuls, each re-reading the full W). For
+    mscn's tall-skinny FC weights (e.g. W=2048x6144) against a thin A (i small)
+    this is ~18x slower than folding (B,P,i) into one GEMM dimension and reading
+    W once. Mathematically identical (fp64: ~1e-12; fp32: reassociation noise,
+    same order as a cutlass GEMM — which is what α,β-CROWN uses anyway).
+    """
+    Bd, Pd, kd, idim = A.shape
+    A2 = A.permute(2, 0, 1, 3).reshape(kd, Bd * Pd * idim)   # (k, B*P*i)
+    O = (W @ A2).reshape(W.shape[0], Bd, Pd, idim)           # (j, B, P, i)
+    return O.permute(1, 2, 0, 3).contiguous()                # (B, P, j, i)
+
+
+def _bnm_gemm(W, AB):
+    """Compute `W @ AB` (W shared across batch) as a SINGLE GEMM.
+
+    W is (j, k); AB is (B, k, m). `W @ AB` broadcasts W to (B,j,k) and runs a
+    `bmm` (B skinny matmuls re-reading W). For mscn's tall FC weights this is
+    ~18x slower than folding (B, m) into one GEMM dim. Same math (fp64 ~1e-12).
+    """
+    Bd, kd, m = AB.shape
+    AB2 = AB.permute(1, 0, 2).reshape(kd, Bd * m)            # (k, B*m)
+    O = (W @ AB2).reshape(W.shape[0], Bd, m)                 # (j, B, m)
+    return O.permute(1, 0, 2).contiguous()                   # (B, j, m)
+
+
 def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
-                                    free_states=False):
+                                    free_states=False,
+                                    forced_varying_mask=None,
+                                    forced_K=None,
+                                    skip_bilinear_is_pt_check=False):
     """Batched LiRPA forward.
 
     Args:
@@ -405,9 +454,21 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
     # in our memory. Dropping them is exact (they multiply x by 0 in
     # `_batched_eval_box`). For mscn cardinality with 1-2 varying dims
     # out of 308 this shrinks per-leaf A by 150×.
-    radii = (xh_b - xl_b) / 2
-    varying_mask = (radii.abs().max(dim=0).values > 0)  # (n_in,)
-    K = int(varying_mask.sum())
+    if forced_varying_mask is not None:
+        varying_mask = forced_varying_mask
+    else:
+        radii = (xh_b - xl_b) / 2
+        varying_mask = (radii.abs().max(dim=0).values > 0)  # (n_in,)
+    # K is a Python int that controls A-matrix shape. int(tensor) is a
+    # GPU sync (and a torch.jit.trace constant-bake). Hot callers can
+    # precompute K and pass it via forced_K to skip the sync.
+    if forced_K is not None:
+        K = forced_K
+    else:
+        K = int(varying_mask.sum())
+    # Expose for callers that need to remap compressed A back to full input
+    # dims (e.g. spec eval inside BaB needs xl_b[:, mask] / xh_b[:, mask]).
+    batched_forward_linear_bounds.last_varying_mask = varying_mask
     if K == n_in or K == 0:
         # No compression possible / nothing to do.
         A_id = torch.eye(n_in, dtype=dtype, device=device).unsqueeze(0).expand(
@@ -431,7 +492,8 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
         xl_eval = xl_b
         xh_eval = xh_b
     state = {gg['input_name']: _BBound(
-        A_id, b_zero, A_id.clone(), b_zero.clone(), xl_b.clone(), xh_b.clone())}
+        A_id, b_zero, A_id.clone(), b_zero.clone(),
+        xl_b.clone(), xh_b.clone())}
     def _maybe_free(op_input_names):
         if not free_states:
             return
@@ -442,9 +504,16 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                     bd = state[inp]
                     interm_box[inp] = (bd.lo_box.clone(), bd.hi_box.clone())
                 del state[inp]
+    import os as _osot, time as _tos
+    _osot_on = _osot.environ.get('DUMP_OPTIME_FLP', '') == '1'
+    _optime = {}
+    _opcount = {}
     for op in gg['ops']:
         name = op['name']; t = op['type']; ins = op['inputs']
         bound_in = state.get(ins[0]) if ins else None
+        if _osot_on:
+            torch.cuda.synchronize()
+            _t0 = _tos.perf_counter()
         if t == 'reshape':
             state[name] = bound_in
         elif t in ('slice', 'gather'):
@@ -454,8 +523,10 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             b_lo_o = bound_in.b_lo.index_select(1, idx_t)
             A_up_o = bound_in.A_up.index_select(1, idx_t)
             b_up_o = bound_in.b_up.index_select(1, idx_t)
-            lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
+            # Box bounds are just a permutation of input box bounds —
+            # no need to re-evaluate from A/b.
+            lo_box = bound_in.lo_box.index_select(1, idx_t)
+            hi_box = bound_in.hi_box.index_select(1, idx_t)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'concat':
             bounds = [state[i] for i in ins]
@@ -463,13 +534,25 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             b_lo_o = torch.cat([b.b_lo for b in bounds], dim=1)
             A_up_o = torch.cat([b.A_up for b in bounds], dim=1)
             b_up_o = torch.cat([b.b_up for b in bounds], dim=1)
-            lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
+            # Box bounds are just the concat of input box bounds.
+            lo_box = torch.cat([b.lo_box for b in bounds], dim=1)
+            hi_box = torch.cat([b.hi_box for b in bounds], dim=1)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'fc':
-            W = op['W'].to(device=device, dtype=dtype)
-            bias = op['bias'].to(device=device, dtype=dtype)
+            W = op['W']
+            bias = op['bias']
+            # Cache |W| on the op dict — reused every batch.
+            W_abs = op.get('W_abs')
+            if W_abs is None:
+                W_abs = W.abs()
+                op['W_abs'] = W_abs
             in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            # If incoming bounds are tight (A_lo == A_up, b_lo == b_up — common
+            # before any activation) we only need ONE matmul instead of four.
+            # Use object-identity check (state machinery shares the tensor
+            # when no relaxation has been introduced) — a fast no-op test.
+            tight = (bound_in.A_lo is bound_in.A_up and
+                     bound_in.b_lo is bound_in.b_up)
             if (in_shape_nd is not None and len(in_shape_nd) >= 2
                     and W.shape[1] == in_shape_nd[-1]):
                 # ND batched matmul: (B, prefix*n_in_inner, n_in) →
@@ -480,33 +563,62 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 n_out_inner = W.shape[0]
                 # Reshape A to (B, prefix_size, n_in_inner, n_input)
                 A_lo_p = bound_in.A_lo.reshape(B, prefix_size, n_in_inner, -1)
-                A_up_p = bound_in.A_up.reshape(B, prefix_size, n_in_inner, -1)
                 b_lo_p = bound_in.b_lo.reshape(B, prefix_size, n_in_inner)
-                b_up_p = bound_in.b_up.reshape(B, prefix_size, n_in_inner)
-                W_pos = W.clamp(min=0); W_neg = W.clamp(max=0)
-                # Per-batch per-prefix: einsum 'jk,bpki->bpji'
-                A_lo_o_nd = (torch.einsum('jk,bpki->bpji', W_pos, A_lo_p)
-                              + torch.einsum('jk,bpki->bpji', W_neg, A_up_p))
-                A_up_o_nd = (torch.einsum('jk,bpki->bpji', W_pos, A_up_p)
-                              + torch.einsum('jk,bpki->bpji', W_neg, A_lo_p))
-                b_lo_o_nd = (torch.einsum('jk,bpk->bpj', W_pos, b_lo_p)
-                              + torch.einsum('jk,bpk->bpj', W_neg, b_up_p) + bias)
-                b_up_o_nd = (torch.einsum('jk,bpk->bpj', W_pos, b_up_p)
-                              + torch.einsum('jk,bpk->bpj', W_neg, b_lo_p) + bias)
+                if tight:
+                    A_o_nd = _bpki_gemm(W, A_lo_p)
+                    b_o_nd = torch.einsum('jk,bpk->bpj', W, b_lo_p) + bias
+                    A_lo_o_nd = A_o_nd; A_up_o_nd = A_o_nd
+                    b_lo_o_nd = b_o_nd; b_up_o_nd = b_o_nd
+                else:
+                    A_up_p = bound_in.A_up.reshape(B, prefix_size, n_in_inner, -1)
+                    b_up_p = bound_in.b_up.reshape(B, prefix_size, n_in_inner)
+                    # Mid/Halfdiff trick — 2 matmuls per A_lo/A_up pair.
+                    A_mid = (A_lo_p + A_up_p) * 0.5
+                    A_half = (A_up_p - A_lo_p) * 0.5
+                    b_mid = (b_lo_p + b_up_p) * 0.5
+                    b_half = (b_up_p - b_lo_p) * 0.5
+                    A_mid_o = _bpki_gemm(W, A_mid)
+                    A_amp = _bpki_gemm(W_abs, A_half)
+                    b_mid_o = torch.einsum('jk,bpk->bpj', W, b_mid) + bias
+                    b_amp = torch.einsum('jk,bpk->bpj', W_abs, b_half)
+                    A_lo_o_nd = A_mid_o - A_amp
+                    A_up_o_nd = A_mid_o + A_amp
+                    b_lo_o_nd = b_mid_o - b_amp
+                    b_up_o_nd = b_mid_o + b_amp
                 A_lo_o = A_lo_o_nd.reshape(B, prefix_size * n_out_inner, -1)
                 A_up_o = A_up_o_nd.reshape(B, prefix_size * n_out_inner, -1)
                 b_lo_o = b_lo_o_nd.reshape(B, -1)
                 b_up_o = b_up_o_nd.reshape(B, -1)
             else:
-                W_pos = W.clamp(min=0); W_neg = W.clamp(max=0)
-                # W: (n_out, n_in). A_lo: (B, n_in, n_input).
-                # W @ A_lo: (B, n_out, n_input) via broadcasting.
-                A_lo_o = W_pos @ bound_in.A_lo + W_neg @ bound_in.A_up
-                A_up_o = W_pos @ bound_in.A_up + W_neg @ bound_in.A_lo
-                b_lo_o = (bound_in.b_lo @ W_pos.T + bound_in.b_up @ W_neg.T
-                          + bias)
-                b_up_o = (bound_in.b_up @ W_pos.T + bound_in.b_lo @ W_neg.T
-                          + bias)
+                if tight:
+                    # Fuse A and b into a single matmul:
+                    #   AB = cat([A_lo, b_lo[..., None]], dim=-1)   (B, n_in, n_input+1)
+                    #   W @ AB → A_out, b_out + bias
+                    AB = torch.cat([bound_in.A_lo,
+                                     bound_in.b_lo.unsqueeze(-1)], dim=-1)
+                    AB_o = _bnm_gemm(W, AB)
+                    A_o = AB_o[..., :-1]
+                    b_o = AB_o[..., -1] + bias
+                    A_lo_o = A_o; A_up_o = A_o
+                    b_lo_o = b_o; b_up_o = b_o
+                else:
+                    # Mid/Halfdiff fused with bias column: 2 matmuls.
+                    A_mid = (bound_in.A_lo + bound_in.A_up) * 0.5
+                    A_half = (bound_in.A_up - bound_in.A_lo) * 0.5
+                    b_mid = (bound_in.b_lo + bound_in.b_up) * 0.5
+                    b_half = (bound_in.b_up - bound_in.b_lo) * 0.5
+                    AB_mid = torch.cat([A_mid, b_mid.unsqueeze(-1)], dim=-1)
+                    AB_half = torch.cat([A_half, b_half.unsqueeze(-1)], dim=-1)
+                    AB_mid_o = _bnm_gemm(W, AB_mid)
+                    AB_amp = _bnm_gemm(W_abs, AB_half)
+                    A_mid_o = AB_mid_o[..., :-1]
+                    A_amp = AB_amp[..., :-1]
+                    b_mid_o = AB_mid_o[..., -1] + bias
+                    b_amp = AB_amp[..., -1]
+                    A_lo_o = A_mid_o - A_amp
+                    A_up_o = A_mid_o + A_amp
+                    b_lo_o = b_mid_o - b_amp
+                    b_up_o = b_mid_o + b_amp
             lo_box, hi_box = _batched_eval_box(
                 A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
@@ -675,8 +787,17 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             b_lo_b_o = (ones_out * bound_b.b_lo.reshape(B, *sh_in[1])).reshape(B, -1)
             b_up_b_o = (ones_out * bound_b.b_up.reshape(B, *sh_in[1])).reshape(B, -1)
             # Per-element check: which side is a point (zero radius).
-            a_is_pt = ((a_hi_o - a_lo_o).abs() < 1e-12).all(dim=1).all().item()
-            b_is_pt = ((b_hi_o2 - b_lo_o2).abs() < 1e-12).all(dim=1).all().item()
+            # `skip_bilinear_is_pt_check=True` (set by sync-free callers
+            # for jit.trace / CUDA-graph paths) forces the McCormick
+            # branch unconditionally. Sound: at r=0.5 McCormick collapses
+            # to the exact linear form when one side is constant
+            # (alpha = (b_lo+b_hi)/2 = b when b_lo==b_hi, gamma cancels).
+            if skip_bilinear_is_pt_check:
+                a_is_pt = False
+                b_is_pt = False
+            else:
+                a_is_pt = ((a_hi_o - a_lo_o).abs() < 1e-12).all(dim=1).all().item()
+                b_is_pt = ((b_hi_o2 - b_lo_o2).abs() < 1e-12).all(dim=1).all().item()
             if b_is_pt:
                 b_const = b_lo_o2
                 b_pos = b_const.clamp(min=0); b_neg = b_const.clamp(max=0)
@@ -701,38 +822,34 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 # blew up width through downstream FC layers.
                 # LB envelope: y >= alpha_l*a + beta_l*b + gamma_l
                 # UB envelope: y <= alpha_u*a + beta_u*b + gamma_u
-                r_l = 0.5
-                r_u = 0.5
-                alpha_l = (b_lo_o2 - b_hi_o2) * r_l + b_hi_o2
-                beta_l = (a_lo_o - a_hi_o) * r_l + a_hi_o
-                gamma_l = (b_hi_o2 * a_hi_o - b_lo_o2 * a_lo_o) * r_l - b_hi_o2 * a_hi_o
-                alpha_u = (b_hi_o2 - b_lo_o2) * r_u + b_lo_o2
-                beta_u = (a_lo_o - a_hi_o) * r_u + a_hi_o
-                gamma_u = (b_lo_o2 * a_hi_o - b_hi_o2 * a_lo_o) * r_u - b_lo_o2 * a_hi_o
-                # Substitute a's and b's linear bounds into envelopes.
-                # For alpha_l*a contrib to LB: when alpha_l>0 use a.A_lo
-                # (lower bound on a); when alpha_l<0 use a.A_up.
-                alpha_l_p = alpha_l.clamp(min=0).unsqueeze(-1)
-                alpha_l_n = alpha_l.clamp(max=0).unsqueeze(-1)
-                beta_l_p = beta_l.clamp(min=0).unsqueeze(-1)
-                beta_l_n = beta_l.clamp(max=0).unsqueeze(-1)
-                alpha_u_p = alpha_u.clamp(min=0).unsqueeze(-1)
-                alpha_u_n = alpha_u.clamp(max=0).unsqueeze(-1)
-                beta_u_p = beta_u.clamp(min=0).unsqueeze(-1)
-                beta_u_n = beta_u.clamp(max=0).unsqueeze(-1)
-                A_lo_o = (alpha_l_p * A_lo_a_o + alpha_l_n * A_up_a_o
-                          + beta_l_p * A_lo_b_o + beta_l_n * A_up_b_o)
-                b_lo_o = (alpha_l.clamp(min=0) * b_lo_a_o
-                          + alpha_l.clamp(max=0) * b_up_a_o
-                          + beta_l.clamp(min=0) * b_lo_b_o
-                          + beta_l.clamp(max=0) * b_up_b_o
+                # McCormick LB/UB envelope at r_l = r_u = 0.5 (matches
+                # ABC's BoundMul.bound_forward_both_perturbed with the
+                # 'middle' MulHelper.interpolated_relaxation option).
+                # At r=0.5 the slope params collapse to midpoints
+                # (alpha_l == alpha_u == (b_lo+b_hi)/2; same for beta).
+                # Gamma_l / gamma_u still differ. Slopes computed once,
+                # clamps shared across LB/UB substitutions.
+                alpha = (b_lo_o2 + b_hi_o2) * 0.5
+                beta = (a_lo_o + a_hi_o) * 0.5
+                gamma_l = -0.5 * (b_hi_o2 * a_hi_o + b_lo_o2 * a_lo_o)
+                gamma_u = -0.5 * (b_lo_o2 * a_hi_o + b_hi_o2 * a_lo_o)
+                alpha_p = alpha.clamp(min=0)
+                alpha_n = alpha.clamp(max=0)
+                beta_p = beta.clamp(min=0)
+                beta_n = beta.clamp(max=0)
+                alpha_p_u = alpha_p.unsqueeze(-1)
+                alpha_n_u = alpha_n.unsqueeze(-1)
+                beta_p_u = beta_p.unsqueeze(-1)
+                beta_n_u = beta_n.unsqueeze(-1)
+                A_lo_o = (alpha_p_u * A_lo_a_o + alpha_n_u * A_up_a_o
+                          + beta_p_u * A_lo_b_o + beta_n_u * A_up_b_o)
+                b_lo_o = (alpha_p * b_lo_a_o + alpha_n * b_up_a_o
+                          + beta_p * b_lo_b_o + beta_n * b_up_b_o
                           + gamma_l)
-                A_up_o = (alpha_u_n * A_lo_a_o + alpha_u_p * A_up_a_o
-                          + beta_u_n * A_lo_b_o + beta_u_p * A_up_b_o)
-                b_up_o = (alpha_u.clamp(max=0) * b_lo_a_o
-                          + alpha_u.clamp(min=0) * b_up_a_o
-                          + beta_u.clamp(max=0) * b_lo_b_o
-                          + beta_u.clamp(min=0) * b_up_b_o
+                A_up_o = (alpha_n_u * A_lo_a_o + alpha_p_u * A_up_a_o
+                          + beta_n_u * A_lo_b_o + beta_p_u * A_up_b_o)
+                b_up_o = (alpha_n * b_lo_a_o + alpha_p * b_up_a_o
+                          + beta_n * b_lo_b_o + beta_p * b_up_b_o
                           + gamma_u)
             lo_box, hi_box = _batched_eval_box(
                 A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
@@ -767,13 +884,20 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                          ).reshape(B, -1, n_input_orig)
             b_lo_b_o = (ones_out * bound_b.b_lo.reshape(B, *sh_in[1])).reshape(B, -1)
             b_up_b_o = (ones_out * bound_b.b_up.reshape(B, *sh_in[1])).reshape(B, -1)
-            assert bool((b_lo_o2 > 0).all()), 'div needs b > 0'
+            # Skip the b>0 assert in sync-free mode (caller takes
+            # responsibility for graph-static invariants; mscn softmax
+            # denominators are always positive by construction).
+            if not skip_bilinear_is_pt_check:
+                assert bool((b_lo_o2 > 0).all()), 'div needs b > 0'
             # Fast path: b is a point (per-leaf constant). Then 1/b is
             # exact, and y = a/b is just a*(1/b) — linear in a's bound.
             # No McCormick slack needed. ABC's BoundReciprocal+BoundMul
             # naturally handles this since Reciprocal of a point is a
             # point and BoundMul falls into the constant-side path.
-            b_is_pt = ((b_hi_o2 - b_lo_o2).abs() < 1e-12).all().item()
+            if skip_bilinear_is_pt_check:
+                b_is_pt = False
+            else:
+                b_is_pt = ((b_hi_o2 - b_lo_o2).abs() < 1e-12).all().item()
             import os as _opfp
             if _opfp.environ.get('DUMP_DIV_FAST', '') == '1':
                 print(f"[DIV_FAST] op {name}: b_is_pt={b_is_pt} b_lo_min={b_lo_o2.min().item():.4f} b_hi_max={b_hi_o2.max().item():.4f}")
@@ -791,7 +915,8 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 _maybe_free(ins)
                 continue
             rs_lb, rc_lb, rs_ub, rc_ub = _reciprocal_linear_bounds(
-                b_lo_o2, b_hi_o2)
+                b_lo_o2, b_hi_o2,
+                skip_positivity_check=skip_bilinear_is_pt_check)
             v_min_o = 1.0 / b_hi_o2; v_max_o = 1.0 / b_lo_o2
             (s_a_lb_m, s_v_lb_m, c_lb_m,
              s_a_ub_m, s_v_ub_m, c_ub_m) = _mccormick_linear_bounds(
@@ -827,9 +952,92 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             lo_box, hi_box = _batched_eval_box(
                 A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
+        elif t == 'conv':
+            # Conv treated as a sparse linear op. bound_in.A_lo/A_up
+            # shape (B, n_in_flat, K). Reshape per-leaf-per-input-col to
+            # (B*K, C_in, H_in, W_in), run F.conv2d, reshape back.
+            # Mid/Halfdiff trick: Conv(A_mid) ± Conv(|W|)(A_half) — uses
+            # the same kernel for the mid part and the abs-kernel for
+            # the amp part. Bias enters only the b accumulator (added
+            # to b_mid; A_amp is bias-free).
+            kernel = op['kernel']  # (C_out, C_in, kH, kW)
+            bias = op['bias']      # (C_out,) or None
+            stride = op.get('stride', (1, 1))
+            padding = op.get('padding', (0, 0))
+            in_shape_nd = op.get('in_shapes_nd', [None])[0]
+            assert in_shape_nd is not None and len(in_shape_nd) == 2, (
+                f'conv {name!r}: need 2D in_shape_nd (C,H,W) or (C,W); '
+                f'got {in_shape_nd!r}')
+            # in_shape_nd is per network.py's convention: 2 dims means
+            # (C, W) → treat as (C, H=1, W). 3 dims would be (C, H, W).
+            if len(in_shape_nd) == 2:
+                C_in, W_in = int(in_shape_nd[0]), int(in_shape_nd[1])
+                H_in = 1
+            else:
+                C_in, H_in, W_in = (int(d) for d in in_shape_nd)
+            n_in_flat = C_in * H_in * W_in
+            assert bound_in.A_lo.shape[1] == n_in_flat, (
+                f'conv {name!r}: A_lo dim mismatch — expected n_in_flat={n_in_flat} '
+                f'got {bound_in.A_lo.shape[1]}')
+            kernel_abs = kernel.abs()
+            tight = (bound_in.A_lo is bound_in.A_up
+                     and bound_in.b_lo is bound_in.b_up)
+            # Helper: apply F.conv2d to A of shape (B, n_in_flat, K).
+            # Returns (B, n_out_flat, K). Treats K as a "batched columns"
+            # axis: rearrange to (B*K, C_in, H_in, W_in), conv, back.
+            K_in = bound_in.A_lo.shape[2]
+            def _conv_A(A, kern):
+                # A: (B, n_in_flat, K). Reshape to (B, C_in, H_in, W_in, K).
+                A5 = A.reshape(B, C_in, H_in, W_in, K_in)
+                # Move K to leading: (B, K, C_in, H_in, W_in) → (B*K, C_in, H_in, W_in)
+                A5p = A5.permute(0, 4, 1, 2, 3).contiguous().reshape(
+                    B * K_in, C_in, H_in, W_in)
+                Ao = F.conv2d(A5p, kern, bias=None,
+                               stride=stride, padding=padding)
+                # Ao: (B*K, C_out, H_out, W_out).
+                C_out, H_out, W_out = Ao.shape[1], Ao.shape[2], Ao.shape[3]
+                Ao5 = Ao.reshape(B, K_in, C_out, H_out, W_out)
+                # Permute back to (B, C_out, H_out, W_out, K) → flatten
+                # spatial dims to n_out_flat.
+                Ao5p = Ao5.permute(0, 2, 3, 4, 1).contiguous().reshape(
+                    B, C_out * H_out * W_out, K_in)
+                return Ao5p
+            def _conv_b(b, kern, with_bias=False):
+                # b: (B, n_in_flat). Reshape (B, C_in, H_in, W_in).
+                b4 = b.reshape(B, C_in, H_in, W_in)
+                bo = F.conv2d(b4, kern, bias=bias if with_bias else None,
+                               stride=stride, padding=padding)
+                return bo.reshape(B, -1)
+            if tight:
+                A_o = _conv_A(bound_in.A_lo, kernel)
+                b_o = _conv_b(bound_in.b_lo, kernel, with_bias=True)
+                A_lo_o = A_o; A_up_o = A_o
+                b_lo_o = b_o; b_up_o = b_o
+            else:
+                A_mid = (bound_in.A_lo + bound_in.A_up) * 0.5
+                A_half = (bound_in.A_up - bound_in.A_lo) * 0.5
+                b_mid = (bound_in.b_lo + bound_in.b_up) * 0.5
+                b_half = (bound_in.b_up - bound_in.b_lo) * 0.5
+                A_mid_o = _conv_A(A_mid, kernel)
+                A_amp = _conv_A(A_half, kernel_abs)
+                b_mid_o = _conv_b(b_mid, kernel, with_bias=True)
+                b_amp = _conv_b(b_half, kernel_abs, with_bias=False)
+                A_lo_o = A_mid_o - A_amp
+                A_up_o = A_mid_o + A_amp
+                b_lo_o = b_mid_o - b_amp
+                b_up_o = b_mid_o + b_amp
+            lo_box, hi_box = _batched_eval_box(
+                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
+            state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o,
+                                    lo_box, hi_box)
         else:
             raise NotImplementedError(
                 f'batched_forward_linear_bounds: unsupported op {t!r}')
+        if _osot_on:
+            torch.cuda.synchronize()
+            _dt = _tos.perf_counter() - _t0
+            _optime[t] = _optime.get(t, 0) + _dt
+            _opcount[t] = _opcount.get(t, 0) + 1
         # Free input states once refcount hits zero (streaming mode).
         _maybe_free(ins)
     # Capture any intermediates that are needed but never had their
@@ -843,7 +1051,152 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
     # intermediate (lo_box, hi_box) needed by backward CROWN without a
     # signature change (existing callers ignore the attribute).
     batched_forward_linear_bounds.last_interm_box = interm_box
+    if _osot_on:
+        total = sum(_optime.values())
+        print(f"[FLP forward] total={total*1000:.1f}ms by type:")
+        for k in sorted(_optime, key=lambda x: -_optime[x]):
+            print(f"  {k:20s} {_optime[k]*1000:7.2f}ms ({_opcount[k]:4d} calls)")
     return state
+
+
+def forward_lirpa_compat_zono_batched(xl_b, xh_b, gg, device, dtype):
+    """Adapter that runs forward LiRPA but returns data in the same shape as
+    ``_forward_zonotope_graph_batched`` so callers can swap in this tighter
+    forward pass without changes downstream.
+
+    Returns ``(sb, (c, G))`` where:
+      - sb: dict ``{layer_idx -> (lo_pre, hi_pre)}`` for ReLU/Sigmoid/Tanh
+        pre-activations (same key/value semantics as zonotope path).
+      - (c, G): output bounds packed as a 1-generator zonotope so the
+        caller's ``lo = c - |G|.sum(-1)``, ``hi = c + |G|.sum(-1)`` pattern
+        still works. ``G`` has shape ``(B, n_out, 1)``.
+
+    Also stashes ``forward_lirpa_compat_zono_batched.last_bilinear_op_bounds``
+    (dict ``name -> (lo_box, hi_box)``) — mirrors zonotope's stash so
+    ``_spec_backward_graph_batched(..., bilinear_op_bounds=...)`` keeps
+    receiving McCormick input bounds for mul/div/sub bilinear ops.
+    """
+    import os as _os_flp_dbg
+    _dbg = (_os_flp_dbg.environ.get('DEBUG_FWD_LIRPA_COMPAT', '') == '1')
+    B_full = xl_b.shape[0]
+    if _dbg:
+        print(f'[fwd-lirpa-compat] called, B={B_full}, '
+              f'gg n_ops={len(gg["ops"])}', flush=True)
+
+    bilinear_inputs = set()
+    for op_ in gg['ops']:
+        if op_['type'] in ('mul_bilinear', 'div_bilinear', 'sub_bilinear'):
+            for inp_ in op_['inputs']:
+                bilinear_inputs.add(inp_)
+    out_name = gg['ops'][-1]['name']
+
+    # OOM-aware chunking. Start with the last successful chunk size (or
+    # B_full); on CUDA OOM, halve and retry. We accumulate per-op (lo, hi)
+    # across chunks by concatenating on batch dim, so caller-visible
+    # tensors are (B_full, n_neurons). Remembering the last good chunk
+    # avoids re-paying the 3-4 OOM halvings each call on consistently
+    # tight memory (e.g. mscn_2048d_dual with B=2260+).
+    _hint = getattr(forward_lirpa_compat_zono_batched,
+                    '_last_good_chunk', None)
+    # Cap initial chunk for very large batches — otherwise we burn 10+
+    # halvings on cardinality_1_{8560..11080} before reaching a fittable
+    # chunk (~24s overhead, often exhausting the 60s budget before BAB).
+    # 1024 is empirically large enough to fit on 10GB GPU but small enough
+    # that 8557-batch starts at 1024 (3 halvings) not 8557 (13 halvings).
+    if _hint is not None:
+        chunk = min(_hint, B_full)
+    else:
+        chunk = min(B_full, 1024)
+    sb_acc = {}
+    op_bounds_acc = {}
+    out_lo_parts = []
+    out_hi_parts = []
+    pos = 0
+    while pos < B_full:
+        end = min(pos + chunk, B_full)
+        try:
+            state_c = batched_forward_linear_bounds(
+                gg, xl_b[pos:end], xh_b[pos:end], device, dtype,
+                free_states=True)
+            interm_c = batched_forward_linear_bounds.last_interm_box
+            # Accumulate.
+            for op in gg['ops']:
+                nm = op['name']
+                if op['type'] in ('relu', 'sigmoid', 'tanh') and 'layer_idx' in op:
+                    pre = op['inputs'][0]
+                    if pre in interm_c:
+                        if op['layer_idx'] not in sb_acc:
+                            sb_acc[op['layer_idx']] = (
+                                [interm_c[pre][0]], [interm_c[pre][1]])
+                        else:
+                            sb_acc[op['layer_idx']][0].append(interm_c[pre][0])
+                            sb_acc[op['layer_idx']][1].append(interm_c[pre][1])
+                if nm in bilinear_inputs and nm in interm_c:
+                    if nm not in op_bounds_acc:
+                        op_bounds_acc[nm] = (
+                            [interm_c[nm][0]], [interm_c[nm][1]])
+                    else:
+                        op_bounds_acc[nm][0].append(interm_c[nm][0])
+                        op_bounds_acc[nm][1].append(interm_c[nm][1])
+            # Output bounds.
+            out_bb = state_c.get(out_name)
+            if out_bb is not None:
+                out_lo_parts.append(out_bb.lo_box)
+                out_hi_parts.append(out_bb.hi_box)
+            else:
+                lo_y, hi_y = interm_c[out_name]
+                out_lo_parts.append(lo_y)
+                out_hi_parts.append(hi_y)
+            del state_c, interm_c
+            pos = end
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            new_chunk = max(1, chunk // 2)
+            if new_chunk == chunk:
+                raise  # truly can't fit even B=1
+            if _dbg:
+                print(f'[fwd-lirpa-compat] OOM at chunk={chunk}, halving '
+                      f'-> {new_chunk}', flush=True)
+            chunk = new_chunk
+        except RuntimeError as e:
+            # CUBLAS_STATUS_EXECUTION_FAILED commonly appears when the GPU
+            # is at the memory edge — CUBLAS fails before torch detects OOM.
+            # Treat it as OOM (halve chunk and retry). Re-raise anything else
+            # so we don't mask real shape/dtype bugs.
+            msg = str(e)
+            if 'CUBLAS_STATUS_EXECUTION_FAILED' not in msg and 'CUBLAS' not in msg:
+                raise
+            torch.cuda.empty_cache()
+            # cuBLAS handle can corrupt after repeated failures — clear
+            # workspaces to force fresh handles on next call. Without
+            # this, even chunk=1 fails after many prior halvings on
+            # cardinality_1_{8560..11080}.
+            try:
+                torch._C._cuda_clearCublasWorkspaces()
+            except AttributeError:
+                pass
+            new_chunk = max(1, chunk // 2)
+            if new_chunk == chunk:
+                raise
+            if _dbg:
+                print(f'[fwd-lirpa-compat] CUBLAS exec failure at chunk={chunk}'
+                      f' (treating as OOM), halving -> {new_chunk}', flush=True)
+            chunk = new_chunk
+
+    # Concatenate accumulated per-layer bounds across chunks.
+    # Stash the chunk size that worked end-to-end so next call starts here.
+    forward_lirpa_compat_zono_batched._last_good_chunk = chunk
+    sb = {L: (torch.cat(lo_parts, dim=0), torch.cat(hi_parts, dim=0))
+          for L, (lo_parts, hi_parts) in sb_acc.items()}
+    op_bounds = {nm: (torch.cat(lo_parts, dim=0), torch.cat(hi_parts, dim=0))
+                 for nm, (lo_parts, hi_parts) in op_bounds_acc.items()}
+    forward_lirpa_compat_zono_batched.last_bilinear_op_bounds = op_bounds
+
+    lo_y = torch.cat(out_lo_parts, dim=0)
+    hi_y = torch.cat(out_hi_parts, dim=0)
+    c = (lo_y + hi_y) * 0.5
+    G = ((hi_y - lo_y) * 0.5).unsqueeze(-1)
+    return sb, (c, G)
 
 
 def batched_forward_linear_bounds_streaming(gg, xl_b, xh_b, device, dtype):
@@ -911,13 +1264,86 @@ def batched_forward_lirpa_layer_bounds_only(gg, xl_b, xh_b, device, dtype):
     return sb_b_layer, last_bb
 
 
+# jit.trace cache for sync-free path. Keyed by (id(gg), B_bucket, K_int).
+# When `use_jit_trace=True`, the chunked wrapper routes through
+# batched_forward_linear_bounds_traceable (sync-free) and caches the trace.
+# Bucketing chunk sizes lets diverse-B BAB calls reuse a small set of traces.
+_TRACE_CACHE = {}
+_TRACE_BUCKETS = (64, 128, 256, 512, 1024, 2048)
+
+
+def _bucket_B(B):
+    for b in _TRACE_BUCKETS:
+        if B <= b:
+            return b
+    return B  # exceeds max bucket — fall back to exact B (cached separately)
+
+
+def _get_or_trace(gg, sample_xl, sample_xh, K_int, varying_mask,
+                   device, dtype, last_name, free_states):
+    """Cache: per-(gg, B_bucket, K) get-or-create a jit.trace'd forward.
+
+    Uses `bounded_module.compile_forward` to generate the straight-line
+    sync-free function, then jit.trace caches the result. Microbench
+    showed 1.27× speedup vs vanilla; bounds match within 3e-8 (ulp).
+    """
+    B_sample = sample_xl.shape[0]
+    key = (id(gg), B_sample, K_int)
+    cached = _TRACE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    from .bounded_module import compile_forward
+    fwd = compile_forward(gg, varying_mask, K_int, device, dtype)
+    traced = torch.jit.trace(fwd, (sample_xl, sample_xh),
+                              check_trace=False, strict=False)
+    _TRACE_CACHE[key] = traced
+    return traced
+
+
+def _build_sb_from_interm(gg, interm_box, bilinear_inputs=None):
+    """Convert interm_box (op_name → (lo, hi)) into the sb/bilinear-bounds
+    structure that `_spec_backward_graph_batched` expects.
+
+    Lets BAB callers reuse the forward pass's intermediate bounds for the
+    backward CROWN spec eval, avoiding a redundant second forward pass.
+    """
+    if bilinear_inputs is None:
+        bilinear_inputs = set()
+        for op in gg['ops']:
+            if op['type'] in ('mul_bilinear', 'div_bilinear', 'sub_bilinear'):
+                for inp in op['inputs']:
+                    bilinear_inputs.add(inp)
+    sb = {}
+    op_bounds = {}
+    for op in gg['ops']:
+        nm = op['name']
+        if op['type'] in ('relu', 'sigmoid', 'tanh') and 'layer_idx' in op:
+            pre = op['inputs'][0]
+            if pre in interm_box:
+                sb[op['layer_idx']] = interm_box[pre]
+        if nm in bilinear_inputs and nm in interm_box:
+            op_bounds[nm] = interm_box[nm]
+    return sb, op_bounds
+
+
 def chunked_batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
-                                            max_chunk=None, free_states=True):
+                                            max_chunk=None, free_states=True,
+                                            use_jit_trace=False,
+                                            track_interm=False):
     """OOM-resilient batched LiRPA: process B leaves in chunks that fit
     GPU memory. Returns only the OUTPUT op's _BBound (concat across chunks).
     `max_chunk` initial chunk size hint. On OOM, halve and retry.
     `free_states` (default True): pass through to batched_forward, freeing
     per-op A matrices once last consumer reads them (peak memory ~5x lower).
+
+    Exposes the varying-input-dim mask via attribute
+    ``chunked_batched_forward_linear_bounds.last_varying_mask`` (bool tensor
+    of shape (n_in,)) so callers can do
+    ``xl_b[:, mask]`` when multiplying the returned compressed-A bb back
+    against the original input box. Without this the caller silently
+    mis-shapes the matmul and either crashes (shape error) or computes
+    wrong bounds.
     """
     B_full = xl_b.shape[0]
     if max_chunk is None:
@@ -929,16 +1355,65 @@ def chunked_batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
     A_up_parts = []; b_up_parts = []
     lo_box_parts = []; hi_box_parts = []
     pos = 0
+    # Compute varying mask ONCE up-front so all chunks share the same
+    # input-dim compression — otherwise different chunks could compress to
+    # different K and we couldn't concat A_lo on dim 0.
+    radii_all = (xh_b - xl_b) / 2
+    full_varying_mask = (radii_all.abs().max(dim=0).values > 0)
+    chunked_batched_forward_linear_bounds.last_varying_mask = full_varying_mask
+    # Pre-compute K once (one sync per call, reused across all chunks).
+    # When use_jit_trace=True this also lets the cached trace stay valid.
+    K_int = int(full_varying_mask.sum()) if use_jit_trace else None
+    # Accumulate interm_box across chunks → BAB BWD_CROWN can reuse without
+    # a second forward pass (kills the 3.8× per-iter cost overhead).
+    _interm_acc = {}  # op_name → ([lo_chunks], [hi_chunks])
     while pos < B_full:
         end = min(pos + chunk, B_full)
         try:
+            if use_jit_trace:
+                B_chunk = end - pos
+                B_padded = _bucket_B(B_chunk)
+                if B_padded > B_chunk:
+                    pad_n = B_padded - B_chunk
+                    xl_in = torch.cat([xl_b[pos:end],
+                                        xl_b[end-1:end].expand(pad_n, -1)], dim=0)
+                    xh_in = torch.cat([xh_b[pos:end],
+                                        xh_b[end-1:end].expand(pad_n, -1)], dim=0)
+                else:
+                    xl_in, xh_in = xl_b[pos:end], xh_b[pos:end]
+                traced_fn = _get_or_trace(gg, xl_in, xh_in, K_int,
+                                            full_varying_mask, device, dtype,
+                                            last_name, free_states)
+                A_lo_o, b_lo_o, A_up_o, b_up_o, lo_o, hi_o = traced_fn(
+                    xl_in, xh_in)
+                if B_padded > B_chunk:
+                    A_lo_o = A_lo_o[:B_chunk]; b_lo_o = b_lo_o[:B_chunk]
+                    A_up_o = A_up_o[:B_chunk]; b_up_o = b_up_o[:B_chunk]
+                    lo_o = lo_o[:B_chunk]; hi_o = hi_o[:B_chunk]
+                A_lo_parts.append(A_lo_o); b_lo_parts.append(b_lo_o)
+                A_up_parts.append(A_up_o); b_up_parts.append(b_up_o)
+                lo_box_parts.append(lo_o); hi_box_parts.append(hi_o)
+                pos = end
+                continue
             state_c = batched_forward_linear_bounds(
                 gg, xl_b[pos:end], xh_b[pos:end], device, dtype,
-                free_states=free_states)
+                free_states=free_states,
+                forced_varying_mask=full_varying_mask)
             bc = state_c[last_name]
             A_lo_parts.append(bc.A_lo); b_lo_parts.append(bc.b_lo)
             A_up_parts.append(bc.A_up); b_up_parts.append(bc.b_up)
             lo_box_parts.append(bc.lo_box); hi_box_parts.append(bc.hi_box)
+            # Accumulate interm_box across chunks (concat on batch dim).
+            # Only when caller needs it (BAB BWD_CROWN path) — concat
+            # has non-trivial overhead at big B.
+            if track_interm:
+                _interm_c = batched_forward_linear_bounds.last_interm_box
+                for _nm, (_lo, _hi) in _interm_c.items():
+                    if _nm not in _interm_acc:
+                        _interm_acc[_nm] = ([_lo], [_hi])
+                    else:
+                        _interm_acc[_nm][0].append(_lo)
+                        _interm_acc[_nm][1].append(_hi)
             # Free intermediate state.
             del state_c, bc
             pos = end
@@ -955,6 +1430,18 @@ def chunked_batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
     b_up = torch.cat(b_up_parts, dim=0)
     lo_box = torch.cat(lo_box_parts, dim=0)
     hi_box = torch.cat(hi_box_parts, dim=0)
+    # Concat interm_box across chunks and stash on function for BAB reuse
+    # (BWD_CROWN can build sb from this without re-running forward).
+    if track_interm:
+        _interm_box = {}
+        for _nm, (_los, _his) in _interm_acc.items():
+            if len(_los) == 1:
+                _interm_box[_nm] = (_los[0], _his[0])
+            else:
+                _interm_box[_nm] = (torch.cat(_los, dim=0), torch.cat(_his, dim=0))
+        chunked_batched_forward_linear_bounds.last_interm_box = _interm_box
+    else:
+        chunked_batched_forward_linear_bounds.last_interm_box = None
     return _BBound(A_lo, b_lo, A_up, b_up, lo_box, hi_box)
 
 
@@ -1342,3 +1829,41 @@ def forward_linear_bounds(gg, xl_np, xh_np, device, dtype,
             raise NotImplementedError(
                 f'forward_lirpa: unsupported op {t!r} at {name!r}')
     return state
+
+
+# ----------------------------------------------------------------------
+# Sync-free traceable variant.
+#
+# Built up stage-by-stage to eliminate every `.item()` / `int(tensor)` /
+# `bool(tensor)` sync from the bound-prop path. End goal: a function
+# pure in (xl_b, xh_b) that `torch.jit.trace` can record once and replay
+# correctly on subsequent calls (no constants baked from per-call data).
+#
+# Current state:
+#   Stage 1 ✓: K passed in (caller pre-computes via .sum().item() once
+#             per `chunked_…` call, then all chunks reuse).
+#   Stage 2 — : mul_bilinear `.item()` syncs at lines 752-753 still present
+#   Stage 3 — : div_bilinear `.item()` + assert at lines 840, 846 still present
+#   Stage 4 — : `verify_zono_bnb._reciprocal_linear_bounds` assert still
+#              present (called from div_bilinear path)
+# ----------------------------------------------------------------------
+def batched_forward_linear_bounds_traceable(
+        gg, xl_b, xh_b, device, dtype, *,
+        varying_mask, K_int, free_states=False):
+    """Sync-free wrapper around batched_forward_linear_bounds.
+
+    Caller is responsible for pre-computing varying_mask and K_int (once
+    per (gg, perturbation-shape) — cheap). This wrapper routes through
+    the sync-free paths (Stages 1-N) accumulated so far.
+
+    Stage 1 ✓: K passed in (no `K = int(...)` sync).
+    Stage 2 ✓: `skip_bilinear_is_pt_check=True` removes the 2 per-mul
+              and 1 per-div `.item()` syncs. Always-McCormick is exact
+              when one side is constant (at r=0.5).
+    """
+    return batched_forward_linear_bounds(
+        gg, xl_b, xh_b, device, dtype,
+        free_states=free_states,
+        forced_varying_mask=varying_mask,
+        forced_K=K_int,
+        skip_bilinear_is_pt_check=True)

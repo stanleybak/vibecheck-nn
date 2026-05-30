@@ -6,30 +6,30 @@ from vibecheck.config_profiles import (
 
 def test_select_profile_small_input_picks_split():
     fp = GraphFingerprint(input_dim=16, has_conv=True, n_relu=8,
-                           fork_count=0)
+                           fork_count=0, n_disjuncts=1, has_nonlinear=False)
     assert select_profile(fp) == 'input_split_small'
 
 
 def test_select_profile_deep_conv_no_forks_picks_conv_deep():
     fp = GraphFingerprint(input_dim=3072, has_conv=True, n_relu=12,
-                           fork_count=0)
+                           fork_count=0, n_disjuncts=1, has_nonlinear=False)
     assert select_profile(fp) == 'conv_deep'
 
 
 def test_select_profile_fc_shallow_picks_fc_shallow():
     fp = GraphFingerprint(input_dim=784, has_conv=False, n_relu=4,
-                           fork_count=0)
+                           fork_count=0, n_disjuncts=1, has_nonlinear=False)
     assert select_profile(fp) == 'fc_shallow'
 
 
 def test_select_profile_falls_through_to_default():
     # FC net with many ReLUs (not "shallow")
     fp = GraphFingerprint(input_dim=784, has_conv=False, n_relu=10,
-                           fork_count=0)
+                           fork_count=0, n_disjuncts=1, has_nonlinear=False)
     assert select_profile(fp) == 'default'
     # Conv net with forks (not "deep no-fork")
     fp2 = GraphFingerprint(input_dim=3072, has_conv=True, n_relu=12,
-                            fork_count=2)
+                            fork_count=2, n_disjuncts=1, has_nonlinear=False)
     assert select_profile(fp2) == 'default'
 
 
@@ -78,6 +78,133 @@ def test_default_settings_for_overrides_win():
                               bab_refine_passes=5)
     assert s.phase1_method == 'legacy'  # user override beats fc_shallow profile
     assert s.bab_refine_passes == 5
+
+
+def test_default_settings_for_applies_each_profile_body():
+    """Exercise every profile function body via default_settings_for so the
+    overlay (not just `select_profile`'s name) is covered."""
+    import numpy as np
+
+    def _graph(nodes, n_relu, forks, shape):
+        class _G:
+            pass
+        g = _G()
+        g.nodes = nodes
+        g.relu_nodes = lambda: list(range(n_relu))
+        g.fork_points = lambda: list(range(forks))
+        g.input_shape = shape
+        return g
+
+    class _Conv:
+        op_type = 'Conv'
+
+    class _Spec:
+        def __init__(self, dim):
+            self.x_lo = np.zeros((1, dim))
+
+    # input_split_small (input_dim ≤ 20) → _profile_input_split_small body
+    s = default_settings_for(_graph({}, 4, 0, (16,)), _Spec(16))
+    assert s._profile == 'input_split_small'
+    assert s.input_split_alpha_iters == 3
+
+    # conv_deep (conv ∧ no forks ∧ n_relu ≥ 5) → _profile_conv_deep body
+    s = default_settings_for(_graph({'c': _Conv()}, 12, 0, (3072,)),
+                              _Spec(3072))
+    assert s._profile == 'conv_deep'
+    assert s.milp_alpha_tighten is True
+
+    # default (FC, many ReLUs) → _profile_default (no-op) body
+    s = default_settings_for(_graph({}, 10, 0, (784,)), _Spec(784))
+    assert s._profile == 'default'
+
+
+def test_fingerprint_input_dim_falls_back_to_graph_shape():
+    """With no spec.x_lo, input_dim comes from graph.input_shape, or 1e9
+    when the graph has no usable shape."""
+    class _G:
+        nodes = {}
+
+        def relu_nodes(self):
+            return []
+
+        def fork_points(self):
+            return []
+
+        input_shape = (3, 4)
+
+    class _NoXlo:
+        pass
+
+    assert GraphFingerprint.from_graph_and_spec(_G(), _NoXlo()).input_dim == 12
+
+    class _Gempty:
+        nodes = {}
+
+        def relu_nodes(self):
+            return []
+
+        def fork_points(self):
+            return []
+
+        input_shape = ()
+
+    assert (GraphFingerprint.from_graph_and_spec(_Gempty(), _NoXlo())
+            .input_dim == 10**9)
+
+
+def test_adapt_per_disjunct_scales_mini_group_size():
+    """`_adapt_per_disjunct` overlays mini_group_size by disjunct-count band:
+    ≤500 → 60, 500<n≤5000 → 120, >5000 → 200."""
+    import numpy as np
+
+    class _G:
+        nodes = {}
+
+        def relu_nodes(self):
+            return list(range(4))
+
+        def fork_points(self):
+            return []
+
+        input_shape = (784,)
+
+    def _spec(n_disj):
+        class _S:
+            x_lo = np.zeros((1, 784))
+            disjuncts = list(range(n_disj))
+        return _S()
+
+    assert default_settings_for(_G(), _spec(100)).mini_group_size == 60
+    assert default_settings_for(_G(), _spec(1000)).mini_group_size == 120
+    assert default_settings_for(_G(), _spec(6000)).mini_group_size == 200
+
+
+def test_fingerprint_detects_nonlinear_and_disjuncts():
+    """has_nonlinear is True when a nonlinear op is present; n_disjuncts
+    counts spec.disjuncts."""
+    import numpy as np
+
+    class _N:
+        op_type = 'Sigmoid'
+
+    class _G:
+        nodes = {'n0': _N()}
+
+        def relu_nodes(self):
+            return [1]
+
+        def fork_points(self):
+            return []
+
+        input_shape = (8,)
+
+    class _S:
+        x_lo = np.zeros((1, 8))
+        disjuncts = [0, 1, 2]
+
+    fp = GraphFingerprint.from_graph_and_spec(_G(), _S())
+    assert fp.has_nonlinear is True
+    assert fp.n_disjuncts == 3
 
 
 def test_fingerprint_from_graph_and_spec_uses_spec_xlo():

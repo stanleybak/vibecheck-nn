@@ -2540,7 +2540,12 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
                 if e_in is not None:
                     try:
                         refined = witness_refine_fn(qi, e_in)
-                    except Exception as _e:
+                    except (RuntimeError, ValueError, KeyError):
+                        # PGD refinement failures: RuntimeError from torch
+                        # autograd on degenerate inputs, ValueError from
+                        # bounds mismatch, KeyError if a layer is missing
+                        # from the cached state. All fall back to no
+                        # refinement (the unrefined witness is still sound).
                         refined = None
                     if refined is not None:
                         witness = refined

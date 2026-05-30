@@ -28,6 +28,12 @@ import numpy as np
 from .settings import default_settings
 
 
+_NONLINEAR_OPS = frozenset({
+    'Sigmoid', 'Tanh', 'Softmax', 'Mul', 'Div', 'Pow', 'Exp', 'Log',
+    'GELU', 'Erf', 'MatMul',  # MatMul on two non-init tensors = bilinear
+})
+
+
 @dataclass(frozen=True)
 class GraphFingerprint:
     """Compact summary used by `default_settings_for` to pick a profile."""
@@ -35,6 +41,8 @@ class GraphFingerprint:
     has_conv: bool
     n_relu: int
     fork_count: int
+    n_disjuncts: int  # per-instance — drives mini_group_size for per-disjunct BAB
+    has_nonlinear: bool  # sigmoid/tanh/mul/div/etc. → forward LiRPA needed
 
     @classmethod
     def from_graph_and_spec(cls, graph, spec) -> 'GraphFingerprint':
@@ -46,10 +54,14 @@ class GraphFingerprint:
             input_dim = 10**9
         has_conv = any(getattr(n, 'op_type', '') == 'Conv'
                         for n in graph.nodes.values())
+        has_nonlinear = any(getattr(n, 'op_type', '') in _NONLINEAR_OPS
+                             for n in graph.nodes.values())
         n_relu = len(graph.relu_nodes())
         fork_count = len(graph.fork_points())
+        n_disjuncts = len(spec.disjuncts) if hasattr(spec, 'disjuncts') else 1
         return cls(input_dim=input_dim, has_conv=has_conv,
-                   n_relu=n_relu, fork_count=fork_count)
+                   n_relu=n_relu, fork_count=fork_count,
+                   n_disjuncts=n_disjuncts, has_nonlinear=has_nonlinear)
 
 
 def _profile_input_split_small(s) -> None:
@@ -106,18 +118,43 @@ def select_profile(fp: GraphFingerprint) -> str:
     return 'default'
 
 
+def _adapt_per_disjunct(s, fp: GraphFingerprint) -> None:
+    """Disjunct-count-driven knobs (overlayed on top of the family profile).
+
+    These don't depend on the network family, only on per-instance shape:
+    - mini_group_size for `_multi_sub_input_split_bab`. Default 60 is good
+      for ≤500 disjuncts (pensieve_*_parallel, simple mscn). Larger groups
+      amortize batched-LiRPA overhead better — empirically:
+        ≤500 disjuncts: 60 (no regression on pensieve)
+        500-5000: 120 (cracked +2 mscn_2048d_dual cases)
+        >5000: 200 (mscn_2048d_dual >_5000 needs bigger groups still)
+      Env MINI_GROUP_SIZE still overrides per-run.
+    """
+    if fp.n_disjuncts > 5000:
+        s.mini_group_size = 200
+    elif fp.n_disjuncts > 500:
+        # 120 beats both 60 and 300 on mscn_2048d_dual: 60 starves the
+        # clip+BAB iters per group, 300 grows the queue faster than
+        # clip can prune (closes 197 vs 1213 on cardinality_1_2260).
+        s.mini_group_size = 120
+    else:
+        s.mini_group_size = 60
+
+
 def default_settings_for(graph, spec, **overrides: Any):
     """Profile-aware settings constructor.
 
-    Returns a settings DotMap with the picked profile's overrides
-    applied on top of `default_settings()`, then user overrides on top
-    of that. Stores the picked profile name in `settings._profile` for
+    Returns a settings object with the picked profile's overrides
+    applied on top of `default_settings()`, plus an instance-shape
+    overlay (`_adapt_per_disjunct`), then user overrides on top of
+    that. Stores the picked profile name in `settings._profile` for
     diagnostics.
     """
     fp = GraphFingerprint.from_graph_and_spec(graph, spec)
     name = select_profile(fp)
     s = default_settings()
     _PROFILES[name](s)
+    _adapt_per_disjunct(s, fp)
     for k, v in overrides.items():
         s[k] = v
     s._profile = name
