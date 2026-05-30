@@ -7564,6 +7564,33 @@ def verify_graph(graph, spec, settings):
                       flush=True)
             return milp_verify(graph, spec, settings)
 
+    # Auto-route SMALL FC nets (few ReLU layers, no conv, no bilinear) to
+    # milp_verify, where the exact per-neuron MILP both attacks (PGD) and
+    # verifies (= AB-CROWN's `complete_verifier: mip`). The graph pipeline's
+    # zono/CROWN relaxation is far too loose on these (e.g. safenlp_2024:
+    # 30->128(ReLU)->2, worst spec_lb ~-10 on a 1-ReLU net) and input-split
+    # explodes on the 30-dim box; the exact MILP is sub-second. Gated on the
+    # net being structurally MILP-tractable (≤2 ReLU layers) and on
+    # input_dim > the input-split cap (so tiny-input FC nets that the
+    # input-split fast-leaf handles well are left alone).
+    _milp_unsupported_acts = {'Sigmoid', 'Tanh', 'Softmax', 'Exp', 'Erf',
+                              'Gelu', 'Elu', 'LeakyRelu', 'Pow', 'Div',
+                              'MatMulBilinear', 'ReduceSum', 'Conv'}
+    _is_pure_relu_fc = not any(
+        getattr(n, 'op_type', '') in _milp_unsupported_acts
+        for n in graph.nodes.values())
+    if (bool(getattr(settings, 'auto_route_milp_for_small_fc', True))
+            and not _has_unsupported
+            and _is_pure_relu_fc           # milp_verify encodes only ReLU
+            and n_in > _split_max
+            and len(graph.relu_nodes()) <= 2
+            and not graph.fork_points()):
+        from .verify_milp import milp_verify
+        if getattr(settings, 'print_progress', False):
+            print('[verify_graph] auto-routing small FC net to milp_verify '
+                  '(exact MILP; graph relaxation too loose)', flush=True)
+        return milp_verify(graph, spec, settings)
+
     impl = str(getattr(settings, 'graph_impl', 'optimized'))
     assert impl in _BUILDERS, f'unknown graph_impl: {impl!r}'
     build_fn = _BUILDERS[impl]

@@ -483,6 +483,11 @@ def default_settings(**overrides):
         # AND no fork points. Disable to force every case through
         # bab_refine (e.g. for benchmarking).
         auto_route_milp_for_conv=True,
+        # Auto-route small FC nets (≤2 ReLU layers, no conv, no bilinear,
+        # input_dim > input-split cap) to milp_verify's exact per-neuron
+        # MILP — the graph relaxation is too loose and input-split explodes
+        # on them, but the exact MILP is sub-second (e.g. safenlp_2024).
+        auto_route_milp_for_small_fc=True,
         # α-CROWN intermediate-bound tightening as Phase 1.5 in
         # milp_verify, BEFORE the per-layer LP/MILP loop. On conv
         # ResNets (oval21 deep_kw img3039: 1.4s α-CROWN closes 3/9

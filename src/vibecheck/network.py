@@ -1395,6 +1395,11 @@ class ComputeGraph:
         from .zonotope import conv_output_shape
         layers = []
         gpu_k, gpu_W_fwd, gpu_b_fwd, layer_types = [], [], [], []
+        # True only immediately after a Gemm/MatMul, so a standalone Add(bias)
+        # is folded into the linear layer ONLY when it directly follows it (no
+        # activation in between). Folding a post-ReLU Add into the pre-ReLU
+        # linear would be unsound (bias can't commute through ReLU).
+        _prev_was_linear = False
 
         for name in self.topo_order:
             node = self.nodes[name]
@@ -1432,6 +1437,7 @@ class ComputeGraph:
                     'input_shape': in_shape, 'stride': stride,
                     'padding': padding,
                 }))
+                _prev_was_linear = False
             elif node.op_type in ('Gemm', 'MatMul'):
                 W = node.params['W']
                 b = node.params['b']
@@ -1444,6 +1450,34 @@ class ComputeGraph:
                 gpu_W_fwd.append(gW)
                 gpu_b_fwd.append(gb)
                 layer_types.append(('fc', None))
+                _prev_was_linear = True
+            elif (node.op_type == 'Add' and 'bias' in node.params and layers
+                  and _prev_was_linear):
+                # TF/Keras export emits the affine layer as MatMul + a
+                # SEPARATE Add(bias) node — the MatMul's own params['b'] is
+                # zero. Fold this Add's constant bias into the preceding
+                # linear layer; without it the gpu_layers net (and thus the
+                # milp_verify MILP) is bias-free and disagrees with the real
+                # network (it found phantom counterexamples on safenlp,
+                # blocking every UNSAT verification). The main gpu_graph
+                # keeps Add as its own op, so zono/CROWN/PGD were unaffected.
+                # `_prev_was_linear` guard: only fold when the Add directly
+                # follows the linear (no ReLU between) — folding a post-ReLU
+                # bias into the pre-ReLU layer would be unsound.
+                add_b = torch.as_tensor(
+                    np.asarray(node.params['bias']).reshape(-1),
+                    dtype=dtype, device=device)
+                if add_b.numel() == layers[-1]['bias'].numel():
+                    layers[-1]['bias'] = (layers[-1]['bias']
+                                          + add_b.reshape(layers[-1]['bias'].shape))
+                    gpu_b_fwd[-1] = (gpu_b_fwd[-1]
+                                     + add_b.reshape(gpu_b_fwd[-1].shape))
+                # stays foldable: a chained bias-Add adds to the same layer
+            else:
+                # Relu, Flatten, Reshape, etc. — handled implicitly. Any such
+                # node breaks linear→Add adjacency (a later Add(bias) must not
+                # fold back past it).
+                _prev_was_linear = False
             # Skip Relu, Flatten, Reshape etc. — handled implicitly
 
         fwd_data = {

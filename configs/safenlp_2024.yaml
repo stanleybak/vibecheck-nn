@@ -1,0 +1,13 @@
+# safenlp_2024 (NLP perturbation robustness). Tiny nets: 30 -> 128 (ReLU) -> 2.
+#
+# No overrides are needed: vibecheck auto-detects this signature (pure-ReLU FC,
+# <=2 ReLU layers, no conv/bilinear, input_dim > input-split cap) and routes to
+# milp_verify's EXACT per-neuron MILP -- the same approach AB-CROWN uses here
+# (complete_verifier: mip). SAT cases are found by PGD; UNSAT cases verified by
+# the exact MILP. The graph zono/CROWN relaxation is far too loose on these
+# (worst spec_lb ~-5 on a 1-ReLU net) and 30-dim input-split explodes, so the
+# exact MILP (<=128 binaries, sub-second locally) is the right tool.
+#
+# This file documents the routing; the behaviour comes from
+# settings.auto_route_milp_for_small_fc=True (on by default), so the benchmark
+# also solves correctly with no --config (auto-settings), like nn4sys.

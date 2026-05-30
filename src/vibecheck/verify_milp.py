@@ -97,6 +97,15 @@ from .verify_zono_bnb import (
 # in `_solve_spec_worker` for the metaroom unsoundness this fixes.
 _GUROBI_FEAS_TOL = 1e-5
 
+# Below this many unstable neurons, the spec-MILP racing skips its gradual
+# bin-escalation and solves the EXACT MILP (all unstable binarized) in one
+# shot — the exact solve is sub-second at this scale, and escalating wastes
+# a Pool+Gurobi-env spawn per intermediate level (which all return loose
+# "feasibility SAT" until the exact level anyway). Big conv nets stay on the
+# gradual schedule (the exact MILP would be intractable). Tuned for
+# safenlp_2024 (≤128 unstable): exact <1s vs escalation timing out at 20s.
+_DIRECT_EXACT_MAX_UNSTABLE = 256
+
 
 def _pgd_attack_general(xl, xh, spec, gg, settings,
                          restrict_disj=None, time_budget=None):
@@ -1567,13 +1576,39 @@ def _racing_escalation(layers_np, x_lo, x_hi, bounds_np, pred, comp,
     Returns (verified: bool, n_binaries: int).
     """
     # Bin schedule: 0, 2, 4, 8, 16, 32, 64, 128, 256, ...
-    bin_schedule = [0]
-    b = 2
-    while b <= len(sorted_neurons):
-        bin_schedule.append(b)
-        b *= 2
-    if bin_schedule[-1] < len(sorted_neurons):
-        bin_schedule.append(len(sorted_neurons))
+    # For small nets the EXACT MILP (all unstable binarized) solves in well
+    # under a second, so the gradual escalation just wastes a full
+    # Pool(2)+Gurobi-env spawn (~0.4s local, ~3.7s on slower boxes) on each
+    # intermediate level — all of which return loose-relaxation
+    # "feasibility SAT" until the exact level anyway. Below
+    # `_DIRECT_EXACT_MAX_UNSTABLE` neurons, go straight to the exact level
+    # (one solve). This is what made safenlp_2024 time out on server1
+    # (reached only bins=16 in 21s) while the exact MILP is <1s.
+    n_uns = len(sorted_neurons)
+    # Only short-circuit for SHALLOW pure-FC nets. Number of ReLU layers =
+    # affine layers minus the (relu-free) output layer.
+    _is_fc_only = not any(l['type'] == 'conv' for l in layers_np)
+    _n_relu_layers = sum(
+        1 for l in layers_np if l['type'] in ('fc', 'conv')) - 1
+    # For a 1-2 relu-layer FC net the full-binary MILP is a near-flat big-M
+    # system Gurobi cracks in <1s, so the gradual escalation just wastes a
+    # Pool(2)+Gurobi-env spawn per intermediate level. For DEEPER nets (e.g.
+    # acasxu's 6 relu layers) the full-binary MILP is combinatorially hard and
+    # the gradual schedule instead verifies at an early intermediate bin count
+    # — forcing direct-exact there makes it time out to 'unknown' (regressed
+    # the acasxu sequential-vs-graph equivalence test). The n_unstable cap is a
+    # secondary guard (one very wide layer can still be slow).
+    if (_is_fc_only and _n_relu_layers <= 2
+            and 0 < n_uns <= _DIRECT_EXACT_MAX_UNSTABLE):
+        bin_schedule = [n_uns]
+    else:
+        bin_schedule = [0]
+        b = 2
+        while b <= n_uns:
+            bin_schedule.append(b)
+            b *= 2
+        if bin_schedule[-1] < n_uns:
+            bin_schedule.append(n_uns)
 
     opt_threads = max(1, n_cores - 1)
 
