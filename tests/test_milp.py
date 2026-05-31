@@ -771,3 +771,56 @@ class TestSpecWorkerNumericalRobustness:
             f'Expected OPTIMAL (2) at loosened FeasibilityTol={_GUROBI_FEAS_TOL}, '
             f'got {m.Status} — fix regressed')
         m.dispose(); env.dispose()
+
+
+class TestInflateMilpBounds:
+    """`_inflate_milp_bounds` — floating-point-soundness widening of the
+    spec-MILP pre-ReLU bounds.
+
+    Bug it guards: the graph spec MILP imposes (lo, hi) as *hard* variable
+    bounds but recomputes the affine in float64, while the bounds come from
+    float32 zono/CROWN. On a tiny perturbation box (collins_rul: 4 of 400
+    inputs move) almost every neuron is near-constant, so its bound is
+    degenerate (width ~1e-9) — tighter than the float32→float64 gap. A
+    genuinely reachable point then lands just outside [lo,hi] and the spec
+    LP is falsely infeasible → `verified` on a case with a real CEX.
+    Outward inflation restores the over-approximation.
+    """
+
+    def test_widens_by_atol_plus_rtol_times_magnitude(self):
+        from vibecheck.verify_milp import _inflate_milp_bounds
+        bounds = {
+            0: (np.array([4.912, -2.0]), np.array([4.912, 10.0])),
+            1: (np.array([0.0]), np.array([0.0])),
+        }
+        atol, rtol = 1e-5, 1e-5
+        out = _inflate_milp_bounds(bounds, atol, rtol)
+        # Layer 0, neuron 0: degenerate at 4.912 → tol = atol + rtol*4.912
+        tol00 = atol + rtol * 4.912
+        assert np.isclose(out[0][0][0], 4.912 - tol00)
+        assert np.isclose(out[0][1][0], 4.912 + tol00)
+        # Layer 0, neuron 1: max|bound| = 10.0 → tol = atol + rtol*10
+        tol01 = atol + rtol * 10.0
+        assert np.isclose(out[0][0][1], -2.0 - tol01)
+        assert np.isclose(out[0][1][1], 10.0 + tol01)
+        # Inflation is strictly outward (lo decreases, hi increases) everywhere.
+        for li, (lo, hi) in out.items():
+            assert np.all(lo <= np.asarray(bounds[li][0]))
+            assert np.all(hi >= np.asarray(bounds[li][1]))
+
+    def test_zero_at_origin_gets_absolute_floor(self):
+        # A neuron whose bound is exactly 0 still gets the absolute floor —
+        # without it a degenerate-at-zero bound would stay a hard equality.
+        from vibecheck.verify_milp import _inflate_milp_bounds
+        out = _inflate_milp_bounds({0: (np.array([0.0]), np.array([0.0]))},
+                                   1e-5, 1e-5)
+        assert out[0][0][0] == pytest.approx(-1e-5)
+        assert out[0][1][0] == pytest.approx(1e-5)
+
+    def test_noop_when_tolerances_nonpositive(self):
+        # atol<=0 and rtol<=0 must short-circuit and return the input
+        # unchanged (lets a config disable inflation entirely).
+        from vibecheck.verify_milp import _inflate_milp_bounds
+        bounds = {0: (np.array([1.0]), np.array([2.0]))}
+        assert _inflate_milp_bounds(bounds, 0.0, 0.0) is bounds
+        assert _inflate_milp_bounds(bounds, -1.0, -1.0) is bounds

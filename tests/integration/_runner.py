@@ -63,6 +63,10 @@ def run_case(case, config_yaml, vnncomp_root, benchmark_dir):
         total_timeout=int(case['timeout']),
         pgd_restarts=int(case.get('pgd_restarts', 100)))
     overrides.update(yaml_overrides)
+    # Per-case settings overrides (e.g. a soundness probe sets
+    # disable_sat_finding=True so a falsely-verified bound surfaces as
+    # `verified` on a SAT case instead of being masked by PGD).
+    overrides.update(case.get('extra_settings', {}))
     settings = default_settings(**overrides)
     settings.print_progress = False
     graph.optimize(settings)

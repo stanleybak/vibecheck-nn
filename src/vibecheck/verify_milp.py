@@ -1690,6 +1690,30 @@ _graph_shared_model = None
 _graph_shared_target_indices = None
 
 
+def _inflate_milp_bounds(bounds_by_relu, atol, rtol):
+    """Outward-inflate pre-ReLU bounds for floating-point soundness.
+
+    The spec MILP/LP imposes `(lo, hi)` as *hard* variable bounds, but it
+    recomputes the affine in float64 while the bounds came from float32
+    (zono/CROWN). For near-degenerate neurons (lo≈hi, e.g. a tiny perturbation
+    box) that float32↔float64 gap can exceed the bound width, so a genuinely
+    reachable point lands just outside [lo,hi] and the relaxation falsely
+    excludes it → false `verified`. Widening by `tol = atol + rtol·max|bound|`
+    keeps the over-approximation sound (a larger feasible set can only make the
+    feasibility LP *less* infeasible — never a false-verify). See
+    `settings.milp_bound_inflation_{atol,rtol}`.
+    """
+    if atol <= 0 and rtol <= 0:
+        return bounds_by_relu
+    out = {}
+    for li, (lo, hi) in bounds_by_relu.items():
+        lo = np.asarray(lo, dtype=np.float64)
+        hi = np.asarray(hi, dtype=np.float64)
+        tol = atol + rtol * np.maximum(np.abs(lo), np.abs(hi))
+        out[li] = (lo - tol, hi + tol)
+    return out
+
+
 def _compute_dead_at(gg_ops, bounds_by_relu):
     """Compute dead neuron mask for each op in the graph.
 
@@ -2860,6 +2884,15 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
         lo, hi = sb[li]
         bounds_by_relu[li] = (lo.cpu().numpy().astype(np.float64),
                                hi.cpu().numpy().astype(np.float64))
+    # Float-point-soundness inflation: these bounds become *hard* variable
+    # bounds in the spec MILP/LP, which recomputes the affine in float64 while
+    # the bounds are float32. Without inflation, near-degenerate bounds (tiny
+    # perturbation box → nearly-constant neurons) exclude genuinely reachable
+    # points → false `verified` (observed: collins_rul). See _inflate_milp_bounds.
+    bounds_by_relu = _inflate_milp_bounds(
+        bounds_by_relu,
+        float(getattr(settings, 'milp_bound_inflation_atol', 1e-5)),
+        float(getattr(settings, 'milp_bound_inflation_rtol', 1e-5)))
 
     # Score neurons: solve LP for each open query, score by fractional gap
     per_query_scored = {}

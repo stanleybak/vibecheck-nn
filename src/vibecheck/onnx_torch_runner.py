@@ -320,7 +320,11 @@ def pgd_via_onnx(onnx_path, spec, n_restarts=256, n_iter=100, lr=0.1,
 
 def _infer_input_shape(model):
     """Get the input shape (excluding batch dim) from an onnx model."""
-    inp = model.graph.input[0]
+    # g.input[0] may be an initializer (old exporters list them in g.input);
+    # the real data input is the one without an initializer entry.
+    _init = {init.name for init in model.graph.initializer}
+    _real = [i for i in model.graph.input if i.name not in _init]
+    inp = _real[0] if _real else model.graph.input[0]
     dims = inp.type.tensor_type.shape.dim
     shape = []
     for i, d in enumerate(dims):

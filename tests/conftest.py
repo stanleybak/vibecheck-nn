@@ -59,3 +59,24 @@ def vnncomp_results(paths):
     if not path.exists():
         pytest.fail(f"vnncomp_results path does not exist: {p}")
     return path
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _gurobi_zero_fixed_var_guard():
+    """Enable the [0,0]-fixed-objective-variable guard in `optimize_checked`
+    for the whole test session — a soundness regression guard against the
+    gen-LP "orphan column" bug class (a noise-symbol column pinned to [0,0]
+    under-approximates the objective and false-verifies SAT cases, e.g.
+    dist_shift index4312). Off in production (per-solve scan cost); the tests
+    are where we want it loud. Subprocess Gurobi workers don't inherit the
+    process-local flag, so this guards main-process solves (incl. the gen-LP
+    fallback that hit the bug)."""
+    try:
+        from vibecheck.gurobi_util import set_zero_fixed_obj_var_check
+    except ImportError:
+        # gurobipy not installed → every Gurobi test is skipped anyway.
+        yield
+        return
+    prev = set_zero_fixed_obj_var_check(True)
+    yield
+    set_zero_fixed_obj_var_check(prev)

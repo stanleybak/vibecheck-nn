@@ -365,6 +365,21 @@ def default_settings(**overrides):
         milp_sample_timeout=5.0,
         milp_scoring='ew_frac',  # 'crown', 'crown_lp_fractional', or 'ew_frac'
         milp_lp_per_worker=True,
+        # Floating-point-soundness inflation for spec-MILP pre-ReLU bounds.
+        # The pre-ReLU interval bounds (lo, hi) are imposed as *hard* variable
+        # bounds in the spec MILP/LP. They are computed in float32 (zono/CROWN),
+        # but the MILP recomputes the affine in float64 (Gurobi + sparse W).
+        # When a neuron's bound is near-degenerate (lo≈hi, e.g. a tiny
+        # perturbation box where most neurons are nearly constant — collins_rul),
+        # the float32↔float64 gap exceeds the bound width, so a genuinely
+        # reachable point lands just outside [lo,hi] → the relaxation excludes
+        # reachable points → falsely-infeasible spec LP → **false verified**.
+        # Outward inflation (lo-=tol, hi+=tol; tol = atol + rtol·max|bound|)
+        # restores the over-approximation: it can only make the feasibility LP
+        # *more* feasible, never create a false-verify. Cost is completeness for
+        # true-UNSAT margins below tol (negligible vs typical margins).
+        milp_bound_inflation_atol=1e-5,
+        milp_bound_inflation_rtol=1e-5,
         # Phase-1 tightening axes
         tighten_formulation='gen_cone',     # 'weight_walk' | 'gen_cone' | 'skip'
         tighten_solver='milp',              # 'lp' | 'milp' | 'probe' (MILP→LP auto)

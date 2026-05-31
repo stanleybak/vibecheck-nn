@@ -48,7 +48,70 @@ class GurobiNumericTrouble(RuntimeError):
         return (type(self), (self.lines,))
 
 
+class GurobiZeroFixedObjVar(RuntimeError):
+    """A variable fixed to [0, 0] carries nonzero objective weight.
+
+    This is the signature of the gen-LP "orphan column" soundness bug: a
+    zonotope noise-symbol column (which MUST be free e ∈ [-1, 1]) was pinned
+    to [0, 0]. Pinned, the column contributes 0 to the objective instead of
+    swinging ±|coef|, so the minimization's optimum is too HIGH — it
+    under-approximates the output zonotope and can certify a false UNSAT (it
+    false-verified dist_shift index4312). A legitimately fixed-at-zero
+    variable (e.g. a dead-neuron bias output) carries *zero* objective weight
+    and is not flagged. See `set_zero_fixed_obj_var_check`.
+    """
+
+    def __init__(self, names, total):
+        self.names = list(names)
+        self.total = int(total)
+        preview = ', '.join(self.names[:8])
+        more = ' ...' if total > len(self.names[:8]) else ''
+        super().__init__(
+            f'{total} variable(s) fixed to [0,0] with nonzero objective '
+            f'weight — a generator/noise-symbol column pinned to [0,0] '
+            f'(the gen-LP orphan-column soundness bug). Offending: '
+            f'{preview}{more}')
+
+
 _NUM_TROUBLE_WARNED_ONCE = False
+
+# When True, `optimize_checked` raises GurobiZeroFixedObjVar if the model has
+# any variable fixed to [0, 0] that carries nonzero objective weight. OFF by
+# default (a per-solve scan over every variable has a cost); enabled during the
+# test suite (see tests/conftest.py) as a soundness regression guard against
+# the gen-LP [0,0]-column bug class. Toggle via `set_zero_fixed_obj_var_check`.
+_CHECK_ZERO_FIXED_OBJ_VARS = False
+_ZERO_FIX_TOL = 1e-12
+
+
+def set_zero_fixed_obj_var_check(enabled):
+    """Enable/disable the [0,0]-fixed-objective-variable guard in
+    `optimize_checked`. Returns the previous value (so callers can restore
+    it). Process-local — subprocess Gurobi workers must enable it
+    themselves."""
+    global _CHECK_ZERO_FIXED_OBJ_VARS
+    prev = _CHECK_ZERO_FIXED_OBJ_VARS
+    _CHECK_ZERO_FIXED_OBJ_VARS = bool(enabled)
+    return prev
+
+
+def _assert_no_zero_fixed_obj_vars(model):
+    """Raise GurobiZeroFixedObjVar if any variable is fixed to [0,0] AND has a
+    nonzero objective coefficient. Batched getAttr keeps it ~O(n) C-side."""
+    model.update()
+    vars_ = model.getVars()
+    if not vars_:
+        return
+    import numpy as np
+    lb = np.asarray(model.getAttr('LB', vars_), dtype=np.float64)
+    ub = np.asarray(model.getAttr('UB', vars_), dtype=np.float64)
+    obj = np.asarray(model.getAttr('Obj', vars_), dtype=np.float64)
+    mask = ((np.abs(lb) <= _ZERO_FIX_TOL) & (np.abs(ub) <= _ZERO_FIX_TOL)
+            & (np.abs(obj) > _ZERO_FIX_TOL))
+    if mask.any():
+        idx = np.nonzero(mask)[0]
+        names = [vars_[int(i)].VarName for i in idx[:8]]
+        raise GurobiZeroFixedObjVar(names, int(mask.sum()))
 
 
 def optimize_checked(model, user_callback=None, *, tokens=TROUBLE_TOKENS,
@@ -67,6 +130,8 @@ def optimize_checked(model, user_callback=None, *, tokens=TROUBLE_TOKENS,
     the trouble scan, so both can observe MESSAGE events.
     """
     global _NUM_TROUBLE_WARNED_ONCE
+    if _CHECK_ZERO_FIXED_OBJ_VARS:
+        _assert_no_zero_fixed_obj_vars(model)
     trouble = []
 
     def cb(m, where):

@@ -1077,20 +1077,23 @@ def _build_alpha_zono_lp(state, qw, qb, milp_set, n_threads,
     # Old loop did 1 addVar per e_in + 1 addVar + m.update() per unstable
     # (~10K addVar calls + ~1300 update() syncs ⇒ ~2.4s build on
     # tinyimagenet). addVars + a single update() drops it to ~0.3s.
-    # Pre-build the FULL n_gens-length e_vars array. Slots that don't
-    # correspond to a real e_in or e_new (gaps from skipped unstables)
-    # get fixed to 0 via lb=ub=0; those slots have no objective weight.
-    e_lb = np.zeros(n_gens, dtype=np.float64)
-    e_ub = np.zeros(n_gens, dtype=np.float64)
-    # Input noise symbols: e_in_i ∈ [-1, 1].
-    e_lb[:n_input] = -1.0
-    e_ub[:n_input] = 1.0
-    # New noise symbols (one per unstable): e_new ∈ [-1, 1] at e_new_col.
-    e_new_cols = np.array([int(ul['e_new_col']) for ul in combined],
-                          dtype=np.int64)
-    if len(e_new_cols) > 0:
-        e_lb[e_new_cols] = -1.0
-        e_ub[e_new_cols] = 1.0
+    #
+    # EVERY column of z_alpha is a zonotope noise symbol ∈ [-1, 1] — input
+    # generators, this query's unstable e_new columns, AND the e_new columns
+    # `state_from_alpha_zono` *reserves* for unstable neurons it skipped
+    # (no pre-ReLU snapshot / no α slope — e.g. mnist_concat's generator
+    # subnetwork, whose ~740 ReLUs are not in `unstable_list`). The old code
+    # fixed every non-input / non-listed column to 0 on the assumption they
+    # "have no objective weight"; that is FALSE — the output zonotope depends
+    # on them (Σ|coef| ≈ 0.17 for index4312). Fixing them at 0 collapses each
+    # such neuron's parallelogram `λ·z + μ·(1+e_new)` to its CENTER line,
+    # which is NOT a sound enclosure of ReLU — it excludes reachable outputs.
+    # Result: the bin-0 LP min disagreed with α-CROWN's spec LB (−1.19 vs
+    # −1.36) and binarising the classifier ReLUs cut off a real CEX, false-
+    # verifying a SAT case (dist_shift index4312). All columns ∈ [-1, 1] is
+    # the sound bound (zero generator columns contribute nothing regardless).
+    e_lb = np.full(n_gens, -1.0, dtype=np.float64)
+    e_ub = np.full(n_gens, 1.0, dtype=np.float64)
     e_vars_arr = m.addMVar(n_gens, lb=e_lb, ub=e_ub, name='e')
     e_vars = list(e_vars_arr.tolist())
     # Binary vars in one batch (one per milp_set member).
