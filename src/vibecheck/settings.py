@@ -553,6 +553,12 @@ def default_settings(**overrides):
         # for per-query spec direction only — tightened bounds are not merged
         # into the global `bounds_by_relu`.
         phase8_per_query_tightened_bounds=True,
+        # Timeout guard for the per-query α-zono state build loop: stop building
+        # new per-query states (and skip the box-halfspace scoring) once fewer
+        # than this many seconds remain, leaving room for the actual Phase 8
+        # solve. Skipped queries fall back to the shared state. Prevents the
+        # per-query loop blowing the budget on big conv nets (tinyimagenet).
+        phase8_per_query_state_reserve_s=8.0,
         # Phase 8 MILP mode. Two orthogonal axes:
         #   relaxation : 'triangle_lp' (Phase 1 precompute_gen_state)
         #              | 'alpha_zono'  (per-query forward_zono_dir_adaptive)

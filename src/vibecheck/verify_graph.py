@@ -6179,7 +6179,24 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             from . import alpha_crown as ac
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            # Timeout enforcement: building a per-query α-zono state (esp. the
+            # box-halfspace scoring below) is expensive on big conv nets
+            # (tinyimagenet resnet: ~18s/query). Without a clock check the loop
+            # blows the total budget — 6 open specs × 18s on a 100s budget runs
+            # to 170s+ (prop_9215 once hit 3242s). Stop building new states once
+            # the budget reserve is gone (skipped queries fall back to the shared
+            # gen_lp_state), and skip the scoring heuristic adaptively when there
+            # is not time for another (it falls back to ew*frac).
+            _pq_reserve = float(getattr(
+                settings, 'phase8_per_query_state_reserve_s', 8.0))
+            _score_dt = [0.0]   # measured cost of one box-halfspace scoring
             for qi in sorted(still_needs_milp):
+                if time_left() <= _pq_reserve:
+                    if print_progress:
+                        print(f'  Per-query α-zono state: {time_left():.1f}s left '
+                              f'<= reserve {_pq_reserve:g}s; remaining queries '
+                              f'use shared state', flush=True)
+                    break
                 _, qw_q, qb_q = queries[qi]
                 # Resolve per-query bbr: prefer Phase 2.5's tightened
                 # bounds when present, else the global bbr.
@@ -6244,18 +6261,23 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 # this query — measured 24/30 overlap with AB-CROWN's
                 # actual splits on tinyimagenet prop_7575 (vs 19/30
                 # for ew*frac). Gated by `phase8_score_box_halfspace`.
-                if bool(getattr(
-                        settings, 'phase8_score_box_halfspace', True)):
+                # Skip the (expensive) box-halfspace scoring when there is not
+                # time for another one plus the reserve — fall back to ew*frac.
+                if (bool(getattr(settings, 'phase8_score_box_halfspace', True))
+                        and time_left() > _score_dt[0] * 1.3 + _pq_reserve):
                     ew_np = {
                         L: (t.detach().cpu().numpy().astype(np.float64)
                             if hasattr(t, 'detach')
                             else np.asarray(t, dtype=np.float64))
                         for L, t in ew_at_relu_q.items()}
+                    _t_sc = time.perf_counter()
                     bh_scores = verify_gen_lp.score_box_halfspace_delta_lb(
                         state_by_qi[qi], qw_q, float(qb_q), ew_np)
                     per_query_scored[qi] = sorted(
                         bh_scores.keys(),
                         key=lambda k: bh_scores[k], reverse=True)
+                    _score_dt[0] = max(_score_dt[0],
+                                       time.perf_counter() - _t_sc)
                 if print_progress:
                     print(f'  Per-query α-zono state q{qi}: '
                           f'n_gens={state_by_qi[qi]["n_gens"]}, '
@@ -6450,6 +6472,13 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 torch.cuda.empty_cache()
             for (qi, qw_q, qb_q, scored_keys_q) in query_specs:
                 if time_left() <= 0:
+                    raw.append((qi, 'unknown', [], None))
+                    continue
+                # If the per-query α-zono state build was budget-truncated, a
+                # skipped query has no alpha_zono state. The dual-ascent needs
+                # one (reads 'lam'); the shared gen_lp_state is a phase1 state
+                # without it. Leave such queries unknown rather than crash.
+                if state_by_qi and qi not in state_by_qi:
                     raw.append((qi, 'unknown', [], None))
                     continue
                 state_q = (state_by_qi.get(qi, gen_lp_state)
