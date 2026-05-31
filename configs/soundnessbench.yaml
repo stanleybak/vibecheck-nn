@@ -1,6 +1,29 @@
-# soundnessbench: large conv net (~240K ReLUs) of adversarially-hidden CEXs;
-# every instance is SAT. The conv auto-route sends it to milp_verify, whose
-# zonotope forward needs ~15 GB and OOMs; route it to verify_graph instead so
-# Phase-0 PGD attacks BEFORE any heavy bound propagation (the CEX is what we
-# need, not a verified bound).
+# soundnessbench: 50/51 instances are SAT with an adversarially-hidden
+# counterexample; the benchmark exists to catch UNSOUND verifiers (a
+# verified/unsat on a SAT case = unsound). vibecheck is already SOUND on it
+# (returns unknown, never false-verifies). SOLVING means matching ABC's `sat`,
+# i.e. FINDING the hidden CEX.
+#
+# ABC's config (exp_configs/vnncomp25/soundnessbench.yaml) is essentially
+# ATTACK-ONLY: pgd_restarts=250, pgd_steps=1000, pgd_alpha=0.005, lr_decay=0.997
+# -> 50/51 sat in ~6-125s. The CEX is found by DEEP PGD (1000 steps, fine step,
+# slow decay), not by many restarts and not by bound propagation. vibecheck's
+# default PGD (pgd_iter=100, pgd_alpha_frac=0.25 -> step 0.125 = 25x ABC's
+# 0.005, 10s budget) is too coarse / too short to descend into the narrow
+# basin, so it returned `unknown`.
+#
+# The input box is width 1.0 on every dim (eps half-width 0.5), so ABC's
+# absolute pgd_alpha=0.005 maps to pgd_alpha_frac = 0.005 / 0.5 = 0.01.
+#
+# Route to verify_graph so Phase-0 PGD runs BEFORE any bound propagation (the
+# dense forward zonotope OOMs at the wide 3->24 conv @ 64x64 ~ 98k neurons;
+# irrelevant once PGD finds the witness first).
 auto_route_milp_for_conv: false
+
+pgd_phase0_enabled: true
+pgd_time_budget_phase0: 180.0      # ABC spends up to ~125s; give headroom
+# Phase-0 PGD falls back to pgd_iter/pgd_restarts (no pgd_phase0_* override).
+pgd_iter: 1000                     # ABC pgd_steps
+pgd_restarts: 250                  # ABC pgd_restarts
+pgd_lr_decay: 0.997                # ABC pgd_lr_decay (slow -> fine convergence)
+pgd_alpha_frac: 0.01               # ABC pgd_alpha 0.005 on half-width 0.5
