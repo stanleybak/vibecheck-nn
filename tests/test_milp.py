@@ -808,14 +808,32 @@ class TestInflateMilpBounds:
             assert np.all(lo <= np.asarray(bounds[li][0]))
             assert np.all(hi >= np.asarray(bounds[li][1]))
 
-    def test_zero_at_origin_gets_absolute_floor(self):
-        # A neuron whose bound is exactly 0 still gets the absolute floor —
-        # without it a degenerate-at-zero bound would stay a hard equality.
+    def test_inflation_preserves_active_dead_classification(self):
+        # The inflation must NOT flip a neuron's active/dead classification:
+        # an active neuron (lo>=0) keeps lo_new>=0, a dead neuron (hi<=0) keeps
+        # hi_new<=0. Otherwise integer-weighted nets (sat_relu) whose
+        # always-active neurons have lo==0 exactly get every one reclassified
+        # unstable and binarised, exploding the spec MILP (90s vs 0.1s).
         from vibecheck.verify_milp import _inflate_milp_bounds
-        out = _inflate_milp_bounds({0: (np.array([0.0]), np.array([0.0]))},
-                                   1e-5, 1e-5)
-        assert out[0][0][0] == pytest.approx(-1e-5)
-        assert out[0][1][0] == pytest.approx(1e-5)
+        bounds = {
+            # active@0, dead@0, unstable straddling 0, active@0.3, dead@-0.3
+            0: (np.array([0.0, -2.0, -1e-8, 0.3, -3.0]),
+                np.array([5.0,  0.0,  1e-8, 9.0, -0.3])),
+        }
+        out = _inflate_milp_bounds(bounds, 1e-5, 1e-5)
+        lo, hi = out[0]
+        # Active neuron (lo==0): stays active (lo_new == 0, NOT -tol).
+        assert lo[0] == 0.0 and hi[0] > 5.0
+        # Dead neuron (hi==0): stays dead (hi_new == 0, NOT +tol).
+        assert hi[1] == 0.0 and lo[1] < -2.0
+        # Unstable neuron (straddles 0): fully inflated both sides.
+        assert lo[2] < -1e-8 and hi[2] > 1e-8
+        # Active@0.3 keeps lo_new>=0 (here 0.3-tol still >0, fully inflated).
+        assert 0.0 <= lo[3] < 0.3
+        # Dead@-0.3 keeps hi_new<=0.
+        assert hi[4] <= 0.0 and hi[4] < -0.3 + 1e-3
+        # Soundness: the inflated box still contains the original box.
+        assert np.all(lo <= bounds[0][0]) and np.all(hi >= bounds[0][1])
 
     def test_noop_when_tolerances_nonpositive(self):
         # atol<=0 and rtol<=0 must short-circuit and return the input

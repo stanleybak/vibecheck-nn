@@ -1702,6 +1702,16 @@ def _inflate_milp_bounds(bounds_by_relu, atol, rtol):
     keeps the over-approximation sound (a larger feasible set can only make the
     feasibility LP *less* infeasible — never a false-verify). See
     `settings.milp_bound_inflation_{atol,rtol}`.
+
+    The inflation MUST NOT flip a neuron's active/dead classification. Flipping
+    is sound but turns a trivially-stable neuron into a binarised one, and on
+    integer-weighted nets (sat_relu) MANY always-active neurons have lo == 0
+    exactly — lo - tol < 0 would reclassify every one as unstable, exploding the
+    spec MILP from ~250 to ~320 degenerate binaries (60 s timeout vs 0.2 s). So
+    clamp: an active neuron (lo >= 0) keeps lo_new >= 0, a dead neuron (hi <= 0)
+    keeps hi_new <= 0. The clamped bound still contains the true reachable range
+    (max(lo-tol,0) <= lo), so soundness is preserved; only the FP-noise slack
+    below 0 is dropped for an already-active neuron, where it is not needed.
     """
     if atol <= 0 and rtol <= 0:
         return bounds_by_relu
@@ -1710,7 +1720,12 @@ def _inflate_milp_bounds(bounds_by_relu, atol, rtol):
         lo = np.asarray(lo, dtype=np.float64)
         hi = np.asarray(hi, dtype=np.float64)
         tol = atol + rtol * np.maximum(np.abs(lo), np.abs(hi))
-        out[li] = (lo - tol, hi + tol)
+        lo_new = lo - tol
+        hi_new = hi + tol
+        # Preserve active (lo>=0) and dead (hi<=0) classification.
+        lo_new = np.where(lo >= 0, np.maximum(lo_new, 0.0), lo_new)
+        hi_new = np.where(hi <= 0, np.minimum(hi_new, 0.0), hi_new)
+        out[li] = (lo_new, hi_new)
     return out
 
 
@@ -2277,18 +2292,34 @@ def _solve_spec_graph_worker(args):
 
     m.update()
 
-    # Spec objective
+    # Spec. `query_w`/`query_bias` are EITHER a single halfspace (1-D w,
+    # scalar b — the common case) OR a CONJUNCTION of halfspaces (2-D w with
+    # one row per conjunct, 1-D b). A conjunctive disjunct's unsafe region is
+    # the INTERSECTION of its halfspaces (e.g. sat_relu's "Y_0>=1 AND Y_1<=0"),
+    # which is often empty even when each halfspace alone is reachable — so
+    # feasibility must enforce ALL of them jointly. optimize/score act on the
+    # first halfspace only (proving it empty still proves the intersection
+    # empty — a sound shortcut; the joint feasibility solve is the general one).
     last_vars = op_var_refs[last_op_name]
-    spec_expr = grb.LinExpr()
-    for j in range(len(query_w)):
-        if query_w[j] != 0 and j < len(last_vars) and last_vars[j] is not None:
-            spec_expr.add(last_vars[j], float(query_w[j]))
+    qw_arr = np.atleast_2d(np.asarray(query_w, dtype=np.float64))
+    qb_arr = np.atleast_1d(np.asarray(query_bias, dtype=np.float64))
+
+    def _halfspace_expr(h):
+        e = grb.LinExpr()
+        row = qw_arr[h]
+        for j in range(row.shape[0]):
+            if row[j] != 0 and j < len(last_vars) and last_vars[j] is not None:
+                e.add(last_vars[j], float(row[j]))
+        return e
+
+    spec_expr = _halfspace_expr(0)
 
     m.setParam('TimeLimit', timeout)
     t0 = time.perf_counter()
 
     if mode == 'feasibility':
-        m.addConstr(spec_expr + float(query_bias) <= 0)
+        for h in range(qw_arr.shape[0]):
+            m.addConstr(_halfspace_expr(h) + float(qb_arr[h]) <= 0)
         m.update(); optimize_checked(m)
         dt = time.perf_counter() - t0
         result = ('SAT' if m.Status == 2 else
@@ -2297,7 +2328,7 @@ def _solve_spec_graph_worker(args):
         return result, dt, None
     elif mode == 'score':
         # Solve LP, extract fractional scores for scoring neurons
-        m.setObjective(spec_expr + float(query_bias), grb.GRB.MINIMIZE)
+        m.setObjective(spec_expr + float(qb_arr[0]), grb.GRB.MINIMIZE)
         m.update(); optimize_checked(m)
         dt = time.perf_counter() - t0
         scores = {}
@@ -2327,7 +2358,7 @@ def _solve_spec_graph_worker(args):
         return 'SCORED', dt, scores
     else:
         m.setParam('BestBdStop', 0.0)
-        m.setObjective(spec_expr + float(query_bias), grb.GRB.MINIMIZE)
+        m.setObjective(spec_expr + float(qb_arr[0]), grb.GRB.MINIMIZE)
         m.update(); optimize_checked(m)
         dt = time.perf_counter() - t0
         lb = None
@@ -2345,8 +2376,17 @@ def _solve_spec_graph_worker(args):
 def _racing_escalation_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
                               query_w, query_bias, scored_keys, n_cores,
                               time_left_fn, input_name, fork_pts,
-                              print_progress=False):
-    """Racing escalation for graph networks."""
+                              print_progress=False, feas_only=False):
+    """Racing escalation for graph networks.
+
+    `feas_only=True` runs ONLY the feasibility worker, with all cores. Use it
+    for a CONJUNCTIVE disjunct (multiple halfspaces): the optimize worker
+    minimises only the FIRST halfspace's margin, which for a conjunction is
+    reachable on its own (never verifies) — so it is pure waste, and the
+    single-thread feasibility worker that DOES prove the joint MILP infeasible
+    is starved of cores (sat_relu unsat_v65: 96.6 s single-threaded → times
+    out). feas_only hands it every core.
+    """
     bin_schedule = [0]
     b = 2
     while b <= len(scored_keys):
@@ -2364,6 +2404,27 @@ def _racing_escalation_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
 
         common = (gg_ops, x_lo, x_hi, bounds_by_relu, query_w, query_bias,
                   scored_keys, n_bins)
+
+        if feas_only:
+            feas_args = ('feasibility',) + common + (
+                max(1, n_cores), tl, input_name, fork_pts)
+            pool = multiprocessing.Pool(1)
+            async_feas = pool.apply_async(_solve_spec_graph_worker,
+                                          (feas_args,))
+            while not async_feas.ready():
+                time.sleep(0.05)
+            feas_result, feas_dt, _ = async_feas.get()
+            pool.terminate(); pool.join()
+            if feas_result == 'UNSAT':
+                if print_progress:
+                    print(f'    Racing bins={n_bins}: '
+                          f'feas UNSAT ({feas_dt:.1f}s) → verified')
+                return True, n_bins
+            if print_progress:
+                print(f'    Racing bins={n_bins}: '
+                      f'feas {feas_result} ({feas_dt:.1f}s) → escalate')
+            continue
+
         feas_args = ('feasibility',) + common + (1, tl, input_name, fork_pts)
         opt_args = ('optimize',) + common + (opt_threads, tl, input_name, fork_pts)
 
@@ -2371,47 +2432,51 @@ def _racing_escalation_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
         async_feas = pool.apply_async(_solve_spec_graph_worker, (feas_args,))
         async_opt = pool.apply_async(_solve_spec_graph_worker, (opt_args,))
 
+        # feas (spec LP/MILP infeasible → safe) and opt (ObjBound > 0 → safe)
+        # are two INDEPENDENT verification signals at this bin count — EITHER
+        # proving safe is enough. Crucially they can DISAGREE: for a conjunctive
+        # disjunct the opt worker minimises only the FIRST halfspace's margin
+        # (reachable → "escalate") while the feas worker enforces ALL halfspaces
+        # jointly (infeasible → verified). So we must NOT terminate the pool the
+        # instant one worker says "escalate" — that used to kill a still-running
+        # feas worker about to return UNSAT (sat_relu's unsat cases). Escalate
+        # only once BOTH workers have finished without verifying.
+        feas_done = opt_done = False
         while True:
-            if async_feas.ready():
+            if not feas_done and async_feas.ready():
                 feas_result, feas_dt, _ = async_feas.get()
-                if feas_result == 'SAT':
-                    if print_progress:
-                        print(f'    Racing bins={n_bins}: '
-                              f'feas SAT ({feas_dt:.1f}s) → escalate')
-                    pool.terminate(); pool.join()
-                    break
-                elif feas_result == 'UNSAT':
+                feas_done = True
+                if feas_result == 'UNSAT':
                     if print_progress:
                         print(f'    Racing bins={n_bins}: '
                               f'feas UNSAT ({feas_dt:.1f}s) → verified')
                     pool.terminate(); pool.join()
                     return True, n_bins
-                else:
-                    # UNKNOWN / TIMEOUT / numeric trouble — NOT a sound
-                    # verification signal. Previously this branch
-                    # printed "feas UNSAT" and returned verified —
-                    # silent unsoundness when LP couldn't solve.
-                    if print_progress:
-                        print(f'    Racing bins={n_bins}: '
-                              f'feas {feas_result} ({feas_dt:.1f}s) → escalate')
-                    pool.terminate(); pool.join()
-                    break
-            if async_opt.ready():
+                # SAT (relaxation feasible) or UNKNOWN/TIMEOUT (not a sound
+                # signal) — feas cannot verify at this bin count; wait for opt.
+                if print_progress:
+                    print(f'    Racing bins={n_bins}: '
+                          f'feas {feas_result} ({feas_dt:.1f}s)')
+            if not opt_done and async_opt.ready():
                 opt_result, opt_dt, opt_lb = async_opt.get()
+                opt_done = True
+                lb_s = f'{opt_lb:.4f}' if opt_lb is not None else '?'
                 if opt_result == 'UNSAT':
-                    lb_s = f'{opt_lb:.4f}' if opt_lb is not None else '?'
                     if print_progress:
                         print(f'    Racing bins={n_bins}: '
                               f'opt lb={lb_s} ({opt_dt:.1f}s) → verified')
                     pool.terminate(); pool.join()
                     return True, n_bins
-                else:
-                    lb_s = f'{opt_lb:.4f}' if opt_lb is not None else '?'
-                    if print_progress:
-                        print(f'    Racing bins={n_bins}: '
-                              f'opt lb={lb_s} ({opt_dt:.1f}s) → escalate')
-                    pool.terminate(); pool.join()
-                    break
+                if print_progress:
+                    print(f'    Racing bins={n_bins}: '
+                          f'opt lb={lb_s} ({opt_dt:.1f}s)')
+            if feas_done and opt_done:
+                # Neither feas (infeasible) nor opt (lb>0) verified at this bin
+                # count → escalate to more binaries.
+                if print_progress:
+                    print(f'    Racing bins={n_bins}: neither → escalate')
+                pool.terminate(); pool.join()
+                break
             time.sleep(0.05)
 
     return False, bin_schedule[-1] if bin_schedule else 0
@@ -2986,6 +3051,51 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
             gg['input_name'], gg['fork_points'], print_progress)
         if verified:
             spec_lbs[qi] = 1.0  # mark as verified
+            n_binaries = max(n_binaries, n_bins)
+
+    # Conjunctive disjuncts: a disjunct with >1 conjunct is unsafe only where
+    # ALL its halfspaces hold simultaneously (their INTERSECTION). The per-query
+    # loop above verifies it only if some single conjunct's halfspace is empty;
+    # when each halfspace alone is reachable but the intersection is empty
+    # (sat_relu's "Y_0>=1 AND Y_1<=0"), prove the JOINT feasibility MILP
+    # infeasible instead. Sound: relaxation ∩ (all halfspaces) = ∅ ⇒ disjunct
+    # safe (feas-mode worker adds every conjunct as a constraint).
+    for di in sorted(disj_queries):
+        qlist = disj_queries[di]
+        if len(qlist) < 2:
+            continue  # single-conjunct already handled per-query
+        if all(spec_lbs.get(qi, -1) > 0 for qi, _, _ in qlist):
+            continue  # already verified (some single halfspace was empty)
+        if time_left() <= 0:
+            break
+        qw_2d = np.stack([w for _, w, _ in qlist]).astype(np.float64)
+        qb_1d = np.array([b for _, _, b in qlist], dtype=np.float64)
+        # Neurons to binarise: reuse a member query's scored keys; else
+        # box-area score over all unstable so the bin schedule can escalate to
+        # exact binarisation.
+        conj_scored = []
+        for qi0, _, _ in qlist:
+            if per_query_scored.get(qi0):
+                conj_scored = per_query_scored[qi0]
+                break
+        if not conj_scored:
+            sc = {}
+            for li in range(nh):
+                lo, hi = bounds_by_relu[li]
+                for i in np.where((lo < 0) & (hi > 0))[0]:
+                    sc[(li, int(i))] = float(hi[i]) * abs(float(lo[i])) / 2
+            conj_scored = sorted(sc, key=lambda k: sc[k], reverse=True)
+        if print_progress:
+            print(f'  MILP conjunctive disjunct {di} '
+                  f'({len(qlist)} conjuncts):')
+        verified, n_bins = _racing_escalation_graph(
+            gg_ops_ser, x_lo_64, x_hi_64, bounds_by_relu,
+            qw_2d, qb_1d, conj_scored, n_cores, time_left,
+            gg['input_name'], gg['fork_points'], print_progress,
+            feas_only=True)
+        if verified:
+            for qi, _, _ in qlist:
+                spec_lbs[qi] = 1.0
             n_binaries = max(n_binaries, n_bins)
 
     # Re-check which disjuncts are now fully verified

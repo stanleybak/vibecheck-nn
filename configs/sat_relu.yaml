@@ -1,0 +1,17 @@
+# sat_relu (extended/regular): SAT problems encoded as integer-weighted ReLU nets.
+# The unsafe spec is a CONJUNCTION (Y_0>=1 AND Y_1<=0); proven via the joint
+# feasibility MILP (see verify_milp conjunctive-disjunct path). The nets have
+# exact INTEGER weights, so the float32->float64 gap is zero and the FP bound
+# inflation is unnecessary; worse, it makes big-M coefficients non-integer
+# (e.g. 4.00001) and defeats Gurobi's integer-aware presolve/cuts, turning a
+# 0.1s infeasibility proof into a 90s timeout. Disable it here (sound: the
+# bounds are exact integers, so the var bounds exactly contain the reachable
+# range).
+milp_bound_inflation_atol: 0.0
+milp_bound_inflation_rtol: 0.0
+# Route EVERY case to the exact MILP (the conjunctive feasibility path), not
+# just nets with input dim > 20. The small instances (v6..v18, ≤20 inputs)
+# otherwise take the input-split graph pipeline, which can't prove the
+# conjunctive unsafe region and times out. sat_relu gains nothing from
+# input-splitting, so disable its cap (n_in > 0 ⇒ always MILP-route).
+input_split_max_dims: 0
