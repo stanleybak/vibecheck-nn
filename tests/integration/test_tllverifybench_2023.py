@@ -43,6 +43,15 @@ CASES = [
         vnnlib='vnnlib/property_N=16_2.vnnlib',
         expected='verified', timeout=60, max_wall_s=15.0,
     ),
+    dict(
+        # The plateau case that ONLY naive branching closes: smart branch_sb
+        # over-splits it ~290x (89,735 leaves → timeout); naive does it in 305
+        # leaves / 3s. Pins the branching fix.
+        desc='tll N=M=24 instance_2_1 (UNSAT, needs naive branching)',
+        net='onnx/tllBench_n=2_N=M=24_m=1_instance_2_1.onnx',
+        vnnlib='vnnlib/property_N=24_1.vnnlib',
+        expected='verified', timeout=60, max_wall_s=15.0,
+    ),
 ]
 
 
