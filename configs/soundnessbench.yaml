@@ -1,0 +1,6 @@
+# soundnessbench: large conv net (~240K ReLUs) of adversarially-hidden CEXs;
+# every instance is SAT. The conv auto-route sends it to milp_verify, whose
+# zonotope forward needs ~15 GB and OOMs; route it to verify_graph instead so
+# Phase-0 PGD attacks BEFORE any heavy bound propagation (the CEX is what we
+# need, not a verified bound).
+auto_route_milp_for_conv: false
