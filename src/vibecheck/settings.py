@@ -266,6 +266,11 @@ def default_settings(**overrides):
         input_split_batched_alpha_boundary_eps=0.0,
         input_split_batched_alpha_iters=10,
         input_split_batched_alpha_max_leaves=200,
+        # When True, run the batched α-CROWN on EVERY unclosed leaf in the
+        # batch (not just the eps-boundary band). Needed when per-leaf CROWN
+        # lb sits far below 0 (tllverifybench: -30..-180) so the boundary band
+        # never fires and the input-split explodes. Default OFF; opt-in.
+        input_split_batched_alpha_all_leaves=False,
         # Exponent on the (1+n_unstable_in_dominant_shallow_layer) split-
         # selection boost. >1 sharpens the preference for bound-critical
         # unstable-branch dims. The non-LP forcing block raises this to

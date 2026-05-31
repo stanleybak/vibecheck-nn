@@ -1,0 +1,11 @@
+# tllverifybench_2023: two-level-lattice nets (2-D input, ~8 ReLU layers, deep
+# MatMul/Add chains). AB-CROWN verifies with batched input-split BaB (no
+# Gurobi). vibecheck routed the pure-ReLU net to the single-leaf fast-leaf path
+# (timeout); the batched path (AB-CROWN-style, GPU-parallel) was gated to
+# bilinear nets — enable it here, and apply batched α-CROWN to every unclosed
+# leaf (the deep net's per-leaf lb sits at -30..-180, far past the default
+# eps-boundary band, so it would never fire and the input-split explodes).
+input_split_batched_enabled: true
+input_split_batched_branch_sb: true
+input_split_batched_alpha_all_leaves: true
+input_split_batched_alpha_iters: 20

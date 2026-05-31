@@ -9841,23 +9841,39 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         # leaves where some query's lb is within `boundary_eps` of 0.
         # Serial per leaf (~5-20 ms each). Win condition: closes
         # enough boundary leaves to cancel the BaB explosion.
+        # `input_split_batched_alpha_all_leaves` (boolean, default OFF) applies
+        # the batched α-CROWN to EVERY unclosed leaf in the batch, not just the
+        # eps-boundary band. For deep nets whose per-leaf backward-CROWN lb is
+        # far below 0 (tllverifybench: -30..-180 — nowhere near the eps band),
+        # the boundary-only α never fires and the 2-D input-split explodes
+        # (45k+ leaves vs AB-CROWN's ~369). Tightening every unclosed leaf cuts
+        # that ~200×. ON per-config (cleaner than tuning a magnitude eps; may
+        # cost on benchmarks where the boundary heuristic was already enough,
+        # hence default OFF). The batch size B bounds the per-iteration cost.
+        alpha_all = bool(getattr(
+            settings, 'input_split_batched_alpha_all_leaves', False))
         alpha_eps = float(getattr(
             settings, 'input_split_batched_alpha_boundary_eps', 0.0))
         alpha_max_iters = int(getattr(
             settings, 'input_split_batched_alpha_iters', 0))
         alpha_max_leaves = int(getattr(
             settings, 'input_split_batched_alpha_max_leaves', 200))
-        if alpha_eps > 0 and alpha_max_iters > 0 and not all_disj_closed.all():
+        if (alpha_max_iters > 0 and (alpha_all or alpha_eps > 0)
+                and not all_disj_closed.all()):
             from .verify_zono_bnb import _run_alpha_crown_inputsplit_batched
             best_per_disj_lb = []
             for di, q_idxs in disj_q_idx.items():
                 best_per_disj_lb.append(spec_lbs_b[:, q_idxs].max(dim=1).values)
             worst_disj_best = torch.stack(best_per_disj_lb, dim=1).min(dim=1).values
-            close_mask = (~all_disj_closed) & (worst_disj_best > -alpha_eps)
+            if alpha_all:
+                close_mask = ~all_disj_closed
+            else:
+                close_mask = (~all_disj_closed) & (worst_disj_best > -alpha_eps)
             close_idx = close_mask.nonzero(as_tuple=True)[0]
             if close_idx.numel() > 0:
-                order = worst_disj_best[close_idx].argsort(descending=True)
-                close_idx = close_idx[order[:alpha_max_leaves]]
+                if not alpha_all:
+                    order = worst_disj_best[close_idx].argsort(descending=True)
+                    close_idx = close_idx[order[:alpha_max_leaves]]
                 # BATCHED α-CROWN on the boundary leaves' boxes. The
                 # whole batch is optimized on GPU in one Adam loop —
                 # massively faster than per-leaf serial. Per-iter cost
