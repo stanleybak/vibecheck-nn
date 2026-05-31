@@ -11,11 +11,11 @@ actually false. (AB-CROWN's results CSV lists one `unsat`, but that row is the
 
 ## Score
 
-- **vibecheck: 49 sat / 50** — the lone miss is `model_26`, a hard instance
-  AB-CROWN also spends 106 s on (see Known unsolved).
+- **vibecheck: 50 sat / 50 — full parity with AB-CROWN.**
 - AB-CROWN: 50/50 sat (~6–125 s/case, median ~80 s).
-- vibecheck cracks via Phase-0 PGD at ~30–90 s/case — **faster than AB-CROWN**
-  where both solve.
+- vibecheck cracks via Phase-0 PGD; 49 cases at ~30–90 s on a single α=0.01, and
+  the last (model_26) needs a second α=0.05 (two-way multi-α, below). Slowest
+  case ~131 s, under the 150 s budget.
 - (vc sweep: `~/persistent_runs/scripts/sweep_soundnessbench.sh` on server1,
   2026-05-31; ABC ref `2025_soundnessbench/results.csv`.)
 
@@ -61,8 +61,9 @@ possible). This is exactly the property the benchmark checks.
 ## Config (`configs/soundnessbench.yaml`)
 
 `auto_route_milp_for_conv: false` + deep-PGD knobs (`pgd_iter=1000`,
-`pgd_restarts=250`, `pgd_lr_decay=0.997`, `pgd_alpha_frac=0.01`,
-`pgd_time_budget_phase0=180`).
+`pgd_lr_decay=0.997`, `pgd_time_budget_phase0=145`) + two-way multi-α
+(`pgd_alpha_multi: true`, `pgd_alpha_multi_fractions: [0.01, 0.05]`,
+`pgd_restarts: 500`).
 
 ## Reproduce
 
@@ -80,13 +81,21 @@ model_0, model_1, model_2 — three SAT cases that deep-PGD cracks (~30 s).
 Expected `sat`; a regression that emitted `verified`/`unsat` (false-verify) or
 `unknown` (lost the attack) fails them.
 
+## The model_26 straggler — and the two-way multi-α fix
+
+49/50 crack on a single α=0.01 (the ABC-matched step). **model_26 does not** —
+its planted basin is missed by α=0.01 (and by 0.002 and 0.25) but **hit by
+α=0.05** (cracks in ~60 s). No single α solves all 50.
+
+The naive fix (4-way `pgd_alpha_multi` at 600 restarts) *regressed* model_6: that
+case is slow (~102 s on α=0.01) and the 4-way split starved it to 150 restarts
+of α=0.01 → `unknown` at 158 s. The fix is a **two-way** split `[0.01, 0.05]` at
+**500 restarts** → 250 each: model_6 keeps its full 250×0.01 density (cracks
+129 s) *and* model_26 gets 250×0.05 running concurrently (cracks 60 s). Verified
+50/50, all < 150 s (slowest model_8 131 s). Cost: ~2.4× slower on easy cases
+(still far under budget). model_26 is a hard instance for AB-CROWN too — it gets
+it `sat` in 106.6 s vs its ~80 s median.
+
 ## Known unsolved
 
-`model_26` (1/50). Deep PGD ran the full 250 restarts × 1000 steps (~109 s)
-without finding the planted CEX, then fell through to the zono (OOM) → `unknown`.
-It is a hard instance for AB-CROWN too: AB-CROWN gets it `sat` in **106.6 s**
-(vs its ~80 s median). The two tools differ in one knob I have not yet matched —
-AB-CROWN runs soundnessbench in **float64** (`double_fp: true`); the planted
-basin may need that precision. Candidate fixes (untested): `--dtype float64`,
-multi-α restarts (`pgd_alpha_multi`), or more restarts. Tracked as the one
-straggler; everything else is `sat`.
+None. 50/50.

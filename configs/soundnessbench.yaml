@@ -1,19 +1,17 @@
-# soundnessbench: 50/51 instances are SAT with an adversarially-hidden
+# soundnessbench: all 50 instances are SAT with an adversarially-hidden
 # counterexample; the benchmark exists to catch UNSOUND verifiers (a
 # verified/unsat on a SAT case = unsound). vibecheck is already SOUND on it
 # (returns unknown, never false-verifies). SOLVING means matching ABC's `sat`,
-# i.e. FINDING the hidden CEX.
+# i.e. FINDING the hidden CEX. (ABC's CSV lists one `unsat`, but that is the
+# unrelated test/test_nano sanity instance, not a soundnessbench model.)
 #
 # ABC's config (exp_configs/vnncomp25/soundnessbench.yaml) is essentially
-# ATTACK-ONLY: pgd_restarts=250, pgd_steps=1000, pgd_alpha=0.005, lr_decay=0.997
-# -> 50/51 sat in ~6-125s. The CEX is found by DEEP PGD (1000 steps, fine step,
-# slow decay), not by many restarts and not by bound propagation. vibecheck's
-# default PGD (pgd_iter=100, pgd_alpha_frac=0.25 -> step 0.125 = 25x ABC's
-# 0.005, 10s budget) is too coarse / too short to descend into the narrow
-# basin, so it returned `unknown`.
-#
-# The input box is width 1.0 on every dim (eps half-width 0.5), so ABC's
-# absolute pgd_alpha=0.005 maps to pgd_alpha_frac = 0.005 / 0.5 = 0.01.
+# ATTACK-ONLY: pgd_restarts=250, pgd_steps=1000, pgd_alpha=0.005, lr_decay=0.997.
+# The CEX is found by DEEP PGD (1000 steps, fine step, slow decay), not by bound
+# propagation. vibecheck's default PGD (pgd_iter=100, pgd_alpha_frac=0.25 ->
+# step 0.125 = 25x ABC's 0.005, 10s budget) is too coarse / short to descend
+# into the narrow basin. The input box is width 1.0/dim (eps half-width 0.5), so
+# ABC's absolute pgd_alpha=0.005 maps to pgd_alpha_frac = 0.005 / 0.5 = 0.01.
 #
 # Route to verify_graph so Phase-0 PGD runs BEFORE any bound propagation (the
 # dense forward zonotope OOMs at the wide 3->24 conv @ 64x64 ~ 98k neurons;
@@ -21,9 +19,19 @@
 auto_route_milp_for_conv: false
 
 pgd_phase0_enabled: true
-pgd_time_budget_phase0: 180.0      # ABC spends up to ~125s; give headroom
-# Phase-0 PGD falls back to pgd_iter/pgd_restarts (no pgd_phase0_* override).
+pgd_time_budget_phase0: 145.0      # competition timeout is 150s; cap under it
 pgd_iter: 1000                     # ABC pgd_steps
-pgd_restarts: 250                  # ABC pgd_restarts
+
+# Two-way multi-alpha. 49/50 cases crack on alpha_frac=0.01 (the ABC-matched
+# step); model_26's planted basin is missed by 0.01 (and by 0.002/0.25) but is
+# hit by 0.05. A SINGLE alpha can't do both, and a naive 4-way multi-alpha
+# STARVES the slowest case (model_6, ~102s on 0.01) of restarts -> it regresses
+# to unknown. The fix: split 500 restarts across just [0.01, 0.05] -> 250 each,
+# so model_6 keeps its full 250x0.01 density AND model_26 gets 250x0.05, both
+# running concurrently. Result: 50/50 sat, all < 150s (slowest ~131s). The cost
+# is ~2.4x slower on easy cases (still well under budget).
+pgd_alpha_multi: true
+pgd_alpha_multi_fractions: [0.01, 0.05]
+pgd_restarts: 500
 pgd_lr_decay: 0.997                # ABC pgd_lr_decay (slow -> fine convergence)
-pgd_alpha_frac: 0.01               # ABC pgd_alpha 0.005 on half-width 0.5
+pgd_alpha_frac: 0.01               # base step (overridden per-restart by multi)
