@@ -166,15 +166,21 @@ def _parse_or_and(text, or_body, dtype=np.float32):
 
     assert and_blocks, "No (and ...) blocks found in (or ...)"
 
-    # Per-block X bounds, then merge as UNION for the global x_lo/x_hi.
-    block_x_bounds_list = []  # one dict per disjunct
-    disjuncts = []
+    # Classify each (and ...) block. A block with output (Y) constraints is an
+    # OUTPUT disjunct; a block with ONLY X constraints is one box of an INPUT
+    # disjunction (acasxu prop_6/7/8 split the heading psi into two ranges, in
+    # a SEPARATE `(assert (or ...))` from the output disjunction).
+    all_block_x = []           # every block's X box (for the global hull)
+    x_only_boxes = []          # boxes of the input disjunction
+    y_disjuncts = []           # (constraints, own_x_box) output disjuncts
     for block in and_blocks:
         block_x = _parse_block_x_bounds(block)
-        block_x_bounds_list.append(block_x)
+        all_block_x.append(block_x)
         constraints = _parse_block_constraints(block)
         if constraints:
-            disjuncts.append((constraints, block_x))
+            y_disjuncts.append((constraints, block_x))
+        elif block_x:
+            x_only_boxes.append(block_x)
 
     # Top-level X bounds (outside the or block) apply to EVERY disjunct.
     top_x_bounds = {}
@@ -183,13 +189,14 @@ def _parse_or_and(text, or_body, dtype=np.float32):
     for m in re.finditer(r'\(assert\s+\(<=\s+X_(\d+)\s+([-\d.eE+]+)\s*\)\)', text):
         top_x_bounds.setdefault(int(m.group(1)), [None, None])[1] = float(m.group(2))
 
-    # UNION across disjuncts + top-level for global bounding box. Take
-    # min of lo, max of hi. (Each disjunct contributes a sub-box of the
-    # input; the verification region is the UNION; the bounding box
-    # over-approximates that union and is what the rest of the pipeline
-    # works against.)
+    # UNION across ALL blocks + top-level for the global bounding box. Take
+    # min of lo, max of hi. (Each block contributes a sub-box of the input;
+    # the verification region is the UNION; the bounding box over-approximates
+    # that union and is what the rest of the pipeline works against. Note: the
+    # hull is SOUND for the verification/`check` side, but NOT for witness
+    # validation, which is why per-disjunct boxes are attached below.)
     union = dict(top_x_bounds)
-    for bx in block_x_bounds_list:
+    for bx in all_block_x:
         for i, (lo, hi) in bx.items():
             if i not in union:
                 union[i] = [lo, hi]
@@ -207,6 +214,32 @@ def _parse_or_and(text, or_body, dtype=np.float32):
     n_input = max(union.keys()) + 1
     x_lo = np.array([union.get(i, [0, 0])[0] or 0 for i in range(n_input)], dtype=dtype)
     x_hi = np.array([union.get(i, [0, 0])[1] or 0 for i in range(n_input)], dtype=dtype)
+
+    # CROSS-PRODUCT a separate INPUT-OR with the OUTPUT-OR. The full unsafe
+    # region is (union of input boxes) AND (union of output conditions);
+    # collapsing the input disjunction to its hull is UNSOUND — a point in the
+    # GAP between input boxes that violates the output would be accepted as a
+    # false counterexample (acasxu prop_6 net 1_1 returned a spurious `sat`).
+    # Expand to DNF: pair each output disjunct with each input box, so every
+    # resulting conjunct carries its real input sub-box (which
+    # `VNNSpec.check_witness` enforces, rejecting gap points).
+    if x_only_boxes:
+        expanded = []
+        for constraints, own_x in y_disjuncts:
+            for in_box in x_only_boxes:
+                merged = {i: list(v) for i, v in own_x.items()}
+                for i, (lo, hi) in in_box.items():
+                    if i not in merged:
+                        merged[i] = [lo, hi]
+                    else:
+                        if lo is not None:
+                            merged[i][0] = lo if merged[i][0] is None else max(merged[i][0], lo)
+                        if hi is not None:
+                            merged[i][1] = hi if merged[i][1] is None else min(merged[i][1], hi)
+                expanded.append((constraints, merged))
+        disjuncts = expanded
+    else:
+        disjuncts = y_disjuncts
 
     assert disjuncts, "No output constraints found in (or (and ...)) blocks"
 

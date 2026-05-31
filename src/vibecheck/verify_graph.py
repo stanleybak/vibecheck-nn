@@ -6994,12 +6994,26 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                         try:
                             w_shared = torch.as_tensor(
                                 all_w_sub[0], dtype=dt, device=dev)
-                            tight_all = {L: (sb_b[L][0], sb_b[L][1])
+                            # Restrict the batched backward to the UNCLOSED subs
+                            # so the returned lbs align with `unclosed` (hence
+                            # with `biases` and the margin loop). Passing the
+                            # FULL xl_t/xh_t returns lbs indexed by sub; once the
+                            # forward pass has closed some subs, `unclosed` is a
+                            # strict subset and `margins[idx]` would read a
+                            # DIFFERENT sub's (possibly positive) margin -> a
+                            # false `verified`. The per-q and per-sub paths below
+                            # already slice; this one did not.
+                            _unc_t = torch.as_tensor(
+                                unclosed, dtype=torch.long, device=dev)
+                            xl_unc = xl_t.index_select(0, _unc_t)
+                            xh_unc = xh_t.index_select(0, _unc_t)
+                            tight_all = {L: (sb_b[L][0].index_select(0, _unc_t),
+                                              sb_b[L][1].index_select(0, _unc_t))
                                           for L in sb_b}
                             spec_ew_shared = {0: (w_shared, 0.0)}
                             import os as _osd0
                             spec_lbs_all = _spec_backward_graph_batched(
-                                tight_all, xl_t, xh_t, gg_fast,
+                                tight_all, xl_unc, xh_unc, gg_fast,
                                 spec_ew_shared, dev, dt)
                             lbs_np_all = spec_lbs_all[:, 0].detach().cpu().numpy()
                             biases = np.array([float(sub_queries[idx][0][2])
@@ -7029,8 +7043,10 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                                     _run_alpha_crown_inputsplit_batched)
                                 idx_t_tensor = torch.as_tensor(
                                     close_idx, dtype=torch.long, device=dev)
-                                xl_open = xl_t.index_select(0, idx_t_tensor)
-                                xh_open = xh_t.index_select(0, idx_t_tensor)
+                                # close_idx are positions WITHIN `unclosed`, so
+                                # index the unclosed slice (not the full xl_t).
+                                xl_open = xl_unc.index_select(0, idx_t_tensor)
+                                xh_open = xh_unc.index_select(0, idx_t_tensor)
                                 spec_lbs_alpha = _run_alpha_crown_inputsplit_batched(
                                     xl_open, xh_open, gg_fast,
                                     spec_ew_shared, dev, dt, n_iters=30)

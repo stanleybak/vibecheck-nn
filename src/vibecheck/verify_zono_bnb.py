@@ -3652,6 +3652,16 @@ def _run_alpha_crown_inputsplit_batched(xl, xh, gg, spec_ew, device, dtype,
     optimizer_params = [alpha_at_layer[L] for L in alpha_at_layer]
     optimizer_params += [a for (a, _, _) in alpha_pow_norm.values()]
     optimizer_params += [a for (a, _, _) in alpha_div_norm.values()]
+    if not optimizer_params:
+        # No tunable α — every ReLU is stable (all active or all dead) over
+        # these leaves and there are no Pow/Div ops. There is nothing to
+        # optimise; the basic backward bound (init α) IS the answer and is
+        # sound. (torch.optim.Adam raises on an empty parameter list; a fully-
+        # stable leaf is reachable both here and via small BaB sub-boxes.)
+        with torch.no_grad():
+            return _spec_backward_graph_batched(
+                sb_init, xl, xh, gg, spec_ew, device, dtype,
+                alpha_at_layer=alpha_at_layer)
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
     # Backward compat for legacy variable names used in clamp loop below
     alpha_pow = alpha_pow_norm
