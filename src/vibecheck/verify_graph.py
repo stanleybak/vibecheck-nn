@@ -6786,7 +6786,7 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
     is 0.2 s to avoid 0-budget no-ops on huge disjunct sets.
     """
     import copy
-    from .spec import VNNSpec, Conjunct
+    from .spec import VNNSpec, Conjunct, Constraint
     t_start = time.perf_counter()
     total = float(getattr(settings, 'total_timeout', 30.0))
 
@@ -6851,6 +6851,11 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
             if len(d.constraints) != 1:
                 ok = False; break
             c = d.constraints[0]
+            # This OR-coverage fast-pass is threshold-only; a PairwiseConstraint
+            # (Y_i >= Y_j, e.g. acasxu prop_6/7/8 disjunctive-input) has no
+            # threshold `.op`/`.value` -> bail and let the CROWN path handle it.
+            if not isinstance(c, Constraint):
+                ok = False; break
             sign = +1 if c.op == '>=' else -1 if c.op == '<=' else 0
             if sign == 0:
                 ok = False; break

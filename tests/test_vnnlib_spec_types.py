@@ -234,6 +234,39 @@ def test_identity_net_gap_spec_not_sat(tmp_path):
         'points are in the excluded input gap -> false SAT (unsound)')
 
 
+def test_identity_net_disjunctive_input_pairwise_output_no_crash(tmp_path):
+    """Disjunctive input + PAIRWISE output (acasxu prop_6/7/8 shape). The
+    per-disjunct verify path's OR-coverage fast-pass must not crash on a
+    PairwiseConstraint (it has no threshold `.op`). Regression: it did
+    (AttributeError), masked as 'unknown' by main.py's handler."""
+    from vibecheck.network import ComputeGraph
+    from vibecheck.settings import default_settings
+    from vibecheck.verify_graph import verify_graph
+
+    net = _identity_onnx(tmp_path, n=2)
+    txt = """
+    (declare-const X_0 Real)
+    (declare-const X_1 Real)
+    (declare-const Y_0 Real)
+    (declare-const Y_1 Real)
+    (assert (or
+        (and (>= X_0 0.0) (<= X_0 1.0))
+        (and (>= X_0 2.0) (<= X_0 3.0))))
+    (assert (>= X_1 0.0))
+    (assert (<= X_1 1.0))
+    (assert (or
+        (and (>= Y_0 Y_1))))
+    """
+    spec = parse_vnnlib_text(txt)
+    assert all(d.input_lo is not None for d in spec.disjuncts)
+    graph = ComputeGraph.from_onnx(net, dtype=np.float32)
+    settings = default_settings(device='cpu', bits=32, total_timeout=20)
+    settings.print_progress = False
+    graph.optimize(settings)
+    result, _ = verify_graph(graph, spec, settings)  # must not raise
+    assert result in ('sat', 'verified', 'unknown')
+
+
 def test_identity_net_real_sat(tmp_path):
     """Control: same net/input region but the unsafe output IS reachable inside
     a real input box -> verifier should find it (sat), confirming the fix did
