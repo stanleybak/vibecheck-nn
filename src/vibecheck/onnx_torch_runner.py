@@ -188,8 +188,12 @@ def onnx_forward(model, x, device=None, dtype=None):
         arr = numpy_helper.to_array(init)
         vals[init.name] = torch.as_tensor(arr, device=device,
                                             dtype=dtype if arr.dtype.kind == 'f' else None)
-    # Input
-    inp_name = g.input[0].name
+    # Input. Old ONNX exporters (e.g. acasxu) also list every initializer in
+    # g.input, so g.input[0] may be an initializer rather than the real data
+    # input. Pick the one g.input entry that is NOT an initializer.
+    _init_names = {init.name for init in g.initializer}
+    _real_inputs = [i.name for i in g.input if i.name not in _init_names]
+    inp_name = _real_inputs[0] if _real_inputs else g.input[0].name
     vals[inp_name] = x
     # Run nodes in order
     for node in g.node:

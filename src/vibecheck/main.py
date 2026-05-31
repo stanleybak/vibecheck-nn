@@ -34,6 +34,11 @@ def main():
                         help='BnB timeout in seconds (default: 30)')
     parser.add_argument('--pgd-restarts', type=int, default=100,
                         help='PGD restarts for BnB (default: 100)')
+    parser.add_argument('--disable-sat-finding', action='store_true',
+                        help='Disable all counterexample search (PGD, MILP '
+                             'witness). Soundness probe: on a SAT case the '
+                             'verdict can then only come from the bounds/MILP '
+                             "path, which must never return 'unsat'.")
     parser.add_argument('--config', default=None,
                         help='Per-benchmark YAML overrides on top of '
                              'default_settings(). When set, overrides take '
@@ -121,6 +126,8 @@ def _verify(args):
                 device=args.device, bits=args.bits,
                 total_timeout=args.timeout, pgd_restarts=args.pgd_restarts)
             cli_overrides.update(yaml_overrides)
+            if args.disable_sat_finding:  # CLI soundness probe wins over YAML
+                cli_overrides['disable_sat_finding'] = True
             settings = default_settings(**cli_overrides)
             settings._profile = f'config:{args.config}'
         else:
@@ -132,6 +139,8 @@ def _verify(args):
                 total_timeout=args.timeout,
                 pgd_restarts=args.pgd_restarts,
             )
+            if args.disable_sat_finding:
+                settings.disable_sat_finding = True
         graph.optimize(settings)
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
