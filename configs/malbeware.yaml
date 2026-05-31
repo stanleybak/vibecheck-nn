@@ -8,10 +8,11 @@
 # closes SAT and most UNSAT in seconds.
 auto_route_milp_for_conv: false
 input_split_enabled: false
-# Push Phase 8 fallback MILP to encode ALL unstable neurons (~8k binaries)
-# with full Gurobi defaults (cuts/presolve ON). 4-25 eps-3 cases plateau
-# at 200 bins (default) but close exactly at full encoding — matches AB-CROWN's
-# `complete_verifier: mip` strategy (single full-MIP solve on
-# α-CROWN-tightened bounds; ABC solves in ~5-7 s, we solve in ~6-18 s).
-phase8_high_bin_count: 10000
+# These 4-25 eps-3 cases need the FULL MILP encoding (~4917 unstable neurons,
+# cuts ON) to close — the small-bin racing plateaus at lb≈-0.75. The default-on
+# all-bins racer (phase8_race_all_bins) handles this automatically: it races a
+# cuts-ON all-neurons task that proves the margin bound > 0 in ~2 s (AB-CROWN's
+# `complete_verifier: mip` strategy). `high_bin_count: all` keeps the same full
+# encoding for the post-racing fallback backup.
+phase8_high_bin_count: all
 phase8_high_bin_time_limit: 25.0

@@ -602,8 +602,23 @@ def default_settings(**overrides):
         # numerical false-INFEASIBLE; if it can't confirm, we keep the
         # query open. Default ON.
         phase8_high_bin_fallback=True,
+        # Max neurons the fallback binarizes. Sentinel 'all' (also None / inf /
+        # <=0) means a full MILP over every unstable neuron — use it instead of
+        # a magic 'bigger than any net' integer.
         phase8_high_bin_count=200,
         phase8_high_bin_time_limit=60.0,
+        # High-bin fallback proof method. Default-on: minimize the spec margin
+        # and stop via BestBdStop once its proven lower bound >= tol > 0 (an
+        # explicit, auditable certificate). Disable to use the legacy
+        # halfspace+INFEASIBLE proof (relies on Gurobi infeasibility detection).
+        phase8_high_bin_bestbdstop=True,
+        phase8_high_bin_bestbdstop_tol=1e-6,
+        # Default-on: queue an all-neurons "complete" task (cuts ON + BestBdStop)
+        # at the FRONT of the parallel racing pool, racing it concurrently with
+        # the small-bin levels. Closes cases where every neuron matters (the
+        # small bins plateau) without a per-benchmark flag. Disable if it slows
+        # many-spec benchmarks (one extra full-MILP worker per open spec).
+        phase8_race_all_bins=True,
         # ----- MILP-seeded PGD refinement -----
         # After every Phase 8 MILP worker that returns a feasible (but not
         # spec-violating) solution, take its e_in (the input-generator

@@ -1129,6 +1129,26 @@ def _solve_spec_worker_graph(args):
     return 'UNKNOWN', dt, info
 
 
+def _resolve_high_bin_count(raw):
+    """Resolve ``phase8_high_bin_count`` to an int cap, or ``None`` = "all".
+
+    The high-bin fallback binarizes up to this many unstable neurons. The
+    sentinel ``'all'`` (also ``None`` / ``float('inf')`` / any value <= 0) means
+    "binarize EVERY unstable neuron" (a full MILP) and returns ``None`` so the
+    caller can resolve it to the per-query neuron count — replacing the old
+    magic ``10000`` ("bigger than any net") with an explicit flag.
+    """
+    if raw is None or raw == 'all':
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v == float('inf') or v <= 0:
+        return None
+    return int(v)
+
+
 def _racing_escalation_graph_correct(impl, gg_ops, x_lo, x_hi, bounds_by_relu,
                                        query_w, query_bias, scored_keys,
                                        n_cores, time_left_fn, input_name,
@@ -6503,7 +6523,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 unsafe_halfspace=_milp_hs,
                 triangle_top_k=_triangle_top_k,
                 witness_refine_fn=_refine_arg,
-                bin_schedule_override=_bin_sched)
+                bin_schedule_override=_bin_sched,
+                race_all_bins=bool(getattr(settings, 'phase8_race_all_bins', True)),
+                bbs_tol=float(getattr(settings, 'phase8_high_bin_bestbdstop_tol', 1e-6)))
         else:
             raw = verify_gen_lp.sequential_query_racing(
                 gen_lp_state, query_specs,
@@ -6594,9 +6616,24 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     # constraint ⇔ standard LP min > 0 (LP feasibility theorem).
     _hi_bin_fallback = bool(getattr(
         settings, 'phase8_high_bin_fallback', True))
-    _hi_bin_count = int(getattr(settings, 'phase8_high_bin_count', 200))
+    # phase8_high_bin_count caps how many neurons the fallback binarizes. The
+    # sentinel 'all' (also None / inf / <= 0) means "binarize EVERY unstable
+    # neuron" — a full MILP. `None` here flags that; n_bins_fb resolves it to
+    # len(scored_keys_q) per query (avoids a magic 'bigger than any net' int).
+    _hi_bin_count = _resolve_high_bin_count(
+        getattr(settings, 'phase8_high_bin_count', 200))
     _hi_bin_time = float(getattr(
         settings, 'phase8_high_bin_time_limit', 60.0))
+    # Default-on (disable to fall back to the legacy halfspace+INFEASIBLE proof):
+    # minimize the spec margin qw·y+qb and stop via BestBdStop as soon as Gurobi
+    # PROVES a lower bound >= tol > 0 on it. That lower bound is an explicit,
+    # auditable soundness certificate (relaxation min margin >= tol > 0 ⟹ unsafe
+    # region empty ⟹ verified) and avoids depending on Gurobi's numerically
+    # fragile infeasibility detection. A tiny positive tol guards borderline
+    # numerics (a barely-positive margin is not certified rather than risked).
+    _hi_bin_bbs = bool(getattr(settings, 'phase8_high_bin_bestbdstop', True))
+    _hi_bin_bbs_tol = float(getattr(
+        settings, 'phase8_high_bin_bestbdstop_tol', 1e-6))
     if (_hi_bin_fallback and _milp_mode in ('alpha_zono_bnb',
                                               'alpha_zono_infeasibility')
             and time_left() > 5.0):
@@ -6609,7 +6646,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                        if state_by_qi else gen_lp_state)
             if state_q is None or not scored_keys_q:
                 continue
-            n_bins_fb = min(_hi_bin_count, len(scored_keys_q))
+            n_bins_fb = (len(scored_keys_q) if _hi_bin_count is None
+                         else min(_hi_bin_count, len(scored_keys_q)))
             tl = min(_hi_bin_time, time_left())
             # Fallback runs sequentially — use ALL cores for one Gurobi
             # solve. Bypass solve_spec because that path disables cuts/
@@ -6619,15 +6657,19 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             # default Gurobi closes in ~19s; bins=200 with cuts off
             # times out at 60s.
             import gurobipy as _grb
+            from .gurobi_util import (optimize_checked, GurobiNumericTrouble)
             try:
                 m_fb, env_fb, _, _ = verify_gen_lp.build_gen_lp_from_state(
                     state_q, qw_q, qb_q,
                     milp_set=set(scored_keys_q[:n_bins_fb]),
-                    n_threads=n_cores, unsafe_halfspace='inequality')
+                    n_threads=n_cores,
+                    unsafe_halfspace=('none' if _hi_bin_bbs else 'inequality'))
                 m_fb.setParam('TimeLimit', float(tl))
-                m_fb.setParam('BestBdStop', _grb.GRB.INFINITY)
-                from .gurobi_util import (
-                    optimize_checked, GurobiNumericTrouble)
+                # BestBdStop: stop as soon as the proven lower bound on the
+                # minimized spec margin reaches tol > 0. Legacy path disables it
+                # and relies on INFEASIBLE under the qw·y+qb<=0 halfspace.
+                m_fb.setParam('BestBdStop',
+                              _hi_bin_bbs_tol if _hi_bin_bbs else _grb.GRB.INFINITY)
                 try:
                     optimize_checked(m_fb)
                 except (GurobiNumericTrouble, _grb.GurobiError):
@@ -6643,25 +6685,31 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 # Outer wrapper: the fallback model build/solve itself
                 # raised. Skip this query and continue with the next.
                 continue
-            if fb_status == _grb.GRB.INFEASIBLE:
+            if _hi_bin_bbs:
+                # Sound: ObjBound is a valid lower bound on min(qw·y+qb); if it
+                # is >= tol > 0 then {qw·y+qb <= 0} ∩ relaxation = ∅ (verified).
+                _closed = (fb_obj_bound is not None
+                           and fb_obj_bound >= _hi_bin_bbs_tol)
+            else:
                 # Sound: relaxation∩{qw·y+qb≤0}=∅ ⇔ relaxation min > 0.
-                # By the same LP feasibility-theorem reasoning the racing
-                # path uses; standard cross-check unnecessary because we
-                # restored Gurobi's default numerics (cuts/presolve ON).
+                _closed = (fb_status == _grb.GRB.INFEASIBLE)
+            if _closed:
                 spec_lbs[qi] = 1.0
                 if print_progress:
-                    print(f'  Fallback q{qi} bins={n_bins_fb} '
-                          f'+halfspace: INFEASIBLE → q{qi} CLOSED',
-                          flush=True)
+                    _how = (f'min-margin lb={fb_obj_bound:+.5f}>={_hi_bin_bbs_tol:g}'
+                            if _hi_bin_bbs else '+halfspace INFEASIBLE')
+                    print(f'  Fallback q{qi} bins={n_bins_fb}: {_how} '
+                          f'→ q{qi} CLOSED', flush=True)
             elif print_progress:
                 status_name = {_grb.GRB.OPTIMAL: 'OPTIMAL',
                                 _grb.GRB.TIME_LIMIT: 'TIMEOUT',
-                                _grb.GRB.USER_OBJ_LIMIT: 'USER_OBJ_LIMIT'}.get(
+                                _grb.GRB.USER_OBJ_LIMIT: 'USER_OBJ_LIMIT',
+                                _grb.GRB.INFEASIBLE: 'INFEASIBLE'}.get(
                     fb_status, f'STATUS_{fb_status}')
                 ob_s = (f'{fb_obj_bound:+.4f}'
                         if isinstance(fb_obj_bound, float) else 'n/a')
-                print(f'  Fallback q{qi} bins={n_bins_fb} '
-                      f'+halfspace: {status_name} lb={ob_s}', flush=True)
+                print(f'  Fallback q{qi} bins={n_bins_fb}: '
+                      f'{status_name} lb={ob_s}', flush=True)
     timing['phase8_milp'] = time.perf_counter() - t_phase8
 
     # If the gen_lp path found a true counterexample from a MILP integer

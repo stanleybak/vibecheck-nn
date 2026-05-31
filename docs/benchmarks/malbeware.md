@@ -47,10 +47,33 @@ coverage.
 - `input_split_enabled: false` — 4096-input image is too high-dim
   for input split BaB; disabled to keep the graph pipeline as the
   default routing path.
-- `phase8_high_bin_count: 10000` / `phase8_high_bin_time_limit: 25.0`
-  — full-unstable MILP encoding with 25s per-query budget. The
-  4-25 eps-3 cases need ALL ~5k-8k unstable neurons binarized to
-  return INFEASIBLE; default 200 is far too small.
+- `phase8_high_bin_count: all` / `phase8_high_bin_time_limit: 25.0`
+  — full-unstable MILP encoding (the `all` sentinel = every unstable
+  neuron; default 200 is far too small for these cases) used by the
+  post-racing fallback backup. The 4-25 eps-3 cases need ALL ~4.9k
+  unstable neurons binarized to prove the margin bound > 0.
+
+## Regression + fix (2026-05-30)
+
+A later merge (`c521691`, the Phase-8 rewrite) regressed 4-25 from
+~6 s → 30 s timeout. Cause (measured): the parallel racing escalates
+small bin counts `[8..40]` and **waits on its slowest level** since
+none close (`bins=40` ran 48 s on the 4917-unstable case), consuming
+the whole budget before the all-neurons fallback could run. Two
+default-on fixes (no malbeware-specific flag needed beyond
+`high_bin_count: all`):
+
+- **`phase8_race_all_bins: true`** — queues an all-neurons **cuts-ON**
+  task at the FRONT of the racing pool, racing it concurrently from
+  t=0. It wins the race on these cases (`bins=4917: UNSAT lb=+0.0137,
+  2.2 s`) while the cheap small bins race alongside for easy cases.
+- **`phase8_high_bin_bestbdstop: true`** — the high-bin proof minimizes
+  the spec margin and stops via `BestBdStop` once its lower bound
+  exceeds tol > 0, yielding an explicit margin certificate instead of
+  an opaque Gurobi INFEASIBLE (more robust to numeric fragility).
+
+Soundness re-confirmed: `BestBdStop` proves `min(qw·y+qb) ≥ +0.015 > 0`
+in 1.8 s, and AB-CROWN independently returns `unsat` (16 s) on 4-25.
 
 ## Reproducing a single case
 

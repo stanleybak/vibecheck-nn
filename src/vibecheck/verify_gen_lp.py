@@ -1799,7 +1799,8 @@ def solve_spec(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
                milp_set=None, time_limit=60.0, best_bd_stop=None,
                n_threads=1, device='cuda', dtype=torch.float64,
                score_method='lp_ew_frac', state=None,
-               unsafe_halfspace='none', triangle_set=None):
+               unsafe_halfspace='none', triangle_set=None,
+               enable_cuts=False):
     """Build + solve gen LP or MILP for spec minimization.
 
     If state is provided (precomputed from precompute_gen_state), reuse it
@@ -1844,7 +1845,11 @@ def solve_spec(gg_ops_ser, x_lo, x_hi, bounds_by_relu, input_name,
     m.setParam('TimeLimit', float(time_limit))
     if best_bd_stop is not None:
         m.setParam('BestBdStop', float(best_bd_stop))
-    if milp_set:
+    if milp_set and not enable_cuts:
+        # Fast small-bin config: cuts/presolve OFF (the bound rarely crosses 0
+        # at low bin counts, so cuts just cost time). The all-bins "complete"
+        # task sets enable_cuts=True to keep Gurobi's defaults (cuts/presolve
+        # ON), which is what actually proves the bound > 0 at full encoding.
         m.setParam('Cuts', 0)
         m.setParam('Heuristics', 0.0)
         m.setParam('Presolve', 0)
@@ -2370,9 +2375,11 @@ _Q_TRIANGLE_TOP_K = 0
 
 
 def _query_race_init(state, n_threads, deadline, unsafe_halfspace='none',
-                      triangle_top_k=0):
+                      triangle_top_k=0, bbs_tol=1e-6):
     global _Q_STATE, _Q_STATE_BY_QI, _Q_N_THREADS
     global _Q_TIME_LEFT_DEADLINE, _Q_UNSAFE_HALFSPACE, _Q_TRIANGLE_TOP_K
+    global _Q_BBS_TOL
+    _Q_BBS_TOL = float(bbs_tol)
     # state is either a raw state dict (legacy) or a (shared_state, state_by_qi)
     # tuple. Workers fall back to shared_state when state_by_qi is None or
     # when a specific qi is absent from the per-query map.
@@ -2398,8 +2405,18 @@ def _query_race_solve(args):
 
 
 def _query_race_one_bin(args):
-    """Solve one (spec, n_bins) task. Returns level info + witness."""
-    qi, qw, qb, scored_keys, n_bins = args
+    """Solve one (spec, n_bins[, all_cuts]) task. Returns level info + witness.
+
+    all_cuts=True is the "complete" racer: every unstable neuron binarized with
+    Gurobi cuts/presolve ON and a positive-tol BestBdStop — it proves the margin
+    lower bound > tol where the cuts-off small-bin tasks plateau. Queued first so
+    it runs concurrently from the start; whichever task closes the spec wins.
+    """
+    if len(args) == 6:
+        qi, qw, qb, scored_keys, n_bins, all_cuts = args
+    else:
+        qi, qw, qb, scored_keys, n_bins = args
+        all_cuts = False
     import time as _t
     tl = _Q_TIME_LEFT_DEADLINE - _t.perf_counter()
     if tl <= 0:
@@ -2424,15 +2441,23 @@ def _query_race_one_bin(args):
     # impossible in exact arithmetic; any trigger is pure numerical
     # overshoot and was the source of the earlier false-UNSAT bug).
     # Only use BestBdStop in the standard Phase 8 path.
-    _bds = (None if (_Q_UNSAFE_HALFSPACE
-                      and _Q_UNSAFE_HALFSPACE != 'none')
-            else 0.0)
+    if all_cuts:
+        # Margin-bound proof with cuts ON: minimize qw·y+qb (no halfspace) and
+        # stop once the proven lower bound reaches tol > 0. tol (not 0) guards
+        # numeric overshoot near the boundary.
+        _bds = _Q_BBS_TOL
+        _hs = 'none'
+    else:
+        _bds = (None if (_Q_UNSAFE_HALFSPACE
+                          and _Q_UNSAFE_HALFSPACE != 'none')
+                else 0.0)
+        _hs = _Q_UNSAFE_HALFSPACE
     result, dt, info = solve_spec(
         None, None, None, None, None, None, qw, qb,
         milp_set=milp_set, time_limit=tl, best_bd_stop=_bds,
         n_threads=_Q_N_THREADS, state=state_for_qi,
-        unsafe_halfspace=_Q_UNSAFE_HALFSPACE,
-        triangle_set=triangle_set)
+        unsafe_halfspace=_hs,
+        triangle_set=triangle_set, enable_cuts=all_cuts)
     level_info = {'n_bins': n_bins, 'result': result, 'time': dt,
                   'lb': info.get('lb'), 'info': info}
 
@@ -2489,7 +2514,8 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
                            unsafe_halfspace='none',
                            triangle_top_k=0,
                            witness_refine_fn=None,
-                           bin_schedule_override=None):
+                           bin_schedule_override=None,
+                           race_all_bins=False, bbs_tol=1e-6):
     """Run MILP racing across open queries with idle-core-filling.
 
     Submits one task per (spec, bin_level). Tasks are ordered so every
@@ -2549,10 +2575,19 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
         per_spec_schedule.append((qi, qw, qb, scored_keys, schedule))
     max_levels = max((len(s[-1]) for s in per_spec_schedule), default=0)
     tasks = []
+    # Queue the all-bins "complete" task FIRST (one per spec) so it launches
+    # immediately alongside the small-bin levels. It binarizes every neuron with
+    # cuts ON; for cases the small bins can't close (all neurons matter) it is
+    # the task that proves the margin bound > 0 — racing it concurrently avoids
+    # burning the budget on small-bin levels first.
+    if race_all_bins:
+        for qi, qw, qb, scored_keys, schedule in per_spec_schedule:
+            if scored_keys:
+                tasks.append((qi, qw, qb, scored_keys, len(scored_keys), True))
     for lvl_idx in range(max_levels):
         for qi, qw, qb, scored_keys, schedule in per_spec_schedule:
             if lvl_idx < len(schedule):
-                tasks.append((qi, qw, qb, scored_keys, schedule[lvl_idx]))
+                tasks.append((qi, qw, qb, scored_keys, schedule[lvl_idx], False))
 
     results = {qi: {'verdict': 'unknown', 'levels': [], 'witness': None}
                for qi, _, _, _ in query_specs}
@@ -2568,7 +2603,7 @@ def parallel_query_racing(state, query_specs, *, time_left_fn,
     pool = ctx.Pool(n_workers, initializer=_query_race_init,
                      initargs=(init_state, gurobi_threads, deadline,
                                 unsafe_halfspace,
-                                int(triangle_top_k)))
+                                int(triangle_top_k), float(bbs_tol)))
     try:
         for out in pool.imap_unordered(_query_race_one_bin, tasks):
             # Hard wall-clock check: if past deadline, terminate the pool
