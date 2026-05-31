@@ -780,6 +780,27 @@ def state_from_phase1(z_final, rec_zono, x_lo, x_hi, gg_ops_ser,
             unstable_list.append(ul)
     unstable_list.sort(key=lambda e: e['e_new_col'])
 
+    # Column model: input generators occupy [0, n_input); each unstable ReLU
+    # contributes a new column at its recorded e_new_col; any remaining "gap"
+    # columns are sigmoid/tanh γ-slack noise symbols e ∈ [-1, 1] handled by
+    # _build_phase1_lp's freed `_unused` padding. (A prior bug pinned those gap
+    # columns to [0, 0], dropping the sigmoid swing → false UNSAT on dist_shift
+    # mnist_concat index1285; fixed — see tests/test_gen_lp_soundness_invariants.)
+    # So `n_gens > n_input + n_unstable_relu` is EXPECTED for sigmoid/tanh nets,
+    # not an error. The real soundness requirement is that every recorded ReLU
+    # column is a real, distinct, in-range column of z_final; fail loud only on
+    # THAT (a genuine misalignment), the way state_from_alpha_zono checks
+    # cur_n_gens == n_gens.
+    e_cols = [int(e['e_new_col']) for e in unstable_list]
+    if e_cols and (min(e_cols) < n_input or max(e_cols) >= n_gens
+                   or len(set(e_cols)) != len(e_cols)):
+        raise NotImplementedError(
+            f'state_from_phase1: recorded ReLU e_new_col indices are out of '
+            f'range or duplicated (n_input={n_input}, n_gens={n_gens}, '
+            f'cols=[{min(e_cols)}, {max(e_cols)}], '
+            f'distinct={len(set(e_cols))}/{len(e_cols)}) — the column model is '
+            f'misaligned with z_final, which would build an unsound spec MILP.')
+
     return {
         'n_input': n_input,
         'n_gens': n_gens,
@@ -840,7 +861,18 @@ def state_from_alpha_zono(z_alpha, pre_relu_gpu, alpha_per_layer, bbr,
         State dict with formulation='alpha_zono', usable with
         `solve_spec(state=...)` and `build_gen_lp_from_state`.
     """
-    n_input = int(len(x_lo))
+    # n_input is the number of INPUT GENERATOR COLUMNS in z_alpha, i.e. one per
+    # PERTURBED input dim — TorchZonotope.from_input_bounds allocates a column
+    # only where the radius is nonzero (x_hi > x_lo) — NOT the full input
+    # dimension len(x_lo). dist_shift's mnist_concat has 792 input dims but only
+    # 8 perturbed, so z_alpha starts with 8 input generators. Using len(x_lo)
+    # here set cur_n_gens 784 too high, throwing every post-input ReLU e_new_col
+    # onto the wrong (zero) column of z_alpha and certifying false UNSAT. This
+    # mirrors state_from_phase1, which reads the true count from
+    # rec_zono['n_input'].
+    x_lo_a = np.asarray(x_lo, dtype=np.float64)
+    x_hi_a = np.asarray(x_hi, dtype=np.float64)
+    n_input = int(np.count_nonzero(x_hi_a > x_lo_a))
 
     # Output zonotope → (obj_c_out, obj_G_out_csr) — same n_gens as the
     # full alpha forward (input gens + sum_L n_unstable_at_L).
@@ -956,8 +988,23 @@ def state_from_alpha_zono(z_alpha, pre_relu_gpu, alpha_per_layer, bbr,
 
         cur_n_gens += len(unstable)
 
-    # cur_n_gens should match n_gens; tolerate mismatch (extra cols are
-    # padded as unused vars in the LP builder).
+    # SOUNDNESS INVARIANT. The e_new_col indices above come from a POSITIONAL
+    # column model: n_input INPUT-GENERATOR columns (one per perturbed input
+    # dim), then one new column per unstable ReLU, then n_cells per sigmoid/tanh
+    # cell. If this walk and z_alpha's real layout agree, cur_n_gens == n_gens.
+    # The historical failure was seeding n_input with len(x_lo) (the input
+    # DIMENSION, 792) instead of the input-GENERATOR count (8 perturbed dims) —
+    # that put cur_n_gens 784 too high (1596 vs 812 on dist_shift mnist_concat)
+    # and threw every post-input ReLU e_new_col onto the wrong (zero) column,
+    # certifying false UNSAT. n_input is now the generator count, so this holds;
+    # keep the check as a loud guard against any future column-model drift.
+    if cur_n_gens != n_gens:
+        raise NotImplementedError(
+            f'alpha_zono gen-LP generator-column model mismatch: cur_n_gens='
+            f'{cur_n_gens} != n_gens={n_gens} (off by {cur_n_gens - n_gens}). '
+            f'The positional column walk disagrees with z_alpha\'s real '
+            f'generator layout, so ReLU e_new_col indices would be misaligned '
+            f'and the spec MILP could certify a false UNSAT.')
 
     return {
         'n_input': n_input,
@@ -1236,8 +1283,14 @@ def _build_phase1_lp(state, qw, qb, milp_set, n_threads, unsafe_halfspace):
         row_idx = ul['row_indices']
         row_val = ul['row_values']
 
+        # Fill any generator-column slots BEFORE this ReLU's e_new column.
+        # For pure-ReLU nets the e_new columns are consecutive so this never
+        # runs; for sigmoid/tanh nets the gap columns are the activation's
+        # γ-slack noise symbols (e ∈ [-1, 1]) and MUST stay free — pinning them
+        # to [0, 0] drops their swing from the objective/constraints and
+        # under-approximates the zonotope (a false-UNSAT soundness bug).
         while len(e_vars) < e_new_col:
-            e_vars.append(m.addVar(lb=0.0, ub=0.0,
+            e_vars.append(m.addVar(lb=-1.0, ub=1.0,
                                     name=f'_unused_{len(e_vars)}'))
 
         # Phase 1 form: e_new ∈ [-1, 1], NOT [0, hi_j]
@@ -1312,10 +1365,13 @@ def _build_phase1_lp(state, qw, qb, milp_set, n_threads, unsafe_halfspace):
             'formulation': 'phase1',
         })
 
-    # Pad e_vars to n_gens if needed (some layers may have produced no
-    # unstable neurons but their column slots still need placeholder vars).
+    # Pad e_vars to n_gens. Trailing columns (e.g. a sigmoid/tanh layer's
+    # γ-slack after the last ReLU) are real zonotope noise symbols e ∈ [-1, 1];
+    # pinning them to [0, 0] would drop them from the objective and
+    # under-approximate the zonotope (false-UNSAT). Genuinely-unused columns
+    # have zero objective weight, so leaving them free changes nothing.
     while len(e_vars) < n_gens:
-        e_vars.append(m.addVar(lb=0.0, ub=0.0,
+        e_vars.append(m.addVar(lb=-1.0, ub=1.0,
                                 name=f'_unused_{len(e_vars)}'))
 
     # Objective: same form as the existing builder.
@@ -1422,8 +1478,11 @@ def build_gen_lp_from_state(state, qw, qb, *, milp_set=None, n_threads=1,
         row_val = ul['row_values']
         kind = ul['_kind']
 
+        # Gap columns (sigmoid/tanh γ-slack between ReLU e_new columns) are
+        # free noise symbols e ∈ [-1, 1]; see _build_phase1_lp for why pinning
+        # them to [0, 0] is an unsound under-approximation.
         while len(e_vars) < e_new_col:
-            e_vars.append(m.addVar(lb=0.0, ub=0.0, name=f'_unused_{len(e_vars)}'))
+            e_vars.append(m.addVar(lb=-1.0, ub=1.0, name=f'_unused_{len(e_vars)}'))
 
         if kind == 'stable':
             # Sparse stable-on: new gen ∈ [lo, hi], equality v == c + G@e
@@ -1471,9 +1530,10 @@ def build_gen_lp_from_state(state, qw, qb, *, milp_set=None, n_threads=1,
             'e_new_col': e_new_col,
         })
 
-    # Pad e_vars to n_gens if needed
+    # Pad e_vars to n_gens. Trailing columns are real noise symbols e ∈ [-1, 1]
+    # (see _build_phase1_lp); pinning to [0, 0] under-approximates the zonotope.
     while len(e_vars) < n_gens:
-        e_vars.append(m.addVar(lb=0.0, ub=0.0, name=f'_unused_{len(e_vars)}'))
+        e_vars.append(m.addVar(lb=-1.0, ub=1.0, name=f'_unused_{len(e_vars)}'))
 
     # Objective: qw @ y_out + qb where y_out = c + G_out @ e
     # obj_coef = qw @ G_out_csr, obj_const = qw @ c_out + qb

@@ -1377,7 +1377,19 @@ def _per_neuron_adaptive_bounds(gg, xl, xh, bounds_by_relu, target_layer_idx,
             target_relu_idx = i
             target_op_name = op['inputs'][0]
             break
-    assert target_op_name is not None
+    if target_op_name is None:
+        # The per-neuron adaptive bounds are a ReLU-triangle method; they only
+        # apply to layers that have a ReLU op. A non-ReLU activation (sigmoid/
+        # tanh) at this layer index means the caller invoked the ReLU-adaptive
+        # path on the wrong layer (a mixed net like dist_shift's mnist_concat).
+        # Fail loud rather than silently mis-tighten a non-ReLU layer.
+        _types_here = sorted({op['type'] for op in ops
+                              if op.get('layer_idx') == target_layer_idx})
+        raise NotImplementedError(
+            f'per-neuron adaptive (ReLU-triangle) bounds requested for layer '
+            f'{target_layer_idx}, which has no ReLU op (op types at this layer: '
+            f'{_types_here}). These bounds apply only to ReLU layers; a non-ReLU '
+            f'activation (sigmoid/tanh) must be excluded from the adaptive loop.')
 
     lo0, hi0 = bounds_by_relu[target_layer_idx]
     n_total = int(len(lo0))
@@ -2030,7 +2042,14 @@ def _tighten_layer_graph_sparse(gg_ops, x_lo, x_hi, bounds_by_relu,
                 and op.get('layer_idx') == target_layer_idx):
             target_op_name = op['inputs'][0]
             break
-    assert target_op_name is not None
+    if target_op_name is None:
+        # ReLU-triangle adaptive bounds — only valid on ReLU layers. A non-ReLU
+        # activation (sigmoid/tanh) at this layer means the adaptive loop was
+        # invoked on the wrong layer; fail loud rather than mis-tighten it.
+        raise NotImplementedError(
+            f'per-neuron adaptive (ReLU-triangle) bounds requested for layer '
+            f'{target_layer_idx}, which has no ReLU op; these apply only to '
+            f'ReLU layers (exclude sigmoid/tanh layers from the adaptive loop).')
 
     probe_j = int(unstable[0])
     dt_build_total = 0.0
