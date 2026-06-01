@@ -32,6 +32,14 @@ CASES = [
         expected='sat', timeout=60, max_wall_s=20.0,
     ),
     dict(
+        # Multi-disjunct SAT (prop_7 = 2 disjuncts). Pins that the dialed-down
+        # between-rounds PGD (every-3 × 500) still catches it.
+        desc='acasxu 1_9 prop_7 (SAT, multi-disjunct, between-rounds PGD)',
+        net='onnx/ACASXU_run2a_1_9_batch_2000.onnx',
+        vnnlib='vnnlib/prop_7.vnnlib',
+        expected='sat', timeout=120, max_wall_s=35.0,
+    ),
+    dict(
         desc='acasxu 3_3 prop_2 (UNSAT, hardest ~46s — diverged before the fix)',
         net='onnx/ACASXU_run2a_3_3_batch_2000.onnx',
         vnnlib='vnnlib/prop_2.vnnlib',
