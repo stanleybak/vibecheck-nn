@@ -20,3 +20,11 @@
 use_hybrid_acasxu: true
 input_split_batched_enabled: true   # fallback if hybrid is disabled
 pgd_init_mode: osi
+# Speed: the between-rounds PGD is wasted on the 139 UNSAT cases. every-3 × 500
+# restarts is ~31% faster on hard UNSAT (3_3 prop_2 48s->33s) and still catches
+# all 4 narrow-witness SAT cases (1_5/1_6/3_2/5_3 prop_2). freeze_iters 50 (no
+# tightness loss vs 100). _full_freeze now also respects the timeout (was
+# overrunning to 150-180s on slower GPUs -> false timeout-misses).
+hybrid_pgd_between_every: 3
+hybrid_pgd_between_restarts: 500
+hybrid_freeze_iters: 50

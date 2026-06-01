@@ -101,7 +101,8 @@ def _simple_pgd(xl, xh, spec, gg, n_output, device, dtype,
 
 
 def _full_freeze(xl, xh, gg, spec_ew, device, dtype,
-                 n_iters_per_layer=100, n_iters_spec=100, lr=0.25):
+                 n_iters_per_layer=100, n_iters_spec=100, lr=0.25,
+                 deadline=None):
     """Per-query α-CROWN layerwise tighten + spec α-CROWN.
     Returns (tight, alpha_per_layer, alpha_spec, best_spec).
     Per-leaf α (each leaf in batch B gets independent α tensors)."""
@@ -113,6 +114,12 @@ def _full_freeze(xl, xh, gg, spec_ew, device, dtype,
                      if op['type'] == 'relu' and 'layer_idx' in op}
     alpha_per_layer = {}
     for L in layer_order:
+        # Respect the budget: if the freeze itself would overrun, stop tightening
+        # (remaining layers keep their sound forward-zono bounds). Without this
+        # the freeze ignored the timeout and overran to 150-180s.
+        if deadline is not None and time.perf_counter() > deadline:
+            alpha_per_layer[L] = {}
+            continue
         feed = relu_op_by_L[L]['inputs'][0]
         n_layer = tight[L][0].shape[1]
         Q = 2 * n_layer
@@ -166,6 +173,9 @@ def _full_freeze(xl, xh, gg, spec_ew, device, dtype,
     opt = torch.optim.Adam([alpha_spec[L] for L in alpha_spec], lr=lr)
     best_spec = None; prev = -float('inf')
     for it in range(n_iters_spec):
+        if (deadline is not None and it > 0
+                and time.perf_counter() > deadline):
+            break
         opt.zero_grad()
         sl = _spec_backward_graph_batched(
             tight, xl, xh, gg, spec_ew, device, dtype,
@@ -259,6 +269,14 @@ def verify_hybrid(graph, spec, settings=None, timeout=120.0,
     # between-rounds). A SAT case must then come back 'unknown' (the BaB can't
     # verify it), never a false 'unsat'.
     _disable_sat = bool(getattr(settings, 'disable_sat_finding', False))
+    # The between-rounds PGD is pure waste on UNSAT cases (139 of 186). Let the
+    # config dial it down (acasxu: every-3 × 500 restarts → ~28% faster on hard
+    # UNSAT cases, SAT still found). Same for the freeze depth.
+    pgd_between_every = int(getattr(
+        settings, 'hybrid_pgd_between_every', pgd_between_every))
+    pgd_between_restarts = int(getattr(
+        settings, 'hybrid_pgd_between_restarts', pgd_between_restarts))
+    freeze_iters = int(getattr(settings, 'hybrid_freeze_iters', 100))
 
     t_start = time.perf_counter()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -312,7 +330,9 @@ def verify_hybrid(graph, spec, settings=None, timeout=120.0,
     xh_init = torch.stack([b[1][0] for b in boxes])
     try:
         tight_K, alpha_layer_K, alpha_spec_K, best_K = _full_freeze(
-            xl_init, xh_init, gg, spec_ew, device, dtype)
+            xl_init, xh_init, gg, spec_ew, device, dtype,
+            n_iters_per_layer=freeze_iters, n_iters_spec=freeze_iters,
+            deadline=t_start + 0.8 * timeout)
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         return {'verdict': 'unknown', 'time': time.perf_counter() - t_start,

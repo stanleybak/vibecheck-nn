@@ -243,6 +243,12 @@ def default_settings(**overrides):
         # loose for ACAS Xu's amplifying weights → it diverges. Default off;
         # acasxu turns it on.
         use_hybrid_acasxu=False,
+        # verify_hybrid tuning (only read when use_hybrid_acasxu). The
+        # between-rounds PGD is wasted on the 139 UNSAT cases — dialing it down
+        # speeds them up; freeze_iters trades freeze tightness for speed.
+        hybrid_pgd_between_every=1,
+        hybrid_pgd_between_restarts=1000,
+        hybrid_freeze_iters=100,
         # Clip → re-CROWN inner cycles. After clipping a leaf, the OLD
         # CROWN bounds are still sound on the smaller box but loose.
         # Re-running CROWN on the clipped box gives tighter spec lbs
