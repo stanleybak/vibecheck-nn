@@ -249,6 +249,20 @@ def default_settings(**overrides):
         hybrid_pgd_between_every=1,
         hybrid_pgd_between_restarts=1000,
         hybrid_freeze_iters=100,
+        # Backward-CROWN intermediate bounds in the batched input-split BaB
+        # (AB-CROWN's bound_prop_method: crown). ~2x tighter than forward zono
+        # -> far fewer leaves on ACAS Xu. Default off.
+        input_split_crown_intermediate=False,
+        # Leaf-level SAT search in the batched input-split BaB. Phase-0 PGD on
+        # the WIDE root box misses a narrow SAT witness (acasxu 1_5/1_9
+        # prop_2/prop_7); the witness-containing leaf survives + keeps splitting
+        # until narrow, where batched-PGD inside that leaf's box finds it. Every
+        # `_every` iters, PGD the `_max_leaves` narrowest surviving leaves.
+        # Default off (0 = disabled); acasxu turns it on.
+        input_split_leaf_pgd_every=0,
+        input_split_leaf_pgd_max_leaves=64,
+        input_split_leaf_pgd_restarts=128,
+        input_split_leaf_pgd_iters=50,
         # Clip → re-CROWN inner cycles. After clipping a leaf, the OLD
         # CROWN bounds are still sound on the smaller box but loose.
         # Re-running CROWN on the clipped box gives tighter spec lbs

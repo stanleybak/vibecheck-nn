@@ -1,30 +1,43 @@
-# acasxu_2023 — small FC controller (5-D input, 50×6 ReLU layers).
-# VNNCOMP regular track, 187 cases (47 SAT + 140 UNSAT).
+# acasxu_2023 — small FC controller (5-D input, 6×50 ReLU layers).
+# VNNCOMP regular track, 186 cases (prop_1..10 across 45 nets).
 #
 # Spec shapes:
-#   prop_2: Y_0 ≥ Y_i for all i=1..4 (single-disjunct AND of 4 pairwise,
+#   prop_2: Y_0 >= Y_i for all i=1..4 (single-disjunct AND of 4 pairwise,
 #           "COC maximal"). Many SAT cases need narrow-region search.
-#   prop_3: Y_0 ≤ Y_i for all i=1..4 ("COC minimal"). UNSAT-leaning.
+#   prop_3: Y_0 <= Y_i for all i=1..4 ("COC minimal"). UNSAT-leaning.
 #   prop_1, 5-10: threshold or pairwise; varied.
 #
-# Freeze-replay α-CROWN with TIGHTENED intermediate bounds
-# (verify_hybrid_acasxu). The batched input-split BaB used forward-zonotope
-# intermediate bounds, which are ~1000x too loose for ACAS Xu's amplifying
-# weights — root spec margin -1597 vs true >0 — so it DIVERGED (6.8M leaves,
-# never converges; e.g. 3_3 prop_2 timed out). _full_freeze tightens per-layer
-# pre-ReLU bounds via backward α-CROWN (seed [I,-I] per layer, optimize earlier
-# layers' α, intersect with forward-zono so it stays SOUND), then _replay_batched
-# reuses the frozen α cheaply per leaf. 3_3 prop_2 unsat 48s, 1_1 prop_3 unsat
-# 32s, 1_5 prop_2 sat 2s — all within the 116s competition timeout. The MILP
-# escalation that dominated the old path (Gurobi pool spawn overhead) is dropped.
-use_hybrid_acasxu: true
-input_split_batched_enabled: true   # fallback if hybrid is disabled
+# ALGORITHM: input-split BaB with BACKWARD-CROWN intermediate bounds
+# (`bound_prop_method: crown`, exactly what AB-CROWN uses for acasxu).
+#
+# Why not the old forward-zonotope intermediate bounds: they are ~2x too loose
+# for ACAS Xu's amplifying weights (root spec margin fwd-zono -2570 vs crown -1101
+# on 3_3 prop_2; -4691 vs -2148 on 1_1 prop_1), so the BaB DIVERGED (6.8M leaves,
+# never converged). Backward CROWN (seed [I,-I] per ReLU layer, min-area slopes,
+# no alpha) is both tighter AND cheaper -> the BaB converges. prop_1 1_1 0.1s,
+# prop_3 1_1 4s, 3_3 prop_2 ~110s (the hardest; ABC does it in ~18s -- the gap is
+# the CPU-side split loop / leaf count, NOT bound quality: a mutual zono<->CROWN
+# tightening was measured to add only ~3% margin, sub-threshold to close a leaf
+# one bisection earlier, so it does not reduce leaf count -- see
+# scratch/acasxu_p2_33/plan.md explore11-14).
+#
+# Why not the freeze-replay hybrid (use_hybrid_acasxu): its per-layer alpha freeze
+# has no fast deadline and overran to 150-180s on server1's RTX 3080 -> 13/32
+# timeout-misses (mostly prop_1's wide box). The input-split+CROWN path verifies
+# prop_1 in <1s instead. Hybrid kept available behind the flag but OFF.
+use_hybrid_acasxu: false
+input_split_batched_enabled: true
+input_split_crown_intermediate: true       # backward-CROWN intermediate bounds
+# SAT-finding: Phase-0 PGD (OSI init) catches the wide-witness SAT cases before
+# the BaB. The NARROW-witness cases (1_5/1_6/3_2/5_3 prop_2, multi-disjunct
+# prop_7/prop_8) are missed by root-box PGD — the witness fills a tiny fraction
+# of the root — so leaf-level PGD attacks the narrowest surviving leaves every
+# few BaB iters, where the witness fills a large fraction of the (now narrow)
+# leaf box. Without this the input-split+CROWN path returns unknown on every
+# narrow-SAT case (the freeze-replay hybrid caught them via between-rounds PGD).
 pgd_init_mode: osi
-# Speed: the between-rounds PGD is wasted on the 139 UNSAT cases. every-3 × 500
-# restarts is ~31% faster on hard UNSAT (3_3 prop_2 48s->33s) and still catches
-# all 4 narrow-witness SAT cases (1_5/1_6/3_2/5_3 prop_2). freeze_iters 50 (no
-# tightness loss vs 100). _full_freeze now also respects the timeout (was
-# overrunning to 150-180s on slower GPUs -> false timeout-misses).
-hybrid_pgd_between_every: 3
-hybrid_pgd_between_restarts: 500
-hybrid_freeze_iters: 50
+pgd_time_budget_phase0: 5.0
+input_split_leaf_pgd_every: 3
+input_split_leaf_pgd_max_leaves: 128
+input_split_leaf_pgd_restarts: 256
+input_split_leaf_pgd_iters: 50

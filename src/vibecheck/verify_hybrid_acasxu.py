@@ -100,6 +100,65 @@ def _simple_pgd(xl, xh, spec, gg, n_output, device, dtype,
     return False, None
 
 
+def _simple_pgd_batched(xl, xh, spec, gg, n_output, device, dtype,
+                          n_restarts=128, n_iter=50, lr=0.1, seed=0):
+    """Sign-gradient PGD over MANY distinct input boxes at once.
+
+    `xl`, `xh`: (B, n_in) — one box per leaf. Samples `n_restarts` points
+    INSIDE each box (each sample clamped to its own box), so it finds a narrow
+    SAT witness that fills a large fraction of a deep input-split leaf — exactly
+    the case `_simple_pgd` on the wide root box misses. SAT iff some sample
+    satisfies some disjunct (all its constraints' margins <= 0). Mirrors
+    `_simple_pgd`'s loss but vectorised across leaves.
+
+    Returns (sat: bool, witness: np.ndarray or None).
+    """
+    B, n_in = xl.shape
+    Ws = []; bs = []
+    for conj in spec.disjuncts:
+        n_c = len(conj.constraints)
+        W = torch.zeros(n_c, n_output, dtype=dtype, device=device)
+        b = torch.zeros(n_c, dtype=dtype, device=device)
+        for i, c in enumerate(conj.constraints):
+            if hasattr(c, 'pred'):
+                W[i, c.pred] = 1.0; W[i, c.comp] = -1.0
+            elif c.op == '>=':
+                W[i, c.index] = -1.0; b[i] = float(c.value)
+            elif c.op == '<=':
+                W[i, c.index] = 1.0; b[i] = -float(c.value)
+            else:
+                return False, None
+        Ws.append(W); bs.append(b)
+    torch.manual_seed(seed)
+    R = n_restarts
+    # (B, R, n_in) samples, then flattened to (B*R, n_in) for the graph forward.
+    lo = xl.unsqueeze(1).expand(B, R, n_in).reshape(B * R, n_in)
+    hi = xh.unsqueeze(1).expand(B, R, n_in).reshape(B * R, n_in)
+    x = lo + (hi - lo) * torch.rand(B * R, n_in, device=device, dtype=dtype)
+    x = x.detach().requires_grad_(True)
+    width = hi - lo
+    for _ in range(n_iter):
+        out = _forward_batch_graph(x, gg)  # (B*R, n_out)
+        max_per_disj = []
+        for W, b in zip(Ws, bs):
+            m = out @ W.T + b
+            max_per_disj.append(m.max(dim=1).values)
+        stacked = torch.stack(max_per_disj, dim=1)
+        min_m, _ = stacked.min(dim=1)
+        with torch.no_grad():
+            sat_mask = min_m <= 1e-6
+            if sat_mask.any():
+                idx = int(sat_mask.nonzero()[0].item())
+                return True, x[idx].detach().cpu().numpy()
+        loss = min_m.sum()
+        loss.backward()
+        with torch.no_grad():
+            step = lr * x.grad.sign() * width
+            x = torch.maximum(torch.minimum(x - step, hi), lo)
+        x = x.detach().requires_grad_(True)
+    return False, None
+
+
 def _full_freeze(xl, xh, gg, spec_ew, device, dtype,
                  n_iters_per_layer=100, n_iters_spec=100, lr=0.25,
                  deadline=None):

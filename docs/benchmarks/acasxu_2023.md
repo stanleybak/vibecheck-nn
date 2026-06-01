@@ -2,6 +2,33 @@
 
 Small FC controller (5-D input, 6 × 50 ReLU layers, 5-D output). VNNCOMP regular track. 186 cases across 10 properties (prop_1–prop_10): 139 UNSAT, 47 SAT.
 
+## UPDATE 2026-06-01 — switched off the hybrid; input-split + CROWN + leaf-PGD + vectorized split
+
+**The freeze-replay hybrid below is SUPERSEDED.** A re-sweep showed `use_hybrid_acasxu: true` timed out **13/32** sampled cases on server1 — the `_full_freeze` per-layer α tightening has no fast deadline and overran to 150–180 s, mostly on prop_1's wide box. The production config now uses the batched input-split BaB directly:
+
+- **`input_split_crown_intermediate: true`** — AB-CROWN's `bound_prop_method: crown` (backward-CROWN intermediate bounds). Forward-zono intermediate bounds are ~2× too loose for ACAS Xu's amplifying weights (root margin fwd-zono −2570 vs crown −1101 on 3_3 prop_2) and diverged; backward CROWN is tighter AND cheaper. (A mutual zono∩CROWN tightening was tried — `_crown_intermediate_batched` `sweeps>1` — and measured to give only ~3 % extra margin, sub-threshold to close a leaf one bisection earlier, so it is a net end-to-end loss; left default-OFF. See `scratch/acasxu_p2_33/plan.md` explore11–14.)
+- **worst-margin leaf-PGD** (`input_split_leaf_pgd_*`) — root-box PGD misses narrow SAT witnesses (200k restarts fail on 1_9 prop_7); the witness leaf can never close, so its margin stays most-negative — batched-PGD the worst-margin leaves and it's caught in ~1 s. `_simple_pgd_batched` in `verify_hybrid_acasxu.py`.
+- **vectorized on-GPU 2-way split** (`verify_graph.py`, K_eff==1 fast path) — the per-child `.cpu()`/`.to(device)` loop was ~80 % of wall (a host round-trip per child × millions of leaves). Building both children of every leaf in a few GPU ops cut **3_3 prop_2 126 s → 73 s** and **4_2 prop_2 151 s → 10 s** — the two hard prop_2-UNSAT cases that timed out before. (This reverted once for breaking a SAT case via reordered leaves; worst-margin leaf-PGD now finds SAT independent of split order.)
+
+### Result — HW-dependent; 0 false-verifies; +11 vs the hybrid
+
+Verdicts correctly keyed by **(onnx, vnnlib)** — `prop_2.vnnlib` is reused across 45 nets with 39 sat/6 unsat, so a basename-only ABC match false-flags misses, see `[[project_audit_abc_key_collision]]`.
+
+| | laptop (RTX PRO 2000, Blackwell) | server1 (RTX 3080, ~4 yr old) |
+|---|---|---|
+| **TOTAL** | **186 / 186** | **184 / 186** |
+| prop_1 (was the hybrid's 13 timeouts) | all verified <1 s | all verified ~65 s |
+| 3_3 prop_2 | 72 s ✓ | **147 s ✗** (>116 s cap) |
+| 4_2 prop_2 | 10 s ✓ | **143 s ✗** (overran the cap) |
+| false-verifies | 0 | 0 |
+
+The 2 server1 misses are a **slow-GPU artifact**: server1's RTX 3080 is ~2× slower than the laptop and slower than typical VNNCOMP datacenter HW, so two hard prop_2-UNSAT cases that finish in 10–72 s on the laptop exceed the 116 s cap there (147 s, 143 s). 4_2 in particular is 14× slower on server1 than the laptop — float32 GPU nondeterminism makes its BaB unstable right at the margin. **Net: +11 over the hybrid's measured 173/186** (the hybrid's `_full_freeze` timed out 13/32 on prop_1's wide box).
+
+**Path to a robust 0-miss (any HW):** the hybrid does 3_3 prop_2 in 47 s via **α-optimized intermediate bounds** (tighter → far fewer leaves); the input-split uses plain CROWN-intermediate (looser → more leaves → ~3× more wall on the hard cases). Cheap levers don't close it — leaf-PGD dial-down saves ~10 s (doesn't clear the cap and risks SAT), and boundary-α gives ~0 (the unclosed leaves are deeply negative, not near-boundary). The real fix is wiring the hybrid's freeze-replay (`_full_freeze` + `_replay_batched`) into the input-split BaB (α frozen once at root, replayed per leaf). Substantial; deferred. Full 186-case v2 sweep on server1: `audit_acasxu_v2.out`.
+
+---
+
+
 ## Final score (server1 RTX 3080, 120 s/case)
 
 | | vibecheck | AB-CROWN (server1) | AB-CROWN published |

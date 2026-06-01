@@ -1,5 +1,17 @@
 # dist_shift_2023 — vibecheck benchmark record
 
+## UPDATE 2026-06-01 — 9 UNSAT misses closed → 72/72
+
+A completeness audit found **9 UNSAT misses** (all `mnist_concat`, ABC solves in 8–13 s, we returned `unknown` in ~6 s). Two root causes, both fixed:
+
+1. **Routing gate blocked the intended input-split path.** The config already set `input_split_batched_enabled: true`, but `verify_graph.py:7736` gates the input-split family on **total** input dim (`n_in ≤ input_split_max_dims`, default 20). `mnist_concat` is **792-dim but only 8 vary** (an 8-D latent; the 784 image pixels are fixed), so 792 > 20 silently routed every case to the dual-ascent `_run_pipeline` instead. That path can't reduce the **sigmoid relaxation slack** (it only splits ReLUs — "sigmoid γ slack is not in the split set"), which is exactly what kept the bound negative. Input-split narrows the 8 sigmoid inputs and closes them. **Fix: `input_split_max_dims: 800`** activates the intended path — index9733/2481 0→verified in <3 s (faster than ABC). 8 of 9 verify in <20 s; index112 in 152 s (within the 300 s timeout).
+
+2. **Dual-ascent witness-check dimension bug** (the masked crash). `_da_witness_check` mapped the LP primal witness `e` (in the **input-generator** subspace = 8 varying dims) back to real input as if it were full-dim (792) → `RuntimeError`, swallowed by `main.py`'s top-level handler as `unknown`. Fixed to scatter the sparse witness into the varying dims (sound — only finds genuine in-box counterexamples). Still valuable for the fallback path / other benchmarks.
+
+Re-audit: **0 MISSES of 72**, 0 false-verifies; the SAT cases stay `sat`, and the soundness probe (index4312, sat-finding off) correctly returns `unknown`.
+
+---
+
 VNNCOMP 2025 regular track. 72 instances on a single model
 (`mnist_concat.onnx`) — an encoder MLP that compresses MNIST input
 through a Sigmoid, then a classifier MLP that consumes the Sigmoid

@@ -51,12 +51,18 @@ CASES = [
     # α-CROWN's LB, −1.19 vs −1.36). With every column free in [-1,1] the
     # relaxation is sound (fallback lb=−0.40 ≤ true margin −0.25); with PGD off
     # the verdict must be `unknown`, NEVER `verified`.
+    # NOTE: dist_shift now routes through the batched input-split BaB
+    # (config `input_split_max_dims: 800` — mnist_concat is 792-dim but only 8
+    # vary, and input-split narrows the SIGMOID inputs, which the old dual-ascent
+    # path couldn't). With sat-finding off the BaB can't close this genuinely-SAT
+    # case, so it runs the full budget then returns `unknown` (sound — never
+    # `verified`). Higher wall than the old α-zono path, hence max_wall_s=45.
     dict(
         desc='dist_shift index4312 SOUNDNESS (SAT, sat-finding off → must NOT '
-             'verify; α-zono orphan-column fix)',
+             'verify; input-split returns unknown, never verified)',
         net='onnx/mnist_concat.onnx',
         vnnlib='vnnlib/index4312_delta0.13.vnnlib',
-        expected='unknown', timeout=30, max_wall_s=15.0,
+        expected='unknown', timeout=30, max_wall_s=45.0,
         extra_settings=dict(disable_sat_finding=True),
     ),
 ]

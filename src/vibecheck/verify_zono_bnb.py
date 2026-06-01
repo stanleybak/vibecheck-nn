@@ -2733,6 +2733,53 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
     return sb, state[last_name]
 
 
+def _crown_intermediate_batched(gg, xl, xh, device, dtype):
+    """Backward-CROWN intermediate pre-ReLU bounds (min-area slopes, no α).
+
+    This is what AB-CROWN uses for ACAS Xu (`bound_prop_method: crown`) and it
+    is ~2x TIGHTER and CHEAPER than the forward zonotope (acasxu 3_3 prop_2 root:
+    forward-zono -1597 / 226 ms vs CROWN -722 / 8 ms). For each ReLU layer L,
+    seed the spec backward at L's pre-activation op with [+I, -I] (lower + upper
+    of every neuron), propagate to the input through the EARLIER layers'
+    min-area ReLU relaxations (which use the bounds tightened so far), and
+    intersect with the running forward-zono bound (max of los / min of his — both
+    are sound over-approximations, so the intersection stays sound). One layer
+    sweep converges for these nets. Drop-in replacement for
+    `_forward_zonotope_graph_batched`'s intermediate bounds in the input-split
+    BaB; the spec backward is then much tighter -> far fewer leaves.
+
+    (A mutual zono<->CROWN tightening was tried — feeding each layer's
+    intersection back into the next forward-zono pass — and measured to add only
+    ~3% margin, sub-threshold to close a leaf one bisection earlier; a net
+    end-to-end loss. Removed. See scratch/acasxu_p2_33/plan.md explore11-14.)
+
+    Returns `tight = {layer_idx: (lo, hi)}` with (B, n_layer) tensors.
+    """
+    sb, _ = _forward_zonotope_graph_batched(xl, xh, gg, device, dtype)
+    tight = {L: (lo.clone(), hi.clone()) for L, (lo, hi) in sb.items()}
+    relu_op_by_L = {op['layer_idx']: op for op in gg['ops']
+                     if op['type'] == 'relu' and 'layer_idx' in op}
+    B = xl.shape[0]
+    for L in sorted(tight):
+        if L not in relu_op_by_L:
+            continue
+        feed = relu_op_by_L[L]['inputs'][0]
+        n = tight[L][0].shape[1]
+        eye = torch.eye(n, dtype=dtype, device=device)
+        seed = {feed: torch.cat([eye, -eye], dim=0)
+                .unsqueeze(0).expand(B, -1, -1)}
+        sl = _spec_backward_graph_batched(
+            tight, xl, xh, gg, None, device, dtype,
+            seed_ew_at=seed,
+            seed_acc=torch.zeros(B, 2 * n, dtype=dtype, device=device))
+        # Intersect the backward-CROWN bound with the running (forward-zono)
+        # bound; both sound, so the tighter one stays sound.
+        lo_t = torch.maximum(tight[L][0], sl[:, :n])
+        hi_t = torch.maximum(torch.minimum(tight[L][1], -sl[:, n:]), lo_t)
+        tight[L] = (lo_t, hi_t)
+    return tight
+
+
 def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                                    return_input_linear=False,
                                    alpha_at_layer=None,

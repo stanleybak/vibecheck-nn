@@ -6439,7 +6439,28 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 w_t = torch.as_tensor(w_e_input, device=device, dtype=dtype)
                 center = (x_lo_t + x_hi_t) * 0.5
                 halfwidth = (x_hi_t - x_lo_t) * 0.5
-                x_real = center.unsqueeze(0) + w_t * halfwidth.unsqueeze(0)
+                n_dim = w_t.shape[1]
+                if n_dim == center.numel():
+                    # Dense witness: one coefficient per input dim.
+                    x_real = center.unsqueeze(0) + w_t * halfwidth.unsqueeze(0)
+                else:
+                    # Sparse witness: the LP/dual-ascent primal `e` lives in the
+                    # INPUT-GENERATOR subspace (one column per VARYING input dim,
+                    # in radius>0 order) — for sparse specs like dist_shift
+                    # mnist_concat only 8 of 792 inputs vary, so w is [N, 8] not
+                    # [N, 792]. Scatter into the varying dims; fixed dims stay at
+                    # center (= x_lo = x_hi). Without this the witness check
+                    # crashed (8-vs-792 broadcast) and main.py's top-level
+                    # handler masked it as 'unknown' — so dual-ascent never ran.
+                    var_idx = (halfwidth > 0).nonzero(as_tuple=True)[0]
+                    if n_dim != var_idx.numel():
+                        # A witness dimension we can't map: skip the attack (the
+                        # BaB bound is still sound — this only forgoes a cex).
+                        return None
+                    x_real = center.unsqueeze(0).expand(
+                        w_t.shape[0], -1).clone()
+                    x_real[:, var_idx] = (center[var_idx].unsqueeze(0)
+                                          + w_t * halfwidth[var_idx].unsqueeze(0))
                 x_real = x_real.reshape(w_t.shape[0], *spec.x_lo.shape)
                 # First: cheap point-forward check (most LP witnesses ARE
                 # already adversarial since we sort by primal value).
@@ -9602,6 +9623,11 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         settings, 'input_split_batched_max_worklist', 200_000))
     clip_enabled = bool(getattr(
         settings, 'input_split_batched_clip_enabled', True))
+    # Use backward-CROWN intermediate bounds (AB-CROWN's `bound_prop_method:
+    # crown`) instead of the loose forward zonotope. ~2x tighter -> far fewer
+    # leaves on amplifying-weight nets (acasxu).
+    crown_intermediate = bool(getattr(
+        settings, 'input_split_crown_intermediate', False))
     # Serialize ops once (for MILP escalation; cheap, no torch tensors).
     gg_ops_ser = []
     for op in gg['ops']:
@@ -9842,8 +9868,16 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 torch.cuda.synchronize()
             _pt_tb = time.perf_counter()
         try:
-            sb_b, _ = _forward_zonotope_graph_batched(
-                xl_batch, xh_batch, gg, device, dtype)
+            if crown_intermediate:
+                # AB-CROWN-style backward-CROWN intermediate bounds (~2x tighter
+                # than forward zono for ACAS Xu's amplifying weights -> far fewer
+                # leaves). Sound (intersection of two over-approximations).
+                from .verify_zono_bnb import _crown_intermediate_batched
+                sb_b = _crown_intermediate_batched(
+                    gg, xl_batch, xh_batch, device, dtype)
+            else:
+                sb_b, _ = _forward_zonotope_graph_batched(
+                    xl_batch, xh_batch, gg, device, dtype)
             if clip_enabled:
                 spec_lbs_b, A_lin, b_lin = _spec_backward_graph_batched(
                     sb_b, xl_batch, xh_batch, gg, spec_ew, device, dtype,
@@ -9935,6 +9969,37 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         unclosed = (~all_disj_closed).nonzero(as_tuple=True)[0]
         n_leaves_visited += B
         n_verified_by_crown_iter = int(all_disj_closed.sum().item())
+
+        # Leaf-level SAT search. Phase-0 PGD on the WIDE root box misses a narrow
+        # SAT witness (acasxu 1_5/1_9 prop_2/prop_7: the witness fills a tiny
+        # fraction of the root, and even 200k random restarts can't find it). The
+        # witness-containing leaf holds a real SAT point so CROWN can NEVER close
+        # it -> its margin stays the most-negative and it keeps splitting until
+        # narrow, where PGD inside that leaf's box finds it. Every `_every` iters,
+        # batched-PGD the leaves with the WORST (most-negative worst-disjunct)
+        # margin (the hybrid's proven selection — targets the witness leaf
+        # directly, vs narrowest which misses multi-disjunct prop_7). Skipped
+        # under disable_sat_finding (the soundness probe).
+        leaf_pgd_every = int(getattr(
+            settings, 'input_split_leaf_pgd_every', 0))
+        if (leaf_pgd_every > 0 and unclosed.numel() > 0
+                and not bool(getattr(settings, 'disable_sat_finding', False))
+                and n_iters % leaf_pgd_every == 0):
+            from .verify_hybrid_acasxu import _simple_pgd_batched
+            lp_max = int(getattr(
+                settings, 'input_split_leaf_pgd_max_leaves', 64))
+            # worst-disjunct best-query lb per unclosed leaf; most negative first.
+            per_disj_lb = [spec_lbs_b[unclosed][:, q_idxs].max(dim=1).values
+                           for q_idxs in disj_q_idx.values()]
+            worst_disj = torch.stack(per_disj_lb, dim=1).min(dim=1).values
+            sel = unclosed[worst_disj.argsort()[:lp_max]]
+            sat_l, w_l = _simple_pgd_batched(
+                xl_batch[sel], xh_batch[sel], spec, gg, n_output, device, dtype,
+                n_restarts=int(getattr(
+                    settings, 'input_split_leaf_pgd_restarts', 128)),
+                n_iter=int(getattr(settings, 'input_split_leaf_pgd_iters', 50)))
+            if sat_l:
+                return 'sat', {'phase': 'batched_leaf_pgd', 'witness': w_l}
 
         # Domain clipping: shrink unclosed leaves to the bounding box of
         # the intersection of unsafe halfspaces (CROWN's input-space
@@ -10257,37 +10322,69 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
             else:
                 top_k_dims = ax.unsqueeze(1)  # (B, 1)
             K_eff = top_k_dims.shape[1]
-            top_k_dims_cpu = top_k_dims.cpu()
-            xl_cpu = xl_split.cpu()
-            xh_cpu = xh_split.cpu()
             n = xl_split.shape[0]
-            n_children = 1 << K_eff
-            for i in range(n):
-                xl_i = xl_cpu[i]
-                xh_i = xh_cpu[i]
-                # Which of the K dims actually have width > 0?
-                usable_k = []
-                mids_k = []
-                for k in range(K_eff):
-                    dk = int(top_k_dims_cpu[i, k].item())
-                    if float(xh_i[dk] - xl_i[dk]) > 1e-12:
-                        usable_k.append(dk)
-                        mids_k.append(float((xl_i[dk] + xh_i[dk]) / 2))
-                if not usable_k:
-                    n_open_at_timeout += 1
-                    continue
-                K_u = len(usable_k)
-                # Enumerate 2^K_u children.
-                for combo in range(1 << K_u):
-                    xl_c = xl_i.clone()
-                    xh_c = xh_i.clone()
-                    for k_idx, dk in enumerate(usable_k):
-                        if (combo >> k_idx) & 1:
-                            xl_c[dk] = mids_k[k_idx]  # high half
-                        else:
-                            xh_c[dk] = mids_k[k_idx]  # low half
-                    worklist_xl.append(xl_c.to(device, dtype=dtype))
-                    worklist_xh.append(xh_c.to(device, dtype=dtype))
+            if K_eff == 1:
+                # Vectorized on-GPU 2-way split (single split dim per leaf).
+                # The per-child Python loop + `.cpu()`/`.to(device)` round-trip
+                # below was ~80% of wall on acasxu's millions of leaves (every
+                # child crossed the PCIe bus). Here both children of every leaf
+                # are built in a handful of GPU ops, no host transfer. Children
+                # are appended low-half-batch then high-half-batch; the order
+                # differs from the per-leaf interleave but BaB correctness is
+                # order-independent and SAT-finding is handled by the worst-margin
+                # leaf-PGD (not split order) — the regression that reverted this
+                # before. K>1 (pensieve) keeps the Python loop below.
+                # top_k_dims/ax are built from `widths` which is on CPU — move
+                # the split-dim index to xl_split's device for the GPU gather.
+                ax1 = top_k_dims[:, 0].to(xl_split.device)  # (n,) split dim/leaf
+                lo_ax = xl_split.gather(1, ax1.unsqueeze(1)).squeeze(1)
+                hi_ax = xh_split.gather(1, ax1.unsqueeze(1)).squeeze(1)
+                usable = (hi_ax - lo_ax) > 1e-12
+                n_open_at_timeout += int((~usable).sum().item())
+                if usable.any():
+                    u = usable.nonzero(as_tuple=True)[0]
+                    xl_u = xl_split[u]
+                    xh_u = xh_split[u]
+                    ax_u = ax1[u].unsqueeze(1)
+                    mid_u = ((lo_ax[u] + hi_ax[u]) * 0.5).unsqueeze(1)
+                    # low child = [xl_u, xh with ax=mid]; high = [xl with ax=mid, xh_u]
+                    xh_low = xh_u.clone().scatter_(1, ax_u, mid_u)
+                    xl_high = xl_u.clone().scatter_(1, ax_u, mid_u)
+                    worklist_xl.extend(xl_u.unbind(0))
+                    worklist_xh.extend(xh_low.unbind(0))
+                    worklist_xl.extend(xl_high.unbind(0))
+                    worklist_xh.extend(xh_u.unbind(0))
+            else:
+                top_k_dims_cpu = top_k_dims.cpu()
+                xl_cpu = xl_split.cpu()
+                xh_cpu = xh_split.cpu()
+                n_children = 1 << K_eff
+                for i in range(n):
+                    xl_i = xl_cpu[i]
+                    xh_i = xh_cpu[i]
+                    # Which of the K dims actually have width > 0?
+                    usable_k = []
+                    mids_k = []
+                    for k in range(K_eff):
+                        dk = int(top_k_dims_cpu[i, k].item())
+                        if float(xh_i[dk] - xl_i[dk]) > 1e-12:
+                            usable_k.append(dk)
+                            mids_k.append(float((xl_i[dk] + xh_i[dk]) / 2))
+                    if not usable_k:
+                        n_open_at_timeout += 1
+                        continue
+                    K_u = len(usable_k)
+                    # Enumerate 2^K_u children.
+                    for combo in range(1 << K_u):
+                        xl_c = xl_i.clone()
+                        xh_c = xh_i.clone()
+                        for k_idx, dk in enumerate(usable_k):
+                            if (combo >> k_idx) & 1:
+                                xl_c[dk] = mids_k[k_idx]  # high half
+                            else:
+                                xh_c[dk] = mids_k[k_idx]  # low half
+                        worklist_xl.append(xl_c.to(device, dtype=dtype))
+                        worklist_xh.append(xh_c.to(device, dtype=dtype))
             if len(worklist_xl) > max_worklist:
                 return 'unknown', {
                     'phase': 'batched_worklist_overflow',

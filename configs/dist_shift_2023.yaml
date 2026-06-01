@@ -17,5 +17,16 @@ phase8_min_budget_frac: 0.5
 input_split_batched_enabled: true
 input_split_batched_clip_enabled: true
 input_split_batch_size: 4096
+# mnist_concat input is 792-dim but only 8 dims VARY (delta perturbs an 8-D
+# latent; the 784 image pixels are fixed). The input-split routing gate
+# (verify_graph.py:7736) caps on TOTAL input dim (n_in <= input_split_max_dims,
+# default 20), so 792 > 20 silently routed every case to the dual-ascent
+# _run_pipeline instead of the intended input-split BaB — even though
+# input_split_batched_enabled was set. Input-split only splits varying dims (8),
+# so it's very tractable AND it narrows the SIGMOID inputs, which the dual-ascent
+# path can't (sigmoid γ slack isn't in its ReLU split set) — the exact blocker
+# for the 9 hard UNSAT misses. Lifting the cap activates the intended path:
+# index9733/2481 0->verified <3s (faster than ABC's 8s).
+input_split_max_dims: 800
 pgd_restarts: 128
 pgd_time_budget_phase0: 2.0
