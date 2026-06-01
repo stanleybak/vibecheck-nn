@@ -7720,6 +7720,31 @@ def verify_graph(graph, spec, settings):
                   f'{getattr(settings, "input_split_max_dims", 20)} '
                   f'batched={bool(getattr(settings, "input_split_batched_enabled", False))}',
                   flush=True)
+        if bool(getattr(settings, 'use_hybrid_acasxu', False)):
+            # Freeze-replay α-CROWN with TIGHTENED intermediate bounds. The
+            # forward-zono intermediate bounds the batched input-split BaB uses
+            # are ~1000x too loose for ACAS Xu's amplifying weights (root spec
+            # margin -1597 vs true >0) -> it diverges (6.8M leaves, never
+            # converges). verify_hybrid tightens per-layer pre-ReLU bounds via
+            # backward α-CROWN (intersected with forward-zono, so still SOUND)
+            # and converges. Adapt its {verdict} dict to (result, details), and
+            # onnxruntime-validate any sat witness (no false sat).
+            from .verify_hybrid_acasxu import verify_hybrid
+            _hres = verify_hybrid(
+                graph, spec, settings,
+                timeout=float(getattr(settings, 'total_timeout', 120.0)))
+            _hv = _hres.get('verdict', 'unknown')
+            if _hv == 'sat':
+                _onnx_p = getattr(graph, 'onnx_path', None)
+                _w = _hres.get('witness')
+                if _onnx_p is not None and _w is not None:
+                    _ok, _info = _validate_sat_witness(
+                        _onnx_p, spec, np.asarray(_w).flatten())
+                    if not _ok:
+                        _hres['spurious_witness'] = _info
+                        return 'unknown', _hres
+                return 'sat', _hres
+            return ('verified' if _hv == 'unsat' else 'unknown'), _hres
         if bool(getattr(settings, 'input_split_batched_enabled', False)):
             # Build the GPU graph once at the top — the batched driver
             # reuses it across all iterations.

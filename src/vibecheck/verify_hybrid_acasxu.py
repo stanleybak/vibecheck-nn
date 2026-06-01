@@ -255,6 +255,10 @@ def verify_hybrid(graph, spec, settings=None, timeout=120.0,
     if settings is None:
         settings = default_settings()
     settings.total_timeout = timeout
+    # Soundness probe: when sat-finding is disabled, skip ALL PGD (Phase 0 +
+    # between-rounds). A SAT case must then come back 'unknown' (the BaB can't
+    # verify it), never a false 'unsat'.
+    _disable_sat = bool(getattr(settings, 'disable_sat_finding', False))
 
     t_start = time.perf_counter()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -277,7 +281,7 @@ def verify_hybrid(graph, spec, settings=None, timeout=120.0,
     xh_root = torch.as_tensor(spec.x_hi, dtype=dtype, device=device).flatten()[None, :]
 
     # --- Phase 0: root PGD (simple direct PGD, sign-gradient, 10K restarts) ---
-    if bool(getattr(settings, 'pgd_phase0_enabled', True)):
+    if bool(getattr(settings, 'pgd_phase0_enabled', True)) and not _disable_sat:
         sat, witness = _simple_pgd(
             xl_root, xh_root, spec, gg, n_output, device, dtype,
             n_restarts=10000, n_iter=50, lr=0.1)
@@ -398,7 +402,8 @@ def verify_hybrid(graph, spec, settings=None, timeout=120.0,
 
         # PGD between rounds — target top-K worst (most negative spec_lb)
         # open leaves. Cheap per call; SAT exit short-circuits everything.
-        if (pgd_between_every > 0 and open_idx.numel() > 0
+        if (pgd_between_every > 0 and not _disable_sat
+                and open_idx.numel() > 0
                 and iters % pgd_between_every == 0):
             wv = worst_per_leaf[open_idx]
             k_atk = min(pgd_between_k, open_idx.numel())

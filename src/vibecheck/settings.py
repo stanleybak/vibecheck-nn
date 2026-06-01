@@ -237,6 +237,12 @@ def default_settings(**overrides):
         # input box is approximately isotropic after splits). Default
         # off; AB-CROWN's `naive` (= widest) is the empirical winner.
         input_split_batched_branch_sb=False,
+        # Route input-split-eligible nets to the freeze-replay α-CROWN verifier
+        # (verify_hybrid_acasxu) with TIGHTENED intermediate bounds. The batched
+        # input-split BaB's forward-zono intermediate bounds are ~1000x too
+        # loose for ACAS Xu's amplifying weights → it diverges. Default off;
+        # acasxu turns it on.
+        use_hybrid_acasxu=False,
         # Clip → re-CROWN inner cycles. After clipping a leaf, the OLD
         # CROWN bounds are still sound on the smaller box but loose.
         # Re-running CROWN on the clipped box gives tighter spec lbs

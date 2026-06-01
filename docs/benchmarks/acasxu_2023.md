@@ -15,7 +15,22 @@ Measured 2026-05-22 on server1 (`~/persistent_runs/sweep_unified.csv`).
 
 ## Algorithm
 
-The pipeline lives in `src/vibecheck/verify_hybrid_acasxu.py`. ACASXU dispatches to `verify_hybrid()` rather than the generic `verify_graph()`; the input space is 5-D so input-split BaB dominates, and the per-leaf cost is small enough that heavy α-CROWN at every leaf would crush throughput.
+The pipeline lives in `src/vibecheck/verify_hybrid_acasxu.py`. `verify_graph()`
+routes ACASXU to `verify_hybrid()` via `use_hybrid_acasxu: true` in the config —
+the input space is 5-D so input-split BaB dominates, and the per-leaf cost is
+small enough that heavy α-CROWN at every leaf would crush throughput.
+
+**This wiring is the fix for a real disconnect.** Until it was added, `verify_graph`
+(the production path used by `main.py`, the CLI, and the cross-sweep) routed
+ACASXU to the *generic* batched input-split BaB, which propagates **forward-zono
+intermediate bounds**. Those are ~1000× too loose for ACAS Xu's amplifying
+weights (root spec margin -1597 vs a true value > 0), so the BaB **diverged** —
+6.8M leaves, never converging — and timed out on 3_3 prop_2. `verify_hybrid`'s
+freeze-replay tightens per-layer pre-ReLU bounds with backward α-CROWN
+(`_full_freeze`), intersected with the forward-zono bound so it stays sound, and
+converges. (The 186/186 below was always achievable via `verify_hybrid` directly
+— e.g. `sweep_unified.py` and the old integration test called it directly — but
+the production verdict path did not, until this wiring.)
 
 1. **Root PGD** (sign-gradient, 10K restarts × 50 iters). Multi-disjunct DNF aware. Catches 42 of the 47 SAT cases by itself in ~5 ms. The remaining 5 SAT cases (1_5/1_6/3_2/5_3 prop_2, 2_9 prop_8) have narrow witnesses — handled by between-rounds PGD or the multi-disjunct fix respectively.
 
@@ -40,9 +55,14 @@ The pipeline lives in `src/vibecheck/verify_hybrid_acasxu.py`. ACASXU dispatches
 - **Group α as warmstart** (not parent α). Tested per-leaf inheritance from parent's opt'd α — measured slower than group warmstart at every spec_iters setting (5..20). Hypothesis: inherited α is locally near-optimal but explores less; group α allows Adam to find a path that converges in fewer iters.
 - **Plain CROWN at the rest of BaB**. Heavy α at every leaf is fatal on easy cases (one of the things AB-CROWN explicitly avoids on ACASXU — their config uses plain CROWN, no α-CROWN).
 
-## Knobs in `configs/acasxu_2023.yaml` (legacy)
+## Knobs in `configs/acasxu_2023.yaml`
 
-The yaml file pre-dates the hybrid runner and is no longer used by `verify_hybrid()`. It remains because `tests/sweep_acasxu.py` and the older `verify_graph` path still load it. Safe to delete once those callers migrate; until then, treat its contents as historical.
+The config now does one load-bearing thing: `use_hybrid_acasxu: true`, which is
+what makes `verify_graph` route to `verify_hybrid`. (`input_split_batched_enabled:
+true` remains as a fallback if the hybrid flag is ever turned off.) The old
+selective-α / MILP-escalation / clipping knobs were removed — the MILP escalation
+in particular dominated the old path (~80% of wall on 3_3 prop_2, from Gurobi
+pool spawn/terminate overhead) and is gone.
 
 The hybrid runner's hyperparameters are baked into `verify_hybrid()`'s function defaults:
 
@@ -59,17 +79,13 @@ The hybrid runner's hyperparameters are baked into `verify_hybrid()`'s function 
 
 ## Reproduction
 
-Single case:
+Single case (production path — routes to verify_hybrid via the config):
 ```bash
-.venv/bin/python -c "
-from vibecheck.network import ComputeGraph
-from vibecheck.vnnlib_loader import load_vnnlib
-from vibecheck.verify_hybrid_acasxu import verify_hybrid
-import numpy as np
-g = ComputeGraph.from_onnx('<onnx>', dtype=np.float32)
-spec = load_vnnlib('<vnnlib>')
-print(verify_hybrid(g, spec, timeout=120))
-"
+B=$VNNCOMP/benchmarks/acasxu_2023
+.venv/bin/python -m vibecheck.main \
+  --net $B/onnx/ACASXU_run2a_3_3_batch_2000.onnx \
+  --spec $B/vnnlib/prop_2.vnnlib \
+  --config configs/acasxu_2023.yaml --timeout 120 --results-file /tmp/r.txt  # unsat ~46s
 ```
 
 Full sweep (on server1):
@@ -83,7 +99,7 @@ Results CSV: `~/persistent_runs/sweep_unified.csv`.
 
 ## Integration tests
 
-`tests/integration/test_acasxu_2023.py` covers 3 cases — 1 narrow-witness SAT (1_5 prop_2) + the two hardest UNSAT cases (3_3 prop_2, 1_1 prop_3). Each pinned with `max_wall_s` ~1.5× observed.
+`tests/integration/test_acasxu_2023.py` covers 3 cases — 1 narrow-witness SAT (1_5 prop_2) + the two hardest UNSAT cases (3_3 prop_2, 1_1 prop_3). It now runs through the **production path** (`verify_graph` + the config via `_runner`), not `verify_hybrid` directly — closing the gap that let the test pass while the production pipeline diverged.
 
 ## Known unsolved cases
 
