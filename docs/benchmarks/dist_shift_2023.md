@@ -1,5 +1,33 @@
 # dist_shift_2023 — vibecheck benchmark record
 
+## UPDATE 2026-06-02 — soundness re-confirmed on AWS A10G (current main)
+
+Re-verified that the gen-LP soundness bug (orphan `[0,0]`-column collapse in
+`_build_alpha_zono_lp`, fixed by `4bc8097`) is fully closed, not just for the two
+cases originally caught.
+
+- **Soundness probe** (`--disable-sat-finding`, production config) on **all 7
+  ABC-`sat` cases** — index 4739 / 1282 / 1285 / 9211 / 4312 / 4272 / 7534 — every
+  one returns `unknown`. **0 unsound of 7.** (Prior record only validated 1285 &
+  4312; the other 5 are confirmed here.) A `verified`/`unsat` here would mean the
+  bounds path falsely closed a genuine counterexample.
+- **Full 72-case production sweep** (config `dist_shift_2023.yaml`, verdict from
+  `--results-file`, cross-checked vs the published ABC verdicts): **72/72 match —
+  7 sat + 65 unsat, 0 unsound / 0 mismatch / 0 incomplete.**
+
+Root cause recap: the spec-MILP / gen-LP reserves a generator column per zonotope
+noise symbol; `state_from_alpha_zono` reserves columns for unstable neurons it
+*skips* (the sigmoid γ-slack + `mnist_concat`'s ~740 generator-subnet ReLUs not in
+`unstable_list`). Pinning those to `[0,0]` collapsed each neuron's parallelogram
+`λ·z + μ·(1+e_new)` to its center line — an unsound ReLU under-approximation that
+let the MILP binarization cut off a real CEX → false `verified`. Masked in
+production because PGD finds the CEX first. Fix = every column free in `[-1,1]`
+(`verify_gen_lp.py:1095-1097`), pinned by
+`tests/test_genlp_relaxation_equals_zonotope_alpha_zono`. Reproduce the probe:
+`python -m vibecheck.main --net onnx/mnist_concat.onnx --spec
+vnnlib/index4312_delta0.13.vnnlib --config configs/dist_shift_2023.yaml
+--disable-sat-finding --timeout 60 --results-file /tmp/r.txt` → must be `unknown`.
+
 ## UPDATE 2026-06-01 — 9 UNSAT misses closed → 72/72
 
 A completeness audit found **9 UNSAT misses** (all `mnist_concat`, ABC solves in 8–13 s, we returned `unknown` in ~6 s). Two root causes, both fixed:
