@@ -1,5 +1,20 @@
 # nn4sys — vibecheck benchmark record
 
+## 2026-06-02 — AWS A10G confirmation: 194/194 (the stale "190/194 AWS" was a pre-fix sweep)
+
+Re-swept the only previously-incomplete model, `pensieve_big_parallel`, on current `main` (commit `65af0be`, the
+K=2 + boost-exp-2.0 branching fix already merged) on the AWS A10G (24 GB). **All 75/75 `unsat`**, slowest 7.08s
+(`pensieve_parallel_35`) against per-case budgets of 30/60/140s. The 4 previously-"failing" cases verified in
+5.4–7.2s wall: pp36 7.19s · pp48 5.39s · pp56 5.36s · pp60 5.42s.
+
+- Verdicts are **file-based** (`--results-file` per case → `~/pensieve_runs/full/summary.csv`; tally `75 unsat`,
+  0 sat / 0 unknown / 0 timeout / 0 NOFILE). Not from exit code.
+- The other 11 models are untouched by the fix (gated on `n_var>8` = pensieve-only) and were already 100%, so
+  **nn4sys = 194/194 on the A10G**. The earlier "190/194, 63–65s margin" was a *pre-fix* sweep that was never
+  re-validated on AWS until now — the fix had landed but the number was stale.
+- No code change: branch `bench/nn4sys-pensieve-aws` was identical to `main`. Runner: `~/sweep_pbp.sh` (AWS);
+  slowest 5: pp_35 7.08s, pp_86 6.84s, pp_83 6.71s, pp_100 6.36s, pp_40 6.11s.
+
 ## 2026-05-29 — pensieve_big_parallel last-4 timeouts FIXED: branching only (K=4→2 + boost exponent 1→2); ~4s, beats ABC
 
 The 4 remaining timeouts (`pensieve_parallel_36/48/56/60`) were closed by **two branching knobs**, not a bounding
