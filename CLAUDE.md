@@ -52,6 +52,16 @@ Pipeline: **ONNX loading → graph construction → zonotope propagation → spe
 - **`verify_gen_lp.py`** — Generator-based LP/MILP encoding. Smaller model than per-neuron builders, identical LP triangle bounds. `phase8_milp_mode` ∈ {find_sat, infeasibility, alpha_zono_bnb, alpha_zono_infeasibility}.
 - **`onnx_optimizer.py`** — Semantics-preserving rewrites: `fold_relusplitter` collapses `Conv(C→2C)→ReLU→Conv(2C→C,1×1)→ReLU` back to `Conv(C→C)→ReLU` (exact: ReLU(z) − ReLU(−z) = z). `fuse_gemm_reshape_conv` merges `Gemm→Reshape→Conv`.
 - **`gurobi_util.py`** — `optimize_checked(model)` wraps `model.optimize()` with a callback that captures numeric-trouble warnings and raises `GurobiNumericTrouble`.
+
+Bounding / search machinery (where the non-zono tightening lives):
+
+- **`alpha_crown.py`** — α-CROWN optimization + direction-adaptive forward zonotope reconstruction. **`alpha_tighten.py`** — GPU-batched α-CROWN layer tightening (shared- or per-target-α).
+- **`forward_lirpa.py`** — LiRPA-style forward-mode linear bound propagation. **`bounded_module.py`** — codegen'd specialized forward bound prop for a fixed graph.
+- **`dual_ascent_bab.py`** — GPU-batched Lagrangian dual-ascent BaB verifier (cifar100 OOM path). **`lagrangian_n.py`** — N-halfspace Lagrangian dual subgradient backing `box_halfspace`.
+- **`batched_zono.py`** — batched zonotope forward over N input boxes (vectorized input-split). **`pgd.py`** — α,β-CROWN-style PGD counterexample search.
+- **`verify_hybrid_acasxu.py`** — hybrid α-CROWN BaB pipeline for ACASXU (currently OFF in production; see `[[project_acasxu_hybrid_wiring]]`).
+- **`onnx_torch_runner.py`** — minimal ONNX→torch interpreter for forward-only execution (point-prop validation). **`io_util.py`** — shared ONNX/VNNLIB I/O helpers (incl. transparent gzip resolution).
+- **`config_loader.py`** — YAML per-benchmark overrides (`--config`). **`config_profiles.py`** — `default_settings_for(graph, spec)` instance-based selection when no `--config`.
 - **`settings.py`** — `default_settings()` returns a DotMap. **`main.py`** — CLI; exit 0 = verified, 1 = unknown.
 
 ## Gurobi convention
