@@ -9,6 +9,10 @@ from .spec import VNNSpec, Conjunct, Constraint, PairwiseConstraint
 
 def load_vnnlib(vnnlib_path, dtype=np.float32):
     """Parse a VNNLIB file into a VNNSpec object."""
+    # Accept gzipped inputs, and resolve a `.vnnlib` reference whose only
+    # on-disk copy is `.vnnlib.gz` (common in VNNCOMP benchmark dirs).
+    from .io_util import ensure_decompressed
+    vnnlib_path = ensure_decompressed(vnnlib_path)
     if vnnlib_path.endswith('.gz'):
         with gzip.open(vnnlib_path, 'rt') as f:
             text = f.read()

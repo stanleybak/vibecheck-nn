@@ -17,6 +17,11 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
     import onnx
     from onnx import numpy_helper
 
+    # Accept gzipped inputs, and resolve a `.onnx` reference whose only
+    # on-disk copy is `.onnx.gz` (common in VNNCOMP benchmark dirs).
+    from .io_util import ensure_decompressed
+    onnx_path = ensure_decompressed(onnx_path)
+
     if onnx_path.endswith('.gz'):
         with gzip.open(onnx_path, 'rb') as f:
             model = onnx.load_from_string(f.read())
