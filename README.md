@@ -7,6 +7,16 @@ spec, it decides whether the property is provably satisfied (`unsat` /
 "verified"), refuted by a counterexample (`sat`), or `unknown`, using abstract
 interpretation with zonotope domains plus CROWN / α-CROWN, LP/MILP, and BaB.
 
+## Benchmarks
+
+vibecheck is tuned per-benchmark against the VNNCOMP 2025 **regular track**, with
+the goal of matching or beating AB-CROWN on every one. Each benchmark has a
+runnable config (`configs/<benchmark>.yaml`), an integration test
+(`tests/integration/test_<benchmark>.py`), and a record in
+[`docs/benchmarks/`](docs/benchmarks/) capturing its score vs AB-CROWN,
+algorithmic wins, and reproduction commands. Verdicts in those records always
+come from the `--results-file` contents, never the exit code.
+
 ## Setup
 
 Use [uv](https://docs.astral.sh/uv/) — a single binary that pulls a prebuilt

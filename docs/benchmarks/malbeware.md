@@ -1,5 +1,23 @@
 # malbeware — vibecheck benchmark record
 
+## UPDATE 2026-06-02 — re-swept on AWS A10G, 150/150 vs ABC (regression stays closed)
+
+Re-confirmed the Phase-8 racing regression (fixed by `7da043b`, defaults
+`phase8_race_all_bins` + `phase8_high_bin_bestbdstop`) is closed on current main.
+Full 150-case sweep on the A10G (config `malbeware.yaml`, verdict from
+`--results-file`): **150/150 match ABC — 19 sat + 131 unsat, 0 unsound /
+0 mismatch / 0 incomplete.** The previously-regressed `4-25` eps-3 cases verify
+in ~2.5 s (warm GPU); the all-neurons `bins=4917` racer wins with a `BestBdStop`
+margin certificate `lb > 0`.
+
+**Sweep-harness lesson (re-learned):** malbeware reuses each vnnlib basename
+across all 3 onnx models, and ABC gives **different verdicts per model** (e.g.
+`Alueron.gen!J idx-21`: linear-25→unsat, 4-25→**sat**, 16-25→unsat). A first pass
+that matched ABC by vnnlib *basename* produced two spurious `UNSOUND-sat` flags;
+matching by the **(onnx, vnnlib) pair** clears them — vc's `sat` verdicts are
+onnxruntime-validated witnesses (`_validate_sat_witness`, no false sat) and agree
+with ABC's per-model verdict. See [[project_audit_abc_key_collision]].
+
 VNNCOMP 2025 regular track. 150 instances across 3 malware-image
 classifier models (64×64 grayscale → 25 classes):
 
