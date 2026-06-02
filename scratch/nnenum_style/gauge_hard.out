@@ -1,0 +1,6 @@
+# per-case timeout = 45.0s
+2_2 prop_3: SAFE 0.2s splits=3 LP=800
+3_3 prop_2: TIMEOUT 45.0s splits=1451 LP=148280
+4_2 prop_2: TIMEOUT 46.1s splits=874 LP=129524
+1_9 prop_7: TIMEOUT 45.3s splits=18 LP=8624
+2_2 prop_2: NOTSAFE 11.2s splits=13 LP=3623

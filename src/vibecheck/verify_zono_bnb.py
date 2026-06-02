@@ -4178,7 +4178,7 @@ def zonotope_bnb_verify(graph, spec, settings=None):
         settings = default_settings()
     device, dtype = resolve_torch(settings)
 
-    torch.set_num_threads(1)
+    torch.set_num_threads(int(__import__('os').environ.get('VIBECHECK_TORCH_THREADS', '1') or '1'))
 
     pw = spec.as_pairwise()
     assert pw is not None, (

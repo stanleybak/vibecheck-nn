@@ -1,0 +1,6 @@
+benchmark                    sigmoid/tanh nets
+cgan_2023                    2/7 nets  acts=['Sigmoid', 'Tanh']
+collins_aerospace_benchmark  1/1 nets  acts=['Sigmoid']
+dist_shift_2023              2/3 nets  acts=['Sigmoid']
+ml4acopf_2024                3/9 nets  acts=['Sigmoid']
+nn4sys                       4/12 nets  acts=['Sigmoid']

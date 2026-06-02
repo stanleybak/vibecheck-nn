@@ -37,9 +37,12 @@ PROGRESS = OUT / 'progress.log'
 
 # Fast benchmarks first so partial overnight coverage is maximised.
 BENCHMARKS = [
-    'acasxu_2023', 'cersyve', 'cgan_2023', 'collins_rul_cnn_2022',
-    'linearizenn_2024', 'malbeware', 'dist_shift_2023', 'metaroom_2023',
-    'safenlp_2024', 'cora_2024', 'cifar100_2024', 'nn4sys',
+    # Benchmarks that had misses in the previous sweep go FIRST, so their
+    # re-check surfaces quickly (main() iterates benchmark-first, A->B->C each).
+    'nn4sys', 'acasxu_2023', 'dist_shift_2023',
+    # Then the rest (previous sweep: 0 misses).
+    'cersyve', 'cgan_2023', 'collins_rul_cnn_2022', 'linearizenn_2024',
+    'malbeware', 'metaroom_2023', 'safenlp_2024', 'cora_2024', 'cifar100_2024',
 ]  # tinyimagenet deliberately excluded (under debugging)
 
 PHASE_A_CAP = 20.0          # soundness-probe timeout cap (s)
@@ -206,20 +209,33 @@ def main():
     A, B, C = build_worklist()
     log(f'worklist: A(sat-soundness)={len(A)} B(unsat-complete)={len(B)} '
         f'C(abc-unsolved)={len(C)}  (already done: {len(done)})')
-    phases = [('A', A), ('B', B), ('C', C)]
+    # Benchmark-FIRST iteration: each benchmark runs all its phases (A soundness
+    # -> B completeness -> C stretch) before the next benchmark. With BENCHMARKS
+    # ordered problem-first, the benchmarks that missed last sweep (nn4sys,
+    # acasxu, dist_shift) are fully re-checked before the clean ones — and
+    # soundness still precedes completeness WITHIN each benchmark.
+    by_bench = {}
+    for phase, work in (('A', A), ('B', B), ('C', C)):
+        for case in work:
+            by_bench.setdefault(case[0], {'A': [], 'B': [], 'C': []})[phase].append(case)
+    ordered = ([b for b in BENCHMARKS if b in by_bench]
+               + [b for b in by_bench if b not in BENCHMARKS])
     n_unsound = 0
-    for phase, work in phases:
-        log(f'=== PHASE {phase}: {len(work)} cases ===')
-        for i, (b, onnx_rel, vnn_rel, tmo, ar, at) in enumerate(work):
-            if (phase, onnx_rel, vnn_rel) in done:
+    for b in ordered:
+        for phase in ('A', 'B', 'C'):
+            work = by_bench[b][phase]
+            if not work:
                 continue
-            vc, wall, flag = run_case(phase, b, onnx_rel, vnn_rel, tmo, ar, at)
-            if flag == 'UNSOUND':
-                n_unsound += 1
-            if i % 20 == 0:
-                log(f'  [{phase}] {i}/{len(work)} {b} last={vc} '
-                    f'({wall:.0f}s) unsound_so_far={n_unsound}')
-        log(f'=== PHASE {phase} done ===')
+            log(f'=== {b} PHASE {phase}: {len(work)} cases ===')
+            for i, (bb, onnx_rel, vnn_rel, tmo, ar, at) in enumerate(work):
+                if (phase, onnx_rel, vnn_rel) in done:
+                    continue
+                vc, wall, flag = run_case(phase, bb, onnx_rel, vnn_rel, tmo, ar, at)
+                if flag == 'UNSOUND':
+                    n_unsound += 1
+                if i % 20 == 0:
+                    log(f'  [{b} {phase}] {i}/{len(work)} last={vc} '
+                        f'({wall:.0f}s) unsound_so_far={n_unsound}')
     log(f'SWEEP COMPLETE. unsound_total={n_unsound}')
 
 

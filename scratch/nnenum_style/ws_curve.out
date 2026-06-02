@@ -1,0 +1,5 @@
+nw= 2: SAFE  83.4s speedup= 1.9x eff=94% LP=570258
+nw= 4: SAFE  46.4s speedup= 3.4x eff=85% LP=570258
+nw= 6: SAFE  35.6s speedup= 4.4x eff=73% LP=570258
+nw= 8: SAFE  29.9s speedup= 5.3x eff=66% LP=570258
+nw=16: SAFE  24.1s speedup= 6.5x eff=41% LP=570258

@@ -1,0 +1,2 @@
+nnenum 1_9 prop_1 mode=default nproc=16: unsat    wall=    0.5s LP=   65779 stars=4165
+nnenum 1_9 prop_1 mode=default nproc=16: unsat    wall=    0.4s LP=   61221 stars=3890

@@ -3509,6 +3509,33 @@ def _forward_zonotope_interleaved(
     return sb, bounds_by_relu, z_final, tb
 
 
+def _conjunct_unsafe_feasible_zono(c, G, w_list, b_list):
+    """Is the UNSAFE conjunct {w_j·y + b_j <= 0 for ALL j} FEASIBLE over the
+    zonotope y = c + G·e, e in [-1,1]^k?  Returns True (disjunct stays open) if a
+    point can satisfy every unsafe constraint simultaneously; False (jointly
+    infeasible -> safe, close the disjunct) otherwise.
+
+    This is the EXACT joint check the per-query `any(lb>0)` closure misses: a
+    conjunct can be jointly unsatisfiable over the zonotope even when no single
+    constraint is always-violated (acasxu y0-is-min, cersyve, sat_relu, ...).
+    SOUND: infeasibility over the zonotope over-approx implies infeasibility over
+    the true reachable set. Unsafe constraint j over the zono:
+        w_j·(c + G·e) + b_j <= 0  <=>  (w_j·G)·e <= -(w_j·c + b_j).
+    """
+    k = G.shape[1] if (G.ndim == 2 and G.size > 0) else 0
+    if k == 0:                                   # zonotope is a point (center)
+        return all(float(w @ c) + float(b) <= 1e-9 for w, b in zip(w_list, b_list))
+    A = np.stack([w @ G for w in w_list])
+    rhs = np.array([-(float(w @ c) + float(b)) for w, b in zip(w_list, b_list)])
+    from scipy.optimize import linprog
+    res = linprog(c=np.zeros(k), A_ub=A, b_ub=rhs,
+                  bounds=[(-1.0, 1.0)] * k, method='highs')
+    if res.status == 2:                          # infeasible -> jointly safe
+        return False
+    # feasible (0) or numerical/other -> conservatively keep open (sound)
+    return True
+
+
 def _zono_spec_lbs_and_open_qis(center, generators, queries_flat,
                                    w_qs=None, b_qs=None):
     """Compute per-query zonotope spec lower bounds + open-query list.
@@ -3563,6 +3590,13 @@ def _zono_spec_lbs_and_open_qis(center, generators, queries_flat,
         qids_in_disj = [qi for qi in range(len(queries_flat))
                          if disj_of_qi[qi] == di]
         if all(spec_lbs[qi] <= 0 for qi in qids_in_disj):
+            # Per-query check says open. For MULTI-constraint conjuncts the unsafe
+            # region may still be JOINTLY infeasible over the zonotope -> safe.
+            # (Single-constraint: per-query == joint, skip the LP.)
+            if len(qids_in_disj) > 1 and not _conjunct_unsafe_feasible_zono(
+                    c, G, [w_qs[qi] for qi in qids_in_disj],
+                    [float(b_qs[qi]) for qi in qids_in_disj]):
+                continue                          # jointly infeasible -> closed
             disj_open.add(di)
     open_qis = [qi for qi in range(len(queries_flat))
                  if disj_of_qi[qi] in disj_open]
@@ -5187,7 +5221,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     Returns (result_str, details_dict) per the contract in the module plan.
     """
     device, dtype = resolve_torch(settings)
-    torch.set_num_threads(1)
+    torch.set_num_threads(int(__import__('os').environ.get('VIBECHECK_TORCH_THREADS', '1') or '1'))
     total_timeout = float(settings.total_timeout)
     print_progress = bool(settings.print_progress)
     verbose = print_progress
@@ -7808,6 +7842,30 @@ def verify_graph(graph, spec, settings):
             try:
                 result, details = _input_split_batched(
                     graph, spec, settings, _gg, _dev, _dtype)
+                # Adaptive escalation: the input-split bailed because plain-CROWN
+                # bounds made the leaf count explode (acasxu 3_3 prop_2). Hand the
+                # case to the freeze-replay hybrid, whose α-tight intermediate
+                # bounds need ~100x fewer leaves (and are far less HW-sensitive,
+                # so the case stays under the competition timeout on slow GPUs).
+                if (isinstance(details, dict)
+                        and details.get('phase') == 'batched_stall_escalate'
+                        and bool(getattr(settings, 'acasxu_hybrid_on_stall', False))):
+                    from .verify_hybrid_acasxu import verify_hybrid
+                    _hres = verify_hybrid(
+                        graph, spec, settings,
+                        timeout=float(getattr(settings, 'total_timeout', 120.0)))
+                    _hv = _hres.get('verdict', 'unknown')
+                    if _hv == 'sat':
+                        _onnx_p = getattr(graph, 'onnx_path', None)
+                        _w = _hres.get('witness')
+                        if _onnx_p is not None and _w is not None:
+                            _ok, _info = _validate_sat_witness(
+                                _onnx_p, spec, np.asarray(_w).flatten())
+                            if not _ok:
+                                _hres['spurious_witness'] = _info
+                                return 'unknown', _hres
+                        return 'sat', _hres
+                    return ('verified' if _hv == 'unsat' else 'unknown'), _hres
             except (ValueError, NotImplementedError, KeyError, RuntimeError) as _e:
                 # batched zono/CROWN can't handle some op (transformer
                 # attention's max_pool/softmax/matmul_bilinear). Fall
@@ -9902,12 +9960,27 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
             batch_size = new_bs
             continue
 
-        # Per-batch closure: every disjunct must have at least one
-        # query with lb > 0.
+        # Per-batch closure: a disjunct (conjunct of unsafe queries) is closed
+        # iff its unsafe region is unreachable over the leaf. The per-query test
+        # closes it when SOME query is provably safe everywhere — sufficient but
+        # NOT necessary for a conjunct. For MULTI-query conjuncts also apply the
+        # JOINT sum-certificate over the CROWN input-linear lower bounds
+        # (spec_q(x) >= A_q·x + acc_q): the unsafe conjunct {all spec_q <= 0} is
+        # infeasible if box-min(Σ_q A_q·x + acc_q) > 0 — captures input
+        # correlations the per-query test misses. Sound (the sum is a valid lb on
+        # Σ spec_q), batched, no-op for single-query conjuncts.
+        joint_conjunct = bool(getattr(
+            settings, 'input_split_joint_conjunct', True))
         disj_closed_masks = []
         for di, q_idxs in disj_q_idx.items():
-            disj_closed_masks.append(
-                (spec_lbs_b[:, q_idxs] > 0).any(dim=1))
+            closed = (spec_lbs_b[:, q_idxs] > 0).any(dim=1)
+            if joint_conjunct and A_lin is not None and len(q_idxs) > 1:
+                cA = A_lin[:, q_idxs, :].sum(dim=1)        # (B, n_in)
+                cb = b_lin[:, q_idxs].sum(dim=1)           # (B,)
+                box_min = cb + torch.minimum(
+                    cA * xl_batch, cA * xh_batch).sum(dim=1)
+                closed = closed | (box_min > 0)
+            disj_closed_masks.append(closed)
         if disj_closed_masks:
             all_disj_closed = torch.stack(disj_closed_masks, dim=1).all(dim=1)
         else:
@@ -9969,6 +10042,22 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         unclosed = (~all_disj_closed).nonzero(as_tuple=True)[0]
         n_leaves_visited += B
         n_verified_by_crown_iter = int(all_disj_closed.sum().item())
+
+        # Stall escalation: plain-CROWN intermediate bounds are ~2x looser than
+        # α-optimised ones, so a few hard cases (acasxu 3_3 prop_2: 1.88M leaves)
+        # churn through orders of magnitude more leaves than they need. The
+        # WORKLIST stays bounded (leaves are consumed, not piled up), so the
+        # frontier cap can't catch it — gate on TOTAL leaves visited instead
+        # (HW-independent). Past the cap, bail with a distinct phase so the caller
+        # can escalate to the freeze-replay hybrid (α-tight bounds -> ~100x fewer
+        # leaves; 3_3 46s vs 71s and far less HW-sensitive). Default 0 = off.
+        stall_cap = int(getattr(
+            settings, 'input_split_batched_stall_leaf_cap', 0))
+        if stall_cap > 0 and n_leaves_visited > stall_cap:
+            return 'unknown', {
+                'phase': 'batched_stall_escalate',
+                'batched_n_leaves': n_leaves_visited,
+                'batched_n_iters': n_iters}
 
         # Leaf-level SAT search. Phase-0 PGD on the WIDE root box misses a narrow
         # SAT witness (acasxu 1_5/1_9 prop_2/prop_7: the witness fills a tiny

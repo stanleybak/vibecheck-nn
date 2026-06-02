@@ -263,6 +263,15 @@ def default_settings(**overrides):
         input_split_leaf_pgd_max_leaves=64,
         input_split_leaf_pgd_restarts=128,
         input_split_leaf_pgd_iters=50,
+        # Adaptive escalation to the freeze-replay hybrid. The plain-CROWN
+        # input-split's leaf count explodes on a few hard acasxu cases (3_3
+        # prop_2: 1.88M leaves). When TOTAL leaves visited exceeds
+        # `stall_leaf_cap` (>0), the BaB bails with phase `batched_stall_escalate`
+        # and, if `acasxu_hybrid_on_stall`, verify_graph re-runs the case through
+        # the α-tight freeze-replay hybrid (~100x fewer leaves, less HW-sensitive
+        # -> stays under the competition timeout on slow GPUs). Both default off.
+        input_split_batched_stall_leaf_cap=0,
+        acasxu_hybrid_on_stall=False,
         # Clip → re-CROWN inner cycles. After clipping a leaf, the OLD
         # CROWN bounds are still sound on the smaller box but loose.
         # Re-running CROWN on the clipped box gives tighter spec lbs
@@ -292,6 +301,14 @@ def default_settings(**overrides):
         input_split_batched_alpha_boundary_eps=0.0,
         input_split_batched_alpha_iters=10,
         input_split_batched_alpha_max_leaves=200,
+        # Joint conjunctive-spec closure. The per-query closure marks a disjunct
+        # (conjunct of unsafe queries) open unless SOME query is provably safe
+        # everywhere — sufficient but NOT necessary. For multi-query conjuncts
+        # (acasxu y0-is-min, cersyve, ...) also apply the joint sum-certificate
+        # over the CROWN input-linear bounds: the unsafe conjunct is infeasible
+        # if box-min(Σ_q A_q·x + acc_q) > 0. Sound, batched, no-op for
+        # single-query conjuncts. Needs clip_enabled (input-linear bounds).
+        input_split_joint_conjunct=True,
         # Exponent on the (1+n_unstable_in_dominant_shallow_layer) split-
         # selection boost. >1 sharpens the preference for bound-critical
         # unstable-branch dims. The non-LP forcing block raises this to

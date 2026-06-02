@@ -1,0 +1,11 @@
+# "HARD" acasxu set (defined 2026-06-02) — to test on later when ready.
+# = the canonical hard UNSAT + v3 sweep timeouts + cases where nnenum (harness)
+#   gave no result so v3 was the only verdict. net prop [why]
+3_3 prop_2    # canonical hard UNSAT (v3 152s serial / 67.8s par-16)
+1_9 prop_7    # v3 sweep TIMEOUT (118s @120 cap)
+2_9 prop_8    # v3 sweep TIMEOUT (176s)
+5_7 prop_1    # sweep inconclusive: nnenum ERROR, v3 unsat
+1_1 prop_5    # sweep inconclusive: nnenum NORESULT, v3 unsat
+1_1 prop_6    # sweep inconclusive: nnenum NORESULT, v3 sat
+3_3 prop_9    # sweep inconclusive: nnenum NORESULT, v3 unsat
+4_5 prop_10   # sweep inconclusive: nnenum NORESULT, v3 unsat

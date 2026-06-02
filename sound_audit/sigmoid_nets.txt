@@ -1,0 +1,12 @@
+
+=== cgan_2023: sigmoid nets=['cGAN_imgSz32_nCh_3_nonlinear_activations.onnx', 'cGAN_imgSz32_nCh_3_upsample.onnx'] ; ABC-SAT-on-sigmoid=0 ===
+
+=== nn4sys: sigmoid nets=['mscn_128d.onnx', 'mscn_128d_dual.onnx', 'mscn_2048d.onnx', 'mscn_2048d_dual.onnx'] ; ABC-SAT-on-sigmoid=0 ===
+
+=== dist_shift_2023: sigmoid nets=['mnist_concat.onnx', 'mnist_generator.onnx'] ; ABC-SAT-on-sigmoid=7 ===
+    ('mnist_concat.onnx', 'index4739_delta0.13.vnnlib')
+    ('mnist_concat.onnx', 'index1282_delta0.13.vnnlib')
+    ('mnist_concat.onnx', 'index1285_delta0.13.vnnlib')
+    ('mnist_concat.onnx', 'index9211_delta0.13.vnnlib')
+    ('mnist_concat.onnx', 'index4312_delta0.13.vnnlib')
+    ('mnist_concat.onnx', 'index4272_delta0.13.vnnlib')

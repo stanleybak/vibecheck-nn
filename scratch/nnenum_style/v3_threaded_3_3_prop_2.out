@@ -1,0 +1,2 @@
+# v3 3_3 prop_2, timeout=400.0s, config={'gen_cap': None, 'multizono': True, 'witness_contract': True, 'single_bound': True}
+n_workers= 1: SAFE     wall=  152.1s solve=  151.5s splits=  6487 LP=  570258 frontier=-

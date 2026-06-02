@@ -1,0 +1,5 @@
+  sigmoid: worst parallelogram violation = 2.086e-07  (>0 ⇒ UNSOUND)
+  sigmoid: worst linear-bound violation   = 1.558e-06  (>0 ⇒ UNSOUND)
+  tanh: worst parallelogram violation = 1.192e-07  (>0 ⇒ UNSOUND)
+  tanh: worst linear-bound violation   = 1.788e-06  (>0 ⇒ UNSOUND)
+VERDICT: relaxation SOUND if all violations <= ~1e-5 (numerical); UNSOUND if clearly positive

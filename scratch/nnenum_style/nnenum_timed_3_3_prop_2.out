@@ -1,0 +1,7 @@
+nnenum 3_3 prop_2 mode=default nproc= 1: unsat    wall=   27.3s LP=  420063 stars=10295
+nnenum 3_3 prop_2 mode=default nproc= 2: unsat    wall=   14.0s LP=   25987 stars=10440
+nnenum 3_3 prop_2 mode=default nproc= 4: unsat    wall=    7.4s LP=   70443 stars=12678
+nnenum 3_3 prop_2 mode=default nproc= 8: unsat    wall=    4.4s LP=  133081 stars=15759
+nnenum 3_3 prop_2 mode=default nproc=16: unsat    wall=    3.2s LP=  171389 stars=17920
+nnenum 3_3 prop_2 mode=default nproc=16: unsat    wall=    3.1s LP=  196627 stars=19128
+nnenum 3_3 prop_2 mode=matched nproc=16: unsat    wall=    6.8s LP=  239850 stars=19018
