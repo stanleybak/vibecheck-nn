@@ -1,0 +1,13 @@
+# tllverifybench_2023: two-level-lattice nets (2-D input, ~8 ReLU layers, deep
+# TERNARY-SPARSE MatMul/Add chains — weights are {-1,0,1}, 2-8 nonzeros/row).
+#
+# Diagnosis vs AB-CROWN (per-layer, root box): our zono+CROWN bounds MATCH
+# ABC's forward+backward CROWN almost exactly (2_1: 2022 vs 2012 unstable; L0
+# exact 788, L1 562, L2+ ~100%). LP-exact L1 barely helps (562->546 — the
+# [-2,2]^2 box is too wide for any bound to matter); α and the ternary sparsity
+# don't change the count. The 15x domain blowup was BRANCHING: our smart
+# split-dim heuristic (branch_sb) over-splits these lattice nets ~290x (89,735
+# leaves -> timeout). AB-CROWN uses NAIVE branching; switching to it closes the
+# 2 plateau cases (2_1: 89,735->305 leaves, 3s; 4_0: 7s) -> 32/32, no α needed.
+input_split_batched_enabled: true
+input_split_batched_branch_sb: false
