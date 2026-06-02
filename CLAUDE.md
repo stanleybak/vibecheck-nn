@@ -162,8 +162,8 @@ Allowed references: read auto_LiRPA / AB-CROWN source (`~/Desktop/temp/abcrown/a
 
 ### Already optimized
 
-acasxu_2023 · cersyve · cgan_2023 · cifar100_2024 · collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · linearizenn_2024 · malbeware · metaroom_2023 · mnist_fc (historical, regression-only) · nn4sys (194/194 on adequate HW — the 4 pensieve_parallel timeouts fixed via input-split branching; see docs) · tinyimagenet_2024 · relusplitter (extended; kept as deliverable).
+acasxu_2023 · cersyve · cgan_2023 · cifar100_2024 · collins_rul_cnn_2022 · cora_2024 · dist_shift_2023 · linearizenn_2024 · malbeware · metaroom_2023 · mnist_fc (historical, regression-only) · nn4sys (194/194 on adequate HW — the 4 pensieve_parallel timeouts fixed via input-split branching; see docs) · safenlp_2024 (1080/1080) · sat_relu (100/100) · soundnessbench · tinyimagenet_2024 · tllverifybench_2023 (32/32) · relusplitter (extended; kept as deliverable).
 
 ### Queue (alphabetical, regular track only)
 
-safenlp_2024 · sat_relu · soundnessbench · tllverifybench_2023.
+(empty — all 16 regular-track benchmarks optimized as of 2026-06-02; tllverifybench_2023 was the last, merged + re-swept 32/32 on the A10G).
