@@ -1,6 +1,6 @@
 # vibecheck
 
-Vibe-Coded Neural Network Verification Tool — graph branch.
+Vibe-Coded Neural Network Verification Tool.
 
 A zonotope-based neural network verifier. Given an ONNX network and a VNNLIB
 spec, it decides whether the property is provably satisfied (`unsat` /
