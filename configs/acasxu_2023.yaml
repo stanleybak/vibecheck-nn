@@ -41,3 +41,29 @@ input_split_leaf_pgd_every: 3
 input_split_leaf_pgd_max_leaves: 128
 input_split_leaf_pgd_restarts: 256
 input_split_leaf_pgd_iters: 50
+
+# Selective batched α-CROWN on boundary leaves. Plain backward-CROWN leaves a
+# tiny tail of leaves whose per-query spec lb plateaus a hair below 0; bisection
+# can't close them — they shrink to width < 1e-12 (fp32 floor) and get dropped
+# as `degenerate`, so the whole case reports `unknown`. Diagnosed on 3_3 prop_2
+# (A10G): of 1.88M leaves, exactly ONE was left degenerate → unknown@63s. ABC
+# closes such leaves with α-CROWN (per-neuron lower-slope optimization). Enabling
+# a WIDE boundary band (eps=10: any unclosed leaf whose worst-disjunct best-query
+# lb is within 10 of 0) closes those leaves EARLY, before they degenerate ->
+# 3_3 prop_2: 1.88M leaves/unknown@63s -> 431k leaves/verified@22s on A10G (ABC
+# ~18s). eps=1 only catches the final leaf (verified but still 1.42M leaves/63s);
+# the wide band is what collapses the leaf count. See scratch/acasxu_crown_33p2.
+input_split_batched_alpha_boundary_eps: 10.0
+input_split_batched_alpha_iters: 20
+input_split_batched_alpha_max_leaves: 2048
+
+# prop_6/7/8 have a DISJUNCTIVE INPUT region → routed through the
+# per-disjunct-subbox path (`_verify_per_disjunct_subboxes`), one batched BaB
+# per subbox. By default each subbox gets only `rem_time / n_subboxes` of the
+# budget; prop_6's 2 subboxes each need >half the 116s cap on a slow GPU, so
+# the fractional split (58s each) times BOTH out. Serial mode gives each subbox
+# the full remaining budget greedily (still bounded by total_timeout, so the
+# wall cap holds): sub0 takes what it needs, sub1 takes the rest. Fixes
+# 1_1 prop_6 unknown→verified on the A10G. Only 3 acasxu props are disjunctive-
+# input and they have ≤2 subboxes, so greedy-serial can't starve.
+input_split_serial_disjuncts: true

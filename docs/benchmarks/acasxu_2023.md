@@ -2,6 +2,57 @@
 
 Small FC controller (5-D input, 6 × 50 ReLU layers, 5-D output). VNNCOMP regular track. 186 cases across 10 properties (prop_1–prop_10): 139 UNSAT, 47 SAT.
 
+## UPDATE 2026-06-02 — robust 186/186 on the A10G (slow reference GPU): α-CROWN boundary closing + serial disjuncts
+
+The 2026-06-01 config was HW-dependent (186/186 on the laptop Blackwell, 184/186 on
+slower GPUs). Re-measured on the AWS A10G (g5, 24 GB — slower than the laptop, closer
+to VNNCOMP datacenter HW) and closed the gap to a robust **186/186, 0 false-verify,
+0 false-sat** (full sweep, verdict-file gated vs published ABC; `~/persistent_runs/
+acasxu_fix2/`, total wall 898 s). Two config-only fixes, both **default-off globally**,
+on in `configs/acasxu_2023.yaml`. See `scratch/acasxu_crown_33p2/plan.md`.
+
+### 1. Wide-band α-CROWN boundary closing → 3_3 prop_2 (unknown@63s → verified@22s)
+
+On the A10G, 3_3 prop_2 returned `unknown`@63s — NOT the 116 s timeout and NOT
+worklist overflow. Captured `details`: of **1,879,101** leaves the BaB closed all but
+**ONE** — a single leaf bisected to the fp32 split-axis floor (width ≤ 1e-12,
+`verify_graph.py:10342`) with its CROWN spec-lb plateaued a hair below 0, dropped as
+`degenerate` → `unknown`. It is fp32-GPU-nondeterministic: the identical ~1.88M-leaf
+tree leaves 0 degenerate leaves on the Blackwell (verifies@79 s) but 1 on the A10G.
+
+Fix: enable the already-built selective batched α-CROWN on boundary leaves with a WIDE
+band — `input_split_batched_alpha_boundary_eps: 10.0` (any unclosed leaf whose
+worst-disjunct best-query lb is within 10 of 0), `alpha_iters: 20`,
+`alpha_max_leaves: 2048`. This closes boundary leaves EARLY (before they degenerate):
+**1.88M leaves/unknown@63s → 431k leaves/verified@22s** on the A10G (ABC ~18 s).
+α-CROWN only maximizes a provably-valid lb, so it cannot cause a false-verify.
+
+**This corrects the 2026-06-01 note below that "boundary-α gives ~0".** That was
+measured with a NARROW band (eps≈default), which only fires once the margin is already
+≈0 — too late, after the leaf has degenerated. The leaves that need help are
+*moderately*-negative; a wide band (eps=10) fires on them while the box is still
+splittable, which is what collapses the leaf count (eps=1 only catches the final leaf:
+verified but still 1.42M leaves/63 s). The "substantial, deferred" freeze-replay wiring
+is NOT needed.
+
+### 2. Serial-disjunct routing → 1_1 prop_6 (unknown@116s → verified@7.6s)
+
+prop_6 (the only disjunctive-input UNSAT; prop_6/7/8 each appear once) timed out@116 s
+on the A10G regardless of α (independent of fix 1). It routes through
+`_verify_per_disjunct_subboxes` (2 input sub-boxes). The default path fed both
+sub-boxes into `_multi_sub_input_split_bab` (one shared worklist), which lacks the
+α-CROWN boundary closing — burning the whole budget (401k leaves, 0/2 closed). Fix:
+`input_split_serial_disjuncts: true` skips the multi-sub-batched path and routes each
+sub-box through its own `verify_graph` call (single-box batched driver WITH α-CROWN),
+each given the full remaining budget greedily (still bounded by `total_timeout`, so the
+116 s wall cap holds): sub0 takes what it needs, sub1 the rest. **prop_6
+unknown@116 s → verified@7.6 s** (both subs close fast via α-CROWN). Default-off
+globally because the rem/n_left split is better with MANY sub-boxes (mscn's thousands,
+where one slow sub must not starve the rest); only acasxu's ≤2-subbox disjunctive props
+benefit. Soundness unchanged: verified iff ALL sub-boxes verified, sat iff ANY sub sat.
+
+---
+
 ## UPDATE 2026-06-01 — switched off the hybrid; input-split + CROWN + leaf-PGD + vectorized split
 
 **The freeze-replay hybrid below is SUPERSEDED.** A re-sweep showed `use_hybrid_acasxu: true` timed out **13/32** sampled cases on server1 — the `_full_freeze` per-layer α tightening has no fast deadline and overran to 150–180 s, mostly on prop_1's wide box. The production config now uses the batched input-split BaB directly:

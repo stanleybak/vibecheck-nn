@@ -7370,7 +7370,14 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
     #   2. Batched forward zono → spec_lb per (leaf, query).
     #   3. Per leaf, mark as safe if ANY query margin > 0.
     #   4. Unsafe leaves split on widest dim → 2 child leaves, push back.
-    if (gg_fast is not None and len(remaining_sub_idx) > 0
+    # `serial_disjuncts` skips this batched-together path: it lacks the
+    # α-CROWN boundary closing the single-box driver has, so on acasxu
+    # prop_6 it burns the whole budget (401k leaves, 0/2 closed) without
+    # converging. Skipping it routes each subbox through the serial per-sub
+    # `verify_graph` loop below, where each gets α-CROWN + the full
+    # remaining budget and closes (sub0 ~Xs, sub1 the rest, ≤ total).
+    _serial_disj = bool(getattr(settings, 'input_split_serial_disjuncts', False))
+    if (gg_fast is not None and len(remaining_sub_idx) > 0 and not _serial_disj
             and total - (time.perf_counter() - t_start) > 1.0):
         # Partition remaining subs by their per-q w-tuple so each
         # group has shared w (multi-sub BAB requirement). mscn dual
@@ -7482,7 +7489,19 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
         # (forward zono + per-q + fast batched ~1s) before BAB starts;
         # the BAB itself needs 1-2s on mscn 128d_dual subs. 3s lets
         # most close.
-        per_sub_budget_dyn = max(3.0, rem_now / max(1, n_left))
+        # Serial-disjunct mode: give each sub-box the FULL remaining budget
+        # (greedy, one at a time) instead of an upfront rem/n_left fraction.
+        # acasxu prop_6 has 2 input sub-boxes that each need >half the 116s
+        # cap on a slow GPU; the fractional split (58s each) times BOTH out,
+        # but serial-with-full-remaining lets sub0 use what it needs and sub1
+        # take the rest — total still bounded by `total`, so the wall cap
+        # holds. Off by default: the rem/n_left split is better when there
+        # are MANY subs (mscn's thousands), where one slow sub must not
+        # starve the rest. See `input_split_serial_disjuncts`.
+        if bool(getattr(settings, 'input_split_serial_disjuncts', False)):
+            per_sub_budget_dyn = max(3.0, rem_now)
+        else:
+            per_sub_budget_dyn = max(3.0, rem_now / max(1, n_left))
         key = order[ki]
         x_lo, x_hi, conjs = groups[key]
         sub_spec = VNNSpec(x_lo, x_hi, conjs)

@@ -292,6 +292,12 @@ def default_settings(**overrides):
         input_split_batched_alpha_boundary_eps=0.0,
         input_split_batched_alpha_iters=10,
         input_split_batched_alpha_max_leaves=200,
+        # Per-disjunct-input (subbox) verification: give each subbox the
+        # FULL remaining budget serially instead of an upfront rem/n_left
+        # fraction. Lets acasxu prop_6's 2 subboxes (each needing >half the
+        # cap on a slow GPU) both close within `total`. Default off — the
+        # fractional split is better when there are many subboxes (mscn).
+        input_split_serial_disjuncts=False,
         # Exponent on the (1+n_unstable_in_dominant_shallow_layer) split-
         # selection boost. >1 sharpens the preference for bound-critical
         # unstable-branch dims. The non-LP forcing block raises this to
