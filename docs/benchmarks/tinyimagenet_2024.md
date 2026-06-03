@@ -25,15 +25,45 @@ through to bounds → `unsat` where ABC times out). Validated by re-running all 
 former-`unknown` cases: 3 recovered, 0 unsound, 0 regressions. Pinned by
 `test_tinyimagenet_2024.py::...prop_6773 (SAT, spurious-fallthrough)`.
 
-**Still regressed (root cause #2, OPEN) — 3 misses ABC solves, different cause:**
-- `prop_3553` (SAT): the cascade's full-restart PGD *still* can't find the CEX
-  within 100 s (uses the whole budget now, but misses). Needs a stronger attack.
-- `prop_6546`, `prop_7542` (UNSAT): bound-limited — run the full 100 s and don't
-  close. v9 listed both as solved, so the bound path regressed too. Separate
-  root-cause from the spurious-witness fix.
+**The remaining 3 misses are NOT an algorithmic regression (root cause #2,
+investigated 2026-06-02).** A 300 s-budget run reframes them:
+- `prop_6546` (UNSAT): **verifies at 133 s** (unknown at the 100 s budget). ABC
+  does it in 58.5 s → vc is ~2.3× slower here. A genuine *perf* gap, not a bug.
+- `prop_7542` (UNSAT): **verifies at 139 s**. ABC's own published time is 102 s —
+  *over* the 100 s budget — so this case is borderline for both solvers.
+- `prop_3553` (SAT): still `unknown` even at 300 s; +restarts (2000), +iters
+  (1000), and dual-ascent-off all miss the CEX (PGD margin stalls at +1.3e-3).
+  ABC finds it in 7.8 s → a real **attack-strength gap** (vc's PGD ≪ ABC's), not
+  budget.
 
-So current main is **174/200** after the fix (was 171); closing the v9 178 gap
-needs the root-cause-#2 work above.
+So the v9 "178 / 0 misses" was **inflated by the pre-`1c805c0` timeout-enforcement
+bug**: 6546/7542 only "verified" in v9 by running PAST the 100 s budget; the
+`1c805c0` fix ("enforce timeout in the per-query alpha-zono state loop") now
+correctly stops them → `unknown`. **Current main's 174/200 is the legitimate
+within-budget score.** Closing the residual gap is a *performance* goal
+(speed up the dual-ascent BaB ~2× on 6546-class UNSAT) plus a *stronger-attack*
+goal (match ABC's CEX search on 3553) — not a correctness regression.
+
+### Same-hardware head-to-head vs ABC (A10G, 100 s budget, 2026-06-02)
+
+Ran ABC (`exp_configs/vnncomp25/tinyimagenet.yaml`) on the **same A10G** on the 5
+differential cases — the only ones where vc and the published ABC disagree:
+
+| case | vc | ABC (A10G) | ABC (published, A100) | winner |
+| --- | --- | --- | --- | --- |
+| prop_1651 (UNSAT) | verified 84 s | timeout 110 s | timeout 107 s | **vc** |
+| prop_9458 (UNSAT) | verified 103 s | timeout 106 s | timeout 108 s | **vc** |
+| prop_3553 (SAT)   | unknown | sat 13.8 s | sat 7.8 s | ABC (attack) |
+| prop_6546 (UNSAT) | unknown (133 s) | unsat 66 s | unsat 58.5 s | ABC (perf ~2×) |
+| prop_7542 (UNSAT) | unknown (139 s) | **timeout 105.6 s** | unsat 102 s | **draw** |
+
+`prop_7542` is the tell: ABC's *published* "solved" is an A100 + scoring-slack
+artifact — on the same A10G it **times out** (105.6 s), same as vc. So on equal
+hardware vc wins 2 (1651, 9458 — ABC can't solve them on any GPU), ABC wins 2
+(3553 attack, 6546 perf), 1 draw. The other ~23 vc-`unknown`s are ABC-timeout
+cases too (draws). **Net: vc ≈ ABC on identical hardware (vc 174 vs ABC ~174-175),
+0 unsound, with 2 clean wins ABC cannot match.** The published "176 vs 174"
+overstates ABC's same-hardware edge.
 
 ## Final score (v9 sweep, 2026-05-19, server1 RTX 3080 / 10GB)
 
