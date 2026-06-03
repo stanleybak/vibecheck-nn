@@ -19,6 +19,19 @@ CASES = [
         expected='sat', timeout=100, max_wall_s=15.0,
     ),
     dict(
+        # Regression guard for the spurious-witness fallthrough fix
+        # (pgd_fallthrough_on_spurious). The light Phase-0 PGD finds a
+        # near-boundary point (worst margin ≈ +1.6e-4) that fails the
+        # 1e-4 sat-validation; before the fix vc returned 'unknown' in
+        # ~5s (abandoning the budget). Now the spurious witness no longer
+        # short-circuits the cascade, whose full-restart PGD finds the
+        # real counterexample. Revert the fix → this reverts to 'unknown'.
+        desc='tinyimagenet medium prop_6773 (SAT, spurious-fallthrough)',
+        net='onnx/TinyImageNet_resnet_medium.onnx',
+        vnnlib='vnnlib/TinyImageNet_resnet_medium_prop_idx_6773_sidx_7001_eps_0.0039.vnnlib',
+        expected='sat', timeout=100, max_wall_s=20.0,
+    ),
+    dict(
         desc='tinyimagenet medium prop_1175 (hard UNSAT, ~36s)',
         net='onnx/TinyImageNet_resnet_medium.onnx',
         vnnlib='vnnlib/TinyImageNet_resnet_medium_prop_idx_1175_sidx_7775_eps_0.0039.vnnlib',

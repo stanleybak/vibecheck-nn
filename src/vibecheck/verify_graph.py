@@ -5242,6 +5242,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         torch.cuda.reset_peak_memory_stats()
 
     def _finalize(result_str, phase, **extra):
+        # `_prevalidated`: the caller (`_sat_or_fallthrough`) already ran
+        # `_validate_sat_witness` and the witness PASSED — skip the
+        # redundant ORT forward below. Popped so it never leaks into
+        # `details`.
+        _prevalidated = bool(extra.pop('_prevalidated', False))
         # Defense-in-depth: every SAT verdict must pass ONNXRuntime
         # validation against the spec (within COUNTEREXAMPLE_ATOL).
         # Catches spurious witnesses from PGD/MILP bugs AND graph-
@@ -5249,6 +5254,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         # Spurious witnesses get downgraded to 'unknown' with
         # `details['spurious_witness']` set and logged.
         if (result_str == 'sat' and extra.get('witness') is not None
+                and not _prevalidated
                 and not bool(getattr(
                     settings, 'skip_sat_validation', False))):
             _atol = float(settings.sat_validate_atol
@@ -5326,6 +5332,44 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             details[k] = v
         details['neuron_stats'] = stats.neuron_stats
         return result_str, details
+
+    def _sat_or_fallthrough(phase, witness):
+        """Validate a PGD/MILP SAT witness; return the finalized 'sat'
+        result if it GENUINELY violates the spec, else return None so the
+        caller FALLS THROUGH to the next (often stronger) attack/bound
+        stage instead of aborting to 'unknown'.
+
+        A weak early PGD stage that produces a near-boundary spurious
+        witness must not short-circuit the full-strength downstream
+        attacks. Observed on tinyimagenet SAT cases: the light Phase-0 PGD
+        returned points with worst margin ≈ +1e-4 (just inside the safe
+        side), which `_finalize` correctly rejected as spurious — but the
+        unconditional `return` then skipped the cascade's full-restart PGD
+        that finds the real counterexample. Soundness is unchanged: every
+        emitted 'sat' is still ORT-validated here (or in `_finalize`).
+        """
+        if (witness is None
+                or bool(getattr(settings, 'skip_sat_validation', False))
+                or not bool(getattr(
+                    settings, 'pgd_fallthrough_on_spurious', True))):
+            # Nothing to validate, validation disabled, or fallthrough
+            # disabled — preserve the original return-on-sat behaviour.
+            return _finalize('sat', phase, witness=witness)
+        _atol = float(settings.sat_validate_atol
+                       if 'sat_validate_atol' in settings else 1e-4)
+        _onnx_path = getattr(graph, 'onnx_path', None)
+        _ok, _info = _validate_sat_witness(_onnx_path, spec, witness,
+                                           atol=_atol)
+        if _ok:
+            return _finalize('sat', phase, witness=witness,
+                             _prevalidated=True)
+        if print_progress:
+            print(f'  [validate] SPURIOUS SAT from {phase} — continuing '
+                  f'(budget left, not aborting): {_info.get("reason")}',
+                  flush=True)
+        details.setdefault('spurious_witnesses', []).append(
+            {'phase': phase, 'info': _info})
+        return None
 
     gg = graph.gpu_graph(device, dtype)
     nh = gg['n_relu']
@@ -5438,7 +5482,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             print(f'Phase 0 (PGD before cascade): '
                   f'{timing["phase0_pgd"]:.2f}s  sat={pgd_sat}', flush=True)
         if pgd_sat:
-            return _finalize('sat', 'pgd', witness=pgd_witness)
+            _r = _sat_or_fallthrough('pgd', pgd_witness)
+            if _r is not None:
+                return _r
 
     # --- Parallel PGD context (spawned inside Phase 1 after Phase 0.5). ---
     # Pass the float32 GPU graph + bounds; _phase1_bab_refine spawns the
@@ -5607,7 +5653,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             timing['parallel_pgd_attacks'] = _pp_attacks
         _pp_witness = phase1_tb.get('parallel_pgd_sat')
         if _pp_witness is not None:
-            return _finalize('sat', 'parallel_pgd', witness=_pp_witness)
+            _r = _sat_or_fallthrough('parallel_pgd', _pp_witness)
+            if _r is not None:
+                return _r
 
     # Phase 1 done — drop the pre-Phase-8 budget cap so Phase 2/2.5/2.6/7/8
     # all see the full remaining time_left. The cap's purpose is to stop
@@ -5620,10 +5668,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                               if isinstance(phase1_tb, dict) else None)
     if _pre_cascade_witness is not None:
         if print_progress:
-            print(f'Phase 1 pre-cascade PGD found SAT — skipping cascade',
+            print(f'Phase 1 pre-cascade PGD found SAT — validating',
                   flush=True)
-        return _finalize('sat', 'pgd_pre_cascade',
-                          witness=_pre_cascade_witness)
+        _r = _sat_or_fallthrough('pgd_pre_cascade', _pre_cascade_witness)
+        if _r is not None:
+            return _r
 
     # --- Phase 2: CROWN backward ---
     # Skippable when Phase 1 already produced tighter α-CROWN spec lbs
@@ -5683,7 +5732,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             print(f'Phase 3 (PGD before): '
                   f'{timing["phase3_pgd"]:.2f}s  sat={pgd_sat}')
         if pgd_sat:
-            return _finalize('sat', 'pgd', witness=pgd_witness)
+            _r = _sat_or_fallthrough('pgd', pgd_witness)
+            if _r is not None:
+                return _r
 
     # --- Phase 3.5: middle PGD — re-attack disjuncts that survived CROWN.
     # α,β-CROWN's `pgd_order="middle"` trick: after Phase 2's intermediate
@@ -5716,7 +5767,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                    f'{n_specs_attacked}/{n_specs_total} specs): '
                    f'{timing["phase3p5_pgd_middle"]:.2f}s  sat={pgd_sat}')
         if pgd_sat:
-            return _finalize('sat', 'pgd_middle', witness=pgd_witness)
+            _r = _sat_or_fallthrough('pgd_middle', pgd_witness)
+            if _r is not None:
+                return _r
 
     if time_left() <= 0:
         return _finalize('unknown', 'timeout',
@@ -5821,7 +5874,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                   f'{timing["phase2p6_pgd_per_spec"]:.2f}s  '
                   f'sat={_p26_sat}', flush=True)
         if _p26_sat:
-            return _finalize('sat', 'pgd_per_spec', witness=pgd_witness)
+            _r = _sat_or_fallthrough('pgd_per_spec', pgd_witness)
+            if _r is not None:
+                return _r
 
     # --- Phase 7: LP score+verify (replaces 7a feasibility + 7b CROWN) ---
     # One LP solve per query in 'score' mode: minimizes spec objective,
@@ -6781,7 +6836,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             pgd_sat, pgd_witness = False, None
         if pgd_sat:
             timing['phase9_pgd'] = time.perf_counter() - t0
-            return _finalize('sat', 'pgd', witness=pgd_witness)
+            _r = _sat_or_fallthrough('pgd', pgd_witness)
+            if _r is not None:
+                return _r
     timing['phase9_pgd'] = time.perf_counter() - t0
 
     if not still_open_disj:

@@ -959,6 +959,15 @@ def default_settings(**overrides):
         # `skip_sat_validation=True` opts out (e.g. for ORT-free envs).
         sat_validate_atol=1e-4,
         skip_sat_validation=False,
+        # When a PGD/MILP stage proposes a SAT witness that fails the
+        # validation above (spurious / near-boundary), DON'T abort to
+        # 'unknown' — fall through to the next, often stronger, attack or
+        # bound stage instead of wasting the remaining budget. A weak
+        # Phase-0 PGD producing a margin≈+1e-4 point must not short-circuit
+        # the full-restart cascade that finds the real counterexample
+        # (tinyimagenet SAT misses). Soundness unchanged: every emitted
+        # 'sat' is still ORT-validated.
+        pgd_fallthrough_on_spurious=True,
         # ONNXRuntime VERIFIED-witness validation (defense-in-depth).
         # When a verdict comes back 'verified', sample N points from the
         # input box, forward them through the ORIGINAL ONNX model, and

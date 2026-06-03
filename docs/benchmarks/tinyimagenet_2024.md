@@ -3,6 +3,38 @@
 VNNCOMP 2025 regular track. TinyImageNet image classification (200 classes,
 3×56×56) on a medium ResNet with L∞ adversarial robustness specs.
 
+## UPDATE 2026-06-02 — regression found + partially fixed (A10G full sweep)
+
+A fresh full 200-case sweep on the AWS A10G (current main) measured **vibecheck
+171/200**, below the v9-claimed 178 — a genuine regression (the A10G has *more*
+VRAM than server1, so it's not hardware). Cross-checked vs ABC by (onnx,vnnlib):
+**0 unsound**, 1 win (prop_1651), 5 misses.
+
+**Root cause #1 (FIXED) — spurious-witness short-circuit.** For 3 of the misses,
+a *light* Phase-0/pre-cascade PGD found a near-boundary point (worst margin
+≈ +1e-4, just inside the safe side) that failed the 1e-4 sat-validation. The
+verifier then `return`ed `unknown` in ~5 s, **abandoning ~95 s of budget and
+skipping the full-restart cascade PGD** that finds the real counterexample. Fixed
+in `verify_graph.py` via `_sat_or_fallthrough` (new setting
+`pgd_fallthrough_on_spurious=True`): a spurious witness is logged and **falls
+through** to the next/stronger stage instead of aborting. Applied at all 7
+PGD/MILP sat-return sites. Soundness unchanged — every emitted `sat` is still
+ORT-validated. **Recovers 3 cases → 174/200:** prop_9992 + prop_6773 (SAT, the
+cascade now finds the CEX) and prop_9458 (a previously-regressed win — falls
+through to bounds → `unsat` where ABC times out). Validated by re-running all 29
+former-`unknown` cases: 3 recovered, 0 unsound, 0 regressions. Pinned by
+`test_tinyimagenet_2024.py::...prop_6773 (SAT, spurious-fallthrough)`.
+
+**Still regressed (root cause #2, OPEN) — 3 misses ABC solves, different cause:**
+- `prop_3553` (SAT): the cascade's full-restart PGD *still* can't find the CEX
+  within 100 s (uses the whole budget now, but misses). Needs a stronger attack.
+- `prop_6546`, `prop_7542` (UNSAT): bound-limited — run the full 100 s and don't
+  close. v9 listed both as solved, so the bound path regressed too. Separate
+  root-cause from the spurious-witness fix.
+
+So current main is **174/200** after the fix (was 171); closing the v9 178 gap
+needs the root-cause-#2 work above.
+
 ## Final score (v9 sweep, 2026-05-19, server1 RTX 3080 / 10GB)
 
 | Solver | Solved / 200 | Rate | Notes |
