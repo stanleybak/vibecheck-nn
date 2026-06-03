@@ -3,6 +3,31 @@
 VNNCOMP 2025 regular track. TinyImageNet image classification (200 classes,
 3×56×56) on a medium ResNet with L∞ adversarial robustness specs.
 
+## UPDATE 2026-06-03 — TF32 disabled (soundness + SAT-finding fix)
+
+Root-caused the long-standing prop_3553 SAT "miss" to **TF32**: by default cuDNN
+runs convolutions in TF32 (10-bit mantissa) on Ampere GPUs. Measured on the A10G,
+the `gpu_graph` forward (which PGD *and* the CROWN/zono bounds run on) was off by
+**~0.004** vs the true fp32 model (`max|gpu_graph − ORT|` = 0.0042 with TF32, vs
+1e-5 with it off / on CPU / in fp64). That error swamps knife-edge counterexample
+margins (~1e-3), so PGD chased gpu_graph-CEs the real model rejects ("spurious
+SAT") and never reached the true CEX — and it makes `verified` margins < ~0.004
+potentially **unsound**. It was NOT BN folding (folding is done in fp64 then cast;
+the folded fp64 forward is exact) — disabling TF32 alone fixes it.
+
+**Fix:** `torch.backends.cudnn.allow_tf32 = False` (+ matmul) in `__init__.py` —
+α,β-CROWN disables both for the same reason (`abcrown.py:76-77`).
+
+**Effect (full A10G re-sweep, TF32 off, same 100 s budget):** 171 solved
+(38 sat + 133 unsat), **0 realized unsoundness** vs ABC (old TF32-on run also had
+0 realized unsound here — the risk was latent). Composition shift vs the TF32-on
+run: **+3 SAT recovered** (3553, 9992, 6773 — now found robustly, 3553 in ~10 s)
+and **−3 UNSAT** (1651, 3574, 7390 — budget-marginal verifies pushed over 100 s by
+the ~1.38× slowdown from losing tensor cores). Net count unchanged (171→171) but
+now **sound**, and directly comparable to ABC (which also runs TF32-off). The
+remaining UNSAT misses are a *performance* gap in the conv-heavy bound phases, not
+soundness.
+
 ## UPDATE 2026-06-02 — regression found + partially fixed (A10G full sweep)
 
 A fresh full 200-case sweep on the AWS A10G (current main) measured **vibecheck

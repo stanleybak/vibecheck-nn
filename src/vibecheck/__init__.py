@@ -17,6 +17,21 @@ _os.environ.setdefault(
     'PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 del _os
 
+# Disable TF32 on Ampere+ GPUs. By default cuDNN runs convolutions in TF32
+# (10-bit mantissa), which introduces ~4e-3 forward error on conv nets —
+# measured on the A10G TinyImageNet ResNet: gpu_graph forward off by 0.004
+# vs the true fp32 model with TF32 on, vs 1e-5 with it off. That error
+# swamps knife-edge counterexample margins (PGD then chases spurious
+# witnesses and misses real CEXes) AND makes the verification BOUNDS
+# unsound at tight margins (a `verified` with certified margin < ~4e-3 may
+# not hold for the true model). α,β-CROWN disables both for the same reason
+# (abcrown.py:76-77). matmul TF32 already defaults off in recent torch;
+# cudnn does not, so set both explicitly.
+import torch as _torch
+_torch.backends.cuda.matmul.allow_tf32 = False
+_torch.backends.cudnn.allow_tf32 = False
+del _torch
+
 from .network import ComputeGraph, GraphNode
 from .zonotope import DenseZonotope, TorchZonotope
 from .verify import zonotope_verify
