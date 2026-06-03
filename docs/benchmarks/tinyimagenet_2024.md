@@ -44,26 +44,35 @@ within-budget score.** Closing the residual gap is a *performance* goal
 (speed up the dual-ascent BaB ~2× on 6546-class UNSAT) plus a *stronger-attack*
 goal (match ABC's CEX search on 3553) — not a correctness regression.
 
-### Same-hardware head-to-head vs ABC (A10G, 100 s budget, 2026-06-02)
+### Same-hardware head-to-head vs ABC (full 200-case A10G sweep, 100 s, 2026-06-03)
 
-Ran ABC (`exp_configs/vnncomp25/tinyimagenet.yaml`) on the **same A10G** on the 5
-differential cases — the only ones where vc and the published ABC disagree:
+Ran ABC (`exp_configs/vnncomp25/tinyimagenet.yaml`) on **all 200 cases on the same
+A10G** at the 100 s budget, vs vc's post-fix verdicts:
 
-| case | vc | ABC (A10G) | ABC (published, A100) | winner |
-| --- | --- | --- | --- | --- |
-| prop_1651 (UNSAT) | verified 84 s | timeout 110 s | timeout 107 s | **vc** |
-| prop_9458 (UNSAT) | verified 103 s | timeout 106 s | timeout 108 s | **vc** |
-| prop_3553 (SAT)   | unknown | sat 13.8 s | sat 7.8 s | ABC (attack) |
-| prop_6546 (UNSAT) | unknown (133 s) | unsat 66 s | unsat 58.5 s | ABC (perf ~2×) |
-| prop_7542 (UNSAT) | unknown (139 s) | **timeout 105.6 s** | unsat 102 s | **draw** |
+```
+vc: 174/200 solved      ABC (A10G): 175/200 solved      UNSOUND: 0
+agree-solved 172 · vc-only wins 2 · ABC-only wins 3 · both-fail 23
+```
 
-`prop_7542` is the tell: ABC's *published* "solved" is an A100 + scoring-slack
-artifact — on the same A10G it **times out** (105.6 s), same as vc. So on equal
-hardware vc wins 2 (1651, 9458 — ABC can't solve them on any GPU), ABC wins 2
-(3553 attack, 6546 perf), 1 draw. The other ~23 vc-`unknown`s are ABC-timeout
-cases too (draws). **Net: vc ≈ ABC on identical hardware (vc 174 vs ABC ~174-175),
-0 unsound, with 2 clean wins ABC cannot match.** The published "176 vs 174"
-overstates ABC's same-hardware edge.
+The 5 differential cases (per-instance, same A10G):
+
+| case | vc | ABC (A10G) | winner |
+| --- | --- | --- | --- |
+| prop_1651 (UNSAT) | verified 84 s | timeout 106.5 s | **vc** |
+| prop_9458 (UNSAT) | verified 103 s | timeout 106.7 s | **vc** |
+| prop_3553 (SAT)   | unknown | sat 7.2 s | ABC (attack) |
+| prop_6546 (UNSAT) | unknown (133 s) | unsat 58.8 s | ABC (perf ~2×) |
+| prop_7542 (UNSAT) | unknown (139 s) | unsat 98.2 s | ABC (borderline) |
+
+**Net: ABC 175 vs vc 174 on identical hardware — within a single case, 0
+unsound.** `prop_7542` is a coin-flip on the 100 s line (ABC `unsat` 98.2 s in the
+full sweep, but `timeout` 105.6 s in a separate run). The robust differential is
+symmetric: **vc wins 2** (1651, 9458 — ABC times out on any GPU), **ABC wins 2**
+(3553 attack-strength, 6546 ~2× perf), plus the 7542 borderline. ABC's *published*
+"176" overstates its same-hardware edge (it solves 7542 only marginally and loses
+nothing vc-relevant on the A10G). Bottom line: **vc ≈ ABC on tinyimagenet at equal
+hardware**, with the two real, non-regression gaps being a stronger SAT attack
+(3553) and ~2× faster dual-ascent on hard UNSAT (6546).
 
 ## Final score (v9 sweep, 2026-05-19, server1 RTX 3080 / 10GB)
 
