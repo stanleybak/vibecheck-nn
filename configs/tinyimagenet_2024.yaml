@@ -8,20 +8,31 @@ zono_lift_enabled: false
 phase2_crown_enabled: false
 phase8_min_budget_frac: 0.5
 pgd_middle_enabled: false
-# BnB-first SAT schedule: cap the upfront pre-cascade PGD at 5s total (it spent
-# ~22s = 44 open disjuncts × 0.5s attacking robust specs, finding nothing — that
-# overhead starved Phase 8 on robust case 6546, 12/13 disjuncts closed then the
-# wall ran out). The cap keeps early-SAT detection on the most-promising
-# disjuncts, then hands off to Phase 8 BnB + the restricted Phase-9 survivor
-# attack. Robust specs → ≤5s attack then verify; SAT specs → caught early or by
-# Phase 9's OSI-PGD on the surviving CEX disjunct.
-phase26_pre_cascade_total_cap: 5.0
+# SAT schedule: Phase-0 PGD screens for counterexamples up front, then Phase-8
+# BnB + Phase-9 OSI-PGD on survivors. (The old pre-cascade PGD hook + its 5s cap
+# are disabled below — they only attacked during MILP windows, which no longer
+# exist now that the MILP cascade is skipped.) These per-spec PGD knobs still
+# govern Phase 2.6 / Phase 9.
 phase26_pgd_per_spec_min_per_spec: 0.5
 phase26_pgd_per_spec_strict_min: true
 phase26_pre_cascade_total_frac: 0.10
 phase26_pre_cascade_per_spec_cap: 5.0
-parallel_pgd_enabled: true
 pgd_restarts: 100
+# Lean Phase-1: the per-layer Gurobi MILP-tighten cascade (~27s, CPU) was
+# largely wasted — α-CROWN (phase 0.5) closes nearly all disjuncts and the fast
+# GPU Phase-8 BnB closes the rest from phase-0.5 bounds. Skipping it (all-GPU
+# path) ~halves UNSAT wall and REGRESSES NOTHING: validated 200-case sweep vs
+# α,β-CROWN = 0 false-verify, 0 MISS, +9 cases ABC timed out on, and faster on
+# every hard case (prop_7542: 27s vs ABC 102s). Sound by construction (looser
+# input bounds only make the sound Phase-8 BnB more conservative).
+#   max_tighten_layer:0          → skip the MILP-tighten cascade (gates line 3738)
+#   parallel_pgd_enabled:false   → the in-MILP-window PGD attacker is redundant
+#                                   with no MILP windows; Phase 0/2.6/9 PGD cover SAT
+#   phase26_pre_cascade_enabled:false → the pre-cascade PGD hook only existed to
+#                                   attack during MILP windows; also redundant now
+max_tighten_layer: 0
+parallel_pgd_enabled: false
+phase26_pre_cascade_enabled: false
 # Reverse-mode α-zono state build (backprop from the ~2k unstable neurons instead
 # of forward-propagating ~11k generator columns) + batched over all open spec
 # directions in one backward. Validated bit-identical (a_g Δ=0, identical BnB node
