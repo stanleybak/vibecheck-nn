@@ -8,9 +8,24 @@ zono_lift_enabled: false
 phase2_crown_enabled: false
 phase8_min_budget_frac: 0.5
 pgd_middle_enabled: false
+# BnB-first SAT schedule: cap the upfront pre-cascade PGD at 5s total (it spent
+# ~22s = 44 open disjuncts × 0.5s attacking robust specs, finding nothing — that
+# overhead starved Phase 8 on robust case 6546, 12/13 disjuncts closed then the
+# wall ran out). The cap keeps early-SAT detection on the most-promising
+# disjuncts, then hands off to Phase 8 BnB + the restricted Phase-9 survivor
+# attack. Robust specs → ≤5s attack then verify; SAT specs → caught early or by
+# Phase 9's OSI-PGD on the surviving CEX disjunct.
+phase26_pre_cascade_total_cap: 5.0
 phase26_pgd_per_spec_min_per_spec: 0.5
 phase26_pgd_per_spec_strict_min: true
 phase26_pre_cascade_total_frac: 0.10
 phase26_pre_cascade_per_spec_cap: 5.0
 parallel_pgd_enabled: true
 pgd_restarts: 100
+# Reverse-mode α-zono state build (backprop from the ~2k unstable neurons instead
+# of forward-propagating ~11k generator columns) + batched over all open spec
+# directions in one backward. Validated bit-identical (a_g Δ=0, identical BnB node
+# counts) to the forward build; cuts Phase-8 state_build 5.78→2.95s on the A10G.
+# CUDA-only (falls back to the forward build on CPU).
+phase8_reverse_g: true
+phase8_reverse_g_batched: true

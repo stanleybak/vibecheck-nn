@@ -611,6 +611,21 @@ def default_settings(**overrides):
         # solve. Skipped queries fall back to the shared state. Prevents the
         # per-query loop blowing the budget on big conv nets (tinyimagenet).
         phase8_per_query_state_reserve_s=8.0,
+        # Reverse-mode per-query α-zono state build (`reverse_g.build_state_reverse`):
+        # construct the state's generator rows BACKWARD from the unstable+output
+        # neurons (reverse-mode Jacobian) instead of FORWARD over all ~11k
+        # generators. Since #unstable (~2k) < #generators (~11k), reverse is the
+        # cheaper autodiff mode: ~4.6× faster than forward_zono_dir_adaptive+
+        # state_from_alpha_zono on the tinyimagenet ResNet (0.31s vs 1.44s/query)
+        # and low-memory (no 1.7GB dense forward). Produces a bit-for-bit identical
+        # state (validated to fp32 ~3e-8). Default off; CUDA only.
+        phase8_reverse_g=False,
+        # Batch the reverse-mode state build over ALL open spec directions in one
+        # backward (build_states_reverse_batched_safe) instead of per-query. ~1.9-
+        # 2.5× over sequential reverse; OOM-safe (halves the direction-chunk on
+        # CUDA OOM, down to 1). Requires phase8_reverse_g + CUDA + no per-query
+        # bound tightening (shared bbr). Default off.
+        phase8_reverse_g_batched=False,
         # Phase 8 MILP mode. Two orthogonal axes:
         #   relaxation : 'triangle_lp' (Phase 1 precompute_gen_state)
         #              | 'alpha_zono'  (per-query forward_zono_dir_adaptive)
@@ -716,6 +731,30 @@ def default_settings(**overrides):
         # computed best_g > 0. Sanity-checked vs Gurobi on prop_4260
         # (250 nodes, 100% decision match, 0 unsoundness). FP32 by default.
         phase8_use_dual_ascent_gpu=False,
+        # Fast GPU dual-ascent node bound (`fast_dual_ascent.Verifier`): a
+        # torch.compile-fused, warm-start replacement for the per-node bound in
+        # `verify_query_dual_ascent_bab`. Same α-zonotope LP (min c0+d·e over the
+        # box + branch half-spaces; certify `unsat` iff min>0), but ~4.7× faster
+        # across the robust TinyImageNet specs and it closes several disjuncts the
+        # legacy K=1 BaB leaves `unknown` (warm-start λ carried to children).
+        # Sound: g(λ) ≤ LP_min for any λ≥0, so a positive bound always certifies;
+        # TF32 forced off. Validated 2026-06-05: 28/28 robust disjuncts certified
+        # (0 misses) and per-node g matches the exact LP (Gurobi-checked to −1.4e-6
+        # in the upstream deliverable). A first integration pass flagged case_6252
+        # (abc=SAT) as a violation, but that was a bad test premise — the dump for
+        # that spec contains only its robust disjunct out[170]−out[27] (which the
+        # verifier correctly certifies; the AB-CROWN CEX gives margin +1.009 on it),
+        # NOT the SAT-bearing disjunct out[170]−out[67] (the one pair the CEX
+        # violates, margin −0.024), which is absent from the dump. Given the actual
+        # SAT disjunct the LP at the CEX leaf is <0, so the verifier leaves it
+        # 'unknown' — sound. Default ON; only takes effect when
+        # `phase8_use_dual_ascent_gpu` is also True AND device is CUDA (CPU falls
+        # back to legacy). Finds NO counterexamples — SAT detection stays with the
+        # PGD/witness path, which honors `disable_sat_finding` (the pgd-disable flag).
+        phase8_fast_dual_ascent=True,
+        phase8_fast_dual_ascent_ls='logbucket',  # 'logbucket' (default) | 'topk'
+        phase8_fast_dual_ascent_K=256,           # line-search width
+        phase8_fast_dual_ascent_compile=True,    # False = eager (skip ~3s warmup for one-off cold cases)
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         # Phase 8 minimum-budget floor as fraction of total_timeout. The
         # pipeline rebudgets so Phase 8 always gets at least this fraction
@@ -938,6 +977,14 @@ def default_settings(**overrides):
         phase26_pre_cascade_enabled=True,
         phase26_pre_cascade_total_frac=0.10,
         phase26_pre_cascade_per_spec_cap=5.0,
+        # Hard wall cap (seconds) on the TOTAL pre-cascade PGD across all
+        # disjuncts in one hook call. n_open × per_spec_min can otherwise grow
+        # this to tens of seconds of upfront attack on robust specs (44 open ×
+        # 0.5 s = 22 s on tinyimagenet), starving Phase 8. Attacks the lowest-
+        # spec_lb (most-likely-SAT) disjuncts until the cap, then stops; the rest
+        # fall to Phase 8 BnB + the restricted Phase-9 survivor attack. None = no
+        # cap (default; other benchmarks unchanged).
+        phase26_pre_cascade_total_cap=None,
         # Parallel PGD (background THREAD) that runs PGD attacks during
         # Phase 1's pure-CPU MILP windows. A GPU lock is held by main
         # during all GPU work (α-CROWN, gen_cone_state setup, forward

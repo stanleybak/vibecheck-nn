@@ -1615,15 +1615,53 @@ def score_box_halfspace_delta_lb(state, qw, qb, ew_per_relu):
             kfsb in selection quality, ~10ms/1000 neurons via O(n log n)
             Lagrangian.
     """
-    from .box_halfspace import lagrangian_min
     obj_c_out = np.asarray(state['obj_c_out'], dtype=np.float64)
     obj_G_out = state['obj_G_out_csr'].toarray().astype(np.float64)
-    n_gens = state['n_gens']
     qw = np.asarray(qw, dtype=np.float64)
     qb = float(qb)
     d_obj_base = qw @ obj_G_out
     c0_obj_base = float(qw @ obj_c_out + qb)
-    baseline_lb = c0_obj_base - float(np.sum(np.abs(d_obj_base)))
+    base_abs = np.abs(d_obj_base)
+    base_abs_sum = float(base_abs.sum())
+    baseline_lb = c0_obj_base - base_abs_sum
+
+    # Sparse-support Lagrangian min. The halfspace `a` is the neuron's pre-ReLU
+    # row (`a_supp` on indices `supp`, zero elsewhere), and `d` equals
+    # `d_obj_base` everywhere except on `supp` (= `d_supp`) and at the single
+    # column `enc` (= `d_enc`). Because `a` is zero off-support, every
+    # breakpoint and the entire dual live on `supp`; the `sum(|d|)` term folds
+    # in the unchanged off-support mass via the precomputed `base_abs_sum`.
+    # Result is bit-identical (≤4e-15) to the dense `box_halfspace.lagrangian_min`
+    # but avoids the O(n_gens) work per neuron (n_gens ~ 11k, |supp| ~ 100s).
+    def _lmin_sparse(supp, a_supp, d_supp, d_enc, enc, c0, beta):
+        off_abs = (base_abs_sum - float(base_abs[supp].sum()) - float(base_abs[enc])
+                   + float(np.abs(d_supp).sum()) + abs(d_enc))
+        g0 = c0 - off_abs
+        eff = np.where(d_supp != 0, np.sign(d_supp), np.sign(a_supp))
+        gp0 = -beta - float((a_supp * eff).sum())
+        if gp0 <= 0:
+            return g0
+        valid = (a_supp != 0) & (d_supp != 0)
+        if not valid.any():
+            return float('inf')
+        lam_v = -d_supp[valid] / a_supp[valid]
+        a_v = a_supp[valid]
+        pos = lam_v > 0
+        if not pos.any():
+            return float('inf')
+        lam_pos = lam_v[pos]
+        decr = 2.0 * np.abs(a_v[pos])
+        order = np.argsort(lam_pos)
+        lam_s = lam_pos[order]
+        decr_s = decr[order]
+        cum_before = np.concatenate(([0.0], np.cumsum(decr_s)))
+        gaps = np.diff(np.concatenate(([0.0], lam_s)))
+        slope_j = gp0 - cum_before[:-1]
+        contrib = np.cumsum(slope_j * gaps)
+        m = int(np.searchsorted(cum_before, gp0, side='left'))
+        if m > lam_s.size:
+            return float('inf')
+        return g0 + float(contrib[m - 1])
 
     scores = {}
     _skip_layers = state.get('sigmoid_tanh_layer_ids', set())
@@ -1667,20 +1705,20 @@ def score_box_halfspace_delta_lb(state, qw, qb, ew_per_relu):
                 continue
             ew_k = float(ew_l[j])
 
-        row_full = np.zeros(n_gens, dtype=np.float64)
-        row_full[row_idx] = row_val
+        db_supp = d_obj_base[row_idx]
+        d_enc = float(d_obj_base[e_new_col]) - ew_k * mu  # shared by both sides
 
         # Off-side: y_k = 0 → subtract ew_k·y_k from objective; halfspace z_k ≤ 0
-        d_off = d_obj_base - ew_k * lam * row_full
-        d_off[e_new_col] -= ew_k * mu
+        d_off_supp = db_supp - ew_k * lam * row_val
         c0_off = c0_obj_base - ew_k * (lam * c_in_k + mu)
-        lb_off = lagrangian_min(d_off, c0_off, row_full, -c_in_k)
+        lb_off = _lmin_sparse(row_idx, row_val, d_off_supp, d_enc, e_new_col,
+                              c0_off, -c_in_k)
 
         # On-side: y_k = z_k → add ew_k·(z_k - y_k); halfspace z_k ≥ 0
-        d_on = d_obj_base + ew_k * (1.0 - lam) * row_full
-        d_on[e_new_col] -= ew_k * mu
+        d_on_supp = db_supp + ew_k * (1.0 - lam) * row_val
         c0_on = c0_obj_base + ew_k * ((1.0 - lam) * c_in_k - mu)
-        lb_on = lagrangian_min(d_on, c0_on, -row_full, c_in_k)
+        lb_on = _lmin_sparse(row_idx, -row_val, d_on_supp, d_enc, e_new_col,
+                             c0_on, c_in_k)
 
         # BaB takes the worse child. Higher delta = harder to verify
         # without binarising = better candidate.

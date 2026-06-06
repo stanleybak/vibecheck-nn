@@ -39,6 +39,23 @@ from . import verify_gen_lp
 
 _OK_STATUSES_GLOBAL = None
 
+_FAST_DA_VERIFIERS = {}
+
+
+def _get_fast_da_verifier(device, ls, K, compile):
+    """Cached fast GPU dual-ascent Verifier (one per (device, ls, K, compile)).
+
+    The `torch.compile` warmup (~3 s) is paid once per process, then the same
+    Verifier is reused across every query/case in that process — so build it
+    lazily and memoize. See `fast_dual_ascent` for the kernel."""
+    key = (str(device), ls, int(K), bool(compile))
+    v = _FAST_DA_VERIFIERS.get(key)
+    if v is None:
+        from .fast_dual_ascent import Verifier
+        v = Verifier(device=str(device), compile=compile, ls=ls, K=K)
+        _FAST_DA_VERIFIERS[key] = v
+    return v
+
 
 def _ok_statuses():
     """Return the set of Gurobi status codes considered non-error."""
@@ -5330,6 +5347,12 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 gg, bounds_by_relu)
         for k, v in extra.items():
             details[k] = v
+        # VNNCOMP: an undecided result that ran out of the time budget is a
+        # 'timeout', distinct from a give-up 'unknown'. The timeout call sites
+        # pass phase='timeout'; surface it so main.py emits the right verdict.
+        if result_str not in ('sat', 'verified') and phase == 'timeout':
+            details['timed_out'] = True
+        details['phase'] = phase
         details['neuron_stats'] = stats.neuron_stats
         return result_str, details
 
@@ -5564,9 +5587,23 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                   f'{_per:.2f}s each (sorted by spec_lb asc; '
                   f'frac={_frac:.2f}, per_min={_per_min:.2f}, '
                   f'cap={_per_cap:.1f})', flush=True)
+        # Total wall cap across ALL disjuncts this hook attacks (not per-spec).
+        # Without it, n_open × per_min grows the budget unboundedly with disjunct
+        # count (44 open × 0.5s = 22s on tinyimagenet 6546 — pure overhead on a
+        # robust spec that then starved Phase 8). The cap stops after the N most-
+        # promising (lowest spec_lb) disjuncts; the rest are left to Phase 8 BnB +
+        # the restricted Phase-9 survivor attack. Default None = no cap (unchanged
+        # for other benchmarks).
+        _total_cap = (float(settings.phase26_pre_cascade_total_cap)
+                      if 'phase26_pre_cascade_total_cap' in settings
+                      and settings.phase26_pre_cascade_total_cap is not None
+                      else None)
         n_attacked = 0
         for di in ordered:
             if time_left() <= 0.5: break
+            if _total_cap is not None and (
+                    time.perf_counter() - t_hook) >= _total_cap:
+                break
             _budget = min(_per, max(time_left() - 0.5, 0.1))
             try:
                 _ok, _w = _pgd_attack_general(
@@ -6245,7 +6282,119 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             _pq_reserve = float(getattr(
                 settings, 'phase8_per_query_state_reserve_s', 8.0))
             _score_dt = [0.0]   # measured cost of one box-halfspace scoring
+            # Phase-8 component profiler (env PHASE8_PROFILE): accumulate per-stage
+            # wall to find the real bottleneck. cuda-synced for accuracy.
+            import os as _os_p8
+            import collections as _coll_p8
+            _p8prof = bool(_os_p8.environ.get('PHASE8_PROFILE'))
+            _p8t = _coll_p8.defaultdict(float)
+
+            def _ptick(_k, _t0):
+                if _p8prof and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _p8t[_k] += time.perf_counter() - _t0
+                return time.perf_counter()
+            import os as _os_rb
+            if _os_rb.environ.get('REVERSE_BATCH_BENCH'):
+                import sys as _sys_rb, time as _tm_rb
+                _sys_rb.path.insert(0, _os_rb.path.expanduser('~/vibecheck/scratch/reverse_g'))
+                from reverse_build import build_state_reverse as _bsr
+                from vibecheck.reverse_batched import build_states_reverse_batched_safe as _bsrb
+                _bq = sorted(still_needs_milp)
+                # collect per-direction alpha (one α-CROWN per query)
+                _alphas = []
+                for _qi in _bq:
+                    _, _qw, _qb = queries[_qi]
+                    _, _ap, _, _ = ac.run_alpha_crown_fixed_intermediate(
+                        gg, xl_g, xh_g, bounds_by_relu, _qw, float(_qb), device, dtype,
+                        n_iters=int(getattr(settings, 'zono_lift_alpha_iters', 10)),
+                        lr=0.25, lr_decay=0.98, early_stop_on_positive=True,
+                        init_alpha=_ph1_spec_alpha)
+                    _, _ew = ac.capture_ew_per_relu(gg, xl_g, xh_g, _ap['spec'],
+                                                    bounds_by_relu, _qw, float(_qb), device, dtype)
+                    _alphas.append(ac.build_dir_adaptive_alpha(_ap['spec'], _ew, bounds_by_relu, device, dtype))
+                torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+                _t0 = _tm_rb.perf_counter()
+                _seq = [_bsr(gg, xl_g, xh_g, bounds_by_relu, _a, device, dtype) for _a in _alphas]
+                torch.cuda.synchronize(); _t_seq = _tm_rb.perf_counter() - _t0
+                _m_seq = torch.cuda.max_memory_allocated() / 1e9
+                torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+                _t0 = _tm_rb.perf_counter()
+                _bench_rb = {}
+                _bat = _bsrb(gg, xl_g, xh_g, bounds_by_relu, _alphas, device, dtype, _bench=_bench_rb)
+                torch.cuda.synchronize(); _t_bat = _tm_rb.perf_counter() - _t0
+                _m_bat = torch.cuda.max_memory_allocated() / 1e9
+                # correctness: batched vs sequential rows
+                _w = 0.0
+                for _d in range(len(_bq)):
+                    _Fs = {(u['layer_idx'], u['neuron_idx']): u for u in _seq[_d]['unstable_list']}
+                    _Fb = {(u['layer_idx'], u['neuron_idx']): u for u in _bat[_d]['unstable_list']}
+                    for _k in _Fs:
+                        _da = np.zeros(_seq[_d]['n_gens']); _db = np.zeros(_bat[_d]['n_gens'])
+                        _da[_Fs[_k]['row_indices']] = _Fs[_k]['row_values']
+                        _db[_Fb[_k]['row_indices']] = _Fb[_k]['row_values']
+                        _w = max(_w, float(np.abs(_da - _db).max()))
+                print(f'  [REVERSE_BATCH_BENCH] D={len(_bq)} | sequential {_t_seq:.2f}s '
+                      f'peak {_m_seq:.2f}GB | batched {_t_bat:.2f}s peak {_m_bat:.2f}GB '
+                      f'(chunk={_bench_rb.get("final_chunk")}, n_chunks={_bench_rb.get("n_chunks")}) '
+                      f'| speedup {_t_seq/_t_bat:.2f}x | max|Δrow|={_w:.2e}', flush=True)
+            # --- batched reverse state build over all open directions ----------
+            _rev_batched = (
+                bool(getattr(settings, 'phase8_reverse_g', False))
+                and bool(getattr(settings, 'phase8_reverse_g_batched', False))
+                and getattr(device, 'type', None) == 'cuda'
+                and not details.get('phase2p5', {}).get('per_query'))
+            _batched_rev_done = set()
+            if _rev_batched:
+                from .reverse_batched import build_states_reverse_batched_safe
+                _bq = [qi for qi in sorted(still_needs_milp)
+                       if time_left() > _pq_reserve]
+                if _bq:
+                    _alphas = []; _ews = {}
+                    _tp = time.perf_counter()
+                    for qi in _bq:
+                        _, qw_q, qb_q = queries[qi]
+                        _, _apq, _, _ = ac.run_alpha_crown_fixed_intermediate(
+                            gg, xl_g, xh_g, bounds_by_relu, qw_q, float(qb_q),
+                            device, dtype,
+                            n_iters=int(getattr(settings, 'zono_lift_alpha_iters', 10)),
+                            lr=float(getattr(settings, 'zono_lift_alpha_lr', 0.25)),
+                            lr_decay=float(getattr(settings, 'alpha_crown_lr_decay', 0.98)),
+                            early_stop_on_positive=bool(getattr(
+                                settings, 'alpha_crown_early_stop_on_positive', True)),
+                            init_alpha=_ph1_spec_alpha)
+                        _, _ewq = ac.capture_ew_per_relu(
+                            gg, xl_g, xh_g, _apq['spec'], bounds_by_relu,
+                            qw_q, float(qb_q), device, dtype)
+                        _ews[qi] = _ewq
+                        _alphas.append(ac.build_dir_adaptive_alpha(
+                            _apq['spec'], _ewq, bounds_by_relu, device, dtype))
+                    _ptick('alpha_crown', _tp)
+                    _tp = time.perf_counter()
+                    _states = build_states_reverse_batched_safe(
+                        gg, xl_g, xh_g, bounds_by_relu, _alphas, device, dtype)
+                    _ptick('state_build', _tp)
+                    for _idx, qi in enumerate(_bq):
+                        state_by_qi[qi] = _states[_idx]
+                        if bool(getattr(settings, 'phase8_score_box_halfspace', True)):
+                            _, qw_q, qb_q = queries[qi]
+                            ew_np = {L: (t.detach().cpu().numpy().astype(np.float64)
+                                         if hasattr(t, 'detach')
+                                         else np.asarray(t, dtype=np.float64))
+                                     for L, t in _ews[qi].items()}
+                            _tp = time.perf_counter()
+                            bh = verify_gen_lp.score_box_halfspace_delta_lb(
+                                state_by_qi[qi], qw_q, float(qb_q), ew_np)
+                            per_query_scored[qi] = sorted(
+                                bh.keys(), key=lambda k: bh[k], reverse=True)
+                            _p8t['scoring'] += time.perf_counter() - _tp
+                        _batched_rev_done.add(qi)
+                    if print_progress:
+                        print(f'  [batched reverse] {len(_bq)} directions built',
+                              flush=True)
             for qi in sorted(still_needs_milp):
+                if qi in _batched_rev_done:
+                    continue
                 if time_left() <= _pq_reserve:
                     if print_progress:
                         print(f'  Per-query α-zono state: {time_left():.1f}s left '
@@ -6270,6 +6419,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 # α-CROWN with fixed intermediate bounds; spec-only α.
                 # Warm-start from Phase 0.5's optimised α when available.
                 t_ac = time.perf_counter()
+                _tp = t_ac
                 _, alpha_params, _, _ = (
                     ac.run_alpha_crown_fixed_intermediate(
                         gg, xl_g, xh_g, merged_bbr, qw_q, float(qb_q),
@@ -6284,12 +6434,15 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                             settings,
                             'alpha_crown_early_stop_on_positive', True)),
                         init_alpha=_ph1_spec_alpha))
+                _tp = _ptick('alpha_crown', _tp)
                 _, ew_at_relu_q = ac.capture_ew_per_relu(
                     gg, xl_g, xh_g, alpha_params['spec'], merged_bbr,
                     qw_q, float(qb_q), device, dtype)
+                _tp = _ptick('capture_ew', _tp)
                 alpha_per_layer_q = ac.build_dir_adaptive_alpha(
                     alpha_params['spec'], ew_at_relu_q, merged_bbr,
                     device, dtype)
+                _tp = _ptick('build_dir_alpha', _tp)
                 # Build per-layer unstable index tensors so the forward
                 # only materialises the unstable rows of the pre-ReLU G.
                 unstable_per_layer_q = {}
@@ -6298,16 +6451,28 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                                    & (np.asarray(hi_np) > 0))[0]
                     unstable_per_layer_q[L] = torch.as_tensor(
                         un, dtype=torch.long, device=device)
-                z_alpha, pre_relu_gpu_q = ac.forward_zono_dir_adaptive(
-                    xl_g, xh_g, gg, alpha_per_layer_q, merged_bbr,
-                    device, dtype, settings=settings,
-                    unstable_per_layer=unstable_per_layer_q)
-                state_by_qi[qi] = verify_gen_lp.state_from_alpha_zono(
-                    z_alpha, pre_relu_gpu_q, alpha_per_layer_q,
-                    merged_bbr, x_lo_64, x_hi_64,
-                    gg_ops_ser, gg['input_name'],
-                    gg_ops_ser[-1]['name'],
-                    unstable_per_layer=unstable_per_layer_q)
+                _use_rev = (bool(getattr(settings, 'phase8_reverse_g', False))
+                            and getattr(device, 'type', None) == 'cuda')
+                _tp = _ptick('unstable_idx', _tp)
+                if _use_rev:
+                    # Reverse-mode build (backward from unstable+output neurons):
+                    # replaces forward_zono_dir_adaptive + state_from_alpha_zono.
+                    from .reverse_g import build_state_reverse
+                    state_by_qi[qi] = build_state_reverse(
+                        gg, xl_g, xh_g, merged_bbr, alpha_per_layer_q,
+                        device, dtype)
+                else:
+                    z_alpha, pre_relu_gpu_q = ac.forward_zono_dir_adaptive(
+                        xl_g, xh_g, gg, alpha_per_layer_q, merged_bbr,
+                        device, dtype, settings=settings,
+                        unstable_per_layer=unstable_per_layer_q)
+                    state_by_qi[qi] = verify_gen_lp.state_from_alpha_zono(
+                        z_alpha, pre_relu_gpu_q, alpha_per_layer_q,
+                        merged_bbr, x_lo_64, x_hi_64,
+                        gg_ops_ser, gg['input_name'],
+                        gg_ops_ser[-1]['name'],
+                        unstable_per_layer=unstable_per_layer_q)
+                _tp = _ptick('state_build', _tp)
                 # Box+halfspace per-neuron delta_LB scoring — closed-form
                 # Lagrangian, ~10ms/1k neurons. Picks kfsb-quality
                 # binarisation candidates by simulating off-side
@@ -6333,15 +6498,20 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                         key=lambda k: bh_scores[k], reverse=True)
                     _score_dt[0] = max(_score_dt[0],
                                        time.perf_counter() - _t_sc)
+                    _p8t['scoring'] += time.perf_counter() - _t_sc
                 if print_progress:
                     print(f'  Per-query α-zono state q{qi}: '
                           f'n_gens={state_by_qi[qi]["n_gens"]}, '
                           f'unstable={len(state_by_qi[qi]["unstable_list"])} '
                           f'({time.perf_counter()-t_ac:.2f}s)')
                 # Free GPU tensors before next query.
-                del z_alpha, pre_relu_gpu_q, alpha_per_layer_q
+                _tp = time.perf_counter()
+                if not _use_rev:
+                    del z_alpha, pre_relu_gpu_q
+                del alpha_per_layer_q
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                _ptick('empty_cache', _tp)
         elif _per_qi_rebuild:
             # Reclaim caching-allocator memory from Phase 2.5's GPU work
             # before allocating fresh tensors for the per-query rebuild.
@@ -6476,6 +6646,26 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             _da_K = int(getattr(settings, 'phase8_dual_ascent_max_iter', 1))
             _da_rep = int(getattr(
                 settings, 'phase8_dual_ascent_repair_steps', 5))
+            # Fast GPU dual-ascent node bound (drop-in for the legacy per-query
+            # BaB). CUDA-only; on CPU fall back to the legacy verifier. It emits
+            # only 'unsat'/'unknown' and never attacks, so SAT detection stays
+            # with the PGD/witness machinery that honors `disable_sat_finding`.
+            _fast_da = (bool(getattr(settings, 'phase8_fast_dual_ascent', True))
+                        and getattr(device, 'type', None) == 'cuda')
+            _fast_verifier = None
+            if _fast_da:
+                _t_fv = time.perf_counter()
+                _fast_verifier = _get_fast_da_verifier(
+                    device,
+                    str(getattr(settings, 'phase8_fast_dual_ascent_ls',
+                                'logbucket')),
+                    int(getattr(settings, 'phase8_fast_dual_ascent_K', 256)),
+                    bool(getattr(settings,
+                                 'phase8_fast_dual_ascent_compile', True)))
+                try:
+                    _ptick('fast_verifier_build(compile)', _t_fv)
+                except NameError:
+                    pass
             raw = []
             # Witness-attack callback: maps each LP-relaxation primal witness
             # (e ∈ [-1,1]^n_input) back to real input space and runs the NN
@@ -6590,20 +6780,42 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                                     'scored_keys': list(scored_keys_q),
                                     'ew_at_relu': _ew_dump}, _f)
                     print(f'  [DA-DUMP] q{qi} → {_path}')
-                vd, info = verify_query_dual_ascent_bab(
-                    state_q, qw_q, qb_q,
-                    [k for k in scored_keys_q],
-                    time_limit=time_left(),
-                    max_iter=_da_K, repair_steps=_da_rep,
-                    print_progress=False, time_left_fn=time_left,
-                    witness_check_fn=_da_witness_check)
+                if _fast_da:
+                    # Fast path: returns 'unsat'(robust) / 'unknown' only.
+                    _t_call = time.perf_counter()
+                    vd, info = _fast_verifier.verify_query(
+                        state_q, qw_q, qb_q,
+                        [k for k in scored_keys_q],
+                        time_limit=time_left())
+                    try:
+                        if _p8prof and torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        _full = time.perf_counter() - _t_call
+                        _p8t['bnb_node'] += float(info.get('wall', 0.0))
+                        _p8t['bnb_parse+upload'] += _full - float(info.get('wall', 0.0))
+                    except NameError:
+                        pass
+                else:
+                    vd, info = verify_query_dual_ascent_bab(
+                        state_q, qw_q, qb_q,
+                        [k for k in scored_keys_q],
+                        time_limit=time_left(),
+                        max_iter=_da_K, repair_steps=_da_rep,
+                        print_progress=False, time_left_fn=time_left,
+                        witness_check_fn=_da_witness_check)
                 if print_progress:
-                    print(f'  [dual-ascent-gpu] query {qi}: {vd} '
-                          f'nodes={info["nodes"]} '
-                          f'wall={info["wall"]:.3f}s '
-                          f'(safe={info["exit_counts"]["dual_safe"]} '
-                          f'uns={info["exit_counts"]["primal_unsafe"]} '
-                          f'cap={info["exit_counts"]["safety_cap"]})')
+                    if _fast_da:
+                        print(f'  [fast-dual-ascent-gpu] query {qi}: {vd} '
+                              f'nodes={info.get("nodes", 0)} '
+                              f'wall={info.get("wall", 0.0):.3f}s '
+                              f'(peak_frontier={info.get("peak_frontier", 0)})')
+                    else:
+                        print(f'  [dual-ascent-gpu] query {qi}: {vd} '
+                              f'nodes={info["nodes"]} '
+                              f'wall={info["wall"]:.3f}s '
+                              f'(safe={info["exit_counts"]["dual_safe"]} '
+                              f'uns={info["exit_counts"]["primal_unsafe"]} '
+                              f'cap={info["exit_counts"]["safety_cap"]})')
                 # CRITICAL: when DA-BaB finds SAT via witness-attack,
                 # info['sat_witness'] is the real-input counterexample.
                 # Bug 2026-05-15: was passing witness=None, dropping all
@@ -6816,6 +7028,16 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 print(f'  Fallback q{qi} bins={n_bins_fb}: '
                       f'{status_name} lb={ob_s}', flush=True)
     timing['phase8_milp'] = time.perf_counter() - t_phase8
+    try:
+        if _p8prof:
+            _tot = timing['phase8_milp']
+            _acc = sum(_p8t.values())
+            _items = sorted(_p8t.items(), key=lambda kv: -kv[1])
+            _s = '  '.join(f'{k}={v:.2f}s' for k, v in _items)
+            print(f'  [PHASE8_PROFILE] total={_tot:.2f}s  accounted={_acc:.2f}s'
+                  f'  unaccounted={_tot-_acc:.2f}s | {_s}', flush=True)
+    except NameError:
+        pass
 
     # If the gen_lp path found a true counterexample from a MILP integer
     # solution, short-circuit to SAT before running final PGD.
@@ -6826,12 +7048,20 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                       if all(spec_lbs.get(qi, -1) > 0 for qi, _, _ in qlist)}
     still_open_disj = set(disj_queries.keys()) - verified_disj
 
-    # --- Phase 9: final PGD ---
+    # --- Phase 9: final PGD, restricted to the BnB survivors ---
+    # BnB-first / attack-the-survivors schedule: Phase 8 already closed every
+    # robust disjunct, so `still_open_disj` is exactly the set BnB left open —
+    # on a robust spec that set is empty and we never attack (0 PGD overhead),
+    # on a SAT spec it is the counterexample-bearing disjunct(s). Restricting the
+    # attack to those disjuncts concentrates OSI/PGD on the live margins instead
+    # of diluting the min over already-verified ones. Reuses VC's own
+    # pgd_attack_general (OSI init + params from configs/default.yaml).
     t0 = time.perf_counter()
     if still_open_disj and time_left() > 0 and not _disable_sat:
         try:
             pgd_sat, pgd_witness = _pgd_attack_general(
-                xl_pgd, xh_pgd, spec, gg_pgd, settings)
+                xl_pgd, xh_pgd, spec, gg_pgd, settings,
+                restrict_disj=still_open_disj)
         except RuntimeError:
             pgd_sat, pgd_witness = False, None
         if pgd_sat:
@@ -10600,7 +10830,7 @@ def _input_split_verify(graph, spec, settings, build_fn, impl):
     def _run_node(s):
         remaining = total_budget - (time.perf_counter() - t_start)
         if remaining < 0.5:
-            return 'unknown', {'phase': 'input_split_timeout'}
+            return 'unknown', {'phase': 'input_split_timeout', 'timed_out': True}
         if fast_leaf:
             return _input_split_fast_leaf(
                 graph, s, settings, fast_gg, fast_device, fast_dtype)

@@ -58,21 +58,26 @@ def lagrangian_min(d, c0, a, beta):
         lam_sorted = np.empty(0, dtype=np.float64)
         decr_sorted = np.empty(0, dtype=np.float64)
 
-    lam_prev = 0.0
-    slope = gprime0_plus
-    g_val = g0
-    for k in range(lam_sorted.size):
-        lam_k = lam_sorted[k]
-        g_val = g_val + slope * (lam_k - lam_prev)
-        new_slope = slope - decr_sorted[k]
-        if slope > 0 and new_slope <= 0:
-            return g_val
-        slope = new_slope
-        lam_prev = lam_k
-    # All breakpoints exhausted with slope still positive — halfspace is
-    # infeasible wrt the box (min a·e > β). Primal infeasible; dual
-    # unbounded. Return +inf to signal vacuous (no feasible point).
-    return float('inf')
+    if lam_sorted.size == 0:
+        # No positive breakpoints, slope stays positive — infeasible.
+        return float('inf')
+    # Vectorized breakpoint walk (replaces the Python loop). The dual g(λ) is
+    # piecewise-linear concave; slope entering breakpoint j is
+    #   slope_j = gprime0_plus - Σ_{i<j} decr_sorted[i],
+    # and g advances by slope_j·(λ_j − λ_{j-1}). We terminate at the first k
+    # where slope_k > 0 and slope_{k+1} ≤ 0 (the concave max). Since the cum
+    # decrements are nondecreasing, that's a searchsorted on the running sum.
+    cum_before = np.concatenate(([0.0], np.cumsum(decr_sorted)))  # len n+1
+    gaps = np.diff(np.concatenate(([0.0], lam_sorted)))           # λ_j − λ_{j-1}
+    slope_j = gprime0_plus - cum_before[:-1]                      # entering bp j
+    contrib = np.cumsum(slope_j * gaps)                          # g_val − g0 @ bp j
+    # First m with cum_before[m] ≥ gprime0_plus ⇒ slope_m ≤ 0; crossing at k=m-1.
+    m = int(np.searchsorted(cum_before, gprime0_plus, side='left'))
+    if m > lam_sorted.size:
+        # Breakpoints exhausted with slope still positive — halfspace
+        # infeasible wrt the box (min a·e > β). Return +inf (no feasible point).
+        return float('inf')
+    return g0 + float(contrib[m - 1])
 
 
 def lagrangian_max(d, c0, a, beta):

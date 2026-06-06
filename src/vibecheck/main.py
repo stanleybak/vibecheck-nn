@@ -203,6 +203,15 @@ def _verify(args):
             'timeout': 'timeout',
         }
         line = verdict_map.get(result, f'unknown ({result})')
+        # VNNCOMP distinguishes 'timeout' (ran out of the wall budget without
+        # deciding) from a give-up 'unknown'. The pipeline returns 'unknown'
+        # on its time-budget-exhausted paths but flags details['timed_out'];
+        # fall back to comparing elapsed wall against the budget for any path
+        # that doesn't set the flag.
+        timed_out = (isinstance(details, dict) and details.get('timed_out'))
+        if line == 'unknown' and (
+                timed_out or (args.timeout is not None and t_total >= args.timeout - 2.0)):
+            line = 'timeout'
         with open(args.results_file, 'w') as f:
             f.write(line + '\n')
 
