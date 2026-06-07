@@ -6805,10 +6805,16 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                         witness_check_fn=_da_witness_check)
                 if print_progress:
                     if _fast_da:
+                        # `reason` attributes WHY the BnB stopped: 'time_limit',
+                        # 'splits_exhausted', 'oom' (all → unknown, frontier not
+                        # emptied) vs proved unsat (frontier emptied, no reason).
+                        # There is NO node cap — the only stops are time/depth/OOM.
+                        _rsn = info.get('reason')
                         print(f'  [fast-dual-ascent-gpu] query {qi}: {vd} '
                               f'nodes={info.get("nodes", 0)} '
                               f'wall={info.get("wall", 0.0):.3f}s '
-                              f'(peak_frontier={info.get("peak_frontier", 0)})')
+                              f'(peak_frontier={info.get("peak_frontier", 0)}'
+                              f'{f", stop={_rsn}" if _rsn else ""})')
                     else:
                         print(f'  [dual-ascent-gpu] query {qi}: {vd} '
                               f'nodes={info["nodes"]} '
@@ -6879,6 +6885,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     'levels': race_levels}
             if verdict == 'unsat':
                 spec_lbs[qi] = 1.0
+                details.setdefault('phase8_close_src', {})[qi] = 'bnb'
             elif (verdict == 'sat' and witness is not None
                     and milp_witness is None
                     and not _disable_sat):
@@ -7012,6 +7019,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 _closed = (fb_status == _grb.GRB.INFEASIBLE)
             if _closed:
                 spec_lbs[qi] = 1.0
+                details.setdefault('phase8_close_src', {})[qi] = 'milp_fallback'
                 if print_progress:
                     _how = (f'min-margin lb={fb_obj_bound:+.5f}>={_hi_bin_bbs_tol:g}'
                             if _hi_bin_bbs else '+halfspace INFEASIBLE')
@@ -7071,8 +7079,22 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 return _r
     timing['phase9_pgd'] = time.perf_counter() - t0
 
+    # Attribute which Phase-8 phase actually closed each query, so the verbose
+    # trace and the final `phase` tag reflect reality (e.g. "verified by BnB" vs
+    # "by the high-bin MILP fallback") instead of a blanket 'spec_milp'.
+    _csrc = details.get('phase8_close_src', {})
+    _n_bnb = sum(1 for v in _csrc.values() if v == 'bnb')
+    _n_fb = sum(1 for v in _csrc.values() if v == 'milp_fallback')
+    if print_progress and (_n_bnb or _n_fb):
+        print(f'  [phase8] closed {_n_bnb} quer{"y" if _n_bnb == 1 else "ies"} '
+              f'by dual-ascent BnB, {_n_fb} by high-bin MILP fallback '
+              f'(α-CROWN/earlier closed the rest)', flush=True)
     if not still_open_disj:
-        return _finalize('verified', 'spec_milp')
+        # 'spec_milp' only if the MILP fallback was load-bearing; else the BnB
+        # (or earlier α-CROWN) carried it — name the phase that did the work.
+        _src_phase = ('spec_milp' if _n_fb
+                      else 'dual_ascent_bab' if _n_bnb else 'alpha_crown')
+        return _finalize('verified', _src_phase)
     return _finalize('unknown', 'timeout', remaining=len(still_open_disj))
 
 

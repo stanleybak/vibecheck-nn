@@ -47,10 +47,11 @@ phase26_pre_cascade_enabled: true
 # The dual-ascent BnB reads the state fields directly (ignores the tag) so it
 # stayed sound — which is why it only surfaced through the MILP fallback, and only
 # on the reverse path (forward was too slow to reach the fallback). Fix: tag the
-# reverse state 'alpha_zono'. Re-validated: all 15 resnet_large SAT cases return
+# reverse state 'alpha_zono' (both build_state_reverse AND the batched
+# reverse_batched path had it). Re-validated: all 15 resnet_large SAT cases return
 # timeout/not-unsat with sat-off (0 false-verify). reverse-g is ~3.3x faster at
 # state build here (2.63s -> 0.80s on prop_1063), freeing budget for the BnB.
-# Kept OFF in production pending a full 71-case re-sweep to confirm the score does
-# not regress before flipping the merged benchmark's behavior.
-phase8_reverse_g: false
+# ENABLED (2026-06-07) now that it is sound + ablated faster on prop_1063; a full
+# 71-case re-sweep will confirm no score regression (tracked separately).
+phase8_reverse_g: true
 phase8_reverse_g_batched: false

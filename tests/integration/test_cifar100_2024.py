@@ -1,9 +1,11 @@
 """Integration tests for cifar100_2024.
 
-Cases probed on AWS A10G with the lean config (cascade-skip + reverse_g:false +
+Cases probed on AWS A10G with the lean config (cascade-skip + reverse_g:true +
 pre-cascade PGD SAT catcher; see configs/cifar100_2024.yaml):
-  - 1 SAT (resnet_large; caught by the pre-cascade PGD — also a soundness guard:
-    reverse_g was UNSOUND on resnet_large, so it MUST verdict `sat`, never `unsat`).
+  - 1 SAT (resnet_large; caught by the pre-cascade PGD — also the reverse-g
+    soundness guard: reverse_g once false-verified resnet_large SAT cases via a
+    formulation-tag dispatch bug, FIXED 2026-06-07; this case MUST verdict `sat`,
+    never `unsat`, with reverse_g enabled. See tests/test_reverse_g.py).
   - 2 hard UNSAT verified via the Phase 8 dual-ascent BaB (now ~21s/30s, faster
     than the old hybrid config's ~33s/42s).
 """

@@ -185,7 +185,8 @@ def _build_both_states(onnx_path, in_shape, qw, qb, eps=0.25):
 
     rev_state = build_state_reverse(
         gg, xl, xh, bbr, alpha_per_layer, DEV, DT)
-    return fwd_state, rev_state, gg
+    ctx = dict(xl=xl, xh=xh, bbr=bbr, alpha_per_layer=alpha_per_layer)
+    return fwd_state, rev_state, gg, ctx
 
 
 def _solve(state, qw, qb, milp_set):
@@ -215,7 +216,7 @@ def test_reverse_state_alpha_zono_dispatch_and_optimum(
     qb = 0.05
     onnx_path = builder()
     try:
-        fwd_state, rev_state, _ = _build_both_states(onnx_path, in_shape, qw, qb)
+        fwd_state, rev_state, _, _ = _build_both_states(onnx_path, in_shape, qw, qb)
 
         # (1) The reverse state MUST be tagged alpha_zono so build_gen_lp_from_state
         # routes it to _build_alpha_zono_lp, not the generic direct-ReLU builder.
@@ -243,6 +244,30 @@ def test_reverse_state_alpha_zono_dispatch_and_optimum(
             milp_rev = _solve(rev_state, qw, qb, milp_set=all_unstable)
             assert milp_fwd is not None and milp_rev is not None
             assert milp_rev == pytest.approx(milp_fwd, abs=1e-4)
+    finally:
+        os.remove(onnx_path)
+
+
+def test_reverse_batched_alpha_zono_dispatch():
+    """The BATCHED reverse build (reverse_batched.build_states_reverse_batched,
+    the phase8_reverse_g_batched path) had the identical formulation='sparse'
+    bug. With D=1 and the same alpha, state[0] must be tagged 'alpha_zono' and
+    match the single-state build_state_reverse's gen-LP optimum."""
+    from vibecheck.reverse_batched import build_states_reverse_batched
+    qw = np.array([1.0, -1.0, 0.0], dtype=np.float64)
+    qb = 0.05
+    onnx_path = _proj_skip_residual()
+    try:
+        _, rev_state, gg, ctx = _build_both_states(onnx_path, [4, 8, 8], qw, qb)
+        states = build_states_reverse_batched(
+            gg, ctx['xl'], ctx['xh'], ctx['bbr'],
+            [ctx['alpha_per_layer']], DEV, DT)
+        assert len(states) == 1
+        assert states[0]['formulation'] == 'alpha_zono'
+        lp_batched = _solve(states[0], qw, qb, milp_set=set())
+        lp_single = _solve(rev_state, qw, qb, milp_set=set())
+        assert lp_batched is not None and lp_single is not None
+        assert lp_batched == pytest.approx(lp_single, abs=1e-5)
     finally:
         os.remove(onnx_path)
 

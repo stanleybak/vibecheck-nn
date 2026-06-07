@@ -151,8 +151,14 @@ def build_states_reverse_batched(gg, xl, xh, bbr, alphas, dev, dt):
                 out[d][i] = (ci.astype(np.int64), valsD[d, sl].astype(np.float64))
         return out
 
+    # formulation MUST be 'alpha_zono' (same contract as build_state_reverse) —
+    # the per-neuron data below is the α-zono parametrization, so the gen-LP/MILP
+    # builder must dispatch to _build_alpha_zono_lp, NOT the generic 'sparse'
+    # direct-ReLU builder. 'sparse' here is the same unsound-MILP-fallback bug
+    # fixed in reverse_g.py; see tests/test_reverse_g.py.
     states = [dict(n_gens=n_gens, n_input=n_input, unstable_list=[],
-                   input_name=in_name, output_op_name=out_name, formulation='sparse',
+                   input_name=in_name, output_op_name=out_name,
+                   formulation='alpha_zono',
                    stable_list=[], x_lo=xl_n, x_hi=xh_n, sigmoid_tanh_layer_ids=set())
               for _ in range(D)]
     for L in Ls:
