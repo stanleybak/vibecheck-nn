@@ -26,8 +26,11 @@ echo "Preparing $TOOL_NAME for '$CATEGORY': onnx=$ONNX_FILE vnnlib=$VNNLIB_FILE"
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
-# 1. Kill zombie processes from a previous (possibly killed) instance.
-killall -q python python3 2>/dev/null
+# 1. Kill stale vibecheck verifier processes from a previous (possibly killed)
+#    instance. NARROW on purpose: a broad `killall python` would also kill a
+#    batch orchestrator (run_benchmarks.py) and, on a dev box, the tmux/agent
+#    session. pkill -f matches only the verifier cmdline (`-m vibecheck.main`).
+pkill -f 'vibecheck\.main' 2>/dev/null || true
 sleep 1
 
 # 2. GPU sanity check. vibecheck runs on CPU if CUDA is absent, but the
@@ -66,8 +69,8 @@ timeout -k 5 60 "$PY" -m vibecheck.main \
 	>/dev/null 2>&1 || true
 rm -f "$TMP_RES"
 
-# Clean up warmup zombies.
-killall -q python python3 2>/dev/null
+# Clean up the warmup verifier (narrow; see note above).
+pkill -f 'vibecheck\.main' 2>/dev/null || true
 sleep 1
 
 echo "Preparation finished."
