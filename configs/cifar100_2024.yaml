@@ -11,9 +11,15 @@ phase8_min_budget_frac: 0.5          # Phase 8 gets >= half of total_timeout
 pgd_middle_enabled: false            # skip Phase 3.5 (2.6 strictly better)
 phase26_pgd_per_spec_min_per_spec: 0.5
 phase26_pgd_per_spec_strict_min: true
-phase26_pre_cascade_total_frac: 0.10
-phase26_pre_cascade_per_spec_cap: 5.0
 pgd_restarts: 100
+# Pre-cascade PGD re-enabled (below) as the SAT catcher. The old config caught
+# hard resnet_large SAT cases via ~13s of parallel-PGD piggybacking on the MILP
+# windows; with the cascade skipped there are no windows, so PGD needs that
+# attack time directly. Budget tuned (per_spec_cap:15, total_frac:0.15) to catch
+# all 5 resnet_large SAT misses (incl. prop_3585, needs ~13s) while keeping UNSAT
+# cases ~34-35s (well under the 100s budget, still ~2.6x faster than ABC).
+phase26_pre_cascade_total_frac: 0.15
+phase26_pre_cascade_per_spec_cap: 15.0
 # Lean Phase-1 (ported from tinyimagenet_2024, validated there: 200-case sweep
 # vs α,β-CROWN = 0 false-verify / 0 MISS / +9 ABC-timeout wins, ~2x faster on
 # UNSAT). The per-layer Gurobi MILP-tighten cascade (~13s/case here — the doc's
@@ -22,16 +28,14 @@ pgd_restarts: 100
 # construction (looser input bounds only make the sound Phase-8 BnB more
 # conservative).
 #   max_tighten_layer:0          -> skip the MILP-tighten cascade
-#   parallel_pgd_enabled:false   -> the in-MILP-window PGD attacker is redundant
-#                                   with no MILP windows; Phase 0/2.6/9 PGD cover SAT
-#   phase26_pre_cascade_enabled:false -> the pre-cascade PGD hook also only existed
-#                                   to attack during MILP windows
-# NOTE: validate that prop_6583-class SAT cases (previously caught by the
-# pre-cascade uniform-split PGD) are still caught by Phase-0/2.6/9 PGD — the full
-# sweep gates this; re-enable a small pre-cascade budget if any SAT regresses.
+#   parallel_pgd_enabled:false   -> the in-MILP-window PGD attacker is dead with no
+#                                   MILP windows (it waits on a lock that never sets)
+#   phase26_pre_cascade_enabled:true -> KEPT as the SAT catcher (budget tuned above):
+#                                   recovers the 5 resnet_large SAT cases the cascade
+#                                   used to catch via parallel-PGD-during-MILP.
 max_tighten_layer: 0
 parallel_pgd_enabled: false
-phase26_pre_cascade_enabled: false
+phase26_pre_cascade_enabled: true
 # Reverse-mode alpha-zono state build is DISABLED here: it is UNSOUND on
 # CIFAR100_resnet_large (silently produces a too-tight a_g -> 6 false-verify in
 # the 2026-06-07 sweep, all resnet_large, 0 on resnet_medium). The forward build
