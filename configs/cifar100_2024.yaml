@@ -1,6 +1,8 @@
 # cifar100_2024 — CIFAR100 ResNet (medium/large), VNNCOMP regular track.
-# Overrides match scratch/runner_p25off.py (the runner used in the v6 sweep
-# that beat AB-CROWN on most SAT cases).
+# Sister benchmark to tinyimagenet_2024 (same CIFAR/TinyImageNet ResNet family,
+# same base pipeline). This config ports the validated tinyimagenet "lean"
+# settings: skip the wasted Phase-1 MILP-tighten cascade and run the all-GPU
+# reverse-mode α-zono Phase-8 BnB instead.
 phase8_use_dual_ascent_gpu: true
 phase8_dual_ascent_max_iter: 1
 zono_lift_enabled: false             # skip Phase 2.5
@@ -9,9 +11,29 @@ phase8_min_budget_frac: 0.5          # Phase 8 gets >= half of total_timeout
 pgd_middle_enabled: false            # skip Phase 3.5 (2.6 strictly better)
 phase26_pgd_per_spec_min_per_spec: 0.5
 phase26_pgd_per_spec_strict_min: true
-# Pre-cascade PGD uniform-split (catches missed SAT like prop_6583).
 phase26_pre_cascade_total_frac: 0.10
 phase26_pre_cascade_per_spec_cap: 5.0
-# Parallel PGD during MILP windows (~10s win on UNSAT).
-parallel_pgd_enabled: true
 pgd_restarts: 100
+# Lean Phase-1 (ported from tinyimagenet_2024, validated there: 200-case sweep
+# vs α,β-CROWN = 0 false-verify / 0 MISS / +9 ABC-timeout wins, ~2x faster on
+# UNSAT). The per-layer Gurobi MILP-tighten cascade (~13s/case here — the doc's
+# "MILP windows") is wasted: alpha-CROWN (phase 0.5) closes nearly all disjuncts
+# and the fast GPU Phase-8 BnB closes the rest from phase-0.5 bounds. Sound by
+# construction (looser input bounds only make the sound Phase-8 BnB more
+# conservative).
+#   max_tighten_layer:0          -> skip the MILP-tighten cascade
+#   parallel_pgd_enabled:false   -> the in-MILP-window PGD attacker is redundant
+#                                   with no MILP windows; Phase 0/2.6/9 PGD cover SAT
+#   phase26_pre_cascade_enabled:false -> the pre-cascade PGD hook also only existed
+#                                   to attack during MILP windows
+# NOTE: validate that prop_6583-class SAT cases (previously caught by the
+# pre-cascade uniform-split PGD) are still caught by Phase-0/2.6/9 PGD — the full
+# sweep gates this; re-enable a small pre-cascade budget if any SAT regresses.
+max_tighten_layer: 0
+parallel_pgd_enabled: false
+phase26_pre_cascade_enabled: false
+# Reverse-mode alpha-zono state build + batched over open spec directions.
+# CUDA-only (falls back to the forward build on CPU). Validated bit-identical to
+# the forward build (a_g delta=0, identical BnB node counts) on tinyimagenet.
+phase8_reverse_g: true
+phase8_reverse_g_batched: true
