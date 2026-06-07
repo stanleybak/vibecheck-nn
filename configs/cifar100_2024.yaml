@@ -32,8 +32,13 @@ pgd_restarts: 100
 max_tighten_layer: 0
 parallel_pgd_enabled: false
 phase26_pre_cascade_enabled: false
-# Reverse-mode alpha-zono state build + batched over open spec directions.
-# CUDA-only (falls back to the forward build on CPU). Validated bit-identical to
-# the forward build (a_g delta=0, identical BnB node counts) on tinyimagenet.
-phase8_reverse_g: true
-phase8_reverse_g_batched: true
+# Reverse-mode alpha-zono state build is DISABLED here: it is UNSOUND on
+# CIFAR100_resnet_large (silently produces a too-tight a_g -> 6 false-verify in
+# the 2026-06-07 sweep, all resnet_large, 0 on resnet_medium). The forward build
+# (reverse_g:false) is sound (the 6 broken cases all return timeout/not-unsat
+# with sat-off). reverse-g was validated bit-exact only on tinyimagenet's medium
+# ResNet; the large net's 3rd downsampling stage (256-ch) exposes a backward math
+# bug. Keep cascade-skip (the main win); re-enable reverse-g once the bug is fixed
+# + the large ResNet is added to the bit-exact validation.
+phase8_reverse_g: false
+phase8_reverse_g_batched: false
