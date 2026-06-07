@@ -10,12 +10,15 @@ phase8_min_budget_frac: 0.5
 pgd_middle_enabled: false
 bab_refine_passes: 1
 bab_refine_window: 1
-# MILP at L1 + L2 with per-neuron timeout 2 s. Empirically (img100):
-# MILP@L1 alone gives spec_lb -0.55; MILP@L1+L2 (with adaptive-backward
-# propagation to L3-L6) closes it in ~29 s. Tuned via
-# scratch/cora_l1_compare.py and a sample_timeout sweep.
-max_tighten_layer: 2
-milp_sample_timeout: 2.0
+# LEAN Phase-1 (2026-06-07): skip the Gurobi MILP-tighten cascade. The cascade
+# was tuned to close cifar10-set img100 in ~29s (MILP@L1+L2), but the fast GPU
+# Phase-8 dual-ascent BaB (+input-split) closes it from the phase-0.5 alpha-CROWN
+# bounds in ~12s WITHOUT the MILP (img398 in 5s) — the cascade was not actually
+# load-bearing. Same lean win as tinyimagenet/cifar100. Sound by construction
+# (looser input bounds only make the sound Phase-8 BaB more conservative; cora is
+# FC so reverse-g is not used). max_tighten_layer was 2; milp_sample_timeout now
+# moot.
+max_tighten_layer: 0
 # PGD knobs
 pgd_restarts: 128
 pgd_time_budget_phase0: 2.0
@@ -26,4 +29,5 @@ phase26_pgd_per_spec_min_per_spec: 0.5
 phase26_pgd_per_spec_strict_min: true
 phase26_pre_cascade_total_frac: 0.1
 phase26_pre_cascade_per_spec_cap: 5.0
-parallel_pgd_enabled: true
+# parallel_pgd dead with no MILP windows (waits on a lock that never sets).
+parallel_pgd_enabled: false
