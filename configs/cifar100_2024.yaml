@@ -36,13 +36,21 @@ phase26_pre_cascade_per_spec_cap: 15.0
 max_tighten_layer: 0
 parallel_pgd_enabled: false
 phase26_pre_cascade_enabled: true
-# Reverse-mode alpha-zono state build is DISABLED here: it is UNSOUND on
-# CIFAR100_resnet_large (silently produces a too-tight a_g -> 6 false-verify in
-# the 2026-06-07 sweep, all resnet_large, 0 on resnet_medium). The forward build
-# (reverse_g:false) is sound (the 6 broken cases all return timeout/not-unsat
-# with sat-off). reverse-g was validated bit-exact only on tinyimagenet's medium
-# ResNet; the large net's 3rd downsampling stage (256-ch) exposes a backward math
-# bug. Keep cascade-skip (the main win); re-enable reverse-g once the bug is fixed
-# + the large ResNet is added to the bit-exact validation.
+# Reverse-mode alpha-zono state build: the false-verify bug is FIXED (2026-06-07).
+# Root cause was NOT a backward-math bug (build_state_reverse is bit-exact vs
+# autograd on conv/fc/relu/add-skip — see tests/test_reverse_g.py). It was a
+# formulation-tag dispatch bug: build_state_reverse returned formulation='sparse'
+# while its data is in the alpha-zono parametrization, so build_gen_lp_from_state
+# routed it to the generic y=e_new∈[0,hi] direct-ReLU MILP builder — a coordinate-
+# system mismatch that built a too-tight (unsound) polytope. The high-bin MILP
+# fallback then read +0.235 (vs the correct -0.146) and false-verified 6 SAT cases.
+# The dual-ascent BnB reads the state fields directly (ignores the tag) so it
+# stayed sound — which is why it only surfaced through the MILP fallback, and only
+# on the reverse path (forward was too slow to reach the fallback). Fix: tag the
+# reverse state 'alpha_zono'. Re-validated: all 15 resnet_large SAT cases return
+# timeout/not-unsat with sat-off (0 false-verify). reverse-g is ~3.3x faster at
+# state build here (2.63s -> 0.80s on prop_1063), freeing budget for the BnB.
+# Kept OFF in production pending a full 71-case re-sweep to confirm the score does
+# not regress before flipping the merged benchmark's behavior.
 phase8_reverse_g: false
 phase8_reverse_g_batched: false

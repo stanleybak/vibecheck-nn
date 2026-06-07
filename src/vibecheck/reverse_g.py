@@ -145,7 +145,17 @@ def build_state_reverse(gg, xl, xh, bbr, alpha, dev, dt):
     obj_G = _backward(out_name, np.arange(n_out), None).cpu().numpy()
     obj_c_out = center[out_name].astype(np.float64)
     obj_G_out_csr = _sp.csr_matrix(obj_G.astype(np.float64))
+    # CRITICAL: formulation MUST be 'alpha_zono' — the per-neuron data here is in
+    # the α-zono parametrization (y=λz+μ(1+e_new), with lam/mu/c_in/row exactly as
+    # state_from_alpha_zono produces). build_gen_lp_from_state dispatches the MILP
+    # builder on this string; 'sparse' routes to the GENERIC y=e_new∈[0,hi] direct-
+    # ReLU builder, a coordinate-system mismatch that yields an UNSOUND (too-tight)
+    # polytope. That false-verified cifar100 resnet_large SAT cases via the high-bin
+    # MILP fallback (the dual-ascent BnB reads the fields directly, ignores this
+    # string, so it stayed sound — which is why the bug only surfaced through the
+    # fallback). See tests/test_reverse_g.py + CLAUDE.md "entry['form']" dispatch.
     return dict(n_gens=n_gens, n_input=n_input, unstable_list=unstable_list,
                 obj_c_out=obj_c_out, obj_G_out_csr=obj_G_out_csr,
-                input_name=in_name, output_op_name=out_name, formulation='sparse',
+                input_name=in_name, output_op_name=out_name,
+                formulation='alpha_zono',
                 stable_list=[], x_lo=xl_n, x_hi=xh_n, sigmoid_tanh_layer_ids=set())
