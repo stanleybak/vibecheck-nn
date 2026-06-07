@@ -35,6 +35,16 @@ uv venv --python 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[dev]"
 ```
 
+This pulls `gurobipy` as a normal dependency (the default `graph` mode uses
+Gurobi for LP/MILP tightening). The pip wheel ships a size-limited license that
+is enough for the unit and integration tests; a full Gurobi license is only
+needed for large models. If you installed an older checkout where `gurobipy`
+was not yet a dependency, add it manually:
+
+```bash
+VIRTUAL_ENV=$PWD/.venv uv pip install gurobipy
+```
+
 Invoke the tool and tests with `.venv/bin/python` (keeps the single-threaded
 BLAS setup in `__init__.py` consistent and avoids env drift).
 
@@ -62,24 +72,59 @@ written to `--results-file` when set).
 ## Tests
 
 ```bash
-# Unit tests only — fast (~2s); must remain 100% line coverage
+# Unit tests only — no external data needed. Takes ~1-2 min (most of it is the
+# coverage instrumentation; drop --cov for a faster run). The zonotope-math and
+# op-propagation unit modules are held at 100% line coverage.
 .venv/bin/python -m pytest tests/ -k "not vnncomp" -m "not integration" \
     --cov=src/vibecheck --cov-report=term
 
-# Per-benchmark verdict regressions (needs the vnncomp benchmark mirror)
+# Per-benchmark verdict regressions (needs the vnncomp benchmark mirror — see below)
 .venv/bin/python -m pytest tests/integration -m integration
 
 # Full correctness check (unit + vnncomp regular)
 .venv/bin/python -m pytest tests/ -k "not extended"
 ```
 
-The integration and vnncomp tests read external benchmark paths from
-`tests/paths.yaml` (gitignored). Create it once:
+**The unit tests above need no external data** — they build synthetic ONNX/VNNLIB
+inline, and run fine on a fresh clone. Running the tool on real benchmarks also
+needs nothing extra.
+
+Only the **integration** and **vnncomp point-propagation** tests read external
+benchmark paths from `tests/paths.yaml` (gitignored). If you skip those, you can
+ignore this. To enable them, point `paths.yaml` at your local benchmark clone:
 
 ```bash
 cp tests/paths.yaml.template tests/paths.yaml
-# then edit it to point at your vnncomp2025_benchmarks / _results clones
+# then edit it to point at your vnncomp2025_benchmarks clone (see "Benchmarks data"
+# below). The optional `results` path (for cross-checking AB-CROWN verdicts) is
+# only used by a few tests and can be left blank.
 ```
+
+### Benchmarks data (only for integration / vnncomp tests)
+
+The integration and point-propagation tests load ONNX/VNNLIB from a local clone
+of the VNNCOMP 2025 benchmarks. The unit tests and normal tool runs do **not**
+need this.
+
+```bash
+# Clone the benchmark repo (public) somewhere outside this repo
+git clone https://github.com/stanleybak/vnncomp2025_benchmarks.git
+cd vnncomp2025_benchmarks
+./setup.sh        # downloads + unpacks the per-benchmark onnx/vnnlib
+```
+
+Then set `vnncomp_benchmarks` in your `tests/paths.yaml` to that clone's root.
+
+Notes / gotchas:
+
+- **`setup.sh` seed.** The benchmark generator uses a fixed random seed derived
+  from the directory name; on some machines that seed fails to generate a few of
+  the largest networks. If `setup.sh` errors on a large benchmark, renaming the
+  clone directory (which changes the seed) is a known workaround. This is an
+  upstream benchmark-repo quirk, not a vibecheck issue.
+- **`vnncomp_results` is optional.** It is only used by a handful of tests that
+  cross-check AB-CROWN's published verdicts. Leave its path blank in `paths.yaml`
+  if you don't have it; nothing in the core unit suite depends on it.
 
 ### Running a single test
 

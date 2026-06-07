@@ -13,6 +13,10 @@ dependencies = [
     "onnx",
     "torch",
     "dotmap",
+    # Gurobi is used by the default `graph` mode's LP/MILP tightening. The pip
+    # wheel ships a size-limited license that is sufficient for the unit +
+    # integration tests; a full license is only needed for large models.
+    "gurobipy",
 ]
 
 [project.optional-dependencies]
