@@ -52,7 +52,32 @@ def main():
                              'Sweep scripts MUST check this file rather than '
                              'inferring from exit code, so a no-op invocation '
                              "cannot masquerade as 'verified'.")
+    parser.add_argument('--verbose', action='store_true',
+                        help='Enable per-phase progress output (sets '
+                             'print_progress). Loaded file paths, the config '
+                             'used, the verdict, and a phase-timing summary '
+                             'print regardless; --verbose adds the per-phase '
+                             'blow-by-blow. Useful for competition logs.')
+    parser.add_argument('--allow-unsafe-pkl-loading', action='store_true',
+                        help='Allow loading a pre-parsed graph/spec from a '
+                             'sidecar .pkl cache (written by prepare_instance.sh). '
+                             'pickle is unsafe (arbitrary code execution on load), '
+                             'so this is OFF by default; only enable for inputs '
+                             'you produced yourself.')
+    parser.add_argument('--write-pkl', action='store_true',
+                        help='Parse --net/--spec into a pre-parse .pkl cache '
+                             '(deterministic path keyed by the onnx/vnnlib/dtype) '
+                             'and exit WITHOUT verifying. Used by '
+                             'prepare_instance.sh; the timed run then loads it '
+                             'via --allow-unsafe-pkl-loading.')
     args = parser.parse_args()
+
+    if args.write_pkl:
+        # Prepare step: parse + cache, no verification.
+        from .preparse import write_cache
+        path = write_cache(args.net, args.spec, _DTYPES[args.dtype])
+        print(f'Wrote pre-parse cache: {path}')
+        sys.exit(0)
 
     try:
         _verify(args)
@@ -74,15 +99,31 @@ def _verify(args):
     dtype = _DTYPES[args.dtype]
     t_start = time.time()
 
-    print(f'Loading network: {args.net}')
-    graph = ComputeGraph.from_onnx(args.net, dtype=dtype)
+    # Fast path: load the pre-parsed graph+spec from prepare_instance.sh's
+    # cache, skipping the (potentially multi-second) ONNX parse. Gated behind
+    # the explicit unsafe-pkl flag; falls back to a normal parse on any miss.
+    graph = spec = None
+    if args.allow_unsafe_pkl_loading:
+        from .preparse import load_cache, pkl_cache_path
+        cached = load_cache(args.net, args.spec, dtype)
+        if cached is not None:
+            graph, spec = cached
+            print(f'Loaded pre-parse cache: '
+                  f'{pkl_cache_path(args.net, args.spec, dtype)}')
+            print(f'  network: {args.net}')
+            print(f'  spec:    {args.spec}')
+
+    if graph is None:
+        print(f'Loading network: {args.net}')
+        graph = ComputeGraph.from_onnx(args.net, dtype=dtype)
     n_relu = len(graph.relu_nodes())
     forks = graph.fork_points()
     print(f'  {len(graph.nodes)} ops, {n_relu} ReLU layers, '
           f'{len(forks)} fork points, input shape: {graph.input_shape}')
 
-    print(f'Loading spec: {args.spec}')
-    spec = load_vnnlib(args.spec)
+    if spec is None:
+        print(f'Loading spec: {args.spec}')
+        spec = load_vnnlib(args.spec)
     print(f'  {spec.n_constraints} constraint(s), '
           f'{len(spec.disjuncts)} disjunct(s)')
 
@@ -96,6 +137,8 @@ def _verify(args):
             bnb_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        if args.verbose:
+            settings.print_progress = True
         graph.optimize(settings)
         print(f'Running BnB verification (device={args.device}, '
               f'bits={args.bits}, order={args.bnb_order})...')
@@ -109,6 +152,8 @@ def _verify(args):
             total_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        if args.verbose:
+            settings.print_progress = True
         graph.optimize(settings)
         print(f'Running MILP verification (device={args.device}, '
               f'timeout={args.timeout}s)...')
@@ -141,6 +186,8 @@ def _verify(args):
             )
             if args.disable_sat_finding:
                 settings.disable_sat_finding = True
+        if args.verbose:
+            settings.print_progress = True
         graph.optimize(settings)
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
@@ -214,8 +261,47 @@ def _verify(args):
             line = 'timeout'
         with open(args.results_file, 'w') as f:
             f.write(line + '\n')
+            # VNNCOMP `sat` results must be accompanied by a counterexample in
+            # the results file: the verdict on line 1, then an s-expression
+            #   ((X_0 <v>) (X_1 <v>) ... (Y_0 <v>) ...)
+            # listing every input dim then every output dim. The harness splits
+            # line 1 (verdict) from the remainder (saved as
+            # `<instance>.counterexample.gz`) and re-runs the ONNX on the X's to
+            # confirm the Y's match and the spec is violated. We reuse the same
+            # ORT forward the soundness validator uses so the emitted Y matches.
+            if line == 'sat' and isinstance(details, dict) \
+                    and details.get('witness') is not None:
+                ce = _counterexample_sexpr(args.net, spec, details['witness'])
+                if ce is not None:
+                    f.write(ce + '\n')
+                else:
+                    print('  [warn] sat verdict but could not build a '
+                          'counterexample (no ORT output); results file has '
+                          'the verdict only.')
 
     sys.exit(0 if result == 'verified' else 1)
+
+
+def _counterexample_sexpr(onnx_path, spec, witness):
+    """Build the VNNCOMP counterexample s-expression for a SAT witness.
+
+    Returns `((X_0 <v>) ... (Y_0 <v>) ...)` (one atom per line) or None if the
+    ONNX output can't be computed (e.g. onnxruntime missing). Y is obtained from
+    the same ORT forward the soundness validator runs, so it matches the
+    scoring harness's recomputed output within tolerance.
+    """
+    import numpy as np
+    from .verify_graph import _validate_sat_witness
+    x = np.asarray(witness).flatten().astype(np.float64)
+    # _validate_sat_witness runs ORT and stashes the output in info['out'].
+    _, info = _validate_sat_witness(onnx_path, spec, witness)
+    y = info.get('out')
+    if y is None:
+        return None
+    y = np.asarray(y).flatten().astype(np.float64)
+    atoms = [f'(X_{i} {v:.17g})' for i, v in enumerate(x)]
+    atoms += [f'(Y_{j} {v:.17g})' for j, v in enumerate(y)]
+    return '(' + '\n'.join(atoms) + ')'
 
 
 if __name__ == '__main__':
