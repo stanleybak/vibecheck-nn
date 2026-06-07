@@ -57,6 +57,19 @@ def _ce_stem(onnx_rel, vnnlib_rel):
     return f'{net}_{prop}'
 
 
+def _drop_instance_pkl(onnx_abs, vnnlib_abs):
+    """Delete this instance's pre-parse .pkl cache (disk hygiene). Best-effort:
+    import lazily and ignore any failure — a stale cache only wastes space."""
+    try:
+        import numpy as np
+        from vibecheck.preparse import pkl_cache_path
+        p = pkl_cache_path(onnx_abs, vnnlib_abs, np.float32)
+        if os.path.isfile(p):
+            os.remove(p)
+    except (ImportError, OSError):
+        pass
+
+
 def _done_keys(results_csv):
     """(onnx, vnnlib) pairs already recorded, for resumability."""
     done = set()
@@ -132,6 +145,13 @@ def run_category(cat, benchmarks_dir, results_dir, version='v1'):
             csv.writer(out).writerow(
                 [cat, onnx_repo, vnnlib_repo,
                  f'{prepare_s:.6f}', verdict, f'{runtime_s:.6f}'])
+
+        # Disk hygiene (the run host can be tight on space over thousands of
+        # instances): the per-instance pre-parse .pkl is only needed for THIS
+        # instance's run, so drop it now. Best-effort; a leftover just wastes
+        # space, never correctness.
+        _drop_instance_pkl(onnx_abs, vnnlib_abs)
+
         print(f'  [{i+1}/{len(rows)}] {os.path.basename(onnx_rel)} / '
               f'{os.path.basename(vnnlib_rel)} → {verdict} '
               f'({runtime_s:.1f}s, prep {prepare_s:.1f}s)', flush=True)
