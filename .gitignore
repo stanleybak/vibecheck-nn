@@ -29,3 +29,5 @@ Thumbs.db
 
 # development files
 run_*.py
+# ...but the committed VNNCOMP batch runner is not a scratch script
+!vnncomp_scripts/run_benchmarks.py
