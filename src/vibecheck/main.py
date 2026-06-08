@@ -86,12 +86,19 @@ def main():
     except BaseException:
         # Sweep aggregator requires a results-file on every run; a crash
         # without one shows up as NO_FILE and breaks the verdict count.
-        # Record 'unknown' so the sweep still has a valid verdict to read.
+        # Write 'error' (NOT 'unknown'): a crash — unloadable/corrupt onnx,
+        # unsupported op, an actual bug — is fundamentally different from a
+        # sound verifier that ran and could not decide ('unknown'). Masking
+        # crashes as 'unknown' hid a corrupt benchmark file (23 nn4sys
+        # mscn_2048d_dual instances that *looked* like legitimate give-ups but
+        # were really a failed ONNX load). The scorer treats 'error' as
+        # not-solved, same as 'unknown' (no penalty), so this only adds
+        # diagnosability. The traceback above carries the cause.
         import traceback
         traceback.print_exc()
         if args.results_file:
             with open(args.results_file, 'w') as f:
-                f.write('unknown\n')
+                f.write('error\n')
         sys.exit(2)
 
 
