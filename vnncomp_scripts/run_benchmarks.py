@@ -49,11 +49,22 @@ def _strip_ext(name):
     return name
 
 
-def _ce_stem(onnx_rel, vnnlib_rel):
-    """`<net>_<prop>` stem for the .counterexample.gz, matching the scoring
-    harness's `f"{net}_{prop}.counterexample.gz"` construction."""
+def _ce_stem(cat, onnx_rel, vnnlib_rel):
+    """CE filename stem, matching the scoring harness EXACTLY (process_results.py).
+
+    Default is `<net>_<prop>`. safenlp is special-cased there: its onnx/vnnlib
+    live in `medical/` and `ruarobot/` subdirs whose basenames collide across the
+    two, so the harness prefixes the CE with the subdir
+    (`medical_<net>_<prop>` / `ruarobot_<net>_<prop>`). We MUST match, or every
+    safenlp `sat` counterexample reads as NO_CE -> a -150 penalty per instance.
+    """
     net = _strip_ext(os.path.basename(onnx_rel))
     prop = _strip_ext(os.path.basename(vnnlib_rel))
+    if cat == 'safenlp_2024':
+        if 'medical' in onnx_rel:
+            return f'medical_{net}_{prop}'
+        # harness asserts the only other safenlp subdir is ruarobot
+        return f'ruarobot_{net}_{prop}'
     return f'{net}_{prop}'
 
 
@@ -137,7 +148,7 @@ def run_category(cat, benchmarks_dir, results_dir, version='v1'):
         # On sat, gzip the counterexample to the scoring sidecar.
         if verdict == 'sat' and ce_lines:
             ce_path = os.path.join(out_dir,
-                                   f'{_ce_stem(onnx_rel, vnnlib_rel)}.counterexample.gz')
+                                   f'{_ce_stem(cat, onnx_rel, vnnlib_rel)}.counterexample.gz')
             with gzip.open(ce_path, 'wb') as gz:
                 gz.write(('\n'.join(ce_lines) + '\n').encode('utf-8'))
 
