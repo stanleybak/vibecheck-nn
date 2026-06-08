@@ -10,9 +10,18 @@ batch=16, 120 s/case). 21/21 cases pass; SAT cases run sub-second to ~5 s,
 UNSAT cases ~5-15 s.
 
 Cases:
-  - small_transformer prop_0 (SAT, ~5 s) — exercises the raw-ONNX PGD
-    fallback (`onnx_torch_runner.pgd_via_onnx`) used when gpu_graph
-    can't represent attention (max_pool / softmax / bilinear MatMul).
+  - small_transformer prop_0 + prop_1 (SAT, ~11 s) — SAGAN-style
+    self-attention generator (spectral-norm Conv/Gemm, bilinear-MatMul
+    attention, Softmax, max-pool). Loading depends on **onnxsim**
+    (`onnx_loader.load_onnx` auto-simplify trigger): it constant-folds
+    the spectral-norm weight divisions and the dynamic Shape→Gather→
+    Concat reshape subgraphs into static form. Without onnxsim the load
+    crashes on the non-constant Gemm weight — this is exactly why the
+    full AWS sweep missed both cases (its venv lacked onnxsim, now a
+    hard dependency). After load, gpu_graph still can't represent
+    attention, so the SAT witness is found via the raw-ONNX PGD
+    fallback (`onnx_torch_runner.pgd_via_onnx`) and validated against
+    the original ONNX.
   - imgSz32_nCh_3 prop_0 (UNSAT, ~14 s) — baseline ConvTranspose+ReLU
     cGAN. Catches regressions in `propagate_conv_transpose` (zono and
     CROWN backward).
@@ -34,9 +43,17 @@ CASES = [
         net='onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx',
         vnnlib=('vnnlib/cGAN_imgSz32_nCh_3_small_transformer_prop_0_'
                 'input_eps_0.005_output_eps_0.010.vnnlib'),
-        expected='sat', timeout=60, max_wall_s=15.0,
-        # Not in default vnncomp mirror (only server1 has the unpacked
-        # small_transformer.onnx). Skip when missing rather than fail.
+        expected='sat', timeout=60, max_wall_s=20.0,
+        # 272 MB onnx — absent from some thin benchmark mirrors. Skip
+        # when missing rather than fail. Requires onnxsim at load time.
+        skip_if_missing=True,
+    ),
+    dict(
+        desc='cgan small_transformer prop_1 (SAT via onnx-PGD fallback)',
+        net='onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx',
+        vnnlib=('vnnlib/cGAN_imgSz32_nCh_3_small_transformer_prop_1_'
+                'input_eps_0.010_output_eps_0.015.vnnlib'),
+        expected='sat', timeout=60, max_wall_s=20.0,
         skip_if_missing=True,
     ),
     dict(

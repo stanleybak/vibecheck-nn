@@ -41,18 +41,27 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
                     and sum(1 for n in model.graph.node
                             if n.op_type == 'MatMul') > 4)
     if simplify:
+        # We only get here when the model NEEDS folding (attention /
+        # spectral-norm patterns the static loader can't represent). onnxsim
+        # is therefore required, not a nicety — a missing install or a
+        # simplify failure must surface loudly, never degrade to a confusing
+        # downstream KeyError on the unfolded graph.
         try:
             import onnxsim
-            model_sim, ok = onnxsim.simplify(model)
-            if ok:
-                model = model_sim
-        except (ImportError, RuntimeError):
-            # ImportError: onnxsim not installed (optional dependency).
-            # RuntimeError: onnxsim choked on this model (rare; happens on
-            # some unsupported op combinations). In both cases, falling back
-            # to the unsimplified model is sound — simplification is a perf
-            # nicety, not a soundness requirement.
-            pass
+        except ImportError as e:
+            raise ImportError(
+                f'onnxsim is required to load {onnx_path!r} (it has '
+                f'attention / spectral-norm sub-graphs that need constant '
+                f'folding) but is not installed. onnxsim is a declared '
+                f'dependency in pyproject.toml — reinstall the package.'
+            ) from e
+        model_sim, ok = onnxsim.simplify(model)
+        if not ok:
+            raise RuntimeError(
+                f'onnxsim could not simplify {onnx_path!r}; this model cannot '
+                f'be loaded without constant folding of its attention / '
+                f'spectral-norm sub-graphs.')
+        model = model_sim
 
     graph = ComputeGraph(dtype=dtype)
     inits = {init.name: numpy_helper.to_array(init).astype(np.float64)
@@ -98,12 +107,16 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
 
         if op == 'Conv':
             computed_inputs = [node.input[0]]
-            params['kernel'] = inits[node.input[1]]
-            if len(node.input) > 2 and node.input[2] in inits:
-                params['bias'] = inits[node.input[2]]
+            kernel = _const(node.input[1])
+            if kernel is None:
+                raise NotImplementedError(
+                    f'Conv at {out_name!r} has a non-constant kernel '
+                    f'{node.input[1]!r} (dynamic kernel unsupported)')
+            params['kernel'] = kernel
+            if len(node.input) > 2 and _const(node.input[2]) is not None:
+                params['bias'] = _const(node.input[2])
             else:
-                params['bias'] = np.zeros(inits[node.input[1]].shape[0],
-                                          dtype=np.float64)
+                params['bias'] = np.zeros(kernel.shape[0], dtype=np.float64)
             params['stride'] = tuple(attrs.get('strides', [1, 1]))
             pads = attrs.get('pads', [0, 0, 0, 0])
             params['padding'] = (pads[0], pads[1])
@@ -111,12 +124,16 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
 
         elif op == 'ConvTranspose':
             computed_inputs = [node.input[0]]
-            params['kernel'] = inits[node.input[1]]
-            if len(node.input) > 2 and node.input[2] in inits:
-                params['bias'] = inits[node.input[2]]
+            kernel = _const(node.input[1])
+            if kernel is None:
+                raise NotImplementedError(
+                    f'ConvTranspose at {out_name!r} has a non-constant kernel '
+                    f'{node.input[1]!r} (dynamic kernel unsupported)')
+            params['kernel'] = kernel
+            if len(node.input) > 2 and _const(node.input[2]) is not None:
+                params['bias'] = _const(node.input[2])
             else:
-                params['bias'] = np.zeros(inits[node.input[1]].shape[1],
-                                          dtype=np.float64)
+                params['bias'] = np.zeros(kernel.shape[1], dtype=np.float64)
             params['stride'] = tuple(attrs.get('strides', [1, 1]))
             pads = attrs.get('pads', [0, 0, 0, 0])
             params['padding'] = (pads[0], pads[1])
@@ -125,9 +142,13 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
 
         elif op == 'Gemm':
             computed_inputs = [node.input[0]]
-            W = inits[node.input[1]]
-            b = (inits[node.input[2]]
-                 if len(node.input) > 2 and node.input[2] in inits
+            W = _const(node.input[1])
+            if W is None:
+                raise NotImplementedError(
+                    f'Gemm at {out_name!r} has a non-constant weight '
+                    f'{node.input[1]!r} (dynamic/bilinear Gemm unsupported)')
+            b = (_const(node.input[2])
+                 if len(node.input) > 2 and _const(node.input[2]) is not None
                  else np.zeros(W.shape[0], dtype=np.float64))
             transB = attrs.get('transB', 0)
             if not transB:
@@ -201,8 +222,12 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
                 computed_inputs = [node.input[0], node.input[1]]
 
         elif op == 'Div':
+            c0 = _const(node.input[0])
             c1 = _const(node.input[1])
-            if c1 is not None:
+            if c0 is not None and c1 is not None:
+                constants[out_name] = c0 / c1
+                continue
+            elif c1 is not None:
                 computed_inputs = [node.input[0]]
                 params['scale'] = 1.0 / c1
             else:

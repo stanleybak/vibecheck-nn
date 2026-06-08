@@ -564,3 +564,125 @@ def test_load_non_gz(tmp_path):
     onnx.save(model, path)
     g = ComputeGraph.from_onnx(path)
     assert g.flat_size(g.output_name) == 2
+
+
+# ---- Spectral-norm-style folded weights (Div const/const → Gemm/Conv weight) ----
+
+def test_div_folded_gemm_weight(tmp_path):
+    """Gemm weight produced by Div(const, const) must fold to a constant.
+
+    Mirrors spectral normalization (W_orig / sigma) as emitted by cgan
+    small_transformer: the weight is computed at inference but from all-constant
+    operands. Exercises the Div const/const fold + Gemm `_const` resolution.
+    """
+    W_orig = _init('W_orig', np.arange(12, dtype=np.float32).reshape(3, 4))
+    sigma = _init('sigma', np.full((3, 1), 2.0, dtype=np.float32))
+    b = _init('b', np.zeros(3))
+    div = helper.make_node('Div', ['W_orig', 'sigma'], ['W_folded'])
+    gemm = helper.make_node('Gemm', ['X', 'W_folded', 'b'], ['Y'], transB=1)
+    g = _save_and_load(_make_model([div, gemm], [_input()], [_output()],
+                                   [W_orig, sigma, b]), tmp_path, 'snlinear.onnx')
+    node = g.nodes[g.output_name]
+    assert node.op_type == 'Gemm'
+    # transB=1 keeps the weight un-transposed: W_orig / sigma
+    np.testing.assert_allclose(node.params['W'], np.arange(12).reshape(3, 4) / 2.0)
+
+
+def test_div_folded_conv_kernel(tmp_path):
+    """Conv kernel produced by Div(const, const) must fold to a constant."""
+    K_orig = _init('K_orig', np.ones((2, 3, 1, 1), dtype=np.float32))
+    sigma = _init('sigma', np.array(4.0, dtype=np.float32))
+    div = helper.make_node('Div', ['K_orig', 'sigma'], ['K_folded'])
+    conv = helper.make_node('Conv', ['X', 'K_folded'], ['Y'],
+                            kernel_shape=[1, 1], strides=[1, 1], pads=[0, 0, 0, 0])
+    g = _save_and_load(_make_model([div, conv], [_input('X', [1, 3, 2, 2])],
+                                   [_output()], [K_orig, sigma]), tmp_path, 'snconv.onnx')
+    node = g.nodes[g.output_name]
+    assert node.op_type == 'Conv'
+    np.testing.assert_allclose(node.params['kernel'], np.ones((2, 3, 1, 1)) / 4.0)
+
+
+def test_dynamic_gemm_weight_raises(tmp_path):
+    """A genuinely non-constant Gemm weight must raise, never silently skip."""
+    b = _init('b', np.zeros(3))
+    gemm = helper.make_node('Gemm', ['X', 'Wdyn', 'b'], ['Y'], transB=1)
+    model = _make_model([gemm],
+                        [_input('X', [1, 4]), _input('Wdyn', [3, 4])],
+                        [_output()], [b])
+    path = str(tmp_path / 'dyn_gemm.onnx')
+    onnx.save(model, path)
+    with pytest.raises(NotImplementedError, match='non-constant weight'):
+        ComputeGraph.from_onnx(path)
+
+
+def test_dynamic_conv_kernel_raises(tmp_path):
+    """A genuinely non-constant Conv kernel must raise, never silently skip."""
+    conv = helper.make_node('Conv', ['X', 'Kdyn'], ['Y'],
+                            kernel_shape=[1, 1], strides=[1, 1], pads=[0, 0, 0, 0])
+    model = _make_model([conv],
+                        [_input('X', [1, 3, 2, 2]), _input('Kdyn', [2, 3, 1, 1])],
+                        [_output()], [])
+    path = str(tmp_path / 'dyn_conv.onnx')
+    onnx.save(model, path)
+    with pytest.raises(NotImplementedError, match='non-constant kernel'):
+        ComputeGraph.from_onnx(path)
+
+
+def test_dynamic_conv_transpose_kernel_raises(tmp_path):
+    """A genuinely non-constant ConvTranspose kernel must raise."""
+    ct = helper.make_node('ConvTranspose', ['X', 'Kdyn'], ['Y'],
+                          kernel_shape=[1, 1], strides=[1, 1], pads=[0, 0, 0, 0])
+    model = _make_model([ct],
+                        [_input('X', [1, 3, 2, 2]), _input('Kdyn', [3, 2, 1, 1])],
+                        [_output()], [])
+    path = str(tmp_path / 'dyn_ct.onnx')
+    onnx.save(model, path)
+    with pytest.raises(NotImplementedError, match='non-constant kernel'):
+        ComputeGraph.from_onnx(path)
+
+
+# ---- onnxsim auto-simplify trigger (Softmax + >4 MatMul) ----
+
+def _attention_trigger_model():
+    """A model that fires the onnxsim auto-simplify trigger: Softmax + 5
+    constant-weight MatMuls (which onnxsim fuses into Gemm)."""
+    inits = [_init(f'W{i}', np.eye(4)) for i in range(5)]
+    nodes = []
+    prev = 'X'
+    for i in range(5):
+        nodes.append(helper.make_node('MatMul', [prev, f'W{i}'], [f'h{i}']))
+        prev = f'h{i}'
+    nodes.append(helper.make_node('Softmax', [prev], ['Y'], axis=1))
+    return _make_model(nodes, [_input('X', [1, 4])],
+                       [_output('Y', [1, 4])], inits)
+
+
+def test_simplify_trigger_loads(tmp_path):
+    """Softmax + >4 MatMul auto-triggers onnxsim and loads the folded graph."""
+    path = str(tmp_path / 'attn.onnx')
+    onnx.save(_attention_trigger_model(), path)
+    g = ComputeGraph.from_onnx(path)
+    # The simplify path ran and produced a loadable graph; Softmax survives.
+    assert any(n.op_type == 'Softmax' for n in g.nodes.values())
+
+
+def test_simplify_missing_onnxsim_raises_loudly(tmp_path, monkeypatch):
+    """When the model needs folding but onnxsim is absent, fail LOUDLY with a
+    clear message — never silently fall back to the unfoldable graph."""
+    import sys
+    path = str(tmp_path / 'attn.onnx')
+    onnx.save(_attention_trigger_model(), path)
+    # Make `import onnxsim` raise ImportError.
+    monkeypatch.setitem(sys.modules, 'onnxsim', None)
+    with pytest.raises(ImportError, match='onnxsim is required'):
+        ComputeGraph.from_onnx(path)
+
+
+def test_simplify_failure_raises_loudly(tmp_path, monkeypatch):
+    """If onnxsim reports it could not simplify, that must surface loudly."""
+    import onnxsim
+    path = str(tmp_path / 'attn.onnx')
+    onnx.save(_attention_trigger_model(), path)
+    monkeypatch.setattr(onnxsim, 'simplify', lambda m, *a, **k: (m, False))
+    with pytest.raises(RuntimeError, match='could not simplify'):
+        ComputeGraph.from_onnx(path)
