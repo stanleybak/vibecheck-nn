@@ -309,3 +309,78 @@ def test_pgd_optim_adam_clipping_box_clamped():
         pgd_restarts=2, pgd_iter=15, pgd_optim='adam_clipping')
     sat, _ = pgd_attack_general(xl, xh, spec, gg, settings)
     assert not sat  # spec is trivially safe; PGD shouldn't claim SAT
+
+
+# ---------------------------------------------------------------------------
+# Per-restart disjunct targeting (pgd_per_restart_disjunct / per_restart_disj)
+# ---------------------------------------------------------------------------
+
+def _two_output_linear_graph():
+    """Identity: 2 inputs → 2 outputs (Y = X), box [-1, 1]^2. Linear so the
+    margin gradient always flows (no dead-ReLU flakiness)."""
+    n = 2
+    gg = {
+        'input_name': 'x', 'fork_points': set(),
+        'ops': [
+            {'name': 'fc1', 'type': 'fc', 'inputs': ['x'],
+             'W': torch.eye(n), 'bias': torch.zeros(n),
+             'in_shape': (n,), 'out_shape': (n,)},
+        ],
+    }
+    xl = torch.tensor([-1.0, -1.0])
+    xh = torch.tensor([1.0, 1.0])
+    return gg, xl, xh
+
+
+def _two_disj_spec(xl, xh):
+    # Unsafe = (Y_0 >= 0.5) OR (Y_1 >= 0.5): two disjuncts, each a different
+    # output. CEX at e.g. (1, *) for disjunct 0 or (*, 1) for disjunct 1.
+    return VNNSpec(
+        x_lo=xl.numpy(), x_hi=xh.numpy(),
+        disjuncts=[Conjunct([Constraint(index=0, op='>=', value=0.5)]),
+                   Conjunct([Constraint(index=1, op='>=', value=0.5)])])
+
+
+def test_pgd_per_restart_disjunct_finds_sat():
+    """Multi-disjunct OR spec, per-restart disjunct targeting on. Each restart
+    descends only its assigned disjunct; the witness screen accepts a CEX from
+    any disjunct. PGD must still find the counterexample."""
+    from vibecheck.pgd import pgd_attack_general
+    from vibecheck.settings import default_settings
+    torch.manual_seed(0)
+    gg, xl, xh = _two_output_linear_graph()
+    settings = default_settings(pgd_restarts=6, pgd_iter=40)
+    sat, w = pgd_attack_general(xl, xh, _two_disj_spec(xl, xh), gg, settings,
+                                per_restart_disj=True)
+    assert sat and w is not None
+
+
+def test_pgd_per_restart_disjunct_noop_single_disjunct():
+    """With a single disjunct the per-restart path is a no-op (n_active == 1):
+    behaves identically to the joint loss and still finds the CEX."""
+    from vibecheck.pgd import pgd_attack_general
+    from vibecheck.settings import default_settings
+    torch.manual_seed(0)
+    gg, xl, xh = _two_output_linear_graph()
+    spec = VNNSpec(
+        x_lo=xl.numpy(), x_hi=xh.numpy(),
+        disjuncts=[Conjunct([Constraint(index=0, op='>=', value=0.5)])])
+    settings = default_settings(pgd_restarts=4, pgd_iter=40)
+    sat_a, _ = pgd_attack_general(xl, xh, spec, gg, settings,
+                                  per_restart_disj=True)
+    sat_b, _ = pgd_attack_general(xl, xh, spec, gg, settings,
+                                  per_restart_disj=False)
+    assert sat_a and sat_b
+
+
+def test_pgd_per_restart_disjunct_reads_setting():
+    """per_restart_disj=None falls back to settings.pgd_per_restart_disjunct."""
+    from vibecheck.pgd import pgd_attack_general
+    from vibecheck.settings import default_settings
+    torch.manual_seed(0)
+    gg, xl, xh = _two_output_linear_graph()
+    settings = default_settings(pgd_restarts=6, pgd_iter=40,
+                                pgd_per_restart_disjunct=True)
+    sat, w = pgd_attack_general(xl, xh, _two_disj_spec(xl, xh), gg,
+                                settings)  # None → reads setting
+    assert sat and w is not None

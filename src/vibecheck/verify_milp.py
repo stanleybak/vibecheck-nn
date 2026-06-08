@@ -108,7 +108,8 @@ _DIRECT_EXACT_MAX_UNSTABLE = 256
 
 
 def _pgd_attack_general(xl, xh, spec, gg, settings,
-                         restrict_disj=None, time_budget=None):
+                         restrict_disj=None, time_budget=None,
+                         per_restart_disj=None):
     """Thin wrapper over `vibecheck.pgd.pgd_attack_general`.
 
     Kept here so existing imports still work; all algorithmic logic lives
@@ -117,7 +118,8 @@ def _pgd_attack_general(xl, xh, spec, gg, settings,
     from . import pgd as _pgd
     return _pgd.pgd_attack_general(xl, xh, spec, gg, settings,
                                      restrict_disj=restrict_disj,
-                                     time_budget=time_budget)
+                                     time_budget=time_budget,
+                                     per_restart_disj=per_restart_disj)
 
 # ---------------------------------------------------------------------------
 # Shared state for multiprocessing workers (COW via fork)

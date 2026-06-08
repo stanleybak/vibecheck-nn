@@ -35,3 +35,21 @@ pgd_alpha_multi_fractions: [0.01, 0.05]
 pgd_restarts: 500
 pgd_lr_decay: 0.997                # ABC pgd_lr_decay (slow -> fine convergence)
 pgd_alpha_frac: 0.01               # base step (overridden per-restart by multi)
+
+# Deterministic restarts. The 500-restart pool reliably finds every planted
+# CEX *when seeded* (verified seeds 0-5 all crack model_6 in ~30-38s), but the
+# random init is otherwise a coin-flip on ambient RNG: the A10G full sweep
+# missed model_6 (unknown @ 23.5s — PGD finished its restarts without a lucky
+# init) while server1 hit it. Seeding makes the verdict reproducible and
+# machine-independent. seed=0 confirmed to crack model_6 + model_26 (the two
+# hard cases) plus a sample of others. Mirrors ABC's reset_seed_after_precompile.
+pgd_seed: 0
+
+# Persist all the Phase-0 budget on attack. A single 500-restart batch only
+# hits the hardest planted basin ~90% of the time (model_6: 9/10 seeds), and a
+# batch takes ~35 s of the 145 s budget — so relaunch fresh-init batches until
+# the budget is spent (~4 rounds → miss prob ~1e-4) instead of running the
+# all-SAT-useless, OOM-prone bound-prop cascade. On budget exhaustion we report
+# `unknown` and skip the cascade (which would otherwise OOM on the 43 GB dense
+# zono). This is the robust fix; pgd_seed just makes round 0 reproducible.
+pgd_phase0_persist_until_budget: true

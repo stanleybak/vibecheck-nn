@@ -207,7 +207,8 @@ def _gpu_witness_candidates(margins_per_disj):
 
 
 def pgd_attack_general(xl, xh, spec, gg, settings,
-                        restrict_disj=None, time_budget=None):
+                        restrict_disj=None, time_budget=None,
+                        per_restart_disj=None):
     """PGD counterexample search for any VNNSpec (DNF).
 
     Args:
@@ -221,6 +222,15 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
         time_budget: optional wall-time cap (seconds). If exceeded, abort
             cleanly and return (False, None). Overrides `pgd_time_budget`
             setting.
+        per_restart_disj: when True (and >1 disjunct is active), each restart
+            descends ONLY its assigned disjunct's loss — restart r targets
+            disjunct r % n_active — instead of one joint loss summed over all
+            disjuncts. A joint loss makes every restart chase whichever
+            disjunct is locally closest, so a CEX in another disjunct's basin
+            never gets dedicated descent; per-restart assignment gives each
+            disjunct its own restarts (α,β-CROWN's diversified PGD). The
+            witness screen still accepts a CEX from ANY disjunct. None reads
+            `settings.pgd_per_restart_disjunct` (default False).
 
     Returns:
         (is_sat: bool, witness: np.ndarray or None).
@@ -280,6 +290,20 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
                              if dj.constraints]
     if not per_disj_constraints:
         return False, None
+
+    # Per-restart disjunct assignment: restart r descends only disjunct
+    # (r % n_active)'s loss, so every disjunct's basin gets dedicated restarts
+    # rather than one joint loss that all restarts share. No-op when only one
+    # disjunct is active.
+    if per_restart_disj is None:
+        per_restart_disj = bool(getattr(
+            settings, 'pgd_per_restart_disjunct', False))
+    _n_active = len(per_disj_constraints)
+    _use_prd = bool(per_restart_disj) and _n_active > 1
+    if _use_prd:
+        _disj_assign = torch.arange(n_restarts, device=dev) % _n_active
+        _disj_restart_mask = [
+            (_disj_assign == d).to(dt) for d in range(_n_active)]
 
     # Batched initial point. Two init modes:
     #   'uniform' — random uniform in input box (historical default)
@@ -402,8 +426,18 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
         flat_margins = torch.cat(margins_pd, dim=1) if margins_pd else None
         if flat_margins is None or flat_margins.numel() == 0:
             return False, None
-        clamped = torch.clamp(flat_margins, min=hinge_thr)
-        per_sample = clamped.sum(dim=1)
+        if _use_prd:
+            # Per-restart disjunct targeting: restart r's loss = clamped
+            # margins of ONLY its assigned disjunct (r % n_active), masked
+            # across the batch, so r's gradient flows solely through that
+            # disjunct — every disjunct gets dedicated descent directions.
+            per_sample = torch.zeros(
+                flat_margins.shape[0], dtype=dt, device=dev)
+            for d, m in enumerate(margins_pd):
+                contrib = torch.clamp(m, min=hinge_thr).sum(dim=1)
+                per_sample = per_sample + contrib * _disj_restart_mask[d]
+        else:
+            per_sample = torch.clamp(flat_margins, min=hinge_thr).sum(dim=1)
         loss = per_sample.sum()
         x_adv.grad = None
         loss.backward()

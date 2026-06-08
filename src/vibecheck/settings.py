@@ -134,6 +134,27 @@ def default_settings(**overrides):
         disable_sat_finding=False,
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
+        # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded
+        # to this value immediately before the Phase-0 attack, so the random
+        # restarts are reproducible across machines. Without it, finding a
+        # narrow planted counterexample (soundnessbench) is a coin-flip on the
+        # ambient RNG state — server1 hit model_6, the A10G sweep missed it.
+        # Mirrors α,β-CROWN's `reset_seed_after_precompile`. Default None keeps
+        # the legacy non-seeded behavior for every other benchmark.
+        pgd_seed=None,
+        # Persist-until-budget Phase-0 PGD: when True, keep relaunching
+        # fresh-init PGD batches (rotating the targeted disjunct) until the
+        # whole `pgd_time_budget_phase0` is spent, then report `unknown` and
+        # skip the bound-prop cascade. For SAT-heavy / OOM-prone benchmarks
+        # (soundnessbench) where the cascade can't help and the dense zono
+        # OOMs — pour all remaining time into attack instead. Default False.
+        pgd_phase0_persist_until_budget=False,
+        # Per-restart disjunct targeting: when True (and >1 disjunct active),
+        # restart r descends only disjunct r%n_active's loss instead of one
+        # joint loss summed over all disjuncts — every disjunct gets dedicated
+        # restarts (α,β-CROWN diversified PGD). No-op on single-disjunct specs.
+        # The persist-until-budget Phase-0 loop passes this explicitly.
+        pgd_per_restart_disjunct=False,
         pgd_lr_decay=0.99,               # step-size × this every iter
         pgd_hinge_threshold=-1e-5,       # clamp margins at this from below
         pgd_alpha_frac=0.25,             # step_size = eps_input * this

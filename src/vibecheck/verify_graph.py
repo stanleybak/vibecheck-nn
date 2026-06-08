@@ -5491,23 +5491,81 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             settings.pgd_iter = _p0_iter
         if _p0_restarts is not None:
             settings.pgd_restarts = _p0_restarts
+        # Optional deterministic seeding (e.g. soundnessbench) — reseed the
+        # torch RNG right before the attack so the random restarts are
+        # reproducible across machines and don't depend on ambient RNG state.
+        _pgd_seed = getattr(settings, 'pgd_seed', None)
+        if _pgd_seed is not None:
+            torch.manual_seed(int(_pgd_seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(_pgd_seed))
+        # Persist-until-budget: for SAT-heavy / OOM-prone benchmarks where the
+        # bound-prop cascade cannot help (soundnessbench is all-SAT; its dense
+        # forward zonotope needs ~43 GB and OOMs), keep relaunching fresh-init
+        # PGD batches until the whole Phase-0 budget is spent, instead of one
+        # batch + a doomed cascade. A single 500-restart batch only has a ~90%
+        # hit rate on the hardest planted basins (model_6: 9/10 seeds) — ~4
+        # batches in the budget drive the miss probability to ~1e-4. Each round
+        # advances the (optionally seeded) RNG so inits differ, and rotates the
+        # targeted disjunct when the spec has several ("target different
+        # classes"). When the budget is exhausted with no witness the cascade
+        # is skipped and we report `unknown` honestly.
+        _persist = bool(getattr(
+            settings, 'pgd_phase0_persist_until_budget', False))
+        pgd_sat, pgd_witness = False, None
+        _round = 0
         try:
-            pgd_sat, pgd_witness = _pgd_attack_general(
-                xl_pgd, xh_pgd, spec, gg_pgd, settings,
-                time_budget=_pgd_budget_phase0)
-        except RuntimeError:
-            pgd_sat, pgd_witness = False, None
+            while True:
+                if _pgd_budget_phase0 - (time.perf_counter() - t0) <= 0.5:
+                    break
+                _remain = _pgd_budget_phase0 - (time.perf_counter() - t0)
+                # Each batch attacks ALL disjuncts (restrict_disj=None), but
+                # with per-restart disjunct assignment: restart r descends only
+                # disjunct (r % n_disj)'s loss, so every disjunct gets dedicated
+                # restarts instead of one joint loss all restarts share (a CEX
+                # in any disjunct is still accepted by the witness screen). No-op
+                # for single-disjunct specs (soundnessbench). Diversity across
+                # rounds comes from the advancing RNG of the fresh inits.
+                try:
+                    pgd_sat, pgd_witness = _pgd_attack_general(
+                        xl_pgd, xh_pgd, spec, gg_pgd, settings,
+                        time_budget=_remain, per_restart_disj=True)
+                except RuntimeError as _pe:
+                    # A round failed (incl. GPU OOM — torch's OutOfMemoryError
+                    # is a RuntimeError subclass). Don't hide it: log to stdout
+                    # so the failure is visible even without --verbose, free the
+                    # cached memory, and keep attacking with the remaining
+                    # budget (Phase-0 PGD is a best-effort SAT-finder).
+                    pgd_sat, pgd_witness = False, None
+                    print(f'  [phase0-pgd] round {_round} failed: '
+                          f'{type(_pe).__name__}: {str(_pe)[:90]}', flush=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                _round += 1
+                if pgd_sat or not _persist:
+                    break
         finally:
             settings.pgd_iter = _orig_iter
             settings.pgd_restarts = _orig_restarts
         timing['phase0_pgd'] = time.perf_counter() - t0
         if print_progress:
             print(f'Phase 0 (PGD before cascade): '
-                  f'{timing["phase0_pgd"]:.2f}s  sat={pgd_sat}', flush=True)
+                  f'{timing["phase0_pgd"]:.2f}s  sat={pgd_sat}'
+                  + (f' ({_round} round(s))' if _persist else ''), flush=True)
         if pgd_sat:
             _r = _sat_or_fallthrough('pgd', pgd_witness)
             if _r is not None:
                 return _r
+        if _persist:
+            # Spent the full attack budget without a valid witness. The cascade
+            # is useless here (all-SAT) or would OOM, so skip it and report
+            # `timeout` (timed_out=True → main maps it to the VNNCOMP `timeout`
+            # line, more informative than a bare `unknown`: we ran the whole
+            # wall budget attacking and couldn't decide). Always log it.
+            print(f'  [phase0-pgd] persist budget exhausted after {_round} '
+                  f'round(s), no witness -> timeout', flush=True)
+            return 'unknown', {'phase': 'pgd_persist_exhausted',
+                                'rounds': _round, 'timed_out': True}
 
     # --- Parallel PGD context (spawned inside Phase 1 after Phase 0.5). ---
     # Pass the float32 GPU graph + bounds; _phase1_bab_refine spawns the
@@ -10224,6 +10282,15 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 torch.cuda.empty_cache()
             new_bs = max(1, batch_size // 2)
             if new_bs == batch_size:
+                # batch=1 still fails. A genuine OOM here is a resource
+                # failure, not an "undecided" verdict: per the project
+                # convention (never silently swallow OOM) re-raise it so it
+                # surfaces as `error`, unless the caller opted into tolerating
+                # OOM (raise_on_oom=False). A non-OOM RuntimeError stays a soft
+                # `unknown` (can be a benign solver/shape edge on this leaf).
+                if (isinstance(_e, torch.cuda.OutOfMemoryError)
+                        and getattr(settings, 'raise_on_oom', True)):
+                    raise
                 return 'unknown', {'phase': 'batched_oom',
                                     'batch_size': batch_size}
             worklist_xl.extend(xl_list); worklist_xh.extend(xh_list)

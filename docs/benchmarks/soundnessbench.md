@@ -42,6 +42,39 @@ propagation. Two things had to be true for vibecheck to match it:
    half-width 0.5, `pgd_lr_decay=0.997`, `pgd_time_budget_phase0=180`) cracks
    them.
 
+3. **Persist all the budget on attack (`pgd_phase0_persist_until_budget: true`,
+   `pgd_seed: 0`).** A single 500-restart batch is *flaky*: it cracks model_6's
+   planted basin only ~90 % of the time (measured 9/10 over seeds 0–9; seed=6
+   misses), and the A10G full sweep drew an unlucky init → MISSED model_6
+   (`unknown` @ 23.5 s) while server1 hit it. A batch takes only ~35 s of the
+   145 s budget, so the fix is to **keep relaunching fresh-init batches until
+   the budget is spent** (~4 rounds → miss probability ~1e-4). Verified: the
+   unlucky seed=6 recovers on round 3 (sat @ 115 s); the lucky seed=0 returns
+   on round 0 (~32 s). `pgd_seed: 0` just makes round 0 reproducible across
+   machines (mirrors AB-CROWN's `reset_seed_after_precompile`). Full local
+   re-sweep: 50/50, 0 miss.
+
+   Each batch attacks all disjuncts with **per-restart disjunct targeting**
+   (`per_restart_disj`): restart *r* descends only disjunct *r % n*'s loss, so
+   every disjunct gets dedicated restarts instead of one joint loss all
+   restarts share (the witness screen still accepts a CEX from any disjunct).
+   This is a no-op for soundnessbench (single-disjunct conjunction) but is the
+   right objective for multi-disjunct SAT specs that may use the same
+   persist-until-budget path.
+
+   *Why not just bound-prop as a backup?* The cascade can close **zero**
+   soundnessbench cases (all SAT) and its dense zono OOMs (~43 GB), so when PGD
+   exhausts the budget without a witness we skip the cascade and report
+   `unknown` directly — all remaining time goes to attack, never to a doomed
+   bound-prop pass.
+
+   *Note on `unknown` vs `error`.* On the A10G, model_6's `unknown` was a true
+   "PGD found no witness", not a crash — the dense zono is never reached once
+   PGD runs first. If the dense zono *were* reached and OOM'd, the default
+   `raise_on_oom=True` surfaces it as `error`, never a silent `unknown` (the
+   one batched-path leaf that swallowed a batch=1 OOM into `unknown` now honors
+   `raise_on_oom` too).
+
 **Why not the zono→CROWN→α-CROWN→targeted-PGD pipeline** (used for
 tinyimagenet)? It doesn't apply here: the spec is a SINGLE disjunct (a
 12-constraint conjunction `Y_j ≥ c_j`), so there are no unsat disjuncts to
@@ -63,7 +96,9 @@ possible). This is exactly the property the benchmark checks.
 `auto_route_milp_for_conv: false` + deep-PGD knobs (`pgd_iter=1000`,
 `pgd_lr_decay=0.997`, `pgd_time_budget_phase0=145`) + two-way multi-α
 (`pgd_alpha_multi: true`, `pgd_alpha_multi_fractions: [0.01, 0.05]`,
-`pgd_restarts: 500`).
+`pgd_restarts: 500`) + deterministic restarts (`pgd_seed: 0`) + persist-until-
+budget attack (`pgd_phase0_persist_until_budget: true` — relaunch batches until
+the budget is spent, then `unknown` + skip the OOM-prone cascade).
 
 ## Reproduce
 

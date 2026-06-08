@@ -27,6 +27,18 @@ All 50 instances are SAT (the lone `unsat` in AB-CROWN's CSV is the unrelated
 `test/test_nano` sanity row). vibecheck cracks 50/50 sat — full parity with
 AB-CROWN. The two-way multi-alpha makes each case ~85 s (still under the 150 s
 competition budget).
+
+PERSIST-UNTIL-BUDGET + DETERMINISTIC RESTARTS (configs/soundnessbench.yaml:
+pgd_phase0_persist_until_budget=true, pgd_seed=0). A single 500-restart batch
+only cracks the hardest basin ~90% of the time (model_6: 9/10 over seeds 0-9),
+and the A10G sweep drew an unlucky init -> MISSED model_6 (unknown @ 23.5 s). A
+batch uses only ~35 s of the 145 s budget, so Phase-0 now relaunches fresh-init
+batches until the budget is spent (~4 rounds -> miss prob ~1e-4), then reports
+`timeout` and SKIPS the all-SAT-useless, OOM-prone cascade. Each batch uses
+per-restart disjunct targeting (restart r descends only disjunct r%n's loss; a
+no-op here since the spec is a single conjunction). pgd_seed=0 makes round 0
+reproducible (mirrors AB-CROWN's reset_seed_after_precompile). Full local
+re-sweep: 50/50, 0 miss.
 """
 import pytest
 from ._runner import run_case
@@ -42,8 +54,14 @@ CASES = [
         expected='sat', timeout=150, max_wall_s=130.0,
     ),
     dict(
-        desc='soundnessbench model_1 (SAT, deep-PGD finds hidden CEX)',
-        net='onnx/model.onnx', vnnlib='vnnlib/model_1.vnnlib',
+        # The flaky straggler: a single 500-restart batch cracks its planted
+        # basin only ~90% of the time (9/10 over seeds 0-9), so the A10G sweep
+        # drew an unlucky init and MISSED it (unknown @ 23.5 s). The config now
+        # persists fresh-init batches until the budget is spent
+        # (pgd_phase0_persist_until_budget) with pgd_seed=0 for a reproducible
+        # round 0 — round 0 hits here (~32 s). Pins the persist+seed fix.
+        desc='soundnessbench model_6 (SAT, pins persist-until-budget + pgd_seed)',
+        net='onnx/model.onnx', vnnlib='vnnlib/model_6.vnnlib',
         expected='sat', timeout=150, max_wall_s=130.0,
     ),
     dict(
