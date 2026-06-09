@@ -31,3 +31,12 @@ phase26_pre_cascade_total_frac: 0.1
 phase26_pre_cascade_per_spec_cap: 5.0
 # parallel_pgd dead with no MILP windows (waits on a lock that never sets).
 parallel_pgd_enabled: false
+
+# Exact-MILP routing for the hopeless-relaxation misses (2026-06-09): cora's 8-layer
+# FC/ReLU nets split cleanly at Phase-8 entry — solved cases enter at worst ≥ −0.65
+# (BnB closes ≤1s), misses at ≤ −3.3 (BnB frontier doubles → 67M-node OOM; heavy
+# tightening only moved −3.33 → −3.18). The exact per-neuron MILP (milp_verify,
+# safenlp's engine) closes all 7 cifar10 misses in 0.9–3.6s, well inside the 30s
+# budget. Hardness is complementary (img100: BnB-easy/MILP-hard), so route ONLY
+# far-below-zero cases; near-boundary keeps the BnB. +7 vs the v1 sweep.
+phase8_exact_milp_below: -2.0

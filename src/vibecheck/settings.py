@@ -790,6 +790,16 @@ def default_settings(**overrides):
         gen_lp_skip_phase7_lp=True,     # skip per-query LP scoring; use α-CROWN/CROWN ew*frac fallback (saves Phase 7 LP wall — was ~4s/query on hard CIFAR100)
         gen_lp_score_method='lp_ew_frac',  # 'lp_ew_frac', 'lp_fractional', 'lp_dual'. lp_dual ranks by |tri_lo|+|tri_up| duals — identifies the actual LP-binding triangles (on CIFAR100_resnet_medium_prop_idx_2477 the duals concentrate in L5 where kfsb/ew_frac promotes L9). lp_dual adds ~1-2s/query Phase-8 overhead to re-solve gen-LP with dual extraction; beneficial on hard queries where the wrong layer is being branched on, neutral-to-slow otherwise. Opt-in via settings.
         skip_phase8_milp=False,         # if True, Phase 8 is skipped and queries Phase 7 LP can't prove UNSAT are returned as 'unknown'
+        # Exact-MILP routing at Phase-8 entry: if set (float) and the worst
+        # still-open spec LB < this value on a pure FC/ReLU graph, skip the
+        # α-zono BnB (frontier doubles per level on far-below-zero bounds and
+        # cannot close in budget) and run `milp_verify` — the exact per-neuron
+        # big-M MILP (safenlp's engine) — with the remaining wall budget.
+        # Measured on cora_2024: solved cases enter Phase 8 at worst ≥ −0.65
+        # (BnB ≤1s); misses at ≤ −3.3 (BnB OOMs at 67M nodes, exact MILP
+        # closes all 7 cifar10 misses in 0.9–3.6s). None (default) = off;
+        # configs/cora_2024.yaml sets −2.0.
+        phase8_exact_milp_below=None,
         # Phase 1 MILP-tightens layers ≤ this idx; LP-only at deeper
         # layers up to `max_tighten_layer_lp`. Default raised from 1 to
         # 2 on 2026-05-10 (+5 mnist_fc verifications), then to 3 later

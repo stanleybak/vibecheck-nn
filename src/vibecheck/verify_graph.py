@@ -6257,6 +6257,37 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                              'input_name': gg['input_name'],
                              'last_name': gg_ops_ser[-1]['name']}, _f)
             print(f'  [debug] saved gen_lp_state + query_specs to {_dbg_save}')
+    # Exact-MILP routing for hopeless-relaxation FC nets (cora_2024): when the
+    # worst still-open spec LB sits far below 0 at Phase-8 entry, the α-zono
+    # BnB frontier doubles every level and cannot close within budget
+    # (measured on cora: solved cases enter Phase 8 at worst ≥ −0.65 and the
+    # BnB closes them in ≤1s; misses enter at ≤ −3.3 and the BnB OOMs at 67M
+    # nodes, while the exact per-neuron MILP closes all 7 cifar10 misses in
+    # 0.9–3.6s). Complementary hardness is real (img100: BnB-easy/MILP-hard),
+    # so this routes ONLY the far-below-zero cases; near-boundary ones keep
+    # the BnB. Sound: milp_verify is the exact big-M encoding (safenlp's
+    # engine). Off by default; configs/cora_2024.yaml sets −2.0.
+    _milp_below = getattr(settings, 'phase8_exact_milp_below', None)
+    if (_milp_below is not None and still_needs_milp
+            and spec_impl == 'gen_lp'):
+        _unsup = {'Sigmoid', 'Tanh', 'Softmax', 'Exp', 'Erf', 'Gelu', 'Elu',
+                  'LeakyRelu', 'Pow', 'Div', 'MatMulBilinear', 'ReduceSum',
+                  'Conv'}
+        _pure_fc = not any(getattr(n, 'op_type', '') in _unsup
+                           for n in graph.nodes.values())
+        _open_lbs = [spec_lbs[qi] for qi in still_needs_milp
+                     if qi in spec_lbs]
+        if _pure_fc and _open_lbs and min(_open_lbs) < float(_milp_below):
+            import copy as _copy
+            from .verify_milp import milp_verify
+            _s2 = _copy.copy(settings)
+            _s2.total_timeout = max(2.0, time_left())
+            if print_progress:
+                print(f'  [phase8→exact-MILP] worst open LB '
+                      f'{min(_open_lbs):.4f} < {float(_milp_below)} on pure '
+                      f'FC/ReLU net → routing to milp_verify '
+                      f'(budget {_s2.total_timeout:.1f}s)', flush=True)
+            return milp_verify(graph, spec, _s2)
     if _skip_milp and still_needs_milp:
         if print_progress:
             print(f'  Phase 8 skipped (skip_phase8_milp=True); '
