@@ -6,14 +6,22 @@ breakpoint sort (which was 80% of the kernel eager AND blocked torch.compile —
 (log-spaced histogram, left-edge understep — sort-free AND topk-free, ties topk on compiled wall,
 robust to any n). ls='topk' (topk(K) partial sort) is the validated alternative.
 
-Both keep the bound g EXACT (pre-step eval, sound for any λ≥0) and the infeasibility cert EXACT
-(order-independent Σdecr). The line search only sets children's warm-start λ → affects node count,
-not soundness, and (measured) not compiled wall either (the GEMMs dominate compiled).
+Both keep the bound g EXACT (pre-step eval, sound for any λ≥0). The line search only sets children's
+warm-start λ → affects node count, not soundness, and (measured) not compiled wall either (the GEMMs
+dominate compiled).
+
+INFEASIBILITY CERT — the original slope-drop test (slope0 > Σdecr, "exact in ℝ") turned out UNSOUND
+in float32: near the dual optimum both sides are ~1e-3 apart by ~1e-6, and the sign is noise. On 94
+Gurobi-labeled joint-infeasibility nodes (metaroom) it false-positive-pruned 42 FEASIBLE nodes
+(Gurobi minima as low as −35) — a pruned feasible node can hide a counterexample. The DEFAULT cert
+is now the FAR PROBE (see node_bound_logbucket): one aggressive dual step past the kinks, prune only
+on a real g(λ_far)>0 witness — sound by weak duality, 0/42 false positives on the labeled cases, and
+measured 480,454 vs 549,068 nodes (−12.5%) at equal wall on the saved tinyimagenet q177 state.
+VC_FARPROBE=0 restores the legacy slope cert (debug only).
 
 Result on case_1175_unsat: exact-sort 1.03 s → topk eager 0.28 s → **topk compiled 0.134 s**
-(unsat, 41,982 nodes vs 41,712 exact, +0.6%). ~53× faster than vibecheck (7.10 s). SOUND
-(g ≤ exact node LP, validated by Gurobi to −1.4e-6; infeasibility cert kept EXACT via the
-order-independent Σdecr — no sort needed for it).
+(unsat, 41,982 nodes vs 41,712 exact, +0.6%). ~53× faster than vibecheck (7.10 s). Bound g
+validated against the exact node LP by Gurobi to −1.4e-6.
 
 Why the topk step stays sound and doesn't blow up the frontier (unlike bucket line search):
 the line search only sets the children's warm-start λ (the bound g is the pre-step eval, valid
@@ -34,11 +42,14 @@ from .fast_verify_dual import parse_problem, parse_problem_gpu, Problem  # geome
 _TOL = 1e-9
 
 
-def node_bound_topk(F, sides, lam0, lam1, K_top=256):
+def node_bound_topk(F, sides, lam0, lam1, K_top=256, use_farprobe=False):
     """K=1 warm-start dual bound. Returns (best [B], lam0', lam1'). The bound `best` = g at the
     inherited λ (sound for any λ≥0); the returned λ is one topk-line-search step ahead for the
-    children's warm start. Infeasible nodes (slope never crosses) get best=+inf — EXACT, via the
-    order-independent total slope-drop (no sort)."""
+    children's warm start. Infeasible nodes (slope never crosses) get best=+inf via the
+    order-independent total slope-drop — exact in ℝ but float-fragile near the dual optimum
+    (see module docstring); this legacy 'topk' line search has no far-probe port."""
+    if use_farprobe:
+        raise NotImplementedError("far-probe is implemented for ls='logbucket' only; use the default")
     a_g = F['a_g']; D, n = a_g.shape; B = sides.shape[0]
     el, eh = F['el'], F['eh']; width = eh - el
     sign = (1 - 2 * sides).to(a_g.dtype)
@@ -59,8 +70,8 @@ def node_bound_topk(F, sides, lam0, lam1, K_top=256):
     slope0 = (sp0 * s0 + sp1 * s1).sum(-1)
     da = (sign * (sp0 - sp1)) @ a_g
     positive = ((da > 0) & (rc < 0)) | ((da < 0) & (rc > 0))
-    # EXACT infeasibility (no sort): total slope-drop is order-independent.
     decr_all = torch.where(positive, width.unsqueeze(0) * da.abs(), torch.zeros_like(da))
+    # slope-drop test (order-independent Σdecr) — exact in ℝ, but fragile in float at the dual opt.
     infeasible = (slope0 > _TOL) & (decr_all.sum(-1) < slope0 - _TOL)
     best = torch.where(infeasible, torch.full_like(best, 1e30), best)
     # topk smallest breakpoints → partial line search (exact on ~90%, sound understep on tail).
@@ -82,9 +93,10 @@ def node_bound_topk(F, sides, lam0, lam1, K_top=256):
     return best, lam0, lam1
 
 
-def node_bound_logbucket(F, sides, lam0, lam1, Kb=256):
+def node_bound_logbucket(F, sides, lam0, lam1, Kb=256, use_farprobe=False):
     """K=1 warm-start dual bound with a LOG-spaced bucket line search (the default). Same bound g
-    and EXACT infeasibility cert as node_bound_topk; differs only in how the step η is found.
+    as node_bound_topk; differs in the step-η search and carries the sound FAR-PROBE cert (default;
+    see module docstring — the legacy slope cert is float-fragile/unsound).
 
     The line search has to locate where the concave PWL slope crosses zero among the breakpoints
     η_j = -rc_j/da_j. Their VALUE range is dominated by a few huge outliers while the true crossing
@@ -115,7 +127,16 @@ def node_bound_logbucket(F, sides, lam0, lam1, Kb=256):
     da = (sign * (sp0 - sp1)) @ a_g
     positive = ((da > 0) & (rc < 0)) | ((da < 0) & (rc > 0))
     decr_all = torch.where(positive, width.unsqueeze(0) * da.abs(), torch.zeros_like(da))
-    infeasible = (slope0 > _TOL) & (decr_all.sum(-1) < slope0 - _TOL)
+    if use_farprobe:
+        # No slope extrapolation: infeasibility is certified after the line search by a REAL
+        # g(λ_far)>0 witness at a far step (computed below). Keep `best` = pre-step bound here.
+        infeasible = torch.zeros(B, dtype=torch.bool, device=a_g.device)
+    else:
+        # slope-drop test (order-independent Σdecr) — exact in ℝ, but fragile in float at the dual
+        # optimum: measured 42/94 FALSE-POSITIVE prunes on Gurobi-labeled joint-infeasibility cases
+        # (a false positive prunes a feasible node → can hide a counterexample → UNSOUND). Kept only
+        # as the legacy escape hatch (VC_FARPROBE=0).
+        infeasible = (slope0 > _TOL) & (decr_all.sum(-1) < slope0 - _TOL)
     best = torch.where(infeasible, torch.full_like(best, 1e30), best)
     # log-spaced histogram of the slope-drops; LEFT edge of the crossing bin = sound understep.
     INF = torch.full_like(rc, float('inf'))
@@ -132,6 +153,28 @@ def node_bound_logbucket(F, sides, lam0, lam1, Kb=256):
     first = crossed.float().argmax(-1)
     eta = torch.where(crossed.any(-1), torch.exp(le + first.to(a_g.dtype) * lw), emax)
     eta = torch.where(torch.isfinite(eta), eta, torch.zeros_like(eta))   # no-breakpoint nodes → 0
+    if use_farprobe:
+        # FAR PROBE: instead of extrapolating the slope sign, take ONE aggressive step to the
+        # furthest sound point on the ascent ray and evaluate g there. g(λ)≤p* for any λ≥0, so
+        # g_far>0 is a real infeasibility/robustness certificate (folded into `best`, pruned by
+        # best>0 upstream). Infeasible nodes have an unbounded dual → g climbs fast → one probe
+        # usually certifies; feasible nodes crest, so g_far just tightens the bound (never wrong).
+        # The furthest valid step is the slope-zero crossing (if the slope turns) else the λ≥0
+        # wall, or far past the last kink when no wall binds.
+        inf_D = torch.full_like(lam0, float('inf'))
+        w0 = torch.where(sp0 < -_TOL, -lam0 / sp0, inf_D)
+        w1 = torch.where(sp1 < -_TOL, -lam1 / sp1, inf_D)
+        ebnd = torch.minimum(w0.min(-1).values, w1.min(-1).values)        # λ≥0 wall (B,)
+        far = torch.where(torch.isfinite(ebnd), ebnd, emax * 1e6)         # past the last kink
+        eta_c = torch.where(crossed.any(-1), eta, far)
+        eta_c = torch.where((slope0 > _TOL) & torch.isfinite(eta_c), eta_c,
+                            torch.zeros_like(eta_c)).clamp_min(0.0)
+        rc_f = rc + eta_c.unsqueeze(-1) * da
+        x_f = torch.where(rc_f < 0, eh.expand(B, n), el.expand(B, n))
+        l0f = (lam0 + eta_c.unsqueeze(-1) * sp0).clamp_min(0.0)
+        l1f = (lam1 + eta_c.unsqueeze(-1) * sp1).clamp_min(0.0)
+        g_far = c0_path + (rc_f * x_f).sum(-1) - (l0f * b0 + l1f * b1).sum(-1)
+        best = torch.maximum(best, g_far)
     eta = torch.where((slope0 > _TOL) & ~infeasible, eta, torch.zeros_like(eta)).clamp_min(0.0) * pend
     lam0 = (lam0 + eta.unsqueeze(-1) * sp0).clamp_min(0.0)
     lam1 = (lam1 + eta.unsqueeze(-1) * sp1).clamp_min(0.0)
@@ -148,8 +191,16 @@ class Verifier:
         if K_top is not None:                                   # back-compat: K_top= forced topk
             ls, K = 'topk', K_top
         self.device = torch.device(device); self.chunk = chunk; self.ls = ls; self.K = K
-        base = _KERNELS[ls]
-        kern = (lambda F, s, l0, l1: base(F, s, l0, l1, K))
+        # VC_FARPROBE (DEFAULT ON): sound infeasibility cert. The legacy slope-extrapolation flag is
+        # UNSOUND — its float-fragile test produced false-positive prunes (42/94 on Gurobi-labeled
+        # joint-infeasibility cases; a wrongly pruned feasible node can hide a counterexample). The
+        # far probe replaces it with a real g(λ_far)>0 witness (g(λ)≤p* for any λ≥0, so a positive
+        # bound is always a sound certificate). Measured on the saved tinyimagenet q177 Phase-8 state
+        # (deterministic, compiled): far 480,454 nodes / ~1.0s vs slope 549,068 / ~1.0s — sound AND
+        # −12.5% nodes at equal wall. Set VC_FARPROBE=0 for the legacy slope cert (debug only).
+        self.use_farprobe = os.environ.get('VC_FARPROBE', '1') not in ('0', 'false', 'False')
+        base = _KERNELS[ls]; use_farprobe = self.use_farprobe
+        kern = (lambda F, s, l0, l1: base(F, s, l0, l1, K, use_farprobe))
         self._kernel = torch.compile(kern, dynamic=True) if compile else kern
         self._warm_depths = warm_depths if compile else ()
         self._warmed = set()   # depths already compile-warmed (reused across queries)
@@ -205,7 +256,9 @@ class Verifier:
         for D in self._warm_depths:
             if D <= prob.n_splits and D not in self._warmed:
                 z = torch.zeros(8, D, device=dev)
-                self._kernel(self._F(G, D), torch.zeros(8, D, device=dev, dtype=torch.long), z, z)
+                # warm with DISTINCT lam0/lam1 tensors — passing `z, z` makes torch.compile specialise
+                # on `l0 is l1` (aliased), forcing a recompile when verify passes distinct tensors.
+                self._kernel(self._F(G, D), torch.zeros(8, D, device=dev, dtype=torch.long), z, z.clone())
                 self._warmed.add(D)
         if dev.type == 'cuda': torch.cuda.synchronize()
         t0 = time.perf_counter(); elapsed = lambda: time.perf_counter() - t0
