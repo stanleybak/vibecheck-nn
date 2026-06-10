@@ -6298,6 +6298,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         if _pure_fc and _open_lbs and min(_open_lbs) < float(_milp_below):
             import copy as _copy
             from .verify_milp import milp_verify
+            from .gurobi_util import GurobiNumericTrouble
             _s2 = _copy.copy(settings)
             _s2.total_timeout = max(2.0, time_left())
             if print_progress:
@@ -6305,7 +6306,18 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                       f'{min(_open_lbs):.4f} < {float(_milp_below)} on pure '
                       f'FC/ReLU net → routing to milp_verify '
                       f'(budget {_s2.total_timeout:.1f}s)', flush=True)
-            return milp_verify(graph, spec, _s2)
+            try:
+                return milp_verify(graph, spec, _s2)
+            except GurobiNumericTrouble as _gnt:
+                # Numerically fragile exact-MILP (e.g. cora mnist-trades
+                # img6): the routed engine claims nothing, so 'unknown' is
+                # the sound result — don't crash the run into
+                # error_no_result.
+                if print_progress:
+                    print(f'  [phase8→exact-MILP] Gurobi numeric trouble '
+                          f'({_gnt}); returning unknown', flush=True)
+                return _finalize('unknown', 'spec_lp',
+                                 remaining=len(still_needs_milp))
     if _skip_milp and still_needs_milp:
         if print_progress:
             print(f'  Phase 8 skipped (skip_phase8_milp=True); '
