@@ -110,6 +110,13 @@ def _serialize_gg_ops(gg):
             d['scale'] = op.get('scale')
             d['in_shapes_nd'] = op.get('in_shapes_nd')
             d['out_shape_nd'] = op.get('out_shape_nd')
+        elif t == 'reshape':
+            pass    # flat passthrough; consumers alias the input vars
+        else:
+            raise NotImplementedError(
+                f'gg serializer: unsupported op {t!r} at '
+                f"{op.get('name')!r} — serializing without its params "
+                f'would make consumers run a different network')
         out.append(d)
     return out
 
@@ -330,6 +337,11 @@ def _build_reference(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
 
         elif t == 'reshape':
             op_var_refs[nm] = op_var_refs[op['inputs'][0]]
+
+        else:
+            raise NotImplementedError(
+                f'LP builder: unsupported op {t!r} at {nm!r} — skipping '
+                f'it would encode a different network')
 
     m.update()
     return m, env, op_var_refs, target_vars
@@ -613,6 +625,11 @@ def _build_optimized(gg_ops, x_lo, x_hi, bounds_by_relu, input_name,
             op_var_refs[nm] = op_var_refs[op['inputs'][0]]
             if compact_lp and op['inputs'][0] in const_offset:
                 const_offset[nm] = const_offset[op['inputs'][0]]
+
+        else:
+            raise NotImplementedError(
+                f'compact-LP builder: unsupported op {t!r} at {nm!r} — '
+                f'skipping it would encode a different network')
 
     m.update()
     return m, env, op_var_refs, target_vars
@@ -1734,6 +1751,14 @@ def _collect_backward_needs(gg_ops, target_op_name, target_neuron_idx,
             needed_at.setdefault(inp, set()).update(
                 int(j) for j in needed)
 
+        else:
+            # Unknown op: retention bookkeeping only — conservatively mark
+            # ALL of its inputs fully needed (sound superset; never lets a
+            # lagging op list silently release bounds a new op still uses).
+            for inp in op['inputs']:
+                needed_at.setdefault(inp, set()).update(
+                    int(j) for j in needed)
+
     return needed_at
 
 
@@ -1924,6 +1949,11 @@ def _build_sparse_neuron_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
 
         elif t == 'reshape':
             var_refs[name] = var_refs.get(op['inputs'][0], {})
+
+        else:
+            raise NotImplementedError(
+                f'window builder: unsupported op {t!r} at {name!r} — '
+                f'skipping it would encode a different network')
 
         if is_target(name):
             target_var = var_refs[name].get(int(target_neuron_idx))
@@ -10110,6 +10140,18 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
             d['bias'] = op.get('bias')
         elif op['type'] == 'sub':
             d['bias'] = op.get('bias')
+        elif op['type'] == 'reshape':
+            pass    # flat passthrough; consumers alias the input vars
+        elif op['type'] == 'conv':
+            d['kernel_np'] = op['kernel_np']; d['bias_np'] = op['bias_np']
+            d['in_shape'] = op['in_shape']; d['out_shape'] = op['out_shape']
+            d['stride'] = op['stride']; d['padding'] = op['padding']
+            d['n_out'] = op['n_out']
+        else:
+            raise NotImplementedError(
+                f"gg serializer (dual-ascent): unsupported op "
+                f"{op['type']!r} at {op['name']!r} — serializing without "
+                f"its params would make consumers run a different network")
         gg_ops_ser.append(d)
 
     # Root-level PGD attack — same as `_input_split_verify`.

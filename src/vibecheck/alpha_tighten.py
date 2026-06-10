@@ -140,6 +140,12 @@ def _walk_backward_per_target(
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
+        else:
+            raise NotImplementedError(
+                f'alpha_tighten backward: unsupported op {t!r} at '
+                f"{op['name']!r} — skipping it would compute bounds for a "
+                f'different network')
+
     input_name = gg['input_name']
     ew_inp = ew_at.get(input_name)
     box_min = (ew_inp.clamp(min=0) * xl_t.unsqueeze(0) +
