@@ -897,28 +897,102 @@ class PadNode(GraphNode):
 
 class ConcatNode(GraphNode):
     def infer_shape(self, input_shapes):
-        total = 0
-        for i_name in self.inputs:
-            if i_name in input_shapes and input_shapes[i_name] is not None:
-                total += _prod(input_shapes[i_name])
+        # True N-D inference: out = live shape with dim[axis] summed over
+        # ALL inputs (live + const). The old flat `(total,)` ignored const
+        # inputs entirely and erased rank — downstream shape-sensitive ops
+        # (Transpose on vit's CLS-token concat) then saw a bogus shape.
+        live = [input_shapes.get(i) for i in self.inputs]
+        axis = self.params.get('axis', 0)
+        consts = self.params.get('const_inputs') or []
+        if live and all(s is not None for s in live):
+            base = live[0]
+            a = axis if axis >= 0 else len(base) + axis
+            if 0 <= a < len(base):
+                total_ax = sum(s[a] for s in live)
+                for _pos, arr in consts:
+                    ash = np.asarray(arr).shape
+                    if len(ash) == len(base):
+                        total_ax += ash[a]
+                out = list(base)
+                out[a] = total_ax
+                self.output_shape = tuple(out)
+                return
+        total = sum(_prod(s) for s in live if s is not None)
+        for _pos, arr in consts:
+            total += int(np.asarray(arr).size)
         if total > 0:
             self.output_shape = (total,)
 
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
+        consts = self.params.get('const_inputs') or []
         parts = [get_input(inp) for inp in self.inputs]
-        max_k = max(p.generators.shape[1] for p in parts)
-        centers, gens = [], []
-        for p in parts:
-            centers.append(p.center)
-            k = p.generators.shape[1]
-            if k < max_k:
-                pad = np.zeros((p.generators.shape[0], max_k - k))
-                gens.append(np.hstack([p.generators, pad]))
+        if not consts:
+            # All-live concat (flat). NOTE: ignores axis — correct when the
+            # concat axis is the outermost varying dim (the only form seen
+            # in practice for all-live concats).
+            max_k = max(p.generators.shape[1] for p in parts)
+            centers, gens = [], []
+            for p in parts:
+                centers.append(p.center)
+                k = p.generators.shape[1]
+                if k < max_k:
+                    pad = np.zeros((p.generators.shape[0], max_k - k))
+                    gens.append(np.hstack([p.generators, pad]))
+                else:
+                    gens.append(p.generators)
+            zono_state[self.name] = DenseZonotope(
+                np.concatenate(centers), np.vstack(gens))
+            return
+        # Const inputs present (vit CLS-token prepend): place every chunk
+        # (const blocks as exact points, live zonos) at its true flat
+        # positions via index scatter — the old code silently DROPPED the
+        # const blocks. Needs static shapes to resolve the axis layout.
+        live_shapes = [graph.nodes[inp].output_shape if inp in graph.nodes
+                       else graph.input_shape for inp in self.inputs]
+        if any(s is None for s in live_shapes):
+            raise NotImplementedError(
+                f'Concat {self.name!r}: const inputs need static live '
+                f'input shapes')
+        rank = len(live_shapes[0])
+        axis = self.params.get('axis', 0)
+        a = axis if axis >= 0 else rank + axis
+        const_by_pos = {int(p): np.asarray(arr, np.float64)
+                        for p, arr in consts}
+        n_positions = len(self.inputs) + len(consts)
+        live_iter = iter(zip(parts, live_shapes))
+        chunks = []     # (kind, shape, payload) in ONNX position order
+        for p in range(n_positions):
+            if p in const_by_pos:
+                arr = const_by_pos[p]
+                if arr.ndim != rank:
+                    raise NotImplementedError(
+                        f'Concat {self.name!r}: const rank {arr.ndim} != '
+                        f'live rank {rank}')
+                chunks.append(('const', arr.shape, arr))
             else:
-                gens.append(p.generators)
-        zono_state[self.name] = DenseZonotope(
-            np.concatenate(centers), np.vstack(gens))
+                z, sh = next(live_iter)
+                chunks.append(('live', sh, z))
+        out_shape = list(live_shapes[0])
+        out_shape[a] = sum(sh[a] for _, sh, _ in chunks)
+        n_out = int(np.prod(out_shape))
+        out_grid = np.arange(n_out).reshape(out_shape)
+        max_k = max(p.generators.shape[1] for p in parts)
+        _dt = parts[0].center.dtype
+        center = np.zeros(n_out, dtype=_dt)
+        gens = np.zeros((n_out, max_k), dtype=_dt)
+        off = 0
+        for kind, sh, payload in chunks:
+            sl = [slice(None)] * rank
+            sl[a] = slice(off, off + sh[a])
+            oidx = out_grid[tuple(sl)].reshape(-1)
+            if kind == 'const':
+                center[oidx] = payload.reshape(-1).astype(_dt)
+            else:
+                center[oidx] = payload.center
+                gens[oidx, :payload.generators.shape[1]] = payload.generators
+            off += sh[a]
+        zono_state[self.name] = DenseZonotope(center, gens)
 
 
 class SplitNode(GraphNode):
@@ -1749,23 +1823,45 @@ class ComputeGraph:
                 inp_name = node.inputs[0]
                 inp_shape = (self.nodes[inp_name].output_shape
                               if inp_name in self.nodes else self.input_shape)
-                if len(inp_shape) == 4:
-                    spatial = inp_shape[2] * inp_shape[3]
-                elif len(inp_shape) == 3:
-                    spatial = inp_shape[1] * inp_shape[2]
+                # ONNX BN normalizes the channel dim of an N-D tensor.
+                # Broadcast the per-channel affine to the full flat size and
+                # emit it as canonical 'mul' + 'add' ops — both already have
+                # handlers in EVERY chain (zono forward, CROWN backward,
+                # α-CROWN, gen-LP, PGD), so no new op type is needed. (The
+                # old dedicated 'bn' op type had handlers in only 3 of the
+                # propagation paths, and its rank-3 channel broadcast
+                # assumed a batchless (C,H,W) layout — wrong for the
+                # batch-led (1,T,d) shapes in vit.) Channel axis: dim 1 for
+                # batch-led shapes, dim 0 for batchless (C,H,W).
+                C = int(np.asarray(factor).size)
+                if inp_shape is not None and len(inp_shape) >= 2 \
+                        and inp_shape[1] == C:
+                    ch_axis = 1
+                elif inp_shape is not None and len(inp_shape) >= 1 \
+                        and inp_shape[0] == C:
+                    ch_axis = 0
                 else:
-                    spatial = 1
-                factor_flat = np.repeat(factor.astype(np.float64), spatial)
-                offset_flat = np.repeat(offset.astype(np.float64), spatial)
-                gf = torch.tensor(factor_flat, dtype=dtype, device=device)
-                go = torch.tensor(offset_flat, dtype=dtype, device=device)
+                    raise NotImplementedError(
+                        f'BatchNormalization {name!r}: cannot locate the '
+                        f'channel dim (shape={inp_shape}, C={C})')
+                bshape = tuple(C if a == ch_axis else 1
+                               for a in range(len(inp_shape)))
+                factor_flat = np.ascontiguousarray(np.broadcast_to(
+                    np.asarray(factor, np.float64).reshape(bshape),
+                    inp_shape)).reshape(-1)
+                offset_flat = np.ascontiguousarray(np.broadcast_to(
+                    np.asarray(offset, np.float64).reshape(bshape),
+                    inp_shape)).reshape(-1)
                 inp_names = [node.inputs[0]
                               if node.inputs[0] in computed else '__input__']
+                scale_name = f'{name}__bnscale'
                 ops.append({
-                    'name': name, 'type': 'bn',
-                    'inputs': inp_names,
-                    'factor': gf, 'offset': go,
-                    'factor_np': factor_flat, 'offset_np': offset_flat,
+                    'name': scale_name, 'type': 'mul',
+                    'inputs': inp_names, 'scale': factor_flat,
+                })
+                ops.append({
+                    'name': name, 'type': 'add', 'inputs': [scale_name],
+                    'is_merge': False, 'bias': offset_flat,
                 })
                 computed.add(name)
 
@@ -1784,6 +1880,21 @@ class ComputeGraph:
                     continue
                 W = node.params['W']
                 b = node.params['b']
+                _mm_in_shape = (self.nodes[node.inputs[0]].output_shape
+                                if node.inputs[0] in self.nodes
+                                else self.input_shape)
+                if (_mm_in_shape is not None and len(_mm_in_shape) >= 3
+                        and int(np.prod(_mm_in_shape[:-1])) > 1
+                        and _mm_in_shape[-1] == W.shape[1]):
+                    # N-D MatMul (e.g. vit tokens (1, T, K) @ W): ONNX
+                    # contracts only the LAST dim, batched over the T
+                    # leading rows. The flat equivalent is the
+                    # block-diagonal kron(I_T, W) with the bias tiled per
+                    # row — emitting plain W here silently computed a
+                    # different (shape-broken) function.
+                    T = int(np.prod(_mm_in_shape[:-1]))
+                    W = np.kron(np.eye(T), np.asarray(W, np.float64))
+                    b = np.tile(np.asarray(b, np.float64), T)
                 gW = torch.tensor(W, dtype=dtype, device=device)
                 gb = torch.tensor(b, dtype=dtype, device=device)
                 inp_names = []
@@ -1792,8 +1903,8 @@ class ComputeGraph:
                 ops.append({
                     'name': name, 'type': 'fc', 'inputs': inp_names,
                     'W': gW, 'bias': gb,
-                    'W_np': W.astype(np.float64),
-                    'bias_np': b.astype(np.float64),
+                    'W_np': np.asarray(W, np.float64),
+                    'bias_np': np.asarray(b, np.float64),
                 })
                 computed.add(name)
 
@@ -1816,10 +1927,26 @@ class ComputeGraph:
                         inp_names.append(inp)
                     # else: constant/initializer — handled by node params
                 is_merge = len(inp_names) == 2
+                _add_bias = (node.params.get('bias', None)
+                             if not is_merge else None)
+                if _add_bias is not None:
+                    # ONNX Add broadcasts the constant against the live
+                    # N-D shape (e.g. a per-token (48,) bias on (1,17,48)
+                    # in vit). The flat 'add' handlers do a plain
+                    # elementwise add, so expand the constant to the full
+                    # flat size here. No-op when sizes already match.
+                    _in_sh = (self.nodes[node.inputs[0]].output_shape
+                              if node.inputs and node.inputs[0] in self.nodes
+                              else self.input_shape)
+                    _ba = np.asarray(_add_bias, np.float64)
+                    if (_in_sh is not None
+                            and _ba.size != int(np.prod(_in_sh))):
+                        _add_bias = np.ascontiguousarray(
+                            np.broadcast_to(_ba, _in_sh)).reshape(-1)
                 ops.append({
                     'name': name, 'type': 'add', 'inputs': inp_names,
                     'is_merge': is_merge,
-                    'bias': node.params.get('bias', None) if not is_merge else None,
+                    'bias': _add_bias,
                 })
                 computed.add(name)
 
@@ -1936,12 +2063,27 @@ class ComputeGraph:
                 computed.add(name)
 
             elif node.op_type == 'Transpose':
-                inp_names = [node.inputs[0]
-                              if node.inputs[0] in computed else '__input__']
+                # Emit as the canonical 'slice' (flat-index permutation):
+                # every chain (zono forward, CROWN backward, gen-LP, PGD,
+                # forward-LiRPA) already supports flat_idx gathers, and the
+                # old dedicated 'transpose' handlers had a silent
+                # passthrough fallback when shape metadata was missing —
+                # i.e. a real permutation treated as identity (unsound).
+                inp = node.inputs[0]
+                inp_names = [inp if inp in computed else '__input__']
+                in_shape = (self.nodes[inp].output_shape
+                            if inp in self.nodes else self.input_shape)
+                perm = tuple(node.params.get('perm', ()))
+                if in_shape is None or not perm \
+                        or len(perm) != len(in_shape):
+                    raise NotImplementedError(
+                        f'Transpose {name!r}: needs a static input shape '
+                        f'matching perm (shape={in_shape}, perm={perm})')
+                flat_idx = np.arange(int(np.prod(in_shape))).reshape(
+                    in_shape).transpose(perm).reshape(-1).astype(np.int64)
                 ops.append({
-                    'name': name, 'type': 'transpose',
-                    'inputs': inp_names,
-                    'perm': tuple(node.params.get('perm', ())),
+                    'name': name, 'type': 'slice', 'inputs': inp_names,
+                    'flat_idx': flat_idx,
                 })
                 computed.add(name)
 
@@ -1978,6 +2120,43 @@ class ComputeGraph:
                     'name': name, 'type': 'softmax',
                     'inputs': inp_names,
                     'axis': int(node.params.get('axis', -1)),
+                })
+                computed.add(name)
+
+            elif node.op_type == 'ReduceMean':
+                # ReduceMean over fixed axes is an exact linear map — emit
+                # the equivalent 'fc' (W = averaging matrix) so EVERY
+                # downstream chain (zono forward, CROWN backward, gen-LP,
+                # MILP, PGD) supports it with zero new handlers (same move
+                # as AveragePool-as-conv). vit_2023 pools tokens this way.
+                inp = node.inputs[0]
+                inp_names = [inp if inp in computed else '__input__']
+                in_shape = (self.nodes[inp].output_shape
+                            if inp in self.nodes else self.input_shape)
+                if in_shape is None:
+                    raise NotImplementedError(
+                        f'ReduceMean {name!r}: input shape unknown')
+                axes = node.params.get('axes')
+                if not axes:
+                    raise NotImplementedError(
+                        f'ReduceMean {name!r}: missing axes (reduce-all '
+                        f'unsupported here)')
+                axes = {a if a >= 0 else len(in_shape) + a for a in axes}
+                n_in = int(np.prod(in_shape))
+                oshape = [1 if a in axes else d
+                          for a, d in enumerate(in_shape)]
+                n_out = int(np.prod(oshape))
+                out_pos = np.arange(n_out).reshape(oshape)
+                out_map = np.broadcast_to(out_pos, in_shape).reshape(-1)
+                k = n_in // n_out
+                W = np.zeros((n_out, n_in))
+                W[out_map, np.arange(n_in)] = 1.0 / k
+                b = np.zeros(n_out)
+                ops.append({
+                    'name': name, 'type': 'fc', 'inputs': inp_names,
+                    'W': torch.tensor(W, dtype=dtype, device=device),
+                    'bias': torch.tensor(b, dtype=dtype, device=device),
+                    'W_np': W, 'bias_np': b,
                 })
                 computed.add(name)
 
@@ -2024,12 +2203,74 @@ class ComputeGraph:
                     if inp in computed or inp == self.input_name:
                         inp_names.append(inp)
                 axis = int(node.params.get('axis', 0))
-                ops.append({
-                    'name': name, 'type': 'concat',
-                    'inputs': inp_names,
-                    'axis': axis,
-                })
-                computed.add(name)
+                consts = node.params.get('const_inputs') or []
+                live_shape = (self.nodes[node.inputs[0]].output_shape
+                              if node.inputs and node.inputs[0] in self.nodes
+                              else self.input_shape)
+                if consts and len(inp_names) == 1 and live_shape is not None:
+                    # One live input + constant blocks (vit CLS-token
+                    # prepend): an EXACT affine map — emit 'fc' with a 0/1
+                    # placement matrix + the constants as bias, so every
+                    # chain supports it. (The legacy 'concat' op drops
+                    # const blocks in several propagation paths.)
+                    rank = len(live_shape)
+                    a = axis if axis >= 0 else rank + axis
+                    n_positions = len(node.inputs) + len(consts)
+                    const_by_pos = {int(p): np.asarray(arr, np.float64)
+                                    for p, arr in consts}
+                    live_pos = [p for p in range(n_positions)
+                                if p not in const_by_pos]
+                    assert len(live_pos) == 1
+                    chunks = []   # (kind, axis_dim, payload) in ONNX order
+                    total_ax = 0
+                    for p in range(n_positions):
+                        if p in const_by_pos:
+                            arr = const_by_pos[p]
+                            if arr.ndim != rank:
+                                raise NotImplementedError(
+                                    f'Concat {name!r}: const rank '
+                                    f'{arr.ndim} != live rank {rank}')
+                            chunks.append(('const', arr.shape[a], arr))
+                            total_ax += arr.shape[a]
+                        else:
+                            chunks.append(('live', live_shape[a],
+                                           live_shape))
+                            total_ax += live_shape[a]
+                    out_shape = list(live_shape)
+                    out_shape[a] = total_ax
+                    n_in = int(np.prod(live_shape))
+                    n_out = int(np.prod(out_shape))
+                    out_grid = np.arange(n_out).reshape(out_shape)
+                    W = np.zeros((n_out, n_in))
+                    bvec = np.zeros(n_out)
+                    off = 0
+                    for kind, d, payload in chunks:
+                        sl = [slice(None)] * rank
+                        sl[a] = slice(off, off + d)
+                        oidx = out_grid[tuple(sl)].reshape(-1)
+                        if kind == 'live':
+                            W[oidx, np.arange(n_in)] = 1.0
+                        else:
+                            csh = list(live_shape)
+                            csh[a] = d
+                            bvec[oidx] = np.broadcast_to(
+                                payload, csh).reshape(-1)
+                        off += d
+                    ops.append({
+                        'name': name, 'type': 'fc', 'inputs': inp_names,
+                        'W': torch.tensor(W, dtype=dtype, device=device),
+                        'bias': torch.tensor(bvec, dtype=dtype,
+                                             device=device),
+                        'W_np': W, 'bias_np': bvec,
+                    })
+                    computed.add(name)
+                else:
+                    ops.append({
+                        'name': name, 'type': 'concat',
+                        'inputs': inp_names,
+                        'axis': axis,
+                    })
+                    computed.add(name)
 
             elif node.op_type in ('Split', 'SplitOutput'):
                 # Emit each Split chunk as an explicit Slice op. The

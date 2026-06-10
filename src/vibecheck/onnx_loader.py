@@ -41,6 +41,17 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
                     and sum(1 for n in model.graph.node
                             if n.op_type == 'MatMul') > 4)
     if simplify:
+        # Pin any symbolic/zero input dims to 1 BEFORE simplifying. VNNLIB
+        # specs are single-instance, so batch=1 is always the verified
+        # shape — and a symbolic batch dim blocks onnxsim's constant
+        # folding of the Shape→Gather→Concat→ConstantOfShape/Reshape
+        # machinery in transformer exports (vit_2023: 29 such shape ops
+        # survive without this; 0 with it).
+        for _inp in model.graph.input:
+            for _d in _inp.type.tensor_type.shape.dim:
+                if _d.dim_param or _d.dim_value == 0:
+                    _d.ClearField('dim_param')
+                    _d.dim_value = 1
         # We only get here when the model NEEDS folding (attention /
         # spectral-norm patterns the static loader can't represent). onnxsim
         # is therefore required, not a nicety — a missing install or a
@@ -78,13 +89,20 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
 
     graph.output_name = model.graph.output[0].name
 
-    # Parse Constant nodes
+    # Parse Constant nodes. Float tensors get the same float64 promotion as
+    # initializers (line above) — onnxsim re-emits weights as Constant
+    # NODES, and without this the whole model's params stayed float32,
+    # tripping the zonotope dtype assert on float64 runs (vit_2023).
+    # Integer tensors (shape/axes/indices) keep their dtype.
     constants = {}
     for node in model.graph.node:
         if node.op_type == 'Constant':
             for attr in node.attribute:
                 if attr.name == 'value':
-                    constants[node.output[0]] = numpy_helper.to_array(attr.t)
+                    arr = numpy_helper.to_array(attr.t)
+                    if arr.dtype.kind == 'f':
+                        arr = arr.astype(np.float64)
+                    constants[node.output[0]] = arr
 
     def _const(name):
         if name in inits:

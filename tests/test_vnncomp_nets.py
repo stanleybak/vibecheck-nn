@@ -48,6 +48,11 @@ _HARD_EXTENDED = {
     'cctsdb_yolo_2023',
     'collins_aerospace_benchmark',
     'ml4acopf_2024',
+    # vit_2023: the gpu_graph path is point-prop EXACT (pinned by
+    # tests/test_vit_gg_pointprop.py) but the basic per-node
+    # DenseZonotope path still mis-propagates the N-D attention ops
+    # this test exercises (~1.2 output error) — keep it out until the
+    # basic path either supports or loudly refuses those ops.
     'vit_2023',
 }
 
