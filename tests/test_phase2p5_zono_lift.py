@@ -140,7 +140,7 @@ def test_phase2p5_runs_when_crown_leaves_queries_open(monkeypatch, tmp_path):
     original_backward = vg._spec_backward_graph
 
     def fake_backward(sb, xl, xh, gg, spec_ew, qids, nh, device, dtype,
-                     return_ew=False):
+                     return_ew=False, op_bounds=None):
         if return_ew:
             return original_backward(sb, xl, xh, gg, spec_ew, qids, nh,
                                      device, dtype, return_ew=True)
@@ -181,7 +181,7 @@ def test_phase2p5_converges_without_verify(monkeypatch, tmp_path):
     original_backward = vg._spec_backward_graph
 
     def fake_backward(sb, xl, xh, gg, spec_ew, qids, nh, device, dtype,
-                     return_ew=False):
+                     return_ew=False, op_bounds=None):
         if return_ew:
             return original_backward(sb, xl, xh, gg, spec_ew, qids, nh,
                                      device, dtype, return_ew=True)
@@ -225,7 +225,7 @@ def test_alpha_crown_v2_fixed_intermediate_runs(monkeypatch, tmp_path):
     original_backward = vg._spec_backward_graph
 
     def fake_backward(sb, xl, xh, gg, spec_ew, qids, nh, device, dtype,
-                      return_ew=False):
+                      return_ew=False, op_bounds=None):
         if return_ew:
             return original_backward(sb, xl, xh, gg, spec_ew, qids, nh,
                                       device, dtype, return_ew=True)
@@ -411,7 +411,7 @@ def test_phase2p5_layers_override(monkeypatch, tmp_path):
     original_backward = vg._spec_backward_graph
 
     def fake_backward(sb, xl, xh, gg, spec_ew, qids, nh, device, dtype,
-                     return_ew=False):
+                     return_ew=False, op_bounds=None):
         if return_ew:
             return original_backward(sb, xl, xh, gg, spec_ew, qids, nh,
                                      device, dtype, return_ew=True)

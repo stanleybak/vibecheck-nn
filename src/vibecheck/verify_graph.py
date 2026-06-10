@@ -5258,7 +5258,8 @@ def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
 
 
 def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
-                      settings, time_left, n_iters=60, lr=0.1):
+                      settings, time_left, n_iters=60, lr=0.1,
+                      tight_bounds=None):
     """Optimize per-neuron ReLU slopes (lam in [0,1]) of the PLAIN graph
     zono forward against ONE open query's margin (alpha-zono, forward
     mode). Every lam is a sound relaxation, so the best-of over iters is
@@ -5270,7 +5271,8 @@ def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
                 if op['type'] == 'relu' and 'layer_idx' in op]
     # init at min-area-ish 0.5; sizes from a probe forward
     sb0, _ = _forward_zonotope_graph(xl, xh, gg, device, dtype,
-                                     settings=settings)
+                                     settings=settings,
+                                     tight_bounds=tight_bounds)
     lams = {op['layer_idx']: torch.full(
                 (sb0[op['layer_idx']][0].numel(),), 0.5,
                 device=device, dtype=dtype, requires_grad=True)
@@ -5294,7 +5296,7 @@ def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
         opt.zero_grad()
         _, zf = _forward_zonotope_graph(
             xl, xh, gg, device, dtype, settings=settings,
-            relu_lambdas=lams)
+            relu_lambdas=lams, tight_bounds=tight_bounds)
         wv = w_t.to(zf.center.dtype)
         lb = wv @ zf.center + float(b_q) - (wv @ zf.generators).abs().sum()
         if float(lb) > 0:
@@ -5321,19 +5323,27 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
         np.asarray(w_q, np.float64), device=device, dtype=dtype)
 
     def bound(clamps):
-        tb = {}
-        for (L, j), side in clamps.items():
-            if L not in tb:
-                tb[L] = [None, None]
-        # build per-layer numpy bounds lazily from the probe sb below
+        ob = {}
         sb_l, zf = _forward_zonotope_graph(
             xl, xh, gg, device, dtype, settings=settings,
             relu_lambdas=lams,
             tight_bounds={L: _mk_tb(L, clamps) for L in
-                          {Lj[0] for Lj in clamps}} if clamps else None)
+                          {Lj[0] for Lj in clamps}} if clamps else None,
+            op_bounds=ob)
         wv = w_t.to(zf.center.dtype)
         lb = float(wv @ zf.center + float(b_q)
                    - (wv @ zf.generators).abs().sum())
+        # best-of with the McCormick backward CROWN under the SAME
+        # clamped relu bounds + this node's op_bounds — each split then
+        # re-tightens the bilinear/softmax planes (the mechanism that
+        # lets alpha,beta-CROWN close these with a couple of splits).
+        try:
+            bw_lbs, _ = _spec_backward_graph(
+                sb_l, xl, xh, gg, {0: (wv, float(b_q))}, {0},
+                len(sb_l), device, dtype, op_bounds=ob)
+            lb = max(lb, float(bw_lbs[0]))
+        except NotImplementedError:
+            pass    # nets whose backward lacks an op: forward-only node
         return lb, sb_l
 
     base_sb = {}
@@ -5355,7 +5365,25 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
         base_sb[L] = (lo_t.detach().cpu().numpy().astype(np.float64),
                       hi_t.detach().cpu().numpy().astype(np.float64))
     if lb0 > 0:
-        return True, 1
+        return True, 1, 'root'
+
+    # Branching scores: instability mass x |root spec-ew| at the neuron
+    # (BaBSR-flavoured; measured ~2x better child bounds than pure
+    # instability on vit). Root ew reused for the whole tree.
+    ew_w = {}
+    try:
+        ob_r = {}
+        sb_r, _zf_r = _forward_zonotope_graph(
+            xl, xh, gg, device, dtype, settings=settings, op_bounds=ob_r)
+        _, _, _ew_at = _spec_backward_graph(
+            sb_r, xl, xh, gg, {0: (w_t, float(b_q))}, {0}, len(sb_r),
+            device, dtype, op_bounds=ob_r, return_ew=True)
+        for L, _e in _ew_at.get(0, {}).items():
+            ew_w[L] = torch.as_tensor(
+                np.abs(np.asarray(_e, np.float64)), device=device,
+                dtype=dtype)
+    except NotImplementedError:
+        pass
 
     def pick_split(sb_l, clamps):
         best = None; best_score = -1.0
@@ -5365,6 +5393,12 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
             if not bool(uns.any()):
                 continue
             score = torch.minimum(-lo, hi) * uns
+            if L in ew_w and ew_w[L].numel() == score.numel():
+                score = score * (ew_w[L] + 1e-12)
+            # avoid re-picking clamped neurons: zero them
+            for (L2, j2) in clamps:
+                if L2 == L:
+                    score[j2] = -1.0
             j = int(score.argmax())
             s = float(score[j])
             if s > best_score and (L, j) not in clamps:
@@ -5375,12 +5409,14 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
     cnt = 0
     sp0 = pick_split(sb0, {})
     if sp0 is None:
-        return False, 1
+        return False, 1, 'no_split'
     heapq.heappush(heap, (lb0, cnt, {}, sp0))
     nodes = 1
     while heap:
-        if time_left() <= 1.0 or nodes >= max_nodes:
-            return False, nodes
+        if time_left() <= 1.0:
+            return False, nodes, 'time'
+        if nodes >= max_nodes:
+            return False, nodes, 'cap'
         lb, _, clamps, sp = heapq.heappop(heap)
         for side in (0, 1):
             c2 = dict(clamps); c2[sp] = side
@@ -5389,10 +5425,21 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
             if lb2 <= 0:
                 sp2 = pick_split(sb2, c2)
                 if sp2 is None:
-                    return False, nodes   # exhausted splits, still open
+                    # No splittable relu left in this leaf (the clamps
+                    # cascade-stabilised the rest); residual gap is
+                    # bilinear/softmax slack — one alpha-zono rescue
+                    # under the leaf's clamps before giving up.
+                    _tb_leaf = {L: _mk_tb(L, c2)
+                                for L in {Lj[0] for Lj in c2}}
+                    if _zono_alpha_close(
+                            gg, xl, xh, w_q, b_q, device, dtype,
+                            settings, time_left, n_iters=40, lr=0.15,
+                            tight_bounds=_tb_leaf):
+                        continue
+                    return False, nodes, 'exhausted'
                 cnt += 1
                 heapq.heappush(heap, (lb2, cnt, c2, sp2))
-    return True, nodes
+    return True, nodes, 'closed'
 
 
 def _zono_input_split_close(gg, xl, xh, w_q, b_q, device, dtype,
@@ -5950,14 +5997,16 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             # handlers live there); also the cheapest when
             # max_tighten_layer=0 anyway.
             _t_p1 = time.perf_counter()
+            _op_bounds_p1 = {}
             sb, z_final_phase1 = _forward_zonotope_graph(
                 xl_g, xh_g, gg, device, dtype, settings=settings,
-                rec_zono=rec_zono)
+                rec_zono=rec_zono, op_bounds=_op_bounds_p1)
             bounds_by_relu = {
                 L: (lo.detach().cpu().numpy().astype(np.float64),
                     hi.detach().cpu().numpy().astype(np.float64))
                 for L, (lo, hi) in sb.items()}
-            phase1_tb = {'plain_forward': time.perf_counter() - _t_p1}
+            phase1_tb = {'plain_forward': time.perf_counter() - _t_p1,
+                         'op_bounds': _op_bounds_p1}
         elif _phase1_method == 'bab_refine':
             # Pass rec_zono into bab_refine so its initial forward
             # populates the per-layer pre-ReLU rows. Phase 7 then takes
@@ -6090,9 +6139,27 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     # optimum on a frozen-intermediate-bounds problem).
     _ph1_spec_alpha = phase1_tb.get('spec_alpha_phase05') if isinstance(phase1_tb, dict) else None
     if _phase2_crown:
+        _ob_p1 = (phase1_tb.get('op_bounds')
+                  if isinstance(phase1_tb, dict) else None)
         with torch.no_grad():
             spec_lbs, _ = _spec_backward_graph(
-                sb, xl_g, xh_g, gg, spec_ew, all_qids, nh, device, dtype)
+                sb, xl_g, xh_g, gg, spec_ew, all_qids, nh, device, dtype,
+                op_bounds=_ob_p1)
+            if (_phase1_method == 'plain'
+                    and z_final_phase1 is not None
+                    and hasattr(z_final_phase1, 'center')):
+                # Best-of: the forward-zono margin and the backward CROWN
+                # bound are both sound — take the max per query (on vit
+                # the forward is tighter for some queries, the McCormick
+                # backward for others).
+                _zc = z_final_phase1.center
+                _zG = z_final_phase1.generators
+                for qi in all_qids:
+                    _w, _b = spec_ew[qi]
+                    _w = _w.to(_zc.dtype)
+                    _fwd = float(_w @ _zc + _b - (_w @ _zG).abs().sum())
+                    if _fwd > spec_lbs.get(qi, -float('inf')):
+                        spec_lbs[qi] = _fwd
     elif _ph1_spec_lbs:
         # Reuse Phase 0.5 α-CROWN spec lbs (already tighter than plain CROWN).
         spec_lbs = {qi: _ph1_spec_lbs.get(qi, -1.0) for qi in all_qids}
@@ -6649,12 +6716,15 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 n_iters=int(getattr(settings, 'zono_alpha_iters', 60)),
                 lr=float(getattr(settings, 'zono_alpha_lr', 0.1)))
             if not ok:
-                ok, n_used = _zono_relu_split_close(
+                ok, n_used, _rs_reason = _zono_relu_split_close(
                     gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype,
                     settings, time_left,
                     max_nodes=int(getattr(
                         settings, 'zono_relu_split_max_nodes', 512)))
                 _zis_nodes += n_used
+                if print_progress and not ok:
+                    print(f'  [relu-split] q{qi} open after {n_used} '
+                          f'boxes ({_rs_reason})', flush=True)
             if not ok and _zis_cap > 0:
                 ok, n_used = _zono_input_split_close(
                     gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype,

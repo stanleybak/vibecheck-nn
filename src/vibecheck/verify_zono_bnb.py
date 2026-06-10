@@ -872,7 +872,7 @@ def _build_spec_ew_graph(gg, pred, comps, device, dtype):
 
 def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
-                             relu_lambdas=None):
+                             relu_lambdas=None, op_bounds=None):
     if relu_lambdas is None:
         # plain (non-differentiable) use: keep the historical no-grad
         # fast path; the alpha-zono caller passes relu_lambdas and needs
@@ -880,15 +880,17 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
         with torch.no_grad():
             return _forward_zonotope_graph_impl(
                 xl, xh, gg, device, dtype, settings=settings,
-                rec_zono=rec_zono, tight_bounds=tight_bounds)
+                rec_zono=rec_zono, tight_bounds=tight_bounds,
+                op_bounds=op_bounds)
     return _forward_zonotope_graph_impl(
         xl, xh, gg, device, dtype, settings=settings, rec_zono=rec_zono,
-        tight_bounds=tight_bounds, relu_lambdas=relu_lambdas)
+        tight_bounds=tight_bounds, relu_lambdas=relu_lambdas,
+        op_bounds=op_bounds)
 
 
 def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
-                             relu_lambdas=None):
+                             relu_lambdas=None, op_bounds=None):
     """Graph-aware zonotope forward pass (supports skip connections).
 
     Args:
@@ -1235,11 +1237,16 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
         elif t == 'mul_bilinear':
             # Element-wise Mul. nn4sys mscn uses Mul(features, mask)
             # where the mask side is constant per-disjunct (zero
-            # radius). When both vary, the product is bilinear — no
-            # sound zonotope; helper raises NotImplementedError.
+            # radius). When both vary, the helper returns the sound
+            # zonotope product (linear exact + boxed remainder).
             from .zonotope import _torch_zono_mul_bilinear
             z_a = _get(op['inputs'][0])
             z_b = _get(op['inputs'][1])
+            if op_bounds is not None:
+                _al, _ah = z_a.bounds(); _bl, _bh = z_b.bounds()
+                op_bounds[name] = (
+                    (_al.detach().clone(), _ah.detach().clone()),
+                    (_bl.detach().clone(), _bh.detach().clone()))
             in_shapes = op.get('in_shapes_nd', [None, None])
             out_shape = op.get('out_shape_nd')
             new_c, new_g = _torch_zono_mul_bilinear(
@@ -1337,6 +1344,11 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                     f'matmul_bilinear {name!r}: need static N-D shapes')
             K_a = za.n_gens; K_b = zb.n_gens
             K = max(K_a, K_b)
+            if op_bounds is not None:
+                _al, _ah = za.bounds(); _bl, _bh = zb.bounds()
+                op_bounds[name] = (
+                    (_al.detach().clone(), _ah.detach().clone()),
+                    (_bl.detach().clone(), _bh.detach().clone()))
             Ac = za.center.reshape(sa)
             Bc = zb.center.reshape(sb_nd)
             # gens to (K, *shape), zero-padded to the common width
@@ -1375,6 +1387,9 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             # because the parallelogram contains f pointwise on [l, u].
             z = _get(op['inputs'][0])
             lo_in, hi_in = z.bounds()
+            if op_bounds is not None:
+                op_bounds[name] = (lo_in.detach().clone(),
+                                   hi_in.detach().clone())
             if t == 'reciprocal':
                 if float(lo_in.min()) <= 0:
                     raise NotImplementedError(
@@ -1497,7 +1512,8 @@ def _find_shared_gens_count(name_a, name_b, gg, gen_count):
 @torch.no_grad()
 def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                           remaining_specs, nh, device, dtype,
-                          return_ew=False, return_input_linear=False):
+                          return_ew=False, return_input_linear=False,
+                          op_bounds=None):
     """Graph-aware spec backward pass for networks with skip connections.
 
     spec_ew maps query_id -> (w, bias) where w is in OUTPUT space.
@@ -1677,6 +1693,89 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                     op.get('keepdims', False), out_shape_nd).squeeze(0)
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif (t in ('exp', 'reciprocal') and op_bounds is not None
+                  and name in op_bounds):
+                # 1-D convex backward (alpha,beta-CROWN BoundExp /
+                # BoundReciprocal planes): positive ew takes the LOWER
+                # plane (tangent), negative ew the UPPER plane (chord).
+                l_in, u_in = op_bounds[name]
+                l_in = l_in.to(device=ew.device, dtype=ew.dtype)
+                u_in = u_in.to(device=ew.device, dtype=ew.dtype)
+                w_ = (u_in - l_in).clamp(min=1e-12)
+                if t == 'exp':
+                    f_l = torch.exp(l_in); f_u = torch.exp(u_in)
+                    k_up = (f_u - f_l) / w_
+                    b_up = f_l - k_up * l_in
+                    m_t = torch.minimum((l_in + u_in) / 2, l_in + 0.99)
+                    k_lo = torch.exp(m_t)
+                    b_lo = k_lo * (1 - m_t)
+                else:
+                    assert bool((l_in > 0).all()), (
+                        f'reciprocal backward {name!r}: nonpositive input '
+                        f'lower bound')
+                    k_up = -1.0 / (l_in * u_in)
+                    b_up = 1.0 / l_in + 1.0 / u_in
+                    m_t = (l_in + u_in) / 2
+                    k_lo = -1.0 / (m_t * m_t)
+                    b_lo = 2.0 / m_t
+                ep = ew.clamp(min=0); en = ew.clamp(max=0)
+                acc += float((ep * b_lo + en * b_up).sum())
+                ew_back = ep * k_lo + en * k_up
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(
+                    inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif (t == 'matmul_bilinear' and op_bounds is not None
+                  and name in op_bounds):
+                # McCormick corner planes per product term (the
+                # alpha,beta-CROWN MulHelper default, r at the corner):
+                #   x*y >= yl*x + xl*y - xl*yl   (lower)
+                #   x*y <= yh*x + xl*y - xl*yh   (upper)
+                # ew on Z distributes to BOTH inputs through the planes.
+                (xl_b, xh_b), (yl_b, yh_b) = op_bounds[name]
+                sa = op['in_shapes_nd'][0]
+                sb_ = op['in_shapes_nd'][1]
+                so = op['out_shape_nd']
+                Xl = xl_b.to(ew.dtype).reshape(sa).unsqueeze(-1)
+                Yl = yl_b.to(ew.dtype).reshape(sb_).unsqueeze(-3)
+                Yh = yh_b.to(ew.dtype).reshape(sb_).unsqueeze(-3)
+                ew_nd = ew.reshape(so)
+                ep = ew_nd.clamp(min=0).unsqueeze(-2)   # (.., n, 1, p)
+                en = ew_nd.clamp(max=0).unsqueeze(-2)
+                acc += float((ep * (-(Xl * Yl))
+                              + en * (-(Xl * Yh))).sum())
+                ew_x = (ep * Yl + en * Yh).sum(dim=-1)
+                ew_y = ((ep + en) * Xl).sum(dim=-3)
+                ia, ib = op['inputs'][0], op['inputs'][1]
+                ew_x = ew_x.reshape(-1); ew_y = ew_y.reshape(-1)
+                ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_x)) + ew_x
+                ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_y)) + ew_y
+
+            elif (t == 'mul_bilinear' and op_bounds is not None
+                  and name in op_bounds):
+                # Element-wise McCormick (broadcast-aware): same corner
+                # planes as matmul_bilinear, per element.
+                from .alpha_crown import _sum_to_shape
+                (xl_b, xh_b), (yl_b, yh_b) = op_bounds[name]
+                sa = op['in_shapes_nd'][0]
+                sb_ = op['in_shapes_nd'][1]
+                so = op['out_shape_nd']
+                ones_o = torch.ones(so, dtype=ew.dtype, device=ew.device)
+                Xl = xl_b.to(ew.dtype).reshape(sa) * ones_o
+                Yl = yl_b.to(ew.dtype).reshape(sb_) * ones_o
+                Yh = yh_b.to(ew.dtype).reshape(sb_) * ones_o
+                ew_nd = ew.reshape(so)
+                ep = ew_nd.clamp(min=0); en = ew_nd.clamp(max=0)
+                acc += float((ep * (-(Xl * Yl))
+                              + en * (-(Xl * Yh))).sum())
+                cx = ep * Yl + en * Yh
+                cy = (ep + en) * Xl
+                ia, ib = op['inputs'][0], op['inputs'][1]
+                ew_x = _sum_to_shape(cx, (), sa).reshape(-1)
+                ew_y = _sum_to_shape(cy, (), sb_).reshape(-1)
+                ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_x)) + ew_x
+                ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_y)) + ew_y
 
             elif t in ('mul_bilinear', 'div_bilinear'):
                 # Sound linearised backward for Div with non-point

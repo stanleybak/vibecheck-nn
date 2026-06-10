@@ -793,6 +793,12 @@ def default_settings(**overrides):
         # dim is the largest |w@G| input column. Off by default.
         zono_input_split_enabled=False,
         zono_input_split_max_nodes=4096,
+        # ReLU-split BnB fallback (same last-chance chain): per-node
+        # best-of(forward zono, McCormick backward) bound with clamped
+        # relu bounds; ew-weighted branching.
+        zono_relu_split_max_nodes=512,
+        zono_alpha_iters=60,
+        zono_alpha_lr=0.1,
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         # Phase 8 minimum-budget floor as fraction of total_timeout. The
         # pipeline rebudgets so Phase 8 always gets at least this fraction
