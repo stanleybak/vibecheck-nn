@@ -225,12 +225,19 @@ def forward_zonotope_graph_batched(xls, xhs, gg, device, dtype):
         elif t == 'sub':
             c, g = state[op['inputs'][0]]
             bias = op.get('bias')
-            if bias is not None:
-                bt = torch.tensor(bias.flatten(), dtype=dtype, device=device)
-                c = c - bt
-            state[name] = (c, g)
+            if bias is None:
+                raise NotImplementedError(
+                    f"batched zono: sub op {name!r} has no 'bias' — "
+                    f"treating it as identity would silently drop the "
+                    f"subtraction")
+            bt = torch.tensor(bias.flatten(), dtype=dtype, device=device)
+            state[name] = (c - bt, g)
         elif t == 'reshape':
             state[name] = state[op['inputs'][0]]
+        else:
+            raise NotImplementedError(
+                f'batched zono forward: unsupported op {t!r} at {name!r} — '
+                f'skipping it would propagate a stale zonotope')
 
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in state:

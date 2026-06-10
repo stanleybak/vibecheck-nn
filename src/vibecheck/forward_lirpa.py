@@ -711,8 +711,9 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 A_up_o = bound_in.A_up
                 b_up_o = bound_in.b_up - bias_t.unsqueeze(0)
             else:
-                A_lo_o, b_lo_o = bound_in.A_lo, bound_in.b_lo
-                A_up_o, b_up_o = bound_in.A_up, bound_in.b_up
+                raise NotImplementedError(
+                    "forward-LiRPA: sub op has no 'bias' — treating it as "
+                    "identity would silently drop the subtraction")
             lo_box, hi_box = _batched_eval_box(
                 A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
@@ -1586,8 +1587,9 @@ def forward_linear_bounds(gg, xl_np, xh_np, device, dtype,
                 A_up_out = bound_in.A_up
                 b_up_out = bound_in.b_up - bias_t
             else:
-                A_lo_out, b_lo_out = bound_in.A_lo, bound_in.b_lo
-                A_up_out, b_up_out = bound_in.A_up, bound_in.b_up
+                raise NotImplementedError(
+                    "forward-LiRPA: sub op has no 'bias' — treating it as "
+                    "identity would silently drop the subtraction")
             lo_box, hi_box = _evaluate_box(
                 A_lo_out, b_lo_out, A_up_out, b_up_out, xl, xh)
             state[name] = _Bound(

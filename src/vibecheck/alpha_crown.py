@@ -31,6 +31,10 @@ from .zonotope import TorchZonotope
 
 def _mul_scale_to_tensor(op, dtype, device):
     scale_t = op.get('scale')
+    if scale_t is None:
+        raise NotImplementedError(
+        f"mul op {op.get('name')!r} has no 'scale' — a missing constant "
+        f"means the multiply would be silently dropped")
     if isinstance(scale_t, np.ndarray):
         scale_t = torch.from_numpy(scale_t).to(device=device, dtype=dtype)
     elif not isinstance(scale_t, torch.Tensor):
@@ -270,12 +274,14 @@ def _compute_point_centers(gg, x_point, device, dtype):
             centers[name] = torch.cat([p.flatten() for p in parts], dim=0)
         elif t == 'mul':
             a = centers[ins[0]]; scale = op.get('scale')
-            if scale is not None:
-                s = torch.as_tensor(np.asarray(scale).flatten(),
-                                       dtype=dtype, device=device)
-                centers[name] = a * s
-            else:
-                centers[name] = a
+            if scale is None:
+                raise NotImplementedError(
+                    f"center forward: mul op {name!r} has no 'scale' — "
+                    f"treating it as identity would silently drop the "
+                    f"multiply")
+            s = torch.as_tensor(np.asarray(scale).flatten(),
+                                   dtype=dtype, device=device)
+            centers[name] = a * s
         elif t == 'mul_bilinear':
             a = centers[ins[0]]; b = centers[ins[1]]
             sh = op.get('in_shapes_nd', [None, None])
@@ -394,12 +400,14 @@ def _compute_point_centers_batched(gg, x_points, device, dtype):
             centers[name] = torch.cat([p.reshape(B, -1) for p in parts], dim=1)
         elif t == 'mul':
             a = centers[ins[0]]; scale = op.get('scale')
-            if scale is not None:
-                s = torch.as_tensor(np.asarray(scale).flatten(),
-                                       dtype=dtype, device=device)
-                centers[name] = a * s.unsqueeze(0)
-            else:
-                centers[name] = a
+            if scale is None:
+                raise NotImplementedError(
+                    f"batched center forward: mul op {name!r} has no "
+                    f"'scale' — treating it as identity would silently "
+                    f"drop the multiply")
+            s = torch.as_tensor(np.asarray(scale).flatten(),
+                                   dtype=dtype, device=device)
+            centers[name] = a * s.unsqueeze(0)
         elif t == 'mul_bilinear':
             a = centers[ins[0]]; b = centers[ins[1]]
             sh = op.get('in_shapes_nd', [None, None])

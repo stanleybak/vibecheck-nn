@@ -562,10 +562,6 @@ def _forward_batch_graph(x, gg):
                 output_padding=op['output_padding']).reshape(batch, -1)
             act[name] = a
 
-        elif t == 'bn':
-            a = act[op['inputs'][0]]
-            act[name] = a * op['factor'] + op['offset']
-
         elif t == 'upsample':
             a = act[op['inputs'][0]]
             in_shape = op['in_shape']
@@ -628,36 +624,20 @@ def _forward_batch_graph(x, gg):
                       padding=op['padding'])
             act[name] = a4.reshape(batch, -1)
 
-        elif t == 'transpose':
-            a = act[op['inputs'][0]]
-            in_shape = op.get('in_shapes_nd', [None])[0]
-            perm = op['perm']
-            if in_shape and len(in_shape) + 1 == len(perm):
-                # ONNX perm includes batch dim (typically perm[0]==0); convert
-                # to N-D body perm by remapping.
-                # Reshape (batch, n) -> (batch, *in_shape), permute, flatten.
-                a_nd = a.reshape(batch, *in_shape)
-                if perm[0] == 0:
-                    body_perm = tuple(p - 1 for p in perm[1:])
-                    a_nd = a_nd.permute(0, *(p + 1 for p in body_perm))
-                else:
-                    a_nd = a_nd.permute(*perm)
-                act[name] = a_nd.reshape(batch, -1)
-            else:
-                act[name] = a  # passthrough fallback
-
         elif t == 'squeeze':
             act[name] = act[op['inputs'][0]]
 
         elif t == 'mul':
             a = act[op['inputs'][0]]
             scale = op.get('scale')
-            if scale is not None:
-                s = torch.as_tensor(np.asarray(scale).flatten(),
-                                      dtype=a.dtype, device=a.device)
-                act[name] = a * s
-            else:
-                act[name] = a
+            if scale is None:
+                raise NotImplementedError(
+                    f"_forward_batch_graph: mul op {name!r} has no 'scale' "
+                    f"— treating it as identity would silently drop the "
+                    f"multiply")
+            s = torch.as_tensor(np.asarray(scale).flatten(),
+                                  dtype=a.dtype, device=a.device)
+            act[name] = a * s
 
         elif t == 'mul_bilinear':
             a = act[op['inputs'][0]]
@@ -2012,14 +1992,6 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
                 G_out = g_out.reshape(B, K, n_out).permute(0, 2, 1).contiguous()
             state[name] = (c_out, G_out)
 
-        elif t == 'bn':
-            c_in, G_in = _get(op['inputs'][0])
-            factor = op['factor']  # (n,)
-            offset = op['offset']  # (n,)
-            c_out = c_in * factor + offset  # (B, n)
-            G_out = G_in * factor.unsqueeze(-1)  # (B, n, K)
-            state[name] = (c_out, G_out)
-
         elif t in ('sigmoid', 'tanh'):
             c_in, G_in = _get(op['inputs'][0])
             abs_sum = G_in.abs().sum(dim=2)
@@ -2376,31 +2348,6 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
             state[name] = (c_out, G_out)
             sb[op['name'] + f'__{t}_box'] = (lo_out.clone(), hi_out.clone())
 
-        elif t == 'transpose':
-            # Linear permutation of dims (excluding the batch dim).
-            # Equivalent to a permutation of the flat indices.
-            c_in, G_in = _get(op['inputs'][0])
-            sh_in = op['in_shapes_nd'][0]
-            sh_out = op['out_shape_nd']
-            perm = op['perm']
-            # Perm is given over (1, *sh_in) (with leading 1 for batch).
-            # Strip the leading 0 and shift the rest by -1 to apply on
-            # (B, *sh_in).
-            perm_b = [0] + [p for p in perm if p != 0]
-            c_nd = c_in.reshape(B, *sh_in)
-            c_out = c_nd.permute(*perm_b).reshape(B, -1).contiguous()
-            K = G_in.shape[2]
-            if K == 0:
-                G_out = torch.zeros(B, c_out.shape[1], 0,
-                                       dtype=dtype, device=device)
-            else:
-                # Permute each gen column the same way.
-                g_perm = G_in.permute(0, 2, 1).reshape(
-                    B * K, *sh_in)
-                g_out = g_perm.permute(*perm_b).reshape(
-                    B * K, -1).reshape(B, K, -1).permute(0, 2, 1).contiguous()
-                G_out = g_out
-            state[name] = (c_out, G_out)
 
         elif t == 'squeeze':
             # Reshape-only: data unchanged.
@@ -3084,17 +3031,6 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                 (f"conv_transpose backward shape mismatch: got "
                  f"{ew_back_4d.shape} expected total {n_in_layer}")
             ew_back = ew_back_4d.reshape(B, Q, n_in_layer)
-            inp = op['inputs'][0]
-            existing = ew_at.get(inp)
-            ew_at[inp] = ew_back if existing is None else existing + ew_back
-
-        elif t == 'bn':
-            # Per-channel affine y = factor * x + offset.
-            # Backward: ew_back = ew * factor; acc += (ew * offset).sum.
-            factor = op['factor']  # (n,)
-            offset = op['offset']  # (n,)
-            acc = acc + (ew * offset).sum(dim=-1)
-            ew_back = ew * factor  # broadcast across (B, Q, n)
             inp = op['inputs'][0]
             existing = ew_at.get(inp)
             ew_at[inp] = ew_back if existing is None else existing + ew_back

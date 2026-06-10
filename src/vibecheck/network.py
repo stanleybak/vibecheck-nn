@@ -1929,6 +1929,11 @@ class ComputeGraph:
                 is_merge = len(inp_names) == 2
                 _add_bias = (node.params.get('bias', None)
                              if not is_merge else None)
+                if not is_merge and _add_bias is None:
+                    raise NotImplementedError(
+                        f'Add {name!r}: single live input but no captured '
+                        f'constant — emitting an identity would silently '
+                        f'drop the addition')
                 if _add_bias is not None:
                     # ONNX Add broadcasts the constant against the live
                     # N-D shape (e.g. a per-token (48,) bias on (1,17,48)
@@ -1981,13 +1986,64 @@ class ComputeGraph:
                         'name': name, 'type': 'sub_bilinear',
                         'inputs': [node.inputs[0], node.inputs[1]],
                     })
-                else:
-                    inp_names = [node.inputs[0] if inp0_computed
-                                  else self.input_name]
+                elif node.params.get('negate'):
+                    # Negate form bias − x (a is the constant, live operand
+                    # is inputs[1]). NO consumer ever implemented the old
+                    # `negate` flag on type 'sub' — every chain computed
+                    # x − bias, a silent SIGN FLIP — and the old emission
+                    # additionally wired inputs[0] (the constant) as the
+                    # live input. Emit the exact canonical equivalent
+                    # mul(−1) + add(bias) instead, which every chain
+                    # already supports.
+                    if bias is None:
+                        raise NotImplementedError(
+                            f'Sub {name!r}: negate form without a captured '
+                            f'constant')
+                    live = node.inputs[1] if inp1_computed else None
+                    if live is None:
+                        raise NotImplementedError(
+                            f'Sub {name!r}: negate form but inputs[1] is '
+                            f'not a computed tensor')
+                    _ba = np.asarray(bias, np.float64)
+                    _in_sh = (self.nodes[live].output_shape
+                              if live in self.nodes else self.input_shape)
+                    if (_in_sh is not None
+                            and _ba.size != int(np.prod(_in_sh))):
+                        _ba = np.ascontiguousarray(
+                            np.broadcast_to(_ba, _in_sh)).reshape(-1)
+                    neg_name = f'{name}__neg'
                     ops.append({
-                        'name': name, 'type': 'sub', 'inputs': inp_names,
-                        'bias': bias,
-                        'negate': node.params.get('negate', False),
+                        'name': neg_name, 'type': 'mul', 'inputs': [live],
+                        'scale': np.array([-1.0]),
+                    })
+                    ops.append({
+                        'name': name, 'type': 'add', 'inputs': [neg_name],
+                        'is_merge': False, 'bias': _ba.reshape(-1),
+                    })
+                else:
+                    # Plain x − const (live operand is inputs[0]). The
+                    # loader stores the constant as 'sub_val' (or 'bias'
+                    # in some forms) — the old emission read ONLY 'bias',
+                    # so every sub_val-form Sub became bias=None and the
+                    # consumers' None-guards silently turned it into an
+                    # IDENTITY (acasxu's input_Sub is all-zero, which is
+                    # the only reason that never showed).
+                    if not inp0_computed:
+                        raise NotImplementedError(
+                            f'Sub {name!r}: live operand is neither '
+                            f'computed nor the graph input')
+                    const = node.params.get('sub_val')
+                    if const is None:
+                        const = bias
+                    if const is None:
+                        raise NotImplementedError(
+                            f'Sub {name!r}: no captured constant — '
+                            f'emitting an identity would silently drop '
+                            f'the subtraction')
+                    ops.append({
+                        'name': name, 'type': 'sub',
+                        'inputs': [node.inputs[0]],
+                        'bias': np.asarray(const, np.float64),
                     })
                 computed.add(name)
 
@@ -2265,6 +2321,23 @@ class ComputeGraph:
                     })
                     computed.add(name)
                 else:
+                    # All-live concat: every chain handles type 'concat' as
+                    # a FLAT concatenation (axis ignored). That is exact
+                    # iff all dims before the concat axis are singleton for
+                    # every input — verify it here instead of silently
+                    # producing a permuted (wrong) layout downstream.
+                    for inp in node.inputs:
+                        sh = (self.nodes[inp].output_shape
+                              if inp in self.nodes else self.input_shape)
+                        if sh is None:
+                            continue
+                        a = axis if axis >= 0 else len(sh) + axis
+                        if any(int(d) != 1 for d in sh[:a]):
+                            raise NotImplementedError(
+                                f'Concat {name!r}: axis {axis} over shape '
+                                f'{sh} is not flat-contiguous — the flat '
+                                f"'concat' op would silently interleave "
+                                f'wrong positions')
                     ops.append({
                         'name': name, 'type': 'concat',
                         'inputs': inp_names,

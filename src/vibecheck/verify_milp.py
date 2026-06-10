@@ -1996,6 +1996,11 @@ def _build_graph_model_to_relu(gg_ops, x_lo, x_hi, bounds_by_relu,
         elif t == 'reshape':
             op_var_refs[nm] = op_var_refs[op['inputs'][0]]
 
+        else:
+            raise NotImplementedError(
+                f'milp graph builder: unsupported op {t!r} at {nm!r} — '
+                f'skipping it would encode a different network')
+
     m.update()
     return m, env, target_vars
 
@@ -2291,6 +2296,11 @@ def _solve_spec_graph_worker(args):
 
         elif t == 'reshape':
             op_var_refs[name] = op_var_refs[op['inputs'][0]]
+
+        else:
+            raise NotImplementedError(
+                f'milp spec worker: unsupported op {t!r} at {name!r} — '
+                f'skipping it would encode a different network')
 
     m.update()
 
@@ -2654,6 +2664,13 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
             d['bias'] = op.get('bias')
         elif op['type'] == 'sub':
             d['bias'] = op.get('bias')
+        elif op['type'] == 'reshape':
+            pass    # flat passthrough; consumers alias the input vars
+        else:
+            raise NotImplementedError(
+                f"milp serializer: unsupported op {op['type']!r} at "
+                f"{op['name']!r} — serializing without its params would "
+                f"make the MILP encode a different network")
         gg_ops_ser.append(d)
 
     x_lo_64 = spec.x_lo.astype(np.float64)
@@ -2991,6 +3008,13 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
             d['bias'] = op.get('bias')
         elif op['type'] == 'sub':
             d['bias'] = op.get('bias')
+        elif op['type'] == 'reshape':
+            pass    # flat passthrough; consumers alias the input vars
+        else:
+            raise NotImplementedError(
+                f"milp serializer: unsupported op {op['type']!r} at "
+                f"{op['name']!r} — serializing without its params would "
+                f"make the MILP encode a different network")
         gg_ops_ser.append(d)
 
     # Precompute sparse matrices (after GPU memory is freed by tightening)

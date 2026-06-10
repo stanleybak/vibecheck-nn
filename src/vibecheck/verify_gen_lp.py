@@ -65,11 +65,26 @@ def forward_point(gg_ops_ser, x, input_name, output_op_name):
         elif t == 'sub':
             a = vals[op['inputs'][0]]
             b = op.get('bias')
-            vals[nm] = (a - np.asarray(b, dtype=np.float64).flatten()
-                        if b is not None else a)
+            if b is None:
+                raise NotImplementedError(
+                    f"gen-LP forward: sub op {nm!r} has no 'bias' — "
+                    f"treating it as identity would silently drop the "
+                    f"subtraction")
+            if op.get('negate'):
+                raise NotImplementedError(
+                    f"gen-LP forward: sub op {nm!r} is the negate form "
+                    f"(bias - x); computing x - bias here would flip the "
+                    f"sign silently")
+            vals[nm] = a - np.asarray(b, dtype=np.float64).flatten()
         elif t == 'mul':
             a = vals[op['inputs'][0]]
-            scale = np.asarray(op.get('scale'), dtype=np.float64).flatten()
+            scale = op.get('scale')
+            if scale is None:
+                raise NotImplementedError(
+                    f"gen-LP forward: mul op {nm!r} has no 'scale' — "
+                    f"treating it as identity would silently drop the "
+                    f"multiply")
+            scale = np.asarray(scale, dtype=np.float64).flatten()
             vals[nm] = a * scale
         elif t == 'sigmoid':
             from scipy.special import expit
