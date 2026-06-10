@@ -1999,11 +1999,13 @@ class ComputeGraph:
                         raise NotImplementedError(
                             f'Sub {name!r}: negate form without a captured '
                             f'constant')
-                    live = node.inputs[1] if inp1_computed else None
+                    # The loader normalizes negate-form inputs to
+                    # [live] (the constant lives in params['bias']).
+                    live = node.inputs[0] if inp0_computed else None
                     if live is None:
                         raise NotImplementedError(
-                            f'Sub {name!r}: negate form but inputs[1] is '
-                            f'not a computed tensor')
+                            f'Sub {name!r}: negate form but its live '
+                            f'operand is not a computed tensor')
                     _ba = np.asarray(bias, np.float64)
                     _in_sh = (self.nodes[live].output_shape
                               if live in self.nodes else self.input_shape)
