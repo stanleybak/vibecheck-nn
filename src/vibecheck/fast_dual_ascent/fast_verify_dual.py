@@ -35,6 +35,11 @@ class Problem:
     c0_off: np.ndarray; c0_on: np.ndarray
     c_in: np.ndarray             # (S,) z_k center  (cut b-values below)
     z_lo: np.ndarray; z_hi: np.ndarray   # (S,) parallelogram caps
+    # Static halfspaces a·e ≤ b in generator space, dualized into every node
+    # bound (INVPROP-style sibling output constraints for conjunctive
+    # disjuncts; empty for single-conjunct specs = all regular-track).
+    hs_a: np.ndarray = None      # (M, n) or None
+    hs_b: np.ndarray = None      # (M,) or None
 
     @property
     def n_splits(self): return self.a_g.shape[0]
@@ -45,7 +50,12 @@ class Problem:
                                         self.d_t * self.e_hi).sum())
 
 
-def parse_problem(state, qw, qb, scored_keys) -> Problem:
+def parse_problem(state, qw, qb, scored_keys, extra_hs=()) -> Problem:
+    """extra_hs: iterable of (w_j, b_j) sibling output constraints. During
+    refutation the SAT set may be assumed, and each sibling constraint
+    requires w_j·y + b_j ≤ 0; projected through the state's output map this
+    is the generator-space halfspace (w_j@G_out)·e ≤ −(w_j@c_out + b_j),
+    dualized into every node bound (g stays ≤ p* — sound for any ν ≥ 0)."""
     qw = np.asarray(qw, float); qb = float(qb)
     n = int(state['n_gens']); n_input = int(state['n_input']); ul = state['unstable_list']
     e_lb = np.zeros(n); e_hi = np.zeros(n); e_lb[:n_input] = -1.0; e_hi[:n_input] = 1.0
@@ -63,17 +73,26 @@ def parse_problem(state, qw, qb, scored_keys) -> Problem:
     z_lo = np.where(safe & (lam > 1e-12), 2 * mu / np.maximum(lam, 1e-30) + c_in, 1e9)
     z_hi = np.where(safe & (1 - lam > 1e-12), 2 * mu / np.maximum(1 - lam, 1e-30) - c_in, 1e9)
     sidx = np.fromiter((idx_by_key[k] for k in scored_keys), np.int64, len(scored_keys))
-    d_t = qw @ state['obj_G_out_csr'].toarray().astype(float)
+    _G_csr = state['obj_G_out_csr']
+    d_t = np.asarray(_G_csr.T.dot(qw), float).ravel()   # sparse dot — no (n_out, n_gens) toarray
     c0 = float(qw @ np.asarray(state['obj_c_out'], float) + qb)
     lamS, cinS, enS, safeS, muS = lam[sidx], c_in[sidx], e_new[sidx], safe[sidx], mu[sidx]
     dnew = d_t[enS]; inv = 1.0 / np.where(safeS, muS, 1.0)
+    hs_a = hs_b = None
+    if extra_hs:
+        c_out = np.asarray(state['obj_c_out'], float)
+        hs_a = np.stack([np.asarray(_G_csr.T.dot(np.asarray(wj, float)),
+                                    float).ravel() for wj, _ in extra_hs])
+        hs_b = np.array([-(float(np.asarray(wj, float) @ c_out) + float(bj))
+                         for wj, bj in extra_hs])
     return Problem(
         n_gens=n, e_lb=e_lb, e_hi=e_hi, d_t=d_t, c0=c0, a_g=a_pu[sidx], e_new_col=enS,
         ratio_off=np.where(safeS, -(lamS * inv) * dnew, 0.0),
         ratio_on=np.where(safeS, ((1 - lamS) * inv) * dnew, 0.0),
         c0_off=np.where(safeS, -(1 + lamS * cinS * inv) * dnew, -dnew),
         c0_on=np.where(safeS, ((1 - lamS) * cinS * inv - 1) * dnew, -dnew),
-        c_in=cinS, z_lo=z_lo[sidx], z_hi=z_hi[sidx])
+        c_in=cinS, z_lo=z_lo[sidx], z_hi=z_hi[sidx],
+        hs_a=hs_a, hs_b=hs_b)
 
 
 def parse_problem_gpu(state, qw, qb, scored_keys, device) -> Problem:
@@ -233,7 +252,12 @@ class Verifier:
             i += step
         return out
 
-    def verify_query(self, state, qw, qb, scored_keys, *, time_limit=120.0, frontier_cap=None):
+    def verify_query(self, state, qw, qb, scored_keys, *, time_limit=120.0, frontier_cap=None,
+                     extra_hs=()):
+        if extra_hs:
+            raise NotImplementedError(
+                'sibling halfspaces: the K-step kernel does not dualize hs rows; '
+                "use the default 1-step verifier (ls='logbucket')")
         return self.verify(parse_problem(state, qw, qb, scored_keys),
                            time_limit=time_limit, frontier_cap=frontier_cap)
 

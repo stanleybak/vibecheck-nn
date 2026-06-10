@@ -6890,10 +6890,24 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 if _fast_da:
                     # Fast path: returns 'unsat'(robust) / 'unknown' only.
                     _t_call = time.perf_counter()
+                    # Sibling output constraints (INVPROP-style): for a
+                    # CONJUNCTIVE disjunct, refutation may assume the SAT
+                    # set, so every sibling conjunct (w_j·y + b_j ≤ 0) is a
+                    # valid halfspace to dualize into the node bound —
+                    # aggressive joint pruning (yolo_2023: 5 conjuncts).
+                    # Inert for single-conjunct disjuncts (regular track).
+                    _sib_hs = ()
+                    if bool(getattr(settings, 'phase8_sibling_halfspaces',
+                                    True)):
+                        _di_q = queries[qi][0]
+                        _sib_hs = [(queries[qj][1], queries[qj][2])
+                                   for qj in range(len(queries))
+                                   if queries[qj][0] == _di_q and qj != qi]
                     vd, info = _fast_verifier.verify_query(
                         state_q, qw_q, qb_q,
                         [k for k in scored_keys_q],
-                        time_limit=time_left())
+                        time_limit=time_left(),
+                        extra_hs=_sib_hs)
                     try:
                         if _p8prof and torch.cuda.is_available():
                             torch.cuda.synchronize()

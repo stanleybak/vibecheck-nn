@@ -776,6 +776,12 @@ def default_settings(**overrides):
         phase8_fast_dual_ascent_ls='logbucket',  # 'logbucket' (default) | 'topk'
         phase8_fast_dual_ascent_K=256,           # line-search width
         phase8_fast_dual_ascent_compile=True,    # False = eager (skip ~3s warmup for one-off cold cases)
+        # For CONJUNCTIVE disjuncts, dualize the sibling conjuncts
+        # (w_j·y + b_j ≤ 0, assumable during refutation) as generator-space
+        # halfspace cuts in every fast-BnB node bound (INVPROP-lite). Sound
+        # by weak duality; bit-exact no-op for single-conjunct disjuncts
+        # (= every regular-track benchmark).
+        phase8_sibling_halfspaces=True,
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         # Phase 8 minimum-budget floor as fraction of total_timeout. The
         # pipeline rebudgets so Phase 8 always gets at least this fraction
