@@ -776,12 +776,23 @@ def default_settings(**overrides):
         phase8_fast_dual_ascent_ls='logbucket',  # 'logbucket' (default) | 'topk'
         phase8_fast_dual_ascent_K=256,           # line-search width
         phase8_fast_dual_ascent_compile=True,    # False = eager (skip ~3s warmup for one-off cold cases)
+        # >1 routes Phase-8 to the K-step dual-ascent GPU kernel (sweeps λ-ascent
+        # iterations per BaB node, warm-started) instead of the 1-step logbucket.
+        # Tighter per-node bound → far fewer surviving nodes per level → smaller
+        # frontier. Default 1 (legacy 1-step). metaroom q8 needs ~20.
+        phase8_fast_dual_ascent_sweeps=1,
         # For CONJUNCTIVE disjuncts, dualize the sibling conjuncts
         # (w_j·y + b_j ≤ 0, assumable during refutation) as generator-space
         # halfspace cuts in every fast-BnB node bound (INVPROP-lite). Sound
         # by weak duality; bit-exact no-op for single-conjunct disjuncts
         # (= every regular-track benchmark).
         phase8_sibling_halfspaces=True,
+        # Last-chance worst-first input-split BnB over the plain graph
+        # zono forward for queries still open before Phase 8. Built for
+        # the vit attention nets (no CROWN backward there); the split
+        # dim is the largest |w@G| input column. Off by default.
+        zono_input_split_enabled=False,
+        zono_input_split_max_nodes=4096,
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         # Phase 8 minimum-budget floor as fraction of total_timeout. The
         # pipeline rebudgets so Phase 8 always gets at least this fraction

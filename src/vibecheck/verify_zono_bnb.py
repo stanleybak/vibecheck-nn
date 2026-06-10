@@ -880,9 +880,25 @@ def _build_spec_ew_graph(gg, pred, comps, device, dtype):
     return spec_ew
 
 
-@torch.no_grad()
 def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
-                             rec_zono=None, tight_bounds=None):
+                             rec_zono=None, tight_bounds=None,
+                             relu_lambdas=None):
+    if relu_lambdas is None:
+        # plain (non-differentiable) use: keep the historical no-grad
+        # fast path; the alpha-zono caller passes relu_lambdas and needs
+        # the autograd graph through the forward.
+        with torch.no_grad():
+            return _forward_zonotope_graph_impl(
+                xl, xh, gg, device, dtype, settings=settings,
+                rec_zono=rec_zono, tight_bounds=tight_bounds)
+    return _forward_zonotope_graph_impl(
+        xl, xh, gg, device, dtype, settings=settings, rec_zono=rec_zono,
+        tight_bounds=tight_bounds, relu_lambdas=relu_lambdas)
+
+
+def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
+                             rec_zono=None, tight_bounds=None,
+                             relu_lambdas=None):
     """Graph-aware zonotope forward pass (supports skip connections).
 
     Args:
@@ -997,6 +1013,42 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
         elif t == 'relu':
             z = _get(op['inputs'][0])
             layer_idx = op.get('layer_idx')
+            if relu_lambdas is not None and layer_idx in relu_lambdas:
+                # Parametrized ReLU relaxation with caller-supplied slopes
+                # lam in [0,1] (alpha-zono forward): for unstable neurons,
+                #   relu(z) - lam*z ∈ [0, max(-lam*lo, (1-lam)*hi)]
+                # so y = lam*z + r/2 + (r/2)*e_new with
+                # r = max(-lam*lo, (1-lam)*hi). Differentiable in lam;
+                # ANY lam in [0,1] is a sound relaxation. Stable neurons
+                # use the exact identity/zero.
+                lam_t = relu_lambdas[layer_idx]
+                lo_p, hi_p = z.bounds()
+                dead = hi_p <= 0
+                act = lo_p >= 0
+                uns = (~dead) & (~act)
+                eff = torch.where(uns, lam_t.clamp(0, 1),
+                                  act.to(lam_t.dtype))
+                r = torch.where(
+                    uns,
+                    torch.maximum(-eff * lo_p, (1 - eff) * hi_p),
+                    torch.zeros_like(lo_p))
+                c_new = eff * z.center + r / 2
+                G_old = z.generators * eff.unsqueeze(1)
+                nzr = torch.nonzero(r).flatten()
+                G_new = torch.zeros(lo_p.numel(), nzr.numel(),
+                                    dtype=z.center.dtype, device=device)
+                G_new[nzr, torch.arange(nzr.numel(), device=device)] = \
+                    r[nzr] / 2
+                z2 = TorchZonotope(c_new, torch.cat([G_old, G_new], 1))
+                if layer_idx is not None:
+                    sb[layer_idx] = (lo_p.detach().clone(),
+                                     hi_p.detach().clone())
+                zono_state[name] = z2
+                gen_count[name] = z2.n_gens
+                for inp in op['inputs']:
+                    if last_use.get(inp) == op_idx and inp in zono_state:
+                        del zono_state[inp]
+                continue
             # Build the (lo, hi) the relaxation will use: intersect z's
             # own bounds with any externally-supplied tight bounds. We
             # record this same (lo, hi) into rec_zono so the LP triangle
@@ -1269,6 +1321,106 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                 z.center, z.generators, int(exp), relaxation=_relax)
             op['_pow_relaxation'] = _relax
             zono_state[name] = TorchZonotope(new_c, new_g)
+
+        elif t == 'matmul_bilinear':
+            # A @ B with BOTH inputs perturbed (vit attention Q@K^T and
+            # attn@V). True zonotope product: with shared noise symbols
+            # e (columns aligned by the zonotope.py prefix invariant),
+            #   (Ac + Σ A_i e_i) @ (Bc + Σ B_j e_j)
+            #     = Ac@Bc + Σ_i (A_i@Bc + Ac@B_i) e_i + R,
+            # the LINEAR terms are exact and column-aligned; the
+            # quadratic remainder R = Σ_{ij} (A_i@B_j) e_i e_j is boxed
+            # soundly by radius-matmul:  |R| ≤ (Σ_i|A_i|) @ (Σ_j|B_j|)
+            # elementwise (each |e_i e_j| ≤ 1), appended as fresh
+            # diagonal columns.
+            za = _get(op['inputs'][0]); zb = _get(op['inputs'][1])
+            sa = op.get('in_shapes_nd', [None, None])[0]
+            sb_nd = op.get('in_shapes_nd', [None, None])[1]
+            if sa is None or sb_nd is None:
+                raise NotImplementedError(
+                    f'matmul_bilinear {name!r}: need static N-D shapes')
+            K_a = za.n_gens; K_b = zb.n_gens
+            K = max(K_a, K_b)
+            Ac = za.center.reshape(sa)
+            Bc = zb.center.reshape(sb_nd)
+            # gens to (K, *shape), zero-padded to the common width
+            GA = za.generators
+            GB = zb.generators
+            if K_a < K:
+                GA = torch.cat([GA, torch.zeros(GA.shape[0], K - K_a,
+                                                dtype=dtype, device=device)], 1)
+            if K_b < K:
+                GB = torch.cat([GB, torch.zeros(GB.shape[0], K - K_b,
+                                                dtype=dtype, device=device)], 1)
+            GA = GA.t().reshape(K, *sa)
+            GB = GB.t().reshape(K, *sb_nd)
+            center = Ac @ Bc
+            lin = GA @ Bc + Ac.unsqueeze(0) @ GB        # (K, ..., n, p)
+            radA = GA.abs().sum(dim=0)
+            radB = GB.abs().sum(dim=0)
+            R = radA @ radB                              # (..., n, p) ≥ 0
+            n_out = center.numel()
+            G_lin = lin.reshape(K, n_out).t().contiguous()
+            Rf = R.reshape(-1)
+            nz = torch.nonzero(Rf).flatten()
+            G_quad = torch.zeros(n_out, nz.numel(), dtype=dtype,
+                                 device=device)
+            G_quad[nz, torch.arange(nz.numel(), device=device)] = Rf[nz]
+            zono_state[name] = TorchZonotope(
+                center.reshape(-1), torch.cat([G_lin, G_quad], dim=1))
+
+        elif t == 'softmax':
+            # Sound interval softmax. y_i = 1/(1 + sum_{j!=i} exp(z_j-z_i)):
+            #   ub_i uses z_i->hi_i, z_j->lo_j; lb_i uses z_i->lo_i,
+            #   z_j->hi_j (monotone in each coordinate). Exp args are
+            #   clamped at 700 to avoid inf: for ub the clamp SHRINKS the
+            #   denominator (ub only grows — sound); for lb an inf denom
+            #   gives lb=0 which is also sound, the clamp just avoids NaNs.
+            z = _get(op['inputs'][0])
+            sh = op.get('in_shapes_nd', [None])[0]
+            if sh is None:
+                raise NotImplementedError(
+                    f'softmax {name!r}: need a static N-D shape')
+            axis = int(op.get('axis', -1))
+            if axis >= 0:
+                # ONNX axis counts the batch dim; in_shapes_nd strips it.
+                axis = axis - 1
+                if axis < 0 or axis >= len(sh):
+                    raise NotImplementedError(
+                        f'softmax {name!r}: axis maps outside the '
+                        f'batch-stripped shape {sh}')
+            lo_in, hi_in = z.bounds()
+            lo_in = lo_in.reshape(sh); hi_in = hi_in.reshape(sh)
+            # build (..., n, n) difference tensors along the softmax axis
+            ax = axis if axis >= 0 else len(sh) + axis
+            lo_m = torch.movedim(lo_in, ax, -1)
+            hi_m = torch.movedim(hi_in, ax, -1)
+            n_ax = lo_m.shape[-1]
+            diff_ub = lo_m.unsqueeze(-2) - hi_m.unsqueeze(-1)   # z_j_lo - z_i_hi
+            diff_lb = hi_m.unsqueeze(-2) - lo_m.unsqueeze(-1)   # z_j_hi - z_i_lo
+            eye = torch.eye(n_ax, dtype=torch.bool, device=device)
+            den_ub = 1 + torch.exp(diff_ub.clamp(max=700.0)).masked_fill(
+                eye, 0).sum(dim=-1)
+            den_lb = 1 + torch.exp(diff_lb.clamp(max=700.0)).masked_fill(
+                eye, 0).sum(dim=-1)
+            ub_m = 1.0 / den_ub
+            lb_m = 1.0 / den_lb
+            lo_out = torch.movedim(lb_m, -1, ax).reshape(-1)
+            hi_out = torch.movedim(ub_m, -1, ax).reshape(-1)
+            rad = (hi_out - lo_out) / 2
+            nz = torch.nonzero(rad).flatten()
+            # keep the shared-history prefix as zero columns (see
+            # matmul_bilinear handler / zonotope.py column invariant).
+            # NOTE (measured 2026-06-10, vit ibp_3_3_8): coupling the
+            # softmax simplex (last coord = 1 - sum of boxed siblings)
+            # LOOSENS the margins ~2x here — the dependent coordinate's
+            # own tight box is worth more than the restored correlation.
+            K_pref = z.n_gens
+            G = torch.zeros(lo_out.numel(), K_pref + nz.numel(),
+                            dtype=dtype, device=device)
+            G[nz, K_pref + torch.arange(nz.numel(),
+                                        device=device)] = rad[nz]
+            zono_state[name] = TorchZonotope((lo_out + hi_out) / 2, G)
 
         else:
             raise NotImplementedError(

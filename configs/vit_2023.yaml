@@ -1,0 +1,15 @@
+# vit_2023 — ViT attention nets (extended track). v1: pure forward-zono
+# (interval attention: matmul_bilinear + softmax box bounds) + PGD. The
+# CROWN/alpha backward chains do not support the attention ops yet, so all
+# backward-based phases are off; verdicts come from the zono spec check and
+# PGD witnesses. ABC bar: 126/200 (alpha-CROWN + custom vit tuning).
+phase2_crown_enabled: false
+zono_lift_enabled: false
+max_tighten_layer: 0
+bab_refine_passes: 0
+skip_phase8_milp: true
+parallel_pgd_enabled: false
+pgd_restarts: 128
+phase1_method: plain
+zono_input_split_enabled: true
+zono_input_split_max_nodes: 0

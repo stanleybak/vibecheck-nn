@@ -42,17 +42,28 @@ _OK_STATUSES_GLOBAL = None
 _FAST_DA_VERIFIERS = {}
 
 
-def _get_fast_da_verifier(device, ls, K, compile):
-    """Cached fast GPU dual-ascent Verifier (one per (device, ls, K, compile)).
+def _get_fast_da_verifier(device, ls, K, compile, sweeps=1):
+    """Cached fast GPU dual-ascent Verifier (one per (device, ls, K, compile, sweeps)).
 
     The `torch.compile` warmup (~3 s) is paid once per process, then the same
     Verifier is reused across every query/case in that process — so build it
-    lazily and memoize. See `fast_dual_ascent` for the kernel."""
-    key = (str(device), ls, int(K), bool(compile))
+    lazily and memoize. See `fast_dual_ascent` for the kernel.
+
+    `sweeps > 1` routes to the K-step dual-ascent kernel
+    (`fast_verify_dual.Verifier`, K = sweeps): it runs `sweeps` λ-ascent
+    iterations per BaB node (warm-started), giving a much tighter per-node
+    bound than the default 1-step logbucket verifier. Far fewer nodes survive
+    per level → the frontier stays small enough to fit (the metaroom q8 case
+    needs this: 1-step → 70M-node OOM; ~20 sweeps → ~1M frontier, closes)."""
+    key = (str(device), ls, int(K), bool(compile), int(sweeps))
     v = _FAST_DA_VERIFIERS.get(key)
     if v is None:
-        from .fast_dual_ascent import Verifier
-        v = Verifier(device=str(device), compile=compile, ls=ls, K=K)
+        if int(sweeps) > 1:
+            from .fast_dual_ascent.fast_verify_dual import Verifier as _KStep
+            v = _KStep(device=str(device), compile=compile, K=int(sweeps))
+        else:
+            from .fast_dual_ascent import Verifier
+            v = Verifier(device=str(device), compile=compile, ls=ls, K=K)
         _FAST_DA_VERIFIERS[key] = v
     return v
 
@@ -112,6 +123,15 @@ def _serialize_gg_ops(gg):
             d['out_shape_nd'] = op.get('out_shape_nd')
         elif t == 'reshape':
             pass    # flat passthrough; consumers alias the input vars
+        elif t in ('slice', 'gather'):
+            d['flat_idx'] = op['flat_idx']
+        elif t in ('matmul_bilinear', 'softmax', 'concat', 'squeeze'):
+            # carried with full geometry; consumers that cannot handle
+            # these types still raise in their own dispatch
+            d['axis'] = op.get('axis')
+            d['axes'] = op.get('axes')
+            d['in_shapes_nd'] = op.get('in_shapes_nd')
+            d['out_shape_nd'] = op.get('out_shape_nd')
         else:
             raise NotImplementedError(
                 f'gg serializer: unsupported op {t!r} at '
@@ -5235,6 +5255,105 @@ def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
     return True, info
 
 
+def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
+                      settings, time_left, n_iters=60, lr=0.1):
+    """Optimize per-neuron ReLU slopes (lam in [0,1]) of the PLAIN graph
+    zono forward against ONE open query's margin (alpha-zono, forward
+    mode). Every lam is a sound relaxation, so the best-of over iters is
+    sound; returns True iff some iterate proves lb > 0. Built for the
+    vit attention nets where no CROWN backward exists."""
+    w_t = w_q if torch.is_tensor(w_q) else torch.as_tensor(
+        np.asarray(w_q, np.float64), device=device, dtype=dtype)
+    relu_ops = [op for op in gg['ops']
+                if op['type'] == 'relu' and 'layer_idx' in op]
+    # init at min-area-ish 0.5; sizes from a probe forward
+    sb0, _ = _forward_zonotope_graph(xl, xh, gg, device, dtype,
+                                     settings=settings)
+    lams = {op['layer_idx']: torch.full(
+                (sb0[op['layer_idx']][0].numel(),), 0.5,
+                device=device, dtype=dtype, requires_grad=True)
+            for op in relu_ops if op['layer_idx'] in sb0}
+    if not lams:
+        return False
+    opt = torch.optim.Adam(list(lams.values()), lr=lr)
+    for it in range(n_iters):
+        if time_left() <= 1.0:
+            return False
+        opt.zero_grad()
+        _, zf = _forward_zonotope_graph(
+            xl, xh, gg, device, dtype, settings=settings,
+            relu_lambdas=lams)
+        wv = w_t.to(zf.center.dtype)
+        lb = wv @ zf.center + float(b_q) - (wv @ zf.generators).abs().sum()
+        if float(lb) > 0:
+            return True
+        (-lb).backward()
+        opt.step()
+        with torch.no_grad():
+            for p_ in lams.values():
+                p_.clamp_(0, 1)
+    return False
+
+
+def _zono_input_split_close(gg, xl, xh, w_q, b_q, device, dtype,
+                             settings, time_left, max_nodes=4096):
+    """Worst-first input-split BnB on ONE open query using the plain
+    graph zonotope forward. Each node re-propagates the sub-box and
+    checks lb(w·y+b) > 0; the split dim is the input dim with the
+    largest |(w@G)| contribution (input dims own the leading generator
+    columns). Sound: every leaf bound is a valid zonotope lower bound
+    over its sub-box; True is returned only when every leaf closed.
+
+    Built for the vit attention nets (the only phase-1 path there is the
+    plain forward — no CROWN backward), but net-agnostic."""
+    import heapq
+    w_t = w_q if torch.is_tensor(w_q) else torch.as_tensor(
+        np.asarray(w_q, np.float64), device=device, dtype=dtype)
+
+    def bound(lo_x, hi_x):
+        _, zf = _forward_zonotope_graph(lo_x, hi_x, gg, device, dtype,
+                                        settings=settings)
+        c = zf.center; G = zf.generators
+        wv = w_t.to(c.dtype)
+        wg = wv @ G
+        lb = float(wv @ c + float(b_q) - wg.abs().sum())
+        nzd = torch.nonzero(hi_x - lo_x).flatten()
+        K_in = min(int(nzd.numel()), G.shape[1])
+        if K_in == 0:
+            return lb, -1
+        col = int(wg[:K_in].abs().argmax())
+        return lb, int(nzd[col])
+
+    lb0, dim0 = bound(xl, xh)
+    if lb0 > 0:
+        return True, 1
+    if dim0 < 0:
+        return False, 1
+    heap = []
+    cnt = 0
+    heapq.heappush(heap, (lb0, cnt, xl, xh, dim0))
+    nodes = 1
+    while heap:
+        if time_left() <= 1.0 or nodes >= max_nodes:
+            return False, nodes
+        lb, _, lo_x, hi_x, d = heapq.heappop(heap)
+        mid = float((lo_x[d] + hi_x[d]) / 2)
+        for half in (0, 1):
+            l2 = lo_x.clone(); h2 = hi_x.clone()
+            if half == 0:
+                h2[d] = mid
+            else:
+                l2[d] = mid
+            lb2, d2 = bound(l2, h2)
+            nodes += 1
+            if lb2 <= 0:
+                if d2 < 0:
+                    return False, nodes   # box degenerate yet open
+                cnt += 1
+                heapq.heappush(heap, (lb2, cnt, l2, h2, d2))
+    return True, nodes
+
+
 def _run_pipeline(graph, spec, settings, build_fn, impl):
     """Run the 9-phase graph verification pipeline.
 
@@ -5724,7 +5843,22 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         return None
 
     try:
-        if _phase1_method == 'bab_refine':
+        if _phase1_method == 'plain':
+            # Plain graph-aware zono forward (verify_zono_bnb) with NO
+            # tightening cascade. The only phase-1 path that supports the
+            # vit attention ops (matmul_bilinear / softmax interval
+            # handlers live there); also the cheapest when
+            # max_tighten_layer=0 anyway.
+            _t_p1 = time.perf_counter()
+            sb, z_final_phase1 = _forward_zonotope_graph(
+                xl_g, xh_g, gg, device, dtype, settings=settings,
+                rec_zono=rec_zono)
+            bounds_by_relu = {
+                L: (lo.detach().cpu().numpy().astype(np.float64),
+                    hi.detach().cpu().numpy().astype(np.float64))
+                for L, (lo, hi) in sb.items()}
+            phase1_tb = {'plain_forward': time.perf_counter() - _t_p1}
+        elif _phase1_method == 'bab_refine':
             # Pass rec_zono into bab_refine so its initial forward
             # populates the per-layer pre-ReLU rows. Phase 7 then takes
             # the state_from_phase1 fast path and avoids the dense
@@ -5782,6 +5916,39 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     timing['phase1_breakdown'] = phase1_tb
     _mem_audit('after phase1')
 
+    # Env-gated bounds dump / intersect — the "combine two tightenings"
+    # experiment. VC_DUMP_BOUNDS pickles the post-Phase-1 bounds_by_relu;
+    # VC_LOAD_BOUNDS loads another run's bounds and INTERSECTS them with the
+    # current ones (max lo, min hi per neuron). Sound: both are valid
+    # over-approximations, so the tighter of each is still valid.
+    import os as _osb
+    _db = _osb.environ.get('VC_DUMP_BOUNDS', '')
+    if _db:
+        import pickle as _pklb
+        with open(_db, 'wb') as _f:
+            _pklb.dump({L: (np.asarray(lo).copy(), np.asarray(hi).copy())
+                        for L, (lo, hi) in bounds_by_relu.items()}, _f)
+        if print_progress:
+            print(f'  [dump-bounds] {len(bounds_by_relu)} layers -> {_db}',
+                  flush=True)
+    _lbf = _osb.environ.get('VC_LOAD_BOUNDS', '')
+    if _lbf:
+        import pickle as _pklb
+        with open(_lbf, 'rb') as _f:
+            _bload = _pklb.load(_f)
+        _ntab = 0
+        for L, (lo, hi) in list(bounds_by_relu.items()):
+            if L in _bload:
+                _lo2, _hi2 = _bload[L]
+                _nlo = np.maximum(np.asarray(lo), np.asarray(_lo2))
+                _nhi = np.minimum(np.asarray(hi), np.asarray(_hi2))
+                _ntab += int(((_nlo > np.asarray(lo))
+                              | (_nhi < np.asarray(hi))).sum())
+                bounds_by_relu[L] = (_nlo, _nhi)
+        if print_progress:
+            print(f'  [intersect-bounds] tightened {_ntab} neuron-bounds '
+                  f'from {_lbf}', flush=True)
+
     # --- Check parallel PGD result (thread joined inside Phase 1) ---
     if isinstance(phase1_tb, dict):
         _pp_attacks = phase1_tb.get('parallel_pgd_attacks')
@@ -5822,13 +5989,27 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     # α-CROWN (saves ~10 iters worth of Adam to re-find the same local
     # optimum on a frozen-intermediate-bounds problem).
     _ph1_spec_alpha = phase1_tb.get('spec_alpha_phase05') if isinstance(phase1_tb, dict) else None
-    if _phase2_crown or not _ph1_spec_lbs:
+    if _phase2_crown:
         with torch.no_grad():
             spec_lbs, _ = _spec_backward_graph(
                 sb, xl_g, xh_g, gg, spec_ew, all_qids, nh, device, dtype)
-    else:
+    elif _ph1_spec_lbs:
         # Reuse Phase 0.5 α-CROWN spec lbs (already tighter than plain CROWN).
         spec_lbs = {qi: _ph1_spec_lbs.get(qi, -1.0) for qi in all_qids}
+    else:
+        # No backward pass available/desired (phase1_method='plain' with
+        # phase2 off — e.g. vit attention nets where the CROWN backward
+        # has no handlers): sound spec margins straight from the forward
+        # zonotope, lb(w·y+b) = w·c + b − Σ|w·G|.
+        with torch.no_grad():
+            _zc = z_final_phase1.center
+            _zG = z_final_phase1.generators
+            spec_lbs = {}
+            for qi in all_qids:
+                _w, _b = spec_ew[qi]
+                _w = _w.to(_zc.dtype)
+                spec_lbs[qi] = float(
+                    _w @ _zc + _b - (_w @ _zG).abs().sum())
     timing['phase2_crown'] = time.perf_counter() - t0
     stats.record_bounds(sb)
 
@@ -6244,12 +6425,15 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     need_ew = [qi for qi in still_needs_milp
                 if qi not in lp_scores_by_query
                 and qi not in alpha_ew_by_qi]
-    if need_ew:
+    if need_ew and not bool(getattr(settings, 'skip_phase8_milp', False)):
         with torch.no_grad():
             _, _, ew_at_relu = _spec_backward_graph(
                 sb, xl_g, xh_g, gg, spec_ew, set(need_ew), nh,
                 device, dtype, return_ew=True)
     else:
+        # No Phase-8 MILP consumer for the scores (skip_phase8_milp) —
+        # don't run a backward pass that some op sets (vit attention)
+        # cannot support anyway.
         ew_at_relu = {}
     # Merge α-CROWN's cached ew into the same dict structure expected below
     # (keyed by qi → {L: np.ndarray}).
@@ -6348,6 +6532,40 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                           f'({_gnt}); returning unknown', flush=True)
                 return _finalize('unknown', 'spec_lp',
                                  remaining=len(still_needs_milp))
+    if (bool(getattr(settings, 'zono_input_split_enabled', False))
+            and still_needs_milp and time_left() > 2.0):
+        # Last-chance input-split BnB on the open queries via the plain
+        # zono forward (vit path: no backward support needed). All-or-
+        # nothing: only a full close changes the verdict.
+        _t_zis = time.perf_counter()
+        _zis_nodes = 0
+        _zis_closed = []
+        _zis_cap = int(getattr(settings, 'zono_input_split_max_nodes', 4096))
+        for qi in sorted(still_needs_milp):
+            _w_zis, _b_zis = spec_ew[qi]
+            ok = _zono_alpha_close(
+                gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype, settings,
+                time_left,
+                n_iters=int(getattr(settings, 'zono_alpha_iters', 60)),
+                lr=float(getattr(settings, 'zono_alpha_lr', 0.1)))
+            if not ok and _zis_cap > 0:
+                ok, n_used = _zono_input_split_close(
+                    gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype,
+                    settings, time_left, max_nodes=_zis_cap)
+                _zis_nodes += n_used
+            if not ok:
+                break
+            _zis_closed.append(qi)
+        timing['zono_input_split'] = time.perf_counter() - _t_zis
+        if print_progress:
+            print(f'  [zono-input-split] closed {len(_zis_closed)}/'
+                  f'{len(still_needs_milp)} open queries '
+                  f'({_zis_nodes} boxes, '
+                  f'{timing["zono_input_split"]:.1f}s)', flush=True)
+        if len(_zis_closed) == len(still_needs_milp):
+            still_needs_milp.clear()
+            return _finalize('verified', 'zono_input_split')
+
     if _skip_milp and still_needs_milp:
         if print_progress:
             print(f'  Phase 8 skipped (skip_phase8_milp=True); '
@@ -6810,7 +7028,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                                 'logbucket')),
                     int(getattr(settings, 'phase8_fast_dual_ascent_K', 256)),
                     bool(getattr(settings,
-                                 'phase8_fast_dual_ascent_compile', True)))
+                                 'phase8_fast_dual_ascent_compile', True)),
+                    int(getattr(settings, 'phase8_fast_dual_ascent_sweeps', 1)))
                 try:
                     _ptick('fast_verifier_build(compile)', _t_fv)
                 except NameError:
@@ -6929,6 +7148,14 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                                     'scored_keys': list(scored_keys_q),
                                     'ew_at_relu': _ew_dump}, _f)
                     print(f'  [DA-DUMP] q{qi} → {_path}')
+                # Phase-8 Problem dump (kernel-ready: dict(problem=Problem, extras))
+                # for offline BnB replay / kernel A/B — env-gated, named bnb_<qi>.pkl.
+                _bnb_dir = _os.environ.get('VC_DUMP_BNB_DIR', '')
+                if _bnb_dir:
+                    from .fast_dual_ascent.fast_verify_dual import (
+                        _dump_bnb_instance as _dbi)
+                    _dbi(state_q, qw_q, qb_q, list(scored_keys_q),
+                         _bnb_dir, query_id=qi)
                 if _fast_da:
                     # Fast path: returns 'unsat'(robust) / 'unknown' only.
                     _t_call = time.perf_counter()
