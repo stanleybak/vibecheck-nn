@@ -390,3 +390,37 @@ def fold_relusplitter_gemm(graph):
         _precache_conv_tensors(graph)
 
     return folded_any
+
+
+def drop_identity_pads(graph):
+    """Remove Pad nodes whose pads are all zero (exact identity).
+
+    TinyYOLO (yolo_2023) carries `Pad(mode=constant, pads=[0]*8, value=0)`
+    nodes in front of its AveragePools — pure no-ops left by the exporter.
+    The gpu_graph serializer (correctly) raises NotImplementedError on Pad
+    rather than silently aliasing, so these identity pads would block the
+    whole pipeline. Splicing them out is semantics-preserving by definition:
+    zero padding on every edge changes nothing. Non-zero pads are left
+    untouched (still raise loudly downstream until a real handler exists).
+    """
+    dropped_any = False
+    for name in list(graph.nodes):
+        node = graph.nodes.get(name)
+        if node is None or node.op_type != 'Pad':
+            continue
+        pads = node.params.get('pads')
+        if pads is None or any(int(p) != 0 for p in pads):
+            # No pads info (e.g. dynamic pads input) → must NOT assume
+            # identity; non-zero pads → real padding. Keep the node either
+            # way so gpu_graph's NotImplementedError stays loud.
+            continue
+        assert len(node.inputs) >= 1, f'Pad {name!r} has no input'
+        src = node.inputs[0]
+        for other in graph.nodes.values():
+            other.inputs = [src if inp == name else inp for inp in other.inputs]
+        if graph.output_name == name:
+            graph.output_name = src
+        del graph.nodes[name]
+        dropped_any = True
+    if dropped_any:
+        graph.topological_sort()

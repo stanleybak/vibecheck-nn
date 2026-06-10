@@ -278,6 +278,14 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
 
         elif op == 'Pad':
             computed_inputs = [node.input[0]]
+            # opset ≤10: pads/value are ATTRIBUTES (TinyYOLO/yolo_2023 exports
+            # this form). Previously ignored → params={} → downstream treated
+            # the node as a silent identity even for non-zero pads. Parse them.
+            if 'pads' in attrs:
+                params['pads'] = [int(p) for p in attrs['pads']]
+            if 'value' in attrs:
+                params['constant_value'] = float(attrs['value'])
+            # opset ≥11: pads/value are inputs; const-resolved form overrides.
             if len(node.input) > 1:
                 c_pads = _const(node.input[1])
                 if c_pads is not None:

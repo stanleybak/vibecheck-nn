@@ -863,24 +863,32 @@ class PadNode(GraphNode):
         z = get_input(self.inputs[0])
         _require_point(self, z)
         torch_dt = torch.float32 if z.dtype == np.float32 else torch.float64
-        pads = self.params.get('pads', [])
+        pads = self.params.get('pads')
+        if pads is None:
+            # Unknown padding spec (e.g. dynamic pads input the loader could
+            # not const-resolve). Passing through silently would alias output
+            # to input and be unsound for any real padding — refuse loudly.
+            raise NotImplementedError(
+                f'Pad {self.name!r}: pads not statically known; refusing '
+                f'silent passthrough')
         val = self.params.get('constant_value', 0.0)
+        if all(int(p) == 0 for p in pads):
+            zono_state[self.name] = z        # exact identity
+            return
         inp_shape = _get_spatial_shape(self, graph, len(z.center))
-        if pads and len(inp_shape) == 3:
-            c4d = torch.tensor(z.center, dtype=torch_dt).reshape(
-                1, *inp_shape)
-            n = len(pads) // 2
-            if n >= 4:
-                torch_pad = (pads[3], pads[3 + n], pads[2], pads[2 + n])
-            elif n >= 2:
-                torch_pad = (pads[1], pads[1 + n], pads[0], pads[0 + n])
-            else:
-                zono_state[self.name] = z
-                return
-            out = F.pad(c4d, torch_pad, value=val)
-            zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
+        n = len(pads) // 2
+        if len(inp_shape) != 3 or n < 2:
+            raise NotImplementedError(
+                f'Pad {self.name!r}: non-zero pads {pads} on unsupported '
+                f'shape {inp_shape} (only CHW spatial pads handled)')
+        c4d = torch.tensor(z.center, dtype=torch_dt).reshape(
+            1, *inp_shape)
+        if n >= 4:
+            torch_pad = (pads[3], pads[3 + n], pads[2], pads[2 + n])
         else:
-            zono_state[self.name] = z
+            torch_pad = (pads[1], pads[1 + n], pads[0], pads[0 + n])
+        out = F.pad(c4d, torch_pad, value=val)
+        zono_state[self.name] = _point_zono(out.flatten().numpy().astype(z.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -1318,9 +1326,14 @@ class ComputeGraph:
 
     def optimize(self, settings):
         """Apply semantics-preserving rewrites gated by settings flags."""
-        from .onnx_optimizer import (fold_relusplitter,
+        from .onnx_optimizer import (drop_identity_pads,
+                                     fold_relusplitter,
                                      fold_relusplitter_gemm,
                                      fuse_gemm_reshape_conv)
+        # Ungated: removing all-zero Pad nodes is an exact identity (TinyYOLO
+        # carries Pad(pads=[0]*8) no-ops that otherwise hit gpu_graph's loud
+        # NotImplementedError). Non-zero pads are kept and still raise.
+        drop_identity_pads(self)
         if settings.optimize_relu_relation:
             fold_relusplitter(self)
             fold_relusplitter_gemm(self)
@@ -1793,15 +1806,59 @@ class ComputeGraph:
                     in_spatial = inp_shape
                 inp_names = [node.inputs[0]
                               if node.inputs[0] in computed else '__input__']
-                ops.append({
-                    'name': name,
-                    'type': 'avg_pool' if node.op_type == 'AveragePool' else 'max_pool',
-                    'inputs': inp_names,
-                    'kernel': tuple(kernel) if len(kernel) == 2 else (kernel[0], kernel[0]),
-                    'stride': tuple(stride) if len(stride) == 2 else (stride[0], stride[0]),
-                    'padding': tuple(padding[:2]) if len(padding) >= 2 else (padding[0], padding[0]),
-                    'in_shape': in_spatial,
-                })
+                kH, kW = (tuple(kernel) if len(kernel) == 2
+                          else (kernel[0], kernel[0]))
+                sH, sW = (tuple(stride) if len(stride) == 2
+                          else (stride[0], stride[0]))
+                pH, pW = (tuple(padding[:2]) if len(padding) >= 2
+                          else (padding[0], padding[0]))
+                if node.op_type == 'AveragePool':
+                    # AveragePool(k, s, pad=0) is EXACTLY a Conv with a fixed
+                    # depthwise-uniform kernel — emit it as a 'conv' op so
+                    # every downstream chain (zono forwards, CROWN backwards,
+                    # gen-LP/MILP builders, PGD) supports it with zero extra
+                    # handlers. C×C×kH×kW kernel is tiny at pool scales
+                    # (TinyYOLO: 16·16·4 floats). Padded average pooling is
+                    # NOT expressible this way under ONNX's default
+                    # count_include_pad=0 — refuse loudly.
+                    if (pH, pW) != (0, 0):
+                        raise NotImplementedError(
+                            f'gpu_graph: AveragePool {name!r} with non-zero '
+                            f'padding {(pH, pW)} (count_include_pad '
+                            f'semantics not expressible as plain conv)')
+                    C = in_spatial[0]
+                    k_eq = np.zeros((C, C, kH, kW), dtype=np.float64)
+                    for c in range(C):
+                        k_eq[c, c] = 1.0 / (kH * kW)
+                    b_eq = np.zeros(C, dtype=np.float64)
+                    H_in, W_in = in_spatial[1], in_spatial[2]
+                    H_out = (H_in - kH) // sH + 1
+                    W_out = (W_in - kW) // sW + 1
+                    out_shape = (C, H_out, W_out)
+                    oph = H_in - ((H_out - 1) * sH + kH)
+                    opw = W_in - ((W_out - 1) * sW + kW)
+                    ops.append({
+                        'name': name, 'type': 'conv', 'inputs': inp_names,
+                        'kernel': torch.tensor(k_eq, dtype=dtype,
+                                               device=device),
+                        'bias': torch.tensor(b_eq, dtype=dtype,
+                                             device=device),
+                        'kernel_np': k_eq,
+                        'bias_np': b_eq,
+                        'in_shape': in_spatial, 'out_shape': out_shape,
+                        'stride': (sH, sW), 'padding': (0, 0),
+                        'output_padding': (oph, opw),
+                        'n_out': C * H_out * W_out,
+                    })
+                else:
+                    ops.append({
+                        'name': name, 'type': 'max_pool',
+                        'inputs': inp_names,
+                        'kernel': (kH, kW),
+                        'stride': (sH, sW),
+                        'padding': (pH, pW),
+                        'in_shape': in_spatial,
+                    })
                 computed.add(name)
 
             elif node.op_type == 'Transpose':

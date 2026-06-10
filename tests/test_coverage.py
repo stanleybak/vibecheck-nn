@@ -399,11 +399,13 @@ def test_pad_propagation():
 
 
 def test_pad_no_pads():
-    """Pad without pads param — passthrough."""
+    """Pad without pads param — REFUSES (silent passthrough would alias
+    output to input and be unsound for any real padding; latent bug fixed
+    2026-06-09 with the yolo_2023 Pad work)."""
     node = PadNode(name='p', op_type='Pad', inputs=['input'], params={})
     g = _make_graph([node], input_shape=(1, 4))
-    out = _run_point(g, np.array([1, 2, 3, 4], dtype=float))
-    np.testing.assert_array_equal(out, [1, 2, 3, 4])
+    with pytest.raises(NotImplementedError, match='pads not statically known'):
+        _run_point(g, np.array([1, 2, 3, 4], dtype=float))
 
 
 # --- ConcatNode with generators (lines 874-875) ---
@@ -671,14 +673,14 @@ def test_avgpool_3d_input():
 # --- Pad n<4 pads (lines 841-845) ---
 
 def test_pad_short_pads():
-    """Pad with only 2 pads (1D-like)."""
+    """Pad with only 2 NON-ZERO pads (1D-like) — REFUSES instead of the old
+    silent passthrough, which dropped a real 1-pixel pad (unsound)."""
     node = PadNode(name='p', op_type='Pad', inputs=['input'],
                    params={'pads': [1, 1], 'constant_value': 0.0})
     g = _make_graph([node], input_shape=(1, 1, 3, 3))
     center = np.arange(9, dtype=float)
-    out = _run_point(g, center)
-    # Short pads → passthrough
-    np.testing.assert_array_equal(out, center)
+    with pytest.raises(NotImplementedError, match='non-zero pads'):
+        _run_point(g, center)
 
 
 # --- ResizeNode shape inference duplicate branch (lines 1101-1105) ---
