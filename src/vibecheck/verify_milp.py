@@ -1052,7 +1052,7 @@ def _solve_neuron_both(args):
 def _tighten_layer_parallel(layers_np, x_lo, x_hi, bounds, l,
                              use_milp, timeout, n_cores,
                              neuron_subset=None, lp_per_worker=False,
-                             witness_n_random=8):
+                             witness_n_random=8, deadline=None):
     """Tighten unstable neurons at layer l using parallel LP or MILP.
 
     For conv layers, uses sparse per-neuron models (much faster).
@@ -1132,7 +1132,37 @@ def _tighten_layer_parallel(layers_np, x_lo, x_hi, bounds, l,
     chunksize = max(1, len(tasks) // (n_cores * 4))
 
     with multiprocessing.Pool(n_cores) as pool:
-        results = pool.map(_solve_neuron_both, tasks, chunksize=chunksize)
+        if deadline is None:
+            results = pool.map(_solve_neuron_both, tasks,
+                               chunksize=chunksize)
+        else:
+            # Hard wall-clock cap: the per-neuron `timeout` bounds ONE
+            # solve, but a 250-neuron layer is 500 solves - without
+            # this the phase blows through total_timeout 2x+ (observed
+            # 30s budget -> 70s walls on cora). Each partial result is
+            # a valid bound, so stopping early is sound.
+            results = []
+            # chunksize MUST be 1: CPython's imap_unordered returns the
+            # timeout-capable IMapUnorderedIterator only for chunksize=1
+            # (chunked mode wraps it in a plain generator with no
+            # .next(timeout)). Per-task IPC overhead is negligible next
+            # to an LP/MILP solve.
+            it = pool.imap_unordered(_solve_neuron_both, tasks,
+                                     chunksize=1)
+            while True:
+                rem = deadline - time.perf_counter()
+                if rem <= 0:
+                    any_timeout = True
+                    pool.terminate()
+                    break
+                try:
+                    results.append(it.next(timeout=max(0.1, rem)))
+                except StopIteration:
+                    break
+                except multiprocessing.TimeoutError:
+                    any_timeout = True
+                    pool.terminate()
+                    break
 
     for idx, lb, ub, _, timed_out in results:
         if timed_out:
@@ -2789,20 +2819,20 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                     layers_np_seq, x_lo_64, x_hi_64, seq_bounds, seq_li,
                     use_milp=True, timeout=sample_timeout,
                     n_cores=n_cores, neuron_subset=samp[:half],
-                    witness_n_random=_wnr)
+                    witness_n_random=_wnr, deadline=deadline)
 
             if not milp_to and is_conv:
                 new_lo, new_hi, _ = _tighten_layer_parallel(
                     layers_np_seq, x_lo_64, x_hi_64, seq_bounds, seq_li,
                     use_milp=True, timeout=sample_timeout, n_cores=n_cores,
-                    witness_n_random=_wnr)
+                    witness_n_random=_wnr, deadline=deadline)
                 method_label = 'MILP-sparse'
             else:
                 new_lo, new_hi, _ = _tighten_layer_parallel(
                     layers_np_seq, x_lo_64, x_hi_64, seq_bounds, seq_li,
                     use_milp=False, timeout=sample_timeout,
                     n_cores=n_cores, lp_per_worker=lp_pw,
-                    witness_n_random=_wnr)
+                    witness_n_random=_wnr, deadline=deadline)
                 method_label = 'LP-seq'
 
             tightened = int(np.sum((new_lo >= 0) | (new_hi <= 0)))
@@ -3469,7 +3499,7 @@ def milp_verify(graph, spec, settings=None):
                     layers_np, x_lo_64, x_hi_64, bounds_np, l,
                     use_milp=True, timeout=sample_timeout,
                     n_cores=n_cores, neuron_subset=sample_idx[:half],
-                    witness_n_random=_wnr)
+                    witness_n_random=_wnr, deadline=deadline)
 
             # Sample LP on second half
             lp_any_timeout = False
@@ -3478,7 +3508,7 @@ def milp_verify(graph, spec, settings=None):
                     layers_np, x_lo_64, x_hi_64, bounds_np, l,
                     use_milp=False, timeout=sample_timeout,
                     n_cores=n_cores, neuron_subset=sample_idx[half:],
-                    lp_per_worker=lp_per_worker, witness_n_random=_wnr)
+                    lp_per_worker=lp_per_worker, witness_n_random=_wnr, deadline=deadline)
 
             if not milp_any_timeout:
                 if print_progress:
@@ -3487,7 +3517,7 @@ def milp_verify(graph, spec, settings=None):
                 new_lo, new_hi, _ = _tighten_layer_parallel(
                     layers_np, x_lo_64, x_hi_64, bounds_np, l,
                     use_milp=True, timeout=sample_timeout,
-                    n_cores=n_cores, witness_n_random=_wnr)
+                    n_cores=n_cores, witness_n_random=_wnr, deadline=deadline)
                 bounds_np[l] = (new_lo, new_hi)
             elif not lp_any_timeout:
                 if print_progress:
@@ -3497,7 +3527,7 @@ def milp_verify(graph, spec, settings=None):
                     layers_np, x_lo_64, x_hi_64, bounds_np, l,
                     use_milp=False, timeout=sample_timeout,
                     n_cores=n_cores, lp_per_worker=lp_per_worker,
-                    witness_n_random=_wnr)
+                    witness_n_random=_wnr, deadline=deadline)
                 bounds_np[l] = (new_lo, new_hi)
                 tighten_mode = 'lp'
             else:
@@ -3513,7 +3543,7 @@ def milp_verify(graph, spec, settings=None):
                 layers_np, x_lo_64, x_hi_64, bounds_np, l,
                 use_milp=False, timeout=sample_timeout,
                 n_cores=n_cores, lp_per_worker=lp_per_worker,
-                witness_n_random=_wnr)
+                witness_n_random=_wnr, deadline=deadline)
             bounds_np[l] = (new_lo, new_hi)
             if any_to:
                 tighten_mode = 'zono'
