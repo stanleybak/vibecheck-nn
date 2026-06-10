@@ -656,21 +656,11 @@ def _forward_batch_graph(x, gg):
             out_nd = a_nd @ b_nd
             act[name] = out_nd.reshape(batch, -1)
 
-        elif t == 'softmax':
-            a = act[op['inputs'][0]]
-            in_shape = op.get('in_shapes_nd', [None])[0]
-            axis = op.get('axis', -1)
-            if in_shape and len(in_shape) >= 1:
-                a_nd = a.reshape(batch, *in_shape)
-                # ONNX axis may include batch dim; if axis 0 → batch dim
-                # which we don't want to softmax over. Normalize.
-                if axis == 0:
-                    axis = -1
-                elif axis > 0:
-                    axis = axis  # already counted including batch dim
-                act[name] = F.softmax(a_nd, dim=axis).reshape(batch, -1)
-            else:
-                act[name] = F.softmax(a, dim=axis)
+        elif t == 'exp':
+            act[name] = torch.exp(act[op['inputs'][0]])
+
+        elif t == 'reciprocal':
+            act[name] = 1.0 / act[op['inputs'][0]]
 
         else:
             raise ValueError(
@@ -1023,6 +1013,12 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                 # use the exact identity/zero.
                 lam_t = relu_lambdas[layer_idx]
                 lo_p, hi_p = z.bounds()
+                if tight_bounds is not None and layer_idx in tight_bounds:
+                    _tl, _th = tight_bounds[layer_idx]
+                    lo_p = torch.maximum(lo_p, torch.as_tensor(
+                        _tl, dtype=lo_p.dtype, device=device))
+                    hi_p = torch.minimum(hi_p, torch.as_tensor(
+                        _th, dtype=hi_p.dtype, device=device))
                 dead = hi_p <= 0
                 act = lo_p >= 0
                 uns = (~dead) & (~act)
@@ -1369,58 +1365,79 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             zono_state[name] = TorchZonotope(
                 center.reshape(-1), torch.cat([G_lin, G_quad], dim=1))
 
-        elif t == 'softmax':
-            # Sound interval softmax. y_i = 1/(1 + sum_{j!=i} exp(z_j-z_i)):
-            #   ub_i uses z_i->hi_i, z_j->lo_j; lb_i uses z_i->lo_i,
-            #   z_j->hi_j (monotone in each coordinate). Exp args are
-            #   clamped at 700 to avoid inf: for ub the clamp SHRINKS the
-            #   denominator (ub only grows — sound); for lb an inf denom
-            #   gives lb=0 which is also sound, the clamp just avoids NaNs.
+        elif t in ('exp', 'reciprocal'):
+            # 1-D convex relaxation as a sound parallelogram:
+            #   y = k*x + (g_end + g_min)/2 + ((g_end - g_min)/2) * e_new
+            # with k the chord slope on [l, u]; the gap g(x) = f(x) - k*x
+            # is maximal (equal) at the endpoints and minimal at the
+            # tangency point x* (f'(x*) = k). Mirrors alpha,beta-CROWN's
+            # BoundExp / BoundReciprocal chord-vs-tangent planes; sound
+            # because the parallelogram contains f pointwise on [l, u].
             z = _get(op['inputs'][0])
-            sh = op.get('in_shapes_nd', [None])[0]
-            if sh is None:
-                raise NotImplementedError(
-                    f'softmax {name!r}: need a static N-D shape')
-            axis = int(op.get('axis', -1))
-            if axis >= 0:
-                # ONNX axis counts the batch dim; in_shapes_nd strips it.
-                axis = axis - 1
-                if axis < 0 or axis >= len(sh):
-                    raise NotImplementedError(
-                        f'softmax {name!r}: axis maps outside the '
-                        f'batch-stripped shape {sh}')
             lo_in, hi_in = z.bounds()
-            lo_in = lo_in.reshape(sh); hi_in = hi_in.reshape(sh)
-            # build (..., n, n) difference tensors along the softmax axis
-            ax = axis if axis >= 0 else len(sh) + axis
-            lo_m = torch.movedim(lo_in, ax, -1)
-            hi_m = torch.movedim(hi_in, ax, -1)
-            n_ax = lo_m.shape[-1]
-            diff_ub = lo_m.unsqueeze(-2) - hi_m.unsqueeze(-1)   # z_j_lo - z_i_hi
-            diff_lb = hi_m.unsqueeze(-2) - lo_m.unsqueeze(-1)   # z_j_hi - z_i_lo
-            eye = torch.eye(n_ax, dtype=torch.bool, device=device)
-            den_ub = 1 + torch.exp(diff_ub.clamp(max=700.0)).masked_fill(
-                eye, 0).sum(dim=-1)
-            den_lb = 1 + torch.exp(diff_lb.clamp(max=700.0)).masked_fill(
-                eye, 0).sum(dim=-1)
-            ub_m = 1.0 / den_ub
-            lb_m = 1.0 / den_lb
-            lo_out = torch.movedim(lb_m, -1, ax).reshape(-1)
-            hi_out = torch.movedim(ub_m, -1, ax).reshape(-1)
-            rad = (hi_out - lo_out) / 2
-            nz = torch.nonzero(rad).flatten()
-            # keep the shared-history prefix as zero columns (see
-            # matmul_bilinear handler / zonotope.py column invariant).
-            # NOTE (measured 2026-06-10, vit ibp_3_3_8): coupling the
-            # softmax simplex (last coord = 1 - sum of boxed siblings)
-            # LOOSENS the margins ~2x here — the dependent coordinate's
-            # own tight box is worth more than the restored correlation.
-            K_pref = z.n_gens
-            G = torch.zeros(lo_out.numel(), K_pref + nz.numel(),
-                            dtype=dtype, device=device)
-            G[nz, K_pref + torch.arange(nz.numel(),
-                                        device=device)] = rad[nz]
-            zono_state[name] = TorchZonotope((lo_out + hi_out) / 2, G)
+            if t == 'reciprocal':
+                if float(lo_in.min()) <= 0:
+                    raise NotImplementedError(
+                        f'reciprocal {name!r}: input lower bound '
+                        f'{float(lo_in.min()):.3g} <= 0 — relaxation only '
+                        f'valid on positive inputs')
+                f_l = 1.0 / lo_in
+                f_u = 1.0 / hi_in
+            else:
+                f_l = torch.exp(lo_in)
+                f_u = torch.exp(hi_in)
+            w_in = (hi_in - lo_in).clamp(min=1e-12)
+            k = (f_u - f_l) / w_in
+            if relu_lambdas is not None and name in relu_lambdas:
+                # alpha-zono: caller-optimized slope, ANY value within
+                # [f'(l), f'(u)] is sound for a convex f (offsets below
+                # are recomputed from the slope, so the parallelogram
+                # always contains f on [l, u]). The raw param in [0, 1]
+                # interpolates the derivative range.
+                _s01 = relu_lambdas[name].clamp(0, 1)
+                if t == 'exp':
+                    k = f_l + _s01 * (f_u - f_l)        # f' = e^x
+                else:
+                    d_lo = -1.0 / lo_in.pow(2)          # most negative
+                    d_hi = -1.0 / hi_in.pow(2)
+                    k = d_lo + _s01 * (d_hi - d_lo)
+            if t == 'exp':
+                xs = torch.log(k.clamp(min=1e-300))
+                fs = k.clamp(min=1e-300)    # f(x*) = e^{x*} = k
+            else:
+                xs = torch.sqrt(1.0 / (-k).clamp(min=1e-300))
+                fs = 1.0 / xs
+            xs = torch.minimum(torch.maximum(xs, lo_in), hi_in)
+            fxs = torch.exp(xs) if t == 'exp' else 1.0 / xs
+            fs = fxs
+            g_l_end = f_l - k * lo_in
+            g_u_end = f_u - k * hi_in
+            g_min = fs - k * xs
+            g_hi = torch.maximum(torch.maximum(g_l_end, g_u_end), g_min)
+            g_lo = torch.minimum(torch.minimum(g_l_end, g_u_end), g_min)
+            # positivity guard: exp/recip outputs are strictly positive,
+            # but the parallelogram's lower edge can dip below 0 on wide
+            # inputs — downstream reciprocal then loses its domain. Where
+            # that happens, fall back per-element to the exact positive
+            # interval box (slope 0). Sound either way.
+            _edge_lo = (torch.minimum(k * lo_in, k * hi_in) + g_lo)
+            _boxm = _edge_lo <= 0
+            _fmin = torch.minimum(f_l, f_u)
+            _fmax = torch.maximum(f_l, f_u)
+            k = torch.where(_boxm, torch.zeros_like(k), k)
+            c_off = torch.where(_boxm, (_fmin + _fmax) / 2,
+                                (g_hi + g_lo) / 2)
+            r_off = torch.where(_boxm, (_fmax - _fmin) / 2,
+                                (g_hi - g_lo) / 2)
+            new_c = k * z.center + c_off
+            G_old = z.generators * k.unsqueeze(1)
+            nzr = torch.nonzero(r_off).flatten()
+            G_new = torch.zeros(new_c.numel(), nzr.numel(), dtype=dtype,
+                                device=device)
+            G_new[nzr, torch.arange(nzr.numel(), device=device)] = \
+                r_off[nzr]
+            zono_state[name] = TorchZonotope(
+                new_c, torch.cat([G_old, G_new], 1))
 
         else:
             raise NotImplementedError(
@@ -2336,6 +2353,51 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
                 scale_4d = sflat.view(1, C, 1, 1).expand(1, C, H, W).reshape(1, -1)
                 c_out = c_in * scale_4d
                 G_out = G_in * scale_4d.unsqueeze(-1)
+            state[name] = (c_out, G_out)
+
+        elif t in ('exp', 'reciprocal'):
+            # Batched 1-D convex parallelogram (same construction as the
+            # unbatched forward): y = k*x + c_off + r_off*e_new with the
+            # chord slope k on [l, u]; offsets bracket the gap
+            # g(x) = f(x) - k*x between its endpoint max and tangency min.
+            c_in, G_in = _get(op['inputs'][0])
+            abs_in = G_in.abs().sum(dim=2)
+            lo_in = c_in - abs_in; hi_in = c_in + abs_in
+            if t == 'reciprocal':
+                if float(lo_in.min()) <= 0:
+                    raise ValueError(
+                        f'reciprocal {name!r}: input lower bound <= 0')
+                f_l = 1.0 / lo_in; f_u = 1.0 / hi_in
+            else:
+                f_l = torch.exp(lo_in); f_u = torch.exp(hi_in)
+            w_in = (hi_in - lo_in).clamp(min=1e-12)
+            k = (f_u - f_l) / w_in
+            if t == 'exp':
+                xs = torch.log(k.clamp(min=1e-300))
+                fxs_fn = torch.exp
+            else:
+                xs = torch.sqrt(1.0 / (-k).clamp(min=1e-300))
+                fxs_fn = torch.reciprocal
+            xs = torch.minimum(torch.maximum(xs, lo_in), hi_in)
+            fxs = fxs_fn(xs)
+            g_l_end = f_l - k * lo_in
+            g_u_end = f_u - k * hi_in
+            g_min = fxs - k * xs
+            g_hi = torch.maximum(torch.maximum(g_l_end, g_u_end), g_min)
+            g_lo = torch.minimum(torch.minimum(g_l_end, g_u_end), g_min)
+            # positivity guard (see unbatched handler)
+            _edge_lo = (torch.minimum(k * lo_in, k * hi_in) + g_lo)
+            _boxm = _edge_lo <= 0
+            _fmin = torch.minimum(f_l, f_u)
+            _fmax = torch.maximum(f_l, f_u)
+            k = torch.where(_boxm, torch.zeros_like(k), k)
+            c_off = torch.where(_boxm, (_fmin + _fmax) / 2,
+                                (g_hi + g_lo) / 2)
+            r_off = torch.where(_boxm, (_fmax - _fmin) / 2,
+                                (g_hi - g_lo) / 2)
+            c_out = k * c_in + c_off
+            G_out = torch.cat(
+                [G_in * k.unsqueeze(-1), torch.diag_embed(r_off)], dim=2)
             state[name] = (c_out, G_out)
 
         elif t in ('mul_bilinear', 'matmul_bilinear', 'softmax'):

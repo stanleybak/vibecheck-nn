@@ -816,18 +816,32 @@ def test_torch_zono_mul_bilinear_with_point_a():
     torch.testing.assert_close(g_out, g_b * c_a.unsqueeze(-1))
 
 
-def test_torch_zono_mul_bilinear_both_varying_raises():
-    """Mul where BOTH sides have nonzero radius is bilinear (nonlinear).
-    We don't approximate it — raise NotImplementedError. Silent zonotope
-    propagation would over-/under-estimate the product's range."""
+def test_torch_zono_mul_bilinear_both_varying_sound():
+    """Mul where BOTH sides vary now returns the sound zonotope product
+    (linear terms exact over shared noise symbols, quadratic remainder
+    boxed by radA*radB). Soundness check by exhaustive corner + random
+    sampling: every sampled product must lie inside the output bounds.
+    (This replaces the old raise pin — the product is implemented for
+    the vit softmax decomposition.)"""
     from vibecheck.zonotope import _torch_zono_mul_bilinear
-    n = 3
+    torch.manual_seed(0)
+    n, K = 3, 2
     c_a = torch.randn(n, dtype=torch.float64)
-    g_a = torch.randn(n, 2, dtype=torch.float64)
+    g_a = torch.randn(n, K, dtype=torch.float64)
     c_b = torch.randn(n, dtype=torch.float64)
-    g_b = torch.randn(n, 2, dtype=torch.float64)
-    with pytest.raises(NotImplementedError, match='bilinear'):
-        _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b)
+    g_b = torch.randn(n, K, dtype=torch.float64)
+    c_out, g_out = _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b)
+    lo = c_out - g_out.abs().sum(dim=1)
+    hi = c_out + g_out.abs().sum(dim=1)
+    for _ in range(500):
+        e = torch.rand(K, dtype=torch.float64) * 2 - 1
+        a = c_a + g_a @ e
+        b = c_b + g_b @ e
+        prod = a * b
+        assert bool((prod >= lo - 1e-9).all()), 'product below lo'
+        assert bool((prod <= hi + 1e-9).all()), 'product above hi'
+    # exactness at the center
+    torch.testing.assert_close(c_out, c_a * c_b)
 
 
 def test_torch_zono_div_bilinear_point_denom():

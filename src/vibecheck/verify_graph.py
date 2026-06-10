@@ -125,11 +125,13 @@ def _serialize_gg_ops(gg):
             pass    # flat passthrough; consumers alias the input vars
         elif t in ('slice', 'gather'):
             d['flat_idx'] = op['flat_idx']
-        elif t in ('matmul_bilinear', 'softmax', 'concat', 'squeeze'):
+        elif t in ('matmul_bilinear', 'softmax', 'concat', 'squeeze',
+                   'exp', 'reciprocal', 'reduce_sum', 'mul_bilinear'):
             # carried with full geometry; consumers that cannot handle
             # these types still raise in their own dispatch
             d['axis'] = op.get('axis')
             d['axes'] = op.get('axes')
+            d['keepdims'] = op.get('keepdims')
             d['in_shapes_nd'] = op.get('in_shapes_nd')
             d['out_shape_nd'] = op.get('out_shape_nd')
         else:
@@ -5273,6 +5275,16 @@ def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
                 (sb0[op['layer_idx']][0].numel(),), 0.5,
                 device=device, dtype=dtype, requires_grad=True)
             for op in relu_ops if op['layer_idx'] in sb0}
+    # convex 1-D ops (softmax decomposition): slope params keyed by op
+    # NAME — the forward interpolates f'(l)..f'(u), any value is sound.
+    for op in gg['ops']:
+        if op['type'] in ('exp', 'reciprocal'):
+            _sh = op.get('out_shape_nd') or op.get('in_shapes_nd', [None])[0]
+            if _sh is None:
+                continue
+            lams[op['name']] = torch.full(
+                (int(np.prod(_sh)),), 0.5, device=device, dtype=dtype,
+                requires_grad=True)
     if not lams:
         return False
     opt = torch.optim.Adam(list(lams.values()), lr=lr)
@@ -5293,6 +5305,94 @@ def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
             for p_ in lams.values():
                 p_.clamp_(0, 1)
     return False
+
+
+def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
+                            settings, time_left, lams=None, max_nodes=512):
+    """Worst-first ReLU-split BnB on ONE open query over the plain graph
+    zono forward. A split on unstable pre-ReLU neuron (L, j) clamps that
+    neuron's bounds via the forward's `tight_bounds` intersection —
+    standard ReLU-BaB soundness: each child's relaxation is valid on its
+    subdomain (z_j <= 0 / z_j >= 0) and the children cover the parent.
+    `lams` (optional alpha-zono slopes) are reused as a warm relaxation.
+    Built for the vit nets (~100 unstables, 0.2 s per forward)."""
+    import heapq
+    w_t = w_q if torch.is_tensor(w_q) else torch.as_tensor(
+        np.asarray(w_q, np.float64), device=device, dtype=dtype)
+
+    def bound(clamps):
+        tb = {}
+        for (L, j), side in clamps.items():
+            if L not in tb:
+                tb[L] = [None, None]
+        # build per-layer numpy bounds lazily from the probe sb below
+        sb_l, zf = _forward_zonotope_graph(
+            xl, xh, gg, device, dtype, settings=settings,
+            relu_lambdas=lams,
+            tight_bounds={L: _mk_tb(L, clamps) for L in
+                          {Lj[0] for Lj in clamps}} if clamps else None)
+        wv = w_t.to(zf.center.dtype)
+        lb = float(wv @ zf.center + float(b_q)
+                   - (wv @ zf.generators).abs().sum())
+        return lb, sb_l
+
+    base_sb = {}
+
+    def _mk_tb(L, clamps):
+        lo0, hi0 = base_sb[L]
+        lo = lo0.copy(); hi = hi0.copy()
+        for (L2, j), side in clamps.items():
+            if L2 != L:
+                continue
+            if side == 0:
+                hi[j] = min(hi[j], 0.0)
+            else:
+                lo[j] = max(lo[j], 0.0)
+        return lo, hi
+
+    lb0, sb0 = bound({})
+    for L, (lo_t, hi_t) in sb0.items():
+        base_sb[L] = (lo_t.detach().cpu().numpy().astype(np.float64),
+                      hi_t.detach().cpu().numpy().astype(np.float64))
+    if lb0 > 0:
+        return True, 1
+
+    def pick_split(sb_l, clamps):
+        best = None; best_score = -1.0
+        for L, (lo_t, hi_t) in sb_l.items():
+            lo = lo_t.detach(); hi = hi_t.detach()
+            uns = (lo < 0) & (hi > 0)
+            if not bool(uns.any()):
+                continue
+            score = torch.minimum(-lo, hi) * uns
+            j = int(score.argmax())
+            s = float(score[j])
+            if s > best_score and (L, j) not in clamps:
+                best_score = s; best = (L, int(j))
+        return best
+
+    heap = []
+    cnt = 0
+    sp0 = pick_split(sb0, {})
+    if sp0 is None:
+        return False, 1
+    heapq.heappush(heap, (lb0, cnt, {}, sp0))
+    nodes = 1
+    while heap:
+        if time_left() <= 1.0 or nodes >= max_nodes:
+            return False, nodes
+        lb, _, clamps, sp = heapq.heappop(heap)
+        for side in (0, 1):
+            c2 = dict(clamps); c2[sp] = side
+            lb2, sb2 = bound(c2)
+            nodes += 1
+            if lb2 <= 0:
+                sp2 = pick_split(sb2, c2)
+                if sp2 is None:
+                    return False, nodes   # exhausted splits, still open
+                cnt += 1
+                heapq.heappush(heap, (lb2, cnt, c2, sp2))
+    return True, nodes
 
 
 def _zono_input_split_close(gg, xl, xh, w_q, b_q, device, dtype,
@@ -6548,6 +6648,13 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 time_left,
                 n_iters=int(getattr(settings, 'zono_alpha_iters', 60)),
                 lr=float(getattr(settings, 'zono_alpha_lr', 0.1)))
+            if not ok:
+                ok, n_used = _zono_relu_split_close(
+                    gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype,
+                    settings, time_left,
+                    max_nodes=int(getattr(
+                        settings, 'zono_relu_split_max_nodes', 512)))
+                _zis_nodes += n_used
             if not ok and _zis_cap > 0:
                 ok, n_used = _zono_input_split_close(
                     gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype,

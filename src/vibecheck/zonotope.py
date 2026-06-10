@@ -727,12 +727,43 @@ def _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b,
     b_is_point = (g_b.numel() == 0
                   or bool(g_b.abs().max() < 1e-12))
     if not (a_is_point or b_is_point):
-        raise NotImplementedError(
-            'mul_bilinear: both sides have nonzero generator radius; '
-            'no sound zonotope encoding without explicit over-approximation. '
-            'For mscn-style models, ensure the mask side has zero radius '
-            '(per-disjunct subbox), or add a McCormick / box '
-            'over-approximation.')
+        # Both sides vary: sound zonotope product (same construction as
+        # the matmul_bilinear handler). With shared noise symbols e
+        # (columns aligned by the prefix invariant),
+        #   (ca + Ga e) ⊙ (cb + Gb e)
+        #     = ca⊙cb + Σ_i (Ga_i⊙cb + ca⊙Gb_i) e_i + R,
+        # linear terms exact; |R| ≤ radA ⊙ radB boxed into fresh
+        # diagonal columns. Supports ND broadcasting via the shapes.
+        sa = shape_a if shape_a is not None else (c_a.numel(),)
+        sb = shape_b if shape_b is not None else (c_b.numel(),)
+        K_a = g_a.shape[1] if g_a.numel() > 0 else 0
+        K_b = g_b.shape[1] if g_b.numel() > 0 else 0
+        K = max(K_a, K_b)
+        dev = c_a.device; dt = c_a.dtype
+        GA = g_a
+        GB = g_b
+        if K_a < K:
+            GA = torch.cat([GA, torch.zeros(GA.shape[0], K - K_a,
+                                            dtype=dt, device=dev)], 1)
+        if K_b < K:
+            GB = torch.cat([GB, torch.zeros(GB.shape[0], K - K_b,
+                                            dtype=dt, device=dev)], 1)
+        a_nd = c_a.reshape(*sa)
+        b_nd = c_b.reshape(*sb)
+        GA_nd = GA.t().reshape(K, *sa)
+        GB_nd = GB.t().reshape(K, *sb)
+        c_out_nd = a_nd * b_nd
+        lin = GA_nd * b_nd.unsqueeze(0) + a_nd.unsqueeze(0) * GB_nd
+        radA = GA_nd.abs().sum(dim=0)
+        radB = GB_nd.abs().sum(dim=0)
+        R = (radA * radB) * torch.ones_like(c_out_nd)
+        n_out = c_out_nd.numel()
+        G_lin = lin.reshape(K, n_out).t().contiguous()
+        Rf = R.reshape(-1)
+        nz = torch.nonzero(Rf).flatten()
+        G_quad = torch.zeros(n_out, nz.numel(), dtype=dt, device=dev)
+        G_quad[nz, torch.arange(nz.numel(), device=dev)] = Rf[nz]
+        return c_out_nd.reshape(-1), torch.cat([G_lin, G_quad], dim=1)
 
     if shape_a is None and shape_b is None:
         # Plain element-wise (same shape both sides).

@@ -2172,12 +2172,55 @@ class ComputeGraph:
                 computed.add(name)
 
             elif node.op_type == 'Softmax':
-                inp_names = [node.inputs[0]
-                              if node.inputs[0] in computed else '__input__']
+                # Decompose into primitives (the alpha,beta-CROWN
+                # 'complex node' treatment, auto_LiRPA softmax.py):
+                #   softmax(x) = exp(x) * reciprocal(reduce_sum(exp(x)))
+                # so every chain only needs the 1-D convex relaxations of
+                # exp/reciprocal plus the bilinear product — no direct
+                # softmax relaxation anywhere. Shapes are carried
+                # explicitly (synthetic ops have no graph nodes for the
+                # in_shapes_nd post-pass to find).
+                inp = node.inputs[0]
+                inp_names = [inp if inp in computed else '__input__']
+                in_shape = (self.nodes[inp].output_shape
+                            if inp in self.nodes else self.input_shape)
+                if in_shape is None:
+                    raise NotImplementedError(
+                        f'Softmax {name!r}: need a static input shape '
+                        f'for decomposition')
+                sh = (tuple(in_shape[1:]) if in_shape[0] == 1
+                      else tuple(in_shape))
+                axis = int(node.params.get('axis', -1))
+                if axis >= 0 and in_shape[0] == 1:
+                    axis -= 1
+                ax = axis if axis >= 0 else len(sh) + axis
+                if ax < 0 or ax >= len(sh):
+                    raise NotImplementedError(
+                        f'Softmax {name!r}: axis {axis} outside shape {sh}')
+                sh_keep = tuple(1 if i == ax else d
+                                for i, d in enumerate(sh))
+                exp_name = f'{name}__exp'
+                sum_name = f'{name}__sum'
+                rcp_name = f'{name}__recip'
                 ops.append({
-                    'name': name, 'type': 'softmax',
-                    'inputs': inp_names,
-                    'axis': int(node.params.get('axis', -1)),
+                    'name': exp_name, 'type': 'exp', 'inputs': inp_names,
+                    'in_shapes_nd': [sh], 'out_shape_nd': sh,
+                })
+                ops.append({
+                    'name': sum_name, 'type': 'reduce_sum',
+                    'inputs': [exp_name],
+                    'axes': (ax,), 'keepdims': True,
+                    'in_shapes_nd': [sh], 'out_shape_nd': sh_keep,
+                })
+                ops.append({
+                    'name': rcp_name, 'type': 'reciprocal',
+                    'inputs': [sum_name],
+                    'in_shapes_nd': [sh_keep], 'out_shape_nd': sh_keep,
+                })
+                ops.append({
+                    'name': name, 'type': 'mul_bilinear',
+                    'inputs': [exp_name, rcp_name],
+                    'in_shapes_nd': [sh, sh_keep], 'out_shape_nd': sh,
                 })
                 computed.add(name)
 
@@ -2555,12 +2598,19 @@ class ComputeGraph:
             n_obj = self.nodes.get(op['name'])
             if n_obj is not None and getattr(n_obj, 'output_shape', None):
                 op['out_shape_nd'] = _strip_batch(n_obj.output_shape)
+            _explicit = op.get('in_shapes_nd')
             in_shapes = []
-            for inp in op['inputs']:
+            for _k, inp in enumerate(op['inputs']):
                 if inp in self.nodes and getattr(self.nodes[inp], 'output_shape', None):
                     in_shapes.append(_strip_batch(self.nodes[inp].output_shape))
                 elif inp == self.input_name and self.input_shape:
                     in_shapes.append(_strip_batch(self.input_shape))
+                elif (_explicit is not None and _k < len(_explicit)
+                      and _explicit[_k] is not None):
+                    # synthetic ops (softmax decomposition, BN pair, ...)
+                    # carry their shapes explicitly — the graph has no
+                    # node for them, so keep the emission-time value.
+                    in_shapes.append(tuple(_explicit[_k]))
                 else:
                     in_shapes.append(None)
             op['in_shapes_nd'] = in_shapes
