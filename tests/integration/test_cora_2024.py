@@ -45,15 +45,18 @@ CASES = [
         expected='verified', timeout=30, max_wall_s=12.0,
     ),
     dict(
-        # phase8_exact_milp_below router (2026-06-09): img440 enters Phase 8
-        # at worst LB −3.33 — the α-zono BnB OOMs at 67M nodes there, while
-        # the exact per-neuron MILP closes it in ~3.5 s. The router (gate at
-        # −2.0 in cora_2024.yaml) sends it to milp_verify. One of the +7
-        # both-miss (vc+abc timeout) cifar10 cases cracked by the router.
-        desc='cora cifar10-set img440 (UNSAT, phase8→exact-MILP router)',
-        net='onnx/cifar10-set.onnx',
-        vnnlib='vnnlib/cifar10-img440.vnnlib',
-        expected='verified', timeout=30, max_wall_s=20.0,
+        # THE gpu_layers soundness canary (2026-06-09): cifar10-trades nets
+        # carry a Mul/Add input-normalization preamble that gpu_layers used
+        # to drop silently — milp_verify then ran on the UNNORMALIZED
+        # network and (with PGD disabled) false-verified this known-SAT
+        # case via a phantom joint-α bound (+1.58 vs true −0.05). The old
+        # img440 pin here was one of 7 phantom exact-MILP-router "gains"
+        # produced by the same bug (all 7 are honest timeouts post-fix).
+        # PGD must find the witness fast; an `unsat` here is UNSOUND.
+        desc='cora cifar10-trades img339 (SAT, normalization-fold canary)',
+        net='onnx/cifar10-trades.onnx',
+        vnnlib='vnnlib/cifar10-img339.vnnlib',
+        expected='sat', timeout=30, max_wall_s=10.0,
     ),
 ]
 

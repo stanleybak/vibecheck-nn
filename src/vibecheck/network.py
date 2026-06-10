@@ -1413,10 +1413,24 @@ class ComputeGraph:
         # activation in between). Folding a post-ReLU Add into the pre-ReLU
         # linear would be unsound (bias can't commute through ReLU).
         _prev_was_linear = False
+        # Pending input-side affine x ↦ s⊙x + t from leading normalization
+        # ops (Mul scale / Add offset BEFORE the first linear layer; cora's
+        # cifar10/svhn nets carry a scalar Mul+Add preamble). Folded into the
+        # first fc as W(s⊙x+t)+b = (W·diag(s))x + (W t + b). These ops used
+        # to fall into the silent catch-all below — the whole milp_verify
+        # engine (zono bounds, joint-α bbr, exact MILP, PGD forward) then ran
+        # on the UNNORMALIZED network and false-verified cora cifar10 SAT
+        # cases (img339 canary, 2026-06-09).
+        _pend_s = None
+        _pend_t = None
 
         for name in self.topo_order:
             node = self.nodes[name]
             if node.op_type == 'Conv':
+                if _pend_s is not None or _pend_t is not None:
+                    raise NotImplementedError(
+                        f'gpu_layers: input affine (Mul/Add preamble) before '
+                        f'Conv at {name!r} is not foldable here')
                 kernel = node.params['kernel']
                 bias = node.params['bias']
                 if not hasattr(node, '_conv_layer'):
@@ -1456,6 +1470,21 @@ class ComputeGraph:
                 b = node.params['b']
                 gW = torch.tensor(W, dtype=dtype, device=device)
                 gb = torch.tensor(b, dtype=dtype, device=device)
+                if _pend_s is not None or _pend_t is not None:
+                    n_in = int(gW.shape[1])
+                    if _pend_t is not None:
+                        t = np.broadcast_to(
+                            np.asarray(_pend_t, np.float64).ravel(),
+                            (n_in,)).copy()
+                        gb = gb + gW @ torch.as_tensor(t, dtype=dtype,
+                                                       device=device)
+                    if _pend_s is not None:
+                        s = np.broadcast_to(
+                            np.asarray(_pend_s, np.float64).ravel(),
+                            (n_in,)).copy()
+                        gW = gW * torch.as_tensor(s, dtype=dtype,
+                                                  device=device).unsqueeze(0)
+                    _pend_s = _pend_t = None
                 layers.append({
                     'type': 'fc', 'W': gW, 'bias': gb,
                 })
@@ -1464,6 +1493,30 @@ class ComputeGraph:
                 gpu_b_fwd.append(gb)
                 layer_types.append(('fc', None))
                 _prev_was_linear = True
+            elif (node.op_type in ('Mul', 'Div') and not layers
+                  and node.params.get('scale') is not None):
+                # Div stores params['scale'] already inverted (y = x·scale).
+                s = np.asarray(node.params['scale'], np.float64).ravel()
+                _pend_s = s if _pend_s is None else _pend_s * s
+                if _pend_t is not None:
+                    _pend_t = _pend_t * s
+            elif (node.op_type == 'Add' and not layers
+                  and node.params.get('bias') is not None):
+                t = np.asarray(node.params['bias'], np.float64).ravel()
+                _pend_t = t if _pend_t is None else _pend_t + t
+            elif (node.op_type == 'Sub' and not layers
+                  and node.params.get('negate')
+                  and node.params.get('bias') is not None):
+                # y = bias − x: s ← −s, t ← bias − t
+                b = np.asarray(node.params['bias'], np.float64).ravel()
+                _pend_s = (np.asarray([-1.0]) if _pend_s is None
+                           else -_pend_s)
+                _pend_t = b if _pend_t is None else b - _pend_t
+            elif (node.op_type == 'Sub' and not layers
+                  and node.params.get('sub_val') is not None):
+                # y = x − sub_val
+                c = np.asarray(node.params['sub_val'], np.float64).ravel()
+                _pend_t = -c if _pend_t is None else _pend_t - c
             elif (node.op_type == 'Add' and 'bias' in node.params and layers
                   and _prev_was_linear):
                 # TF/Keras export emits the affine layer as MatMul + a
@@ -1486,12 +1539,33 @@ class ComputeGraph:
                     gpu_b_fwd[-1] = (gpu_b_fwd[-1]
                                      + add_b.reshape(gpu_b_fwd[-1].shape))
                 # stays foldable: a chained bias-Add adds to the same layer
-            else:
-                # Relu, Flatten, Reshape, etc. — handled implicitly. Any such
-                # node breaks linear→Add adjacency (a later Add(bias) must not
+            elif node.op_type == 'Relu':
+                if _pend_s is not None or _pend_t is not None:
+                    # ReLU(s⊙x+t) followed by linear is NOT affine-foldable.
+                    raise NotImplementedError(
+                        f'gpu_layers: input affine (Mul/Add preamble) hits '
+                        f'ReLU at {name!r} before any linear layer')
+                _prev_was_linear = False
+            elif node.op_type in ('Flatten', 'Reshape', 'Identity',
+                                  'Squeeze', 'Unsqueeze'):
+                # Shape-only on the flat vector — handled implicitly, but
+                # breaks linear→Add adjacency (a later Add(bias) must not
                 # fold back past it).
                 _prev_was_linear = False
-            # Skip Relu, Flatten, Reshape etc. — handled implicitly
+            else:
+                # NEVER silently skip an op: gpu_layers feeds the milp_verify
+                # MILP encoding, its zono/CROWN bounds and its PGD forward —
+                # a dropped op means every consumer runs on a DIFFERENT
+                # network (cora cifar10 false-verifies shipped from exactly
+                # this fall-through).
+                raise NotImplementedError(
+                    f'gpu_layers: unsupported op {node.op_type!r} at '
+                    f'{name!r}')
+
+        if _pend_s is not None or _pend_t is not None:
+            raise NotImplementedError(
+                'gpu_layers: input affine (Mul/Add preamble) never folded — '
+                'no linear layer found')
 
         fwd_data = {
             'gpu_k': gpu_k, 'gpu_W_fwd': gpu_W_fwd,
