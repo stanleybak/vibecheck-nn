@@ -1,0 +1,18 @@
+# yolo_2023 — TinyYOLO (extended track). ResNet-style ReLU CNN: 14 Conv, 7 ReLU
+# layers, skip-Adds, identity Pads (dropped by drop_identity_pads) and 2x2/2
+# AveragePools (emitted as equivalent depthwise-uniform convs by gpu_graph).
+# 72 instances, eps=1/255, 300 s budgets. ABC reference: 62 unsat / 10 timeout.
+#
+# Start from the tinyimagenet lean profile: the default per-layer interleaved
+# MILP-tighten cascade burned 163 s of the 300 s budget on the first probe;
+# the all-GPU path (phase-0.5 α-CROWN + fast Phase-8 BnB) is the proven shape
+# for conv ReLU nets at this scale.
+phase8_use_dual_ascent_gpu: true
+phase8_dual_ascent_max_iter: 1
+zono_lift_enabled: true
+phase2_crown_enabled: false
+phase8_min_budget_frac: 0.5
+pgd_middle_enabled: false
+max_tighten_layer: 0
+parallel_pgd_enabled: false
+pgd_restarts: 100
