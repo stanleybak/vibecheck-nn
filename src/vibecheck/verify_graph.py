@@ -4960,8 +4960,19 @@ def _phase2p5_zono_lift(
             except NameError: pass
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            if closed_here:
+                # ANY-closure: one refuted conjunct closes the whole
+                # disjunct — skip its sibling queries (saves ~26s/query on
+                # yolo's 5-conjunct specs).
+                break
         info['per_query'][di] = q_info
-        if not any_open_after:
+        # ANY-closure: the disjunct is a conjunction — one refuted conjunct
+        # (closed query) closes it. any_open_after stays as the legacy
+        # all-closed signal; either condition is sound, ANY is complete
+        # for multi-conjunct specs (yolo). Single-conjunct disjuncts
+        # (regular track) behave identically.
+        _any_closed = any(bool(v.get('closed')) for v in q_info.values())
+        if not any_open_after or _any_closed:
             verified_here.add(di)
             info['n_closed'] += 1
 
@@ -5791,8 +5802,15 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     timing['phase2_crown'] = time.perf_counter() - t0
     stats.record_bounds(sb)
 
+    # ANY-closure: a disjunct is a CONJUNCTION of constraints (the SAT set
+    # is their AND); refuting ANY single conjunct (its query lb > 0) proves
+    # the whole disjunct infeasible. all() here was sound but needlessly
+    # strict — multi-conjunct specs (yolo_2023: 5 objectness conjuncts per
+    # disjunct) could only verify by refuting EVERY conjunct, which is
+    # usually impossible. For single-conjunct disjuncts (all regular-track
+    # benchmarks) any() == all(), so behavior there is unchanged.
     verified_disj = {di for di, qlist in disj_queries.items()
-                      if all(spec_lbs.get(qi, -1) > 0 for qi, _, _ in qlist)}
+                      if any(spec_lbs.get(qi, -1) > 0 for qi, _, _ in qlist)}
     still_open_disj = set(disj_queries.keys()) - verified_disj
 
     if print_progress:
@@ -7141,8 +7159,15 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     if milp_witness is not None:
         return _finalize('sat', 'spec_milp', witness=milp_witness)
 
+    # ANY-closure: a disjunct is a CONJUNCTION of constraints (the SAT set
+    # is their AND); refuting ANY single conjunct (its query lb > 0) proves
+    # the whole disjunct infeasible. all() here was sound but needlessly
+    # strict — multi-conjunct specs (yolo_2023: 5 objectness conjuncts per
+    # disjunct) could only verify by refuting EVERY conjunct, which is
+    # usually impossible. For single-conjunct disjuncts (all regular-track
+    # benchmarks) any() == all(), so behavior there is unchanged.
     verified_disj = {di for di, qlist in disj_queries.items()
-                      if all(spec_lbs.get(qi, -1) > 0 for qi, _, _ in qlist)}
+                      if any(spec_lbs.get(qi, -1) > 0 for qi, _, _ in qlist)}
     still_open_disj = set(disj_queries.keys()) - verified_disj
 
     # --- Phase 9: final PGD, restricted to the BnB survivors ---
