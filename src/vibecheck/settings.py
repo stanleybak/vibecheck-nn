@@ -799,6 +799,9 @@ def default_settings(**overrides):
         zono_relu_split_max_nodes=512,
         zono_alpha_iters=60,
         zono_alpha_lr=0.1,
+        # root backward-alpha (attn_crown) iterations in the last-chance
+        # chain; optimized plane params are reused by every BnB node.
+        zono_backward_alpha_iters=60,
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         # Phase 8 minimum-budget floor as fraction of total_timeout. The
         # pipeline rebudgets so Phase 8 always gets at least this fraction

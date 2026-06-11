@@ -110,3 +110,60 @@ def test_eps_box_backward_sound(tmp_path):
     assert lb <= true_min + 1e-9, f'UNSOUND backward: lb {lb} > {true_min}'
     # sanity: the backward shouldn't be wildly looser than the forward
     assert lb > fwd - 5.0, (lb, fwd)
+
+
+def test_alpha_backward_init_matches_fixed(tmp_path):
+    """attn_crown_lb at the fixed-corner defaults (empty params) must
+    reproduce the _spec_backward_graph bound (same planes)."""
+    graph = _attn_net(str(tmp_path))
+    gg = graph.gpu_graph(torch.device('cpu'), torch.float64)
+    rng = np.random.default_rng(3)
+    xc = rng.uniform(-0.5, 0.5, 4)
+    xl = torch.tensor(xc - 0.05, dtype=torch.float64)
+    xh = torch.tensor(xc + 0.05, dtype=torch.float64)
+    w = np.array([1.0, -2.0, 0.5])
+    from vibecheck.verify_zono_bnb import (_forward_zonotope_graph,
+                                           _spec_backward_graph)
+    from vibecheck.attn_crown import attn_crown_lb
+    ob = {}
+    sb, _ = _forward_zonotope_graph(xl, xh, gg, torch.device('cpu'),
+                                    torch.float64, op_bounds=ob)
+    w_t = torch.tensor(w, dtype=torch.float64)
+    fixed, _ = _spec_backward_graph(
+        sb, xl, xh, gg, {0: (w_t, 0.25)}, {0}, len(sb),
+        torch.device('cpu'), torch.float64, op_bounds=ob)
+    with torch.no_grad():
+        diff = attn_crown_lb(gg, xl, xh, sb, ob, w, 0.25, {})
+    # empty params: relu falls back to min-area (may differ slightly from
+    # _spec_backward's relu choice); allow small slack but require the
+    # same ballpark
+    assert float(diff) == pytest.approx(float(fixed[0]), abs=0.05)
+
+
+def test_alpha_backward_improves_and_sound(tmp_path):
+    from vibecheck.verify_zono_bnb import (_forward_zonotope_graph,
+                                           _forward_batch_graph)
+    from vibecheck.attn_crown import (attn_crown_alpha, attn_crown_lb,
+                                      init_params)
+    graph = _attn_net(str(tmp_path))
+    gg = graph.gpu_graph(torch.device('cpu'), torch.float64)
+    rng = np.random.default_rng(4)
+    xc = rng.uniform(-0.5, 0.5, 4)
+    xl = torch.tensor(xc - 0.08, dtype=torch.float64)
+    xh = torch.tensor(xc + 0.08, dtype=torch.float64)
+    w = np.array([1.0, -2.0, 0.5])
+    ob = {}
+    sb, _ = _forward_zonotope_graph(xl, xh, gg, torch.device('cpu'),
+                                    torch.float64, op_bounds=ob)
+    params0 = init_params(gg, sb, ob, torch.device('cpu'), torch.float64)
+    with torch.no_grad():
+        lb_init = float(attn_crown_lb(gg, xl, xh, sb, ob, w, 0.0, params0))
+    best, params = attn_crown_alpha(
+        gg, xl, xh, sb, ob, w, 0.0, n_iters=80, lr=0.1)
+    assert best >= lb_init - 1e-9, 'alpha made the bound worse'
+    # soundness vs sampling
+    xs = torch.tensor(rng.uniform(xl.numpy(), xh.numpy(), (500, 4)),
+                      dtype=torch.float64)
+    ys = _forward_batch_graph(xs, gg)
+    true_min = float((ys @ torch.tensor(w, dtype=torch.float64)).min())
+    assert best <= true_min + 1e-9, f'UNSOUND: {best} > {true_min}'

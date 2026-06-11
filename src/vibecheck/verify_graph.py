@@ -5310,7 +5310,8 @@ def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
 
 
 def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
-                            settings, time_left, lams=None, max_nodes=512):
+                            settings, time_left, lams=None, max_nodes=512,
+                            plane_params=None):
     """Worst-first ReLU-split BnB on ONE open query over the plain graph
     zono forward. A split on unstable pre-ReLU neuron (L, j) clamps that
     neuron's bounds via the forward's `tight_bounds` intersection —
@@ -5333,15 +5334,25 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
         wv = w_t.to(zf.center.dtype)
         lb = float(wv @ zf.center + float(b_q)
                    - (wv @ zf.generators).abs().sum())
-        # best-of with the McCormick backward CROWN under the SAME
-        # clamped relu bounds + this node's op_bounds — each split then
-        # re-tightens the bilinear/softmax planes (the mechanism that
-        # lets alpha,beta-CROWN close these with a couple of splits).
+        # best-of with the backward CROWN under the SAME clamped relu
+        # bounds + this node's op_bounds — each split then re-tightens
+        # the bilinear/softmax planes. When the root alpha pass supplied
+        # optimized plane parameters, evaluate THOSE planes against the
+        # node's own bounds (the params are interpolation coefficients,
+        # sound for any bounds).
         try:
-            bw_lbs, _ = _spec_backward_graph(
-                sb_l, xl, xh, gg, {0: (wv, float(b_q))}, {0},
-                len(sb_l), device, dtype, op_bounds=ob)
-            lb = max(lb, float(bw_lbs[0]))
+            if plane_params is not None:
+                from .attn_crown import attn_crown_lb
+                with torch.no_grad():
+                    lb_bw = float(attn_crown_lb(
+                        gg, xl, xh, sb_l, ob, wv, float(b_q),
+                        plane_params))
+            else:
+                bw_lbs, _ = _spec_backward_graph(
+                    sb_l, xl, xh, gg, {0: (wv, float(b_q))}, {0},
+                    len(sb_l), device, dtype, op_bounds=ob)
+                lb_bw = float(bw_lbs[0])
+            lb = max(lb, lb_bw)
         except NotImplementedError:
             pass    # nets whose backward lacks an op: forward-only node
         return lb, sb_l
@@ -5427,10 +5438,24 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
                 if sp2 is None:
                     # No splittable relu left in this leaf (the clamps
                     # cascade-stabilised the rest); residual gap is
-                    # bilinear/softmax slack — one alpha-zono rescue
-                    # under the leaf's clamps before giving up.
+                    # bilinear/softmax slack — a short backward-alpha
+                    # rescue under the leaf's clamps before giving up.
                     _tb_leaf = {L: _mk_tb(L, c2)
                                 for L in {Lj[0] for Lj in c2}}
+                    try:
+                        from .attn_crown import attn_crown_alpha
+                        ob_leaf = {}
+                        sb_leaf, _zfL = _forward_zonotope_graph(
+                            xl, xh, gg, device, dtype, settings=settings,
+                            tight_bounds=_tb_leaf, op_bounds=ob_leaf)
+                        _best_leaf, _ = attn_crown_alpha(
+                            gg, xl, xh, sb_leaf, ob_leaf, w_t,
+                            float(b_q), n_iters=30, lr=0.2,
+                            time_left=time_left)
+                        if _best_leaf > 0:
+                            continue
+                    except NotImplementedError:
+                        pass
                     if _zono_alpha_close(
                             gg, xl, xh, w_q, b_q, device, dtype,
                             settings, time_left, n_iters=40, lr=0.15,
@@ -6715,12 +6740,36 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 time_left,
                 n_iters=int(getattr(settings, 'zono_alpha_iters', 60)),
                 lr=float(getattr(settings, 'zono_alpha_lr', 0.1)))
+            _root_params = None
+            if not ok:
+                # root backward-alpha (ABC's alpha-CROWN over the
+                # McCormick r / tangent / relu-lambda planes); its
+                # optimized params are reused by every BnB node below.
+                try:
+                    from .attn_crown import attn_crown_alpha
+                    _ob_r = {}
+                    _sb_r, _zf_r2 = _forward_zonotope_graph(
+                        xl_g, xh_g, gg, device, dtype, settings=settings,
+                        op_bounds=_ob_r)
+                    _best_r, _root_params = attn_crown_alpha(
+                        gg, xl_g, xh_g, _sb_r, _ob_r, _w_zis,
+                        float(_b_zis),
+                        n_iters=int(getattr(
+                            settings, 'zono_backward_alpha_iters', 60)),
+                        lr=0.25, time_left=time_left)
+                    if print_progress:
+                        print(f'  [bw-alpha] q{qi} root lb '
+                              f'{_best_r:+.4f}', flush=True)
+                    ok = _best_r > 0
+                except NotImplementedError:
+                    _root_params = None
             if not ok:
                 ok, n_used, _rs_reason = _zono_relu_split_close(
                     gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype,
                     settings, time_left,
                     max_nodes=int(getattr(
-                        settings, 'zono_relu_split_max_nodes', 512)))
+                        settings, 'zono_relu_split_max_nodes', 512)),
+                    plane_params=_root_params)
                 _zis_nodes += n_used
                 if print_progress and not ok:
                     print(f'  [relu-split] q{qi} open after {n_used} '
