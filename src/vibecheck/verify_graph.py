@@ -5259,7 +5259,7 @@ def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
 
 def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
                       settings, time_left, n_iters=60, lr=0.1,
-                      tight_bounds=None):
+                      tight_bounds=None, op_clamps=None):
     """Optimize per-neuron ReLU slopes (lam in [0,1]) of the PLAIN graph
     zono forward against ONE open query's margin (alpha-zono, forward
     mode). Every lam is a sound relaxation, so the best-of over iters is
@@ -5272,7 +5272,8 @@ def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
     # init at min-area-ish 0.5; sizes from a probe forward
     sb0, _ = _forward_zonotope_graph(xl, xh, gg, device, dtype,
                                      settings=settings,
-                                     tight_bounds=tight_bounds)
+                                     tight_bounds=tight_bounds,
+                                     op_clamps=op_clamps)
     lams = {op['layer_idx']: torch.full(
                 (sb0[op['layer_idx']][0].numel(),), 0.5,
                 device=device, dtype=dtype, requires_grad=True)
@@ -5296,7 +5297,8 @@ def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
         opt.zero_grad()
         _, zf = _forward_zonotope_graph(
             xl, xh, gg, device, dtype, settings=settings,
-            relu_lambdas=lams, tight_bounds=tight_bounds)
+            relu_lambdas=lams, tight_bounds=tight_bounds,
+            op_clamps=op_clamps)
         wv = w_t.to(zf.center.dtype)
         lb = wv @ zf.center + float(b_q) - (wv @ zf.generators).abs().sum()
         if float(lb) > 0:
@@ -5312,25 +5314,81 @@ def _zono_alpha_close(gg, xl, xh, w_q, b_q, device, dtype,
 def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
                             settings, time_left, lams=None, max_nodes=512,
                             plane_params=None):
-    """Worst-first ReLU-split BnB on ONE open query over the plain graph
-    zono forward. A split on unstable pre-ReLU neuron (L, j) clamps that
-    neuron's bounds via the forward's `tight_bounds` intersection —
-    standard ReLU-BaB soundness: each child's relaxation is valid on its
-    subdomain (z_j <= 0 / z_j >= 0) and the children cover the parent.
+    """Worst-first BnB on ONE open query over the plain graph zono
+    forward, with two split types:
+
+    * **ReLU split** on unstable pre-ReLU neuron (L, j): clamps that
+      neuron's bounds via the forward's `tight_bounds` intersection —
+      standard ReLU-BaB soundness: each child's relaxation is valid on
+      its subdomain (z_j <= 0 / z_j >= 0) and the children cover the
+      parent.
+    * **Bilinear-input split** on an exp-input coordinate (pre-softmax
+      score) — ABC's splittable-Mul analog. Clamping the op's input
+      interval at its midpoint (via the forward's `op_clamps`
+      intersection) shrinks both exp parallelograms/planes AND the
+      downstream product remainder. Same value-split soundness argument
+      as the ReLU case (split on the TRUE score value; children cover
+      the parent). Proposed only when no unstable relu remains — the
+      'exhausted' leaves whose residual gap is pure bilinear slack.
+
     `lams` (optional alpha-zono slopes) are reused as a warm relaxation.
-    Built for the vit nets (~100 unstables, 0.2 s per forward)."""
+    Built for the vit nets (~100 unstables, 0.2 s per forward).
+
+    Clamp keys: relu = (layer_idx:int, j) -> side 0/1; exp =
+    (op_name:str, j) -> (lo, hi) accumulated interval."""
     import heapq
     w_t = w_q if torch.is_tensor(w_q) else torch.as_tensor(
         np.asarray(w_q, np.float64), device=device, dtype=dtype)
+    exp_names = {op['name'] for op in gg['ops'] if op['type'] == 'exp'}
+    exp_numel = {}
+
+    def _mk_oc(clamps):
+        oc = {}
+        for key, val in clamps.items():
+            if not isinstance(key[0], str):
+                continue
+            nm, j = key
+            if nm not in oc:
+                oc[nm] = (torch.full((exp_numel[nm],), -np.inf,
+                                     device=device, dtype=dtype),
+                          torch.full((exp_numel[nm],), np.inf,
+                                     device=device, dtype=dtype))
+            oc[nm][0][j] = val[0]
+            oc[nm][1][j] = val[1]
+        return oc or None
+
+    def _mk_rc(clamps):
+        # relu split halfspaces for the rbeta Lagrangian: side 0 means
+        # z_j <= 0 (finite hi), side 1 means z_j >= 0 (finite lo)
+        rc = {}
+        for key, side in clamps.items():
+            if isinstance(key[0], str):
+                continue
+            L, j = key
+            if L not in rc:
+                n = base_sb[L][0].size
+                rc[L] = (torch.full((n,), -np.inf, device=device,
+                                    dtype=dtype),
+                         torch.full((n,), np.inf, device=device,
+                                    dtype=dtype))
+            if side == 0:
+                rc[L][1][j] = 0.0
+            else:
+                rc[L][0][j] = 0.0
+        return rc or None
 
     def bound(clamps):
         ob = {}
+        oc = _mk_oc(clamps)
+        rc = _mk_rc(clamps)
         sb_l, zf = _forward_zonotope_graph(
             xl, xh, gg, device, dtype, settings=settings,
             relu_lambdas=lams,
             tight_bounds={L: _mk_tb(L, clamps) for L in
-                          {Lj[0] for Lj in clamps}} if clamps else None,
-            op_bounds=ob)
+                          {Lj[0] for Lj in clamps
+                           if not isinstance(Lj[0], str)}}
+                          if clamps else None,
+            op_clamps=oc, op_bounds=ob)
         wv = w_t.to(zf.center.dtype)
         lb = float(wv @ zf.center + float(b_q)
                    - (wv @ zf.generators).abs().sum())
@@ -5353,9 +5411,36 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
                     len(sb_l), device, dtype, op_bounds=ob)
                 lb_bw = float(bw_lbs[0])
             lb = max(lb, lb_bw)
+            if lb <= 0 and (oc is not None or rc is not None):
+                # Split node still open: the split constraints enter the
+                # bound only through their beta Lagrangian terms — bound
+                # clamping alone keeps spurious traces from inputs
+                # OUTSIDE the subdomain (a clamped relu routes true z>0
+                # through y=0; a clamped exp plane still concretizes
+                # over the FULL input box). Short per-node beta/plane
+                # optimization, warm-started from the root plane params
+                # when available — beta-CROWN's core mechanism.
+                from .attn_crown import attn_crown_alpha
+                _wp = None
+                if plane_params is not None:
+                    _wp = {k: v.detach().clone().requires_grad_(True)
+                           for k, v in plane_params.items()}
+                    for nm2, (cl2, _ch2) in (oc or {}).items():
+                        _wp[('beta', nm2)] = torch.zeros(
+                            (2, cl2.numel()), device=device, dtype=dtype,
+                            requires_grad=True)
+                    for L2, (cl2, _ch2) in (rc or {}).items():
+                        _wp[('rbeta', L2)] = torch.zeros(
+                            (2, cl2.numel()), device=device, dtype=dtype,
+                            requires_grad=True)
+                lb_beta, _ = attn_crown_alpha(
+                    gg, xl, xh, sb_l, ob, wv, float(b_q),
+                    n_iters=20, lr=0.2, time_left=time_left,
+                    params=_wp, op_clamps=oc, relu_clamps=rc)
+                lb = max(lb, lb_beta)
         except NotImplementedError:
             pass    # nets whose backward lacks an op: forward-only node
-        return lb, sb_l
+        return lb, sb_l, ob
 
     base_sb = {}
 
@@ -5371,10 +5456,13 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
                 lo[j] = max(lo[j], 0.0)
         return lo, hi
 
-    lb0, sb0 = bound({})
+    lb0, sb0, ob0 = bound({})
     for L, (lo_t, hi_t) in sb0.items():
         base_sb[L] = (lo_t.detach().cpu().numpy().astype(np.float64),
                       hi_t.detach().cpu().numpy().astype(np.float64))
+    for nm in exp_names:
+        if nm in ob0:
+            exp_numel[nm] = int(ob0[nm][0].numel())
     if lb0 > 0:
         return True, 1, 'root'
 
@@ -5396,7 +5484,7 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
     except NotImplementedError:
         pass
 
-    def pick_split(sb_l, clamps):
+    def pick_split(sb_l, clamps, ob):
         best = None; best_score = -1.0
         for L, (lo_t, hi_t) in sb_l.items():
             lo = lo_t.detach(); hi = hi_t.detach()
@@ -5413,12 +5501,33 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
             j = int(score.argmax())
             s = float(score[j])
             if s > best_score and (L, j) not in clamps:
-                best_score = s; best = (L, int(j))
+                best_score = s; best = ('relu', L, int(j))
+        if best is not None:
+            return best
+        # no unstable relu left: propose a bilinear-input (exp) split.
+        # Score = the exp parallelogram's slack height (chord gap minus
+        # tangency gap) — the slack a midpoint split actually removes.
+        for nm in exp_names:
+            if nm not in ob:
+                continue
+            lo, hi = ob[nm]
+            w_in = hi - lo
+            k = (torch.exp(hi) - torch.exp(lo)) / w_in.clamp(min=1e-12)
+            xs = torch.log(k.clamp(min=1e-300))
+            xs = torch.minimum(torch.maximum(xs, lo), hi)
+            slack = (torch.exp(lo) - k * lo) - (torch.exp(xs) - k * xs)
+            slack = torch.where(w_in > 1e-6, slack.clamp(min=0.0),
+                                torch.full_like(slack, -1.0))
+            j = int(slack.argmax())
+            s = float(slack[j])
+            if s > best_score:
+                best_score = s
+                best = ('exp', nm, j, float(lo[j]), float(hi[j]))
         return best
 
     heap = []
     cnt = 0
-    sp0 = pick_split(sb0, {})
+    sp0 = pick_split(sb0, {}, ob0)
     if sp0 is None:
         return False, 1, 'no_split'
     heapq.heappush(heap, (lb0, cnt, {}, sp0))
@@ -5430,28 +5539,37 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
             return False, nodes, 'cap'
         lb, _, clamps, sp = heapq.heappop(heap)
         for side in (0, 1):
-            c2 = dict(clamps); c2[sp] = side
-            lb2, sb2 = bound(c2)
+            c2 = dict(clamps)
+            if sp[0] == 'relu':
+                c2[(sp[1], sp[2])] = side
+            else:
+                _, nm, j, l_, u_ = sp
+                m_ = 0.5 * (l_ + u_)
+                c2[(nm, j)] = (l_, m_) if side == 0 else (m_, u_)
+            lb2, sb2, ob2 = bound(c2)
             nodes += 1
             if lb2 <= 0:
-                sp2 = pick_split(sb2, c2)
+                sp2 = pick_split(sb2, c2, ob2)
                 if sp2 is None:
-                    # No splittable relu left in this leaf (the clamps
-                    # cascade-stabilised the rest); residual gap is
-                    # bilinear/softmax slack — a short backward-alpha
-                    # rescue under the leaf's clamps before giving up.
+                    # No splittable relu or exp coordinate left in this
+                    # leaf; a short backward-alpha rescue under the
+                    # leaf's clamps before giving up.
                     _tb_leaf = {L: _mk_tb(L, c2)
-                                for L in {Lj[0] for Lj in c2}}
+                                for L in {Lj[0] for Lj in c2
+                                          if not isinstance(Lj[0], str)}}
+                    _oc_leaf = _mk_oc(c2)
                     try:
                         from .attn_crown import attn_crown_alpha
                         ob_leaf = {}
                         sb_leaf, _zfL = _forward_zonotope_graph(
                             xl, xh, gg, device, dtype, settings=settings,
-                            tight_bounds=_tb_leaf, op_bounds=ob_leaf)
+                            tight_bounds=_tb_leaf, op_bounds=ob_leaf,
+                            op_clamps=_oc_leaf)
                         _best_leaf, _ = attn_crown_alpha(
                             gg, xl, xh, sb_leaf, ob_leaf, w_t,
                             float(b_q), n_iters=30, lr=0.2,
-                            time_left=time_left)
+                            time_left=time_left, op_clamps=_oc_leaf,
+                            relu_clamps=_mk_rc(c2))
                         if _best_leaf > 0:
                             continue
                     except NotImplementedError:
@@ -5459,7 +5577,7 @@ def _zono_relu_split_close(gg, xl, xh, w_q, b_q, device, dtype,
                     if _zono_alpha_close(
                             gg, xl, xh, w_q, b_q, device, dtype,
                             settings, time_left, n_iters=40, lr=0.15,
-                            tight_bounds=_tb_leaf):
+                            tight_bounds=_tb_leaf, op_clamps=_oc_leaf):
                         continue
                     return False, nodes, 'exhausted'
                 cnt += 1
@@ -5754,6 +5872,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     xl_g = torch.tensor(spec.x_lo.astype(np.float64), dtype=dtype, device=device)
     xh_g = torch.tensor(spec.x_hi.astype(np.float64), dtype=dtype, device=device)
 
+    # Softmax max-shift retarget (exact reparametrization; only the
+    # gather index changes, picked at the box center)
+    from .verify_zono_bnb import retarget_softmax_shifts
+    retarget_softmax_shifts(gg, 0.5 * (xl_g + xh_g))
+
     # PGD only needs approximate gradients — run it in float32 on a
     # dedicated float32 gpu_graph so the attack stays cheap even when the
     # main verification is float64. When `bits=32`, `gg` is already fp32,
@@ -5762,6 +5885,14 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         gg_pgd = gg
     else:
         gg_pgd = graph.gpu_graph(device, torch.float32)
+        # the fp32 work graph must be the SAME function as gg: copy the
+        # retargeted softmax-shift indices (fresh op dicts re-emit the
+        # k=0 placeholder otherwise, changing node semantics under it)
+        _shift_idx = {op['name']: op['flat_idx'] for op in gg['ops']
+                      if op['type'] == 'slice' and 'softmax_axis' in op}
+        for _op2 in gg_pgd['ops']:
+            if _op2['name'] in _shift_idx:
+                _op2['flat_idx'] = _shift_idx[_op2['name']]
     xl_pgd = xl_g.to(torch.float32)
     xh_pgd = xh_g.to(torch.float32)
 
@@ -6733,7 +6864,117 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         _zis_nodes = 0
         _zis_closed = []
         _zis_cap = int(getattr(settings, 'zono_input_split_max_nodes', 4096))
+        # Root forward + CROWN intermediate-bound refinement are query-
+        # independent: compute ONCE and share across all open queries.
+        _sb_r0 = _ob_r0 = None
+        try:
+            _ob_r0 = {}
+            _sb_r0, _ = _forward_zonotope_graph(
+                xl_g, xh_g, gg, device, dtype, settings=settings,
+                op_bounds=_ob_r0)
+            _ref_passes = int(getattr(
+                settings, 'attn_refine_passes', 0) or 0)
+            if _ref_passes > 0:
+                # CROWN intermediate-bound refinement (ABC's backward
+                # intermediates): tightens the exp / McCormick plane
+                # ranges for the root alpha and every BnB domain.
+                from .attn_crown import attn_refine_op_bounds
+                _n_ref = attn_refine_op_bounds(
+                    gg, xl_g, xh_g, _sb_r0, _ob_r0,
+                    time_left=time_left, passes=_ref_passes)
+                if print_progress:
+                    print(f'  [interm-refine] tightened {_n_ref} bounds '
+                          f'({time.perf_counter() - _t_zis:.1f}s)',
+                          flush=True)
+        except NotImplementedError:
+            _sb_r0 = _ob_r0 = None
+        # JOINT alpha over all open queries with differentiable
+        # intermediate bounds (the ABC mechanism: spec loss backprops
+        # into the planes of every intermediate-bound backward; their
+        # vit pgd instances close in ~2 such steps). Certified fp64
+        # bounds replace the shared root state for everything after.
+        _joint_closed = set()
+        _joint_params = None
+        if (bool(getattr(settings, 'attn_alpha_joint', False))
+                and _sb_r0 is not None and still_needs_milp
+                and any(op['type'] == 'exp' for op in gg['ops'])
+                and time_left() > 5.0):
+            try:
+                from .attn_crown import attn_alpha_joint
+                _jq = sorted(still_needs_milp)
+                _Wm = np.stack([
+                    spec_ew[qi][0].detach().cpu().numpy().astype(
+                        np.float64) for qi in _jq])
+                _bv = np.array([float(spec_ew[qi][1]) for qi in _jq])
+                _bab_fp32 = bool(getattr(settings, 'attn_bab_fp32',
+                                         True))
+                # phase budget: each joint iteration re-derives every
+                # capped intermediate (expensive on 3-block nets) —
+                # leave the BaB its share of the wall
+                _t_j0 = time.perf_counter()
+                _j_budget = min(
+                    time_left() * float(getattr(
+                        settings, 'attn_joint_frac', 0.35)),
+                    float(getattr(settings, 'attn_joint_max_s', 30.0)))
+                # Budget gate by GAP DEPTH, not query count: BaB closes
+                # shallow gaps (~0.05, thousands of domains) but never
+                # deep ones (measured: -0.3 gaps crawl at 24k domains;
+                # ABC's alpha_iter2 ablation flips deep-gap cases to
+                # timeout). Shallow worst-gap -> keep alpha short and
+                # let BaB spend the wall; deep -> alpha needs its ~50
+                # iterations.
+                _worst_open = min(
+                    (spec_lbs.get(qi, -1.0) for qi in _jq),
+                    default=-1.0)
+                if _worst_open > -float(getattr(
+                        settings, 'attn_joint_deep_gap', 0.15)):
+                    # shallow gaps: BaB closes these; alpha overhead
+                    # costs cases (6769 closed pre-joint at 85.6s,
+                    # lost to phase overhead afterwards)
+                    _j_budget = min(
+                        _j_budget,
+                        float(getattr(settings, 'attn_joint_s_per_q',
+                                      6.0)) * len(_jq),
+                        float(getattr(settings,
+                                      'attn_joint_shallow_max_s', 8.0)))
+                _tl_j = (lambda: min(
+                    time_left(),
+                    _j_budget - (time.perf_counter() - _t_j0)))
+                _lb_j, _joint_params, _ob_r0, _sb_r0 = attn_alpha_joint(
+                    gg, xl_g, xh_g, _sb_r0, _ob_r0, _Wm, _bv,
+                    n_iters=int(getattr(
+                        settings, 'attn_joint_iters', 60)),
+                    lr=float(getattr(settings, 'attn_joint_lr', 0.4)),
+                    lr_decay=float(getattr(
+                        settings, 'attn_joint_lr_decay', 0.98)),
+                    time_left=_tl_j,
+                    gg_work=gg_pgd if _bab_fp32 else None,
+                    work_dtype=torch.float32 if _bab_fp32 else None,
+                    max_rows=int(getattr(
+                        settings, 'attn_joint_max_rows', 4096)),
+                    per_row_rows=int(getattr(
+                        settings, 'attn_joint_per_row_rows', 1024)),
+                    freeze_tol=float(getattr(
+                        settings, 'attn_joint_freeze_tol', 1e-4)),
+                    freeze_patience=int(getattr(
+                        settings, 'attn_joint_freeze_patience', 2)),
+                    refresh_every=int(getattr(
+                        settings, 'attn_joint_refresh_every', 1)),
+                    freeze_refresh=int(getattr(
+                        settings, 'attn_joint_freeze_refresh', 8)))
+                for _qi, _lb in zip(_jq, _lb_j):
+                    if _lb > 0:
+                        _joint_closed.add(_qi)
+                if print_progress:
+                    print(f'  [joint-alpha] {len(_joint_closed)}/'
+                          f'{len(_jq)} closed, worst '
+                          f'{float(min(_lb_j)):+.4f}', flush=True)
+            except NotImplementedError:
+                _joint_params = None
         for qi in sorted(still_needs_milp):
+            if qi in _joint_closed:
+                _zis_closed.append(qi)
+                continue
             _w_zis, _b_zis = spec_ew[qi]
             ok = _zono_alpha_close(
                 gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype, settings,
@@ -6741,28 +6982,85 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 n_iters=int(getattr(settings, 'zono_alpha_iters', 60)),
                 lr=float(getattr(settings, 'zono_alpha_lr', 0.1)))
             _root_params = None
-            if not ok:
+            if not ok and _sb_r0 is not None:
                 # root backward-alpha (ABC's alpha-CROWN over the
                 # McCormick r / tangent / relu-lambda planes); its
                 # optimized params are reused by every BnB node below.
                 try:
                     from .attn_crown import attn_crown_alpha
-                    _ob_r = {}
-                    _sb_r, _zf_r2 = _forward_zonotope_graph(
-                        xl_g, xh_g, gg, device, dtype, settings=settings,
-                        op_bounds=_ob_r)
+                    _sb_r, _ob_r = _sb_r0, _ob_r0
+                    _a_iters = int(getattr(
+                        settings, 'zono_backward_alpha_iters', 60))
+                    _warm = None
+                    if _joint_params is not None:
+                        _warm = {k: v.detach().clone().requires_grad_(
+                            True) for k, v in _joint_params.items()}
                     _best_r, _root_params = attn_crown_alpha(
                         gg, xl_g, xh_g, _sb_r, _ob_r, _w_zis,
-                        float(_b_zis),
-                        n_iters=int(getattr(
-                            settings, 'zono_backward_alpha_iters', 60)),
-                        lr=0.25, time_left=time_left)
+                        float(_b_zis), n_iters=_a_iters,
+                        lr=0.25, time_left=time_left, params=_warm)
+                    # iterate refine <-> alpha: param-aware intermediate
+                    # refinement compounds (pgd_7086 q3 measured
+                    # -1.16 -> +0.0009 -> +0.23 over two rounds). The
+                    # shared _sb_r0/_ob_r0 tighten in place, so gains
+                    # accumulate across queries (sound: monotone
+                    # intersection of valid enclosures).
+                    _rounds = int(getattr(
+                        settings, 'attn_refine_rounds', 0) or 0)
+                    for _rr in range(_rounds):
+                        if _best_r > 0 or time_left() <= 5.0:
+                            break
+                        from .attn_crown import attn_refine_op_bounds
+                        attn_refine_op_bounds(
+                            gg, xl_g, xh_g, _sb_r, _ob_r,
+                            params=_root_params, time_left=time_left,
+                            passes=1)
+                        _b2, _root_params = attn_crown_alpha(
+                            gg, xl_g, xh_g, _sb_r, _ob_r, _w_zis,
+                            float(_b_zis), n_iters=_a_iters, lr=0.25,
+                            time_left=time_left, params=_root_params)
+                        _best_r = max(_best_r, _b2)
                     if print_progress:
                         print(f'  [bw-alpha] q{qi} root lb '
                               f'{_best_r:+.4f}', flush=True)
                     ok = _best_r > 0
                 except NotImplementedError:
                     _root_params = None
+            _bab_batch = int(getattr(settings, 'attn_bab_batch', 0) or 0)
+            if (not ok and _bab_batch > 0 and _root_params is not None
+                    and any(op['type'] == 'exp' for op in gg['ops'])):
+                # Batched no-reforward beta-CROWN BaB (the ABC vit
+                # recipe): ~10-30x the unbatched node throughput.
+                from .attn_crown import attn_beta_bab
+                _ew_w = {}
+                try:
+                    _, _, _ew_at = _spec_backward_graph(
+                        _sb_r, xl_g, xh_g, gg,
+                        {0: (_w_zis, float(_b_zis))}, {0}, len(_sb_r),
+                        device, dtype, op_bounds=_ob_r, return_ew=True)
+                    for _L, _e in _ew_at.get(0, {}).items():
+                        _ew_w[_L] = torch.as_tensor(
+                            np.abs(np.asarray(_e, np.float64)),
+                            device=device, dtype=dtype)
+                except NotImplementedError:
+                    pass
+                _bab_fp32 = bool(getattr(settings, 'attn_bab_fp32',
+                                         True))
+                ok, n_used, _rs_reason = attn_beta_bab(
+                    gg, xl_g, xh_g, _sb_r, _ob_r, _w_zis,
+                    float(_b_zis), _root_params, time_left=time_left,
+                    ew_w=_ew_w or None, batch=_bab_batch,
+                    n_iters=int(getattr(settings, 'attn_bab_iters', 12)),
+                    lr=float(getattr(settings, 'attn_bab_lr', 0.1)),
+                    print_progress=print_progress,
+                    gg_work=gg_pgd if _bab_fp32 else None,
+                    work_dtype=torch.float32 if _bab_fp32 else None,
+                    kfsb_k=int(getattr(settings, 'attn_bab_kfsb', 4)))
+                _zis_nodes += n_used
+                if print_progress:
+                    print(f'  [beta-bab] q{qi} '
+                          f'{"closed" if ok else "open"} after {n_used} '
+                          f'domains ({_rs_reason})', flush=True)
             if not ok:
                 ok, n_used, _rs_reason = _zono_relu_split_close(
                     gg, xl_g, xh_g, _w_zis, _b_zis, device, dtype,

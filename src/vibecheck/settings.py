@@ -802,6 +802,71 @@ def default_settings(**overrides):
         # root backward-alpha (attn_crown) iterations in the last-chance
         # chain; optimized plane params are reused by every BnB node.
         zono_backward_alpha_iters=60,
+        # Batched no-reforward beta-CROWN BaB (attn_beta_bab) for nets
+        # with a softmax decomposition: bound `attn_bab_batch` domains
+        # per autograd call (ABC vit recipe: batch 32, 10 beta iters).
+        # 0 = disabled (fall through to the unbatched relu-split BnB).
+        attn_bab_batch=0,
+        attn_bab_iters=12,
+        attn_bab_lr=0.1,
+        # CROWN intermediate-bound refinement passes before the root
+        # backward-alpha (per-coordinate ±I backward from each node
+        # feeding a relaxation; ABC computes all intermediates this
+        # way). 0 = off.
+        attn_refine_passes=0,
+        # refine <-> alpha iteration rounds per open query (param-aware
+        # refinement compounds; pgd_7086 q3: -1.16 -> +0.23 in 2
+        # rounds). 0 = off.
+        attn_refine_rounds=0,
+        # JOINT alpha over all open queries with differentiable
+        # intermediate bounds (spec loss backprops into every
+        # intermediate-bound backward's planes — the ABC vit closer).
+        attn_alpha_joint=False,
+        # cap on differentiable ±I rows in attn_alpha_joint (autograd
+        # memory ~ rows x net size); earliest targets are trimmed first
+        # and keep their frozen sound enclosures.
+        attn_joint_max_rows=4096,
+        # joint-alpha wall budget: min(frac of remaining, max_s)
+        attn_joint_frac=0.35,
+        attn_joint_max_s=30.0,
+        attn_joint_s_per_q=6.0,
+        # open-query gap below which BaB cannot close (alpha gets the
+        # full budget); shallow gaps keep the short-alpha regime
+        attn_joint_deep_gap=0.15,
+        # row budget for per-row intermediate alphas (latest targets
+        # first); memory ~ rows x walk graph
+        attn_joint_per_row_rows=1024,
+        attn_joint_shallow_max_s=8.0,
+        # adaptive target freezing in attn_alpha_joint: a target whose
+        # re-derived widths change < tol (rel, per coord) for
+        # `patience` consecutive iterations stops being re-derived
+        # (last raw bounds reused — sound enclosures; the final fp64
+        # cert pass still re-derives everything). refresh_every K > 1
+        # re-derives non-per-row unfrozen targets only every K iters.
+        # 0.0 disables freezing: measured net-negative on the probe set
+        # (8836 regressed unsat->timeout; no flips gained)
+        attn_joint_freeze_tol=0.0,
+        attn_joint_freeze_patience=2,
+        attn_joint_refresh_every=1,
+        # frozen targets are re-derived every K iterations anyway
+        # (cache updated, target unfrozen if its widths moved):
+        # staleness <= K keeps the search near the full-rederivation
+        # trajectory and bounds search-vs-cert drift. 0 = never.
+        attn_joint_freeze_refresh=8,
+        # joint-alpha optimization schedule (ABC: lr 0.5 decay ~0.98,
+        # ~50 iterations REQUIRED on the pgd family per ablation)
+        attn_joint_iters=60,
+        attn_joint_lr=0.4,
+        attn_joint_lr_decay=0.98,
+        # Run the BaB search in fp32 on a fp32 graph (consumer GPUs do
+        # fp64 at ~1/32 rate); every closure is re-certified by a full-
+        # precision walk before pruning, so soundness never rests on
+        # fp32 arithmetic.
+        attn_bab_fp32=True,
+        # kFSB-lite branching: cheap-evaluate this many top-scored
+        # split candidates per domain (one batched eval), pick
+        # max(min(children)) — FSB. 1 = plain heuristic pick.
+        attn_bab_kfsb=4,
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         # Phase 8 minimum-budget floor as fraction of total_timeout. The
         # pipeline rebudgets so Phase 8 always gets at least this fraction

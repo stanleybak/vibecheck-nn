@@ -2202,8 +2202,44 @@ class ComputeGraph:
                 exp_name = f'{name}__exp'
                 sum_name = f'{name}__sum'
                 rcp_name = f'{name}__recip'
+                # Max-shift (alpha,beta-CROWN's fixed-index trick):
+                # softmax(x) = softmax(x - x_k) EXACTLY for any fixed
+                # per-row index k (shift invariance), and subtracting a
+                # fixed coordinate is a linear op (gather + negate +
+                # add-merge — all exact on zonotopes). With k ~= the
+                # row argmax, exp inputs stay <= ~0 so the exp
+                # relaxation operates in its tame range (ABC measured
+                # [-10.2, +0.19] on the pgd nets vs unshifted scores).
+                # k=0 placeholder here is still exact; the pipeline
+                # retargets flat_idx to the center-point argmax
+                # (retarget_softmax_shifts) before verification.
+                n_sm = int(np.prod(sh))
+                pos = np.arange(n_sm).reshape(sh)
+                sl0 = [slice(None)] * len(sh)
+                sl0[ax] = slice(0, 1)
+                idx0 = np.broadcast_to(pos[tuple(sl0)], sh).reshape(-1)
+                shift_name = f'{name}__shift'
+                nsh_name = f'{name}__nshift'
+                sub_name = f'{name}__shifted'
                 ops.append({
-                    'name': exp_name, 'type': 'exp', 'inputs': inp_names,
+                    'name': shift_name, 'type': 'slice',
+                    'inputs': inp_names,
+                    'flat_idx': idx0.copy(),
+                    'softmax_axis': ax,
+                    'in_shapes_nd': [sh], 'out_shape_nd': sh,
+                })
+                ops.append({
+                    'name': nsh_name, 'type': 'mul',
+                    'inputs': [shift_name], 'scale': -1.0,
+                    'in_shapes_nd': [sh], 'out_shape_nd': sh,
+                })
+                ops.append({
+                    'name': sub_name, 'type': 'add', 'is_merge': True,
+                    'inputs': [inp_names[0], nsh_name],
+                    'in_shapes_nd': [sh, sh], 'out_shape_nd': sh,
+                })
+                ops.append({
+                    'name': exp_name, 'type': 'exp', 'inputs': [sub_name],
                     'in_shapes_nd': [sh], 'out_shape_nd': sh,
                 })
                 ops.append({
@@ -2633,6 +2669,17 @@ class ComputeGraph:
             n_input = 1
             for d in self.input_shape:
                 n_input *= d
+
+        # Fork points must reflect the EMITTED op graph, not just the
+        # ComputeGraph nodes: synthetic decompositions (softmax exp ->
+        # {reduce_sum, mul_bilinear}; max-shift S -> {slice, add}) create
+        # op-level multi-consumers whose zonotopes must be copy-on-get
+        # (in-place handlers like fc/conv mutate their input otherwise).
+        _op_refs = {}
+        for _op in ops:
+            for _inp in _op['inputs']:
+                _op_refs[_inp] = _op_refs.get(_inp, 0) + 1
+        forks = set(forks) | {n for n, c in _op_refs.items() if c > 1}
 
         return {
             'ops': ops,

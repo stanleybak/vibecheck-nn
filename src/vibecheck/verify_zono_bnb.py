@@ -872,7 +872,8 @@ def _build_spec_ew_graph(gg, pred, comps, device, dtype):
 
 def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
-                             relu_lambdas=None, op_bounds=None):
+                             relu_lambdas=None, op_bounds=None,
+                             op_clamps=None):
     if relu_lambdas is None:
         # plain (non-differentiable) use: keep the historical no-grad
         # fast path; the alpha-zono caller passes relu_lambdas and needs
@@ -881,16 +882,17 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
             return _forward_zonotope_graph_impl(
                 xl, xh, gg, device, dtype, settings=settings,
                 rec_zono=rec_zono, tight_bounds=tight_bounds,
-                op_bounds=op_bounds)
+                op_bounds=op_bounds, op_clamps=op_clamps)
     return _forward_zonotope_graph_impl(
         xl, xh, gg, device, dtype, settings=settings, rec_zono=rec_zono,
         tight_bounds=tight_bounds, relu_lambdas=relu_lambdas,
-        op_bounds=op_bounds)
+        op_bounds=op_bounds, op_clamps=op_clamps)
 
 
 def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
-                             relu_lambdas=None, op_bounds=None):
+                             relu_lambdas=None, op_bounds=None,
+                             op_clamps=None):
     """Graph-aware zonotope forward pass (supports skip connections).
 
     Args:
@@ -921,6 +923,17 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             (lo, hi), keeping the parametrization consistent so
             ``state_from_phase1``'s LP triangle constraints use the
             same (lo, hi) as the recorded μ, λ.
+        op_clamps: optional ``{op_name: (lo_t, hi_t)}`` of input-bound
+            clamps for exp/reciprocal ops (flat torch tensors, ±inf for
+            unclamped coordinates). The BnB's bilinear-input value-split
+            (z_j <= m / z_j >= m on the TRUE op input) intersects the
+            zonotope input range with these before building the convex
+            parallelogram — same soundness argument as ReLU
+            ``tight_bounds``: on the subdomain, every true input value
+            lies in the clamped range, so the clamped-range relaxation
+            contains every true (x, f(x)) point, and the two children
+            cover the parent. Recorded ``op_bounds`` carry the
+            intersected range so backward planes tighten identically.
 
     Returns:
         sb: dict mapping layer_idx -> (lo, hi) bounds at each ReLU
@@ -954,6 +967,26 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
         if name in forks:
             return zono_state[name].copy()
         return zono_state[name]
+
+    # True-value interval side-channel: iv_state[name] = (lo, hi) is a
+    # sound enclosure of the op's TRUE output values on the (possibly
+    # op_clamps-split) subdomain, sometimes strictly tighter than the
+    # output zonotope's own range. Why needed: a clamped exp's linear
+    # term k*z still ranges over the UNCLAMPED zonotope coordinate, so
+    # z.bounds() of the output can dip below the true range (even below
+    # 0, breaking the downstream reciprocal's domain). Seeded at
+    # exp/reciprocal (monotone closed form on the intersected input
+    # range), propagated through reduce_sum and mul_bilinear, and
+    # intersected wherever a handler consumes input bounds.
+    iv_state = {}
+
+    def _iv_bounds(inp_name, z):
+        lo, hi = z.bounds()
+        if inp_name in iv_state:
+            lo = torch.maximum(lo, iv_state[inp_name][0])
+            hi = torch.minimum(hi, iv_state[inp_name][1])
+            hi = torch.maximum(hi, lo)
+        return lo, hi
 
     for op_idx, op in enumerate(gg['ops']):
         name = op['name']
@@ -1242,13 +1275,26 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             from .zonotope import _torch_zono_mul_bilinear
             z_a = _get(op['inputs'][0])
             z_b = _get(op['inputs'][1])
+            _al, _ah = _iv_bounds(op['inputs'][0], z_a)
+            _bl, _bh = _iv_bounds(op['inputs'][1], z_b)
             if op_bounds is not None:
-                _al, _ah = z_a.bounds(); _bl, _bh = z_b.bounds()
                 op_bounds[name] = (
                     (_al.detach().clone(), _ah.detach().clone()),
                     (_bl.detach().clone(), _bh.detach().clone()))
             in_shapes = op.get('in_shapes_nd', [None, None])
             out_shape = op.get('out_shape_nd')
+            if (in_shapes[0] is not None and in_shapes[1] is not None
+                    and (op['inputs'][0] in iv_state
+                         or op['inputs'][1] in iv_state)):
+                # interval product (4 broadcast corner products) brackets
+                # the true elementwise products
+                _av = (_al.reshape(in_shapes[0]), _ah.reshape(in_shapes[0]))
+                _bv = (_bl.reshape(in_shapes[1]), _bh.reshape(in_shapes[1]))
+                _corners = torch.stack([
+                    (_av[i] * _bv[j]).reshape(-1)
+                    for i in (0, 1) for j in (0, 1)])
+                iv_state[name] = (_corners.min(dim=0).values.detach(),
+                                  _corners.max(dim=0).values.detach())
             new_c, new_g = _torch_zono_mul_bilinear(
                 z_a.center, z_a.generators, z_b.center, z_b.generators,
                 shape_a=in_shapes[0], shape_b=in_shapes[1],
@@ -1300,6 +1346,18 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             new_c, new_g = _torch_zono_reduce_sum(
                 z.center, z.generators, in_shape_nd,
                 op.get('axes', ()), op.get('keepdims', False))
+            if op['inputs'][0] in iv_state:
+                # sum is monotone per coordinate: summed iv brackets the
+                # true reduced values
+                _l0, _h0 = iv_state[op['inputs'][0]]
+                _g_empty = z.generators[:, :0]
+                _lr, _ = _torch_zono_reduce_sum(
+                    _l0, _g_empty, in_shape_nd, op.get('axes', ()),
+                    op.get('keepdims', False))
+                _hr, _ = _torch_zono_reduce_sum(
+                    _h0, _g_empty, in_shape_nd, op.get('axes', ()),
+                    op.get('keepdims', False))
+                iv_state[name] = (_lr.detach(), _hr.detach())
             zono_state[name] = TorchZonotope(new_c, new_g)
 
         elif t == 'pow':
@@ -1345,7 +1403,8 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             K_a = za.n_gens; K_b = zb.n_gens
             K = max(K_a, K_b)
             if op_bounds is not None:
-                _al, _ah = za.bounds(); _bl, _bh = zb.bounds()
+                _al, _ah = _iv_bounds(op['inputs'][0], za)
+                _bl, _bh = _iv_bounds(op['inputs'][1], zb)
                 op_bounds[name] = (
                     (_al.detach().clone(), _ah.detach().clone()),
                     (_bl.detach().clone(), _bh.detach().clone()))
@@ -1386,7 +1445,15 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             # BoundExp / BoundReciprocal chord-vs-tangent planes; sound
             # because the parallelogram contains f pointwise on [l, u].
             z = _get(op['inputs'][0])
-            lo_in, hi_in = z.bounds()
+            lo_in, hi_in = _iv_bounds(op['inputs'][0], z)
+            if op_clamps is not None and name in op_clamps:
+                cl, ch = op_clamps[name]
+                lo_in = torch.maximum(lo_in, cl.to(lo_in.dtype))
+                hi_in = torch.minimum(hi_in, ch.to(hi_in.dtype))
+                # an empty intersection means the subdomain is infeasible
+                # for this abstract state; keep numerics valid (any bound
+                # over the degenerate point interval is sound)
+                hi_in = torch.maximum(hi_in, lo_in)
             if op_bounds is not None:
                 op_bounds[name] = (lo_in.detach().clone(),
                                    hi_in.detach().clone())
@@ -1401,6 +1468,10 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             else:
                 f_l = torch.exp(lo_in)
                 f_u = torch.exp(hi_in)
+            # monotone closed form exactly brackets the true outputs on
+            # the intersected input range
+            iv_state[name] = (torch.minimum(f_l, f_u).detach(),
+                              torch.maximum(f_l, f_u).detach())
             w_in = (hi_in - lo_in).clamp(min=1e-12)
             k = (f_u - f_l) / w_in
             if relu_lambdas is not None and name in relu_lambdas:
@@ -4467,3 +4538,42 @@ def zonotope_bnb_verify(graph, spec, settings=None):
                            settings)
 
     return _run_bnb(evaluate_fn, pgd_fn, x_lo_np, x_hi_np, comps, settings)
+
+
+def retarget_softmax_shifts(gg, x_center):
+    """Point the softmax max-shift gathers at the row argmax of the
+    CENTER input (alpha,beta-CROWN's fixed-index trick).
+
+    The emission's k=0 placeholder is already exact (softmax is shift
+    invariant for any fixed per-row index); retargeting only improves
+    relaxation quality: with k = argmax, the shifted scores' upper
+    bounds sit near 0, so exp operates in its tame range. A point
+    forward records the (shifted) scores at the center; the row argmax
+    of the shifted values equals the row argmax of the raw scores
+    (constant per-row shift). Mutates flat_idx in place; call BEFORE
+    any bound computation. No-op for graphs without softmax shifts."""
+    shift_ops = [op for op in gg['ops']
+                 if op['type'] == 'slice' and 'softmax_axis' in op]
+    if not shift_ops:
+        return 0
+    ob = {}
+    _forward_zonotope_graph(x_center, x_center, gg, x_center.device,
+                            x_center.dtype, op_bounds=ob)
+    n_re = 0
+    for op in shift_ops:
+        base = op['name'][:-len('__shift')]
+        exp_name = f'{base}__exp'
+        if exp_name not in ob:
+            raise NotImplementedError(
+                f'retarget_softmax_shifts: no recorded bounds for '
+                f'{exp_name!r} — decomposition shape changed?')
+        v = ob[exp_name][0].detach().cpu().numpy()
+        sh = tuple(op['in_shapes_nd'][0])
+        ax = int(op['softmax_axis'])
+        pos = np.arange(int(np.prod(sh))).reshape(sh)
+        k = v.reshape(sh).argmax(axis=ax, keepdims=True)
+        flat_idx = np.take_along_axis(
+            pos, np.broadcast_to(k, sh), axis=ax).reshape(-1)
+        op['flat_idx'] = flat_idx
+        n_re += 1
+    return n_re

@@ -1,8 +1,11 @@
-# vit_2023 — ViT attention nets (extended track). v1: pure forward-zono
-# (interval attention: matmul_bilinear + softmax box bounds) + PGD. The
-# CROWN/alpha backward chains do not support the attention ops yet, so all
-# backward-based phases are off; verdicts come from the zono spec check and
-# PGD witnesses. ABC bar: 126/200 (alpha-CROWN + custom vit tuning).
+# vit_2023 — ViT attention nets (extended track). Stack: softmax
+# decomposition (exp/reduce_sum/reciprocal/mul_bilinear) with exact
+# max-shift, attention-aware backward CROWN (exp/recip planes + McCormick
+# bilinear), joint differentiable-intermediate alpha, batched beta-CROWN
+# BaB with relu+bilinear splits (attn_crown.py). The generic FC/conv
+# tightening phases (LP lift / MILP tighten / bab_refine / Phase-8 MILP)
+# have no bilinear/softmax support and stay off. ABC published bar:
+# 125/200 (65 ibp + 60 pgd). See docs/benchmarks/vit_2023.md.
 phase2_crown_enabled: true
 zono_lift_enabled: false
 max_tighten_layer: 0
@@ -14,3 +17,16 @@ phase1_method: plain
 zono_input_split_enabled: true
 zono_input_split_max_nodes: 0
 zono_relu_split_max_nodes: 6000
+# batched no-reforward beta-CROWN BaB (ABC vit recipe: batch 32, 10 it)
+attn_bab_batch: 32
+attn_bab_iters: 12
+# CROWN intermediate refinement: pgd-family roots -7.7 -> -3.0 (alpha)
+# in 0.7s; ibp marginal (+0.002, ~10s). fp32 search is default-on.
+attn_refine_passes: 2
+attn_refine_rounds: 1
+attn_alpha_joint: true
+# pgd-family alpha-closes need ~50 iters (ABC ablation: iteration=2
+# flips their unsat -> timeout); s_per_q keeps ibp's short-alpha regime
+attn_joint_max_s: 45.0
+attn_joint_frac: 0.5
+attn_joint_iters: 80
