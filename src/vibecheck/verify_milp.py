@@ -3470,6 +3470,14 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 'phase': 'crown_tightened_graph'}, stats)
 
     # --- Phase 3: MILP escalation for remaining queries ---
+    # Skippable per-benchmark: on wide conv nets the spec MILP cannot
+    # finish, overruns the CLI deadline (observed NOFILE verdicts at
+    # ext-kill: vc6/probe4), and Gurobi numeric trouble aborts the case.
+    if not bool(getattr(settings, 'milp_graph_escalation_enabled', True)):
+        return _make_result('unknown', {
+            'time': time.perf_counter() - (deadline - total_timeout),
+            'phase': 'no_escalation',
+            'remaining': len(still_open_disj)}, stats)
     # Collect still-open query indices
     remaining_qids = set()
     for di in still_open_disj:

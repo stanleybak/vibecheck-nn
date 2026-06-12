@@ -6,14 +6,15 @@
 # (probe 2026-06-12: 3.8 vs 7.6 s, 6.1 vs 8.6 s, 11.4 vs 51 s) — the
 # settings below leave that path untouched.
 #
-# tinyimagenet models (12288-dim input): the zonotope forward's
+# ALL models route through the graph path with the IBP phase 1 (threshold
+# covers cifar10's 3072 dims too). tinyimagenet: the zonotope forward's
 # input-identity generators (12288 gens x 262144 first-layer acts) need
 # ~12 GiB per layer at fp32 — two consecutive layers OOM a 24 GB A10G.
-# Route inputs >= 8000 dims through the IBP forward (CROWN-IBP):
-# O(activations) memory, and on these IBP-trained nets the backward CROWN
-# over IBP intermediates is tight (verified ABC's unsat@15.4s case
-# outright in the prototype).
-phase1_ibp_input_dim_threshold: 8000
+# cifar10: the legacy layers path fails its harder cases (probe4:
+# GurobiNumericTrouble aborts on eps8, OOM in the tightener on eps8_wide,
+# deadline overruns/NOFILE on eps2 s3/s5) — the graph path's
+# tighten+alpha+BaB handles them and is memory-stable.
+phase1_ibp_input_dim_threshold: 3000
 # After CROWN-IBP, ~9-12 queries stay open at worst lb ~-2 on the 550 s
 # tinyimagenet cases. The per-layer MILP tightener cannot move these
 # (measured: 546 s for -1.80 -> -1.79 on idx7018_sample4, probe3 0612);
@@ -34,3 +35,6 @@ milp_graph_ibp_bab_enabled: true
 # (measured idx7018: 7464/2295/2546 vs ABC 7472/2307/2618) and moved the
 # open query's root lb -0.34 -> -0.18.
 milp_graph_tighten_big_layers: true
+# Spec-MILP escalation cannot finish on these nets and overruns the CLI
+# deadline (NOFILE verdicts at ext-kill in probe4); end cleanly instead.
+milp_graph_escalation_enabled: false

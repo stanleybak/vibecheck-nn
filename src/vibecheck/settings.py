@@ -596,6 +596,10 @@ def default_settings(**overrides):
         # start cap (chunked; see Phase 1.5). Off by default.
         milp_graph_tighten_big_layers=False,
         milp_graph_tighten_big_iters=15,
+        # Graph-path Phase 3 spec-MILP escalation. Disable on benchmarks
+        # where the MILP cannot finish (wide conv nets) — it overruns
+        # the CLI deadline and numeric trouble aborts cases.
+        milp_graph_escalation_enabled=True,
         # Multi-pass cascade: each pass loops L=0..max_layer applying
         # MILP+α-CROWN refresh. Pass N starts from bounds tightened by
         # pass N-1, so MILPs get a closer starting point and α-CROWN
