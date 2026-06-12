@@ -922,13 +922,16 @@ def _ibp_forward_graph(xl, xh, gg, device, dtype):
                 l2, h2 = lo[op['inputs'][1]], hi[op['inputs'][1]]
                 lo[name], hi[name] = l + l2, h + h2
             else:
-                b = torch.as_tensor(op['bias'], dtype=dtype, device=device)
+                b = torch.as_tensor(op['bias'], dtype=dtype,
+                                    device=device).reshape(-1)
                 lo[name], hi[name] = l + b, h + b
         elif t == 'sub':
-            b = torch.as_tensor(op['bias'], dtype=dtype, device=device)
+            b = torch.as_tensor(op['bias'], dtype=dtype,
+                                device=device).reshape(-1)
             lo[name], hi[name] = l - b, h - b
         elif t == 'mul':
-            s = torch.as_tensor(op['scale'], dtype=dtype, device=device)
+            s = torch.as_tensor(op['scale'], dtype=dtype,
+                                device=device).reshape(-1)
             a, b2 = s * l, s * h
             lo[name], hi[name] = torch.minimum(a, b2), torch.maximum(a, b2)
         elif t == 'max_pool':
@@ -1017,13 +1020,16 @@ def _ibp_forward_graph_batched(xl, xh, gg, device, dtype,
                 l2, h2 = lo[op['inputs'][1]], hi[op['inputs'][1]]
                 lo[name], hi[name] = l + l2, h + h2
             else:
-                b = torch.as_tensor(op['bias'], dtype=dtype, device=device)
+                b = torch.as_tensor(op['bias'], dtype=dtype,
+                                    device=device).reshape(-1)
                 lo[name], hi[name] = l + b, h + b
         elif t == 'sub':
-            b = torch.as_tensor(op['bias'], dtype=dtype, device=device)
+            b = torch.as_tensor(op['bias'], dtype=dtype,
+                                device=device).reshape(-1)
             lo[name], hi[name] = l - b, h - b
         elif t == 'mul':
-            s = torch.as_tensor(op['scale'], dtype=dtype, device=device)
+            s = torch.as_tensor(op['scale'], dtype=dtype,
+                                device=device).reshape(-1)
             a, b2 = s * l, s * h
             lo[name], hi[name] = torch.minimum(a, b2), torch.maximum(a, b2)
         else:
