@@ -28,3 +28,9 @@ milp_graph_tighten_enabled: false
 # β-BaB plateaued: -0.36 -> -0.15 in 13k domains; ABC closes in ~1.1k
 # domains with refresh).
 milp_graph_ibp_bab_enabled: true
+# Layers above the alpha start cap (L1-L3, 131k-262k neurons) keep raw
+# IBP bounds without this; targeted per-target alpha tightening of their
+# unstable neurons makes every layer tighter than ABC's alpha-CROWN init
+# (measured idx7018: 7464/2295/2546 vs ABC 7472/2307/2618) and moved the
+# open query's root lb -0.34 -> -0.18.
+milp_graph_tighten_big_layers: true

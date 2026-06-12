@@ -592,6 +592,10 @@ def default_settings(**overrides):
         milp_graph_ibp_bab_batch=64,
         milp_graph_ibp_bab_alpha_iters=8,
         milp_graph_ibp_bab_root_alpha_iters=50,
+        # Targeted per-target α-CROWN tightening of layers above the
+        # start cap (chunked; see Phase 1.5). Off by default.
+        milp_graph_tighten_big_layers=False,
+        milp_graph_tighten_big_iters=15,
         # Multi-pass cascade: each pass loops L=0..max_layer applying
         # MILP+α-CROWN refresh. Pass N starts from bounds tightened by
         # pass N-1, so MILPs get a closer starting point and α-CROWN

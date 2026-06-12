@@ -2532,7 +2532,7 @@ def _racing_escalation_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
 def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                    time_left, ew_w=None, batch=64, alpha_iters=8,
                    lr=0.25, max_domains=500000, print_progress=False,
-                   alpha_init=None):
+                   alpha_init=None, kfsb_k=4):
     """ReLU-split BaB with per-domain IBP intermediate refresh for ONE query.
 
     The IBP-route counterpart of `attn_crown.attn_beta_bab`. That kernel
@@ -2654,12 +2654,22 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                 for L in beta_params:
                     beta_params[L].clamp_(min=0.0)
         with torch.no_grad():
+            # kfsb-lite: per unpruned domain, take the top-k unstable
+            # candidates by width score, evaluate ALL their children
+            # bounds in one batched pass (init α, no Adam — a valid
+            # though looser bound), commit to the candidate whose worse
+            # child is best (max-min), and push children with their
+            # EVALUATED lbs. Children that already evaluate > 0 are
+            # pruned immediately. Plain width-argmax splits gave a
+            # logarithmic trajectory (vc9: -0.177 -> -0.027 in 39k
+            # domains without closing); candidate evaluation is ABC's
+            # kfsb mechanism.
+            cand_specs = []   # (slot, bi, (L, j))
+            dom_cands = {}    # bi -> [(L, j), ...]
             for bi, (_, _, clamps) in enumerate(batch_doms):
-                lb_d = float(best_lbs[bi])
-                if lb_d > 0:
+                if float(best_lbs[bi]) > 0:
                     continue
-                # Split on highest ew-weighted unstable width.
-                best_score, best_key = -1.0, None
+                scored = []
                 for L, (lo_b, hi_b) in sb_b.items():
                     lo_d, hi_d = lo_b[bi], hi_b[bi]
                     unstable = (lo_d < 0) & (hi_d > 0)
@@ -2669,21 +2679,83 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                     score = width * unstable.to(dtype)
                     if ew_w is not None and L in ew_w:
                         score = score * ew_w[L]
-                    j = int(torch.argmax(score))
-                    s = float(score[j])
-                    if s > best_score:
-                        best_score, best_key = s, (L, j)
-                if best_key is None:
+                    kk = min(kfsb_k, int(unstable.sum()))
+                    vals, idxs = torch.topk(score, kk)
+                    for v, j in zip(vals.tolist(), idxs.tolist()):
+                        if v > 0:
+                            scored.append((v, (L, int(j))))
+                if not scored:
                     # Fully split ReLU pattern, bound still <= 0: the
                     # backward bound over a fixed pattern is exact for
                     # the affine composition — cannot improve by
                     # splitting further.
                     return False, n_domains, 'exhausted_pattern'
+                scored.sort(reverse=True)
+                picks = [key for _, key in scored[:kfsb_k]]
+                dom_cands[bi] = picks
+                for key in picks:
+                    cand_specs.append((len(cand_specs), bi, key))
+            if not cand_specs:
+                continue
+            # Evaluate all children (2 per candidate) in chunks.
+            child_lbs = torch.empty(2 * len(cand_specs), dtype=dtype)
+            CH = max(8, batch)
+            for c0 in range(0, 2 * len(cand_specs), CH):
+                rows = range(c0, min(c0 + CH, 2 * len(cand_specs)))
+                Bc = len(rows)
+                xl_c = xl.unsqueeze(0).expand(Bc, -1).contiguous()
+                xh_c = xh.unsqueeze(0).expand(Bc, -1).contiguous()
+                rc_c = {}
+                al_c = {}
+                for r_i, r in enumerate(rows):
+                    slot, side = r // 2, r % 2
+                    _, bi, key = cand_specs[slot]
+                    clamps = dict(batch_doms[bi][2])
+                    clamps[key] = side
+                    for (L, j), sd in clamps.items():
+                        if L not in rc_c:
+                            n_L = sb_root_d[L][0].numel()
+                            rc_c[L] = (
+                                torch.full((Bc, n_L), -np.inf,
+                                           device=device, dtype=dtype),
+                                torch.full((Bc, n_L), np.inf,
+                                           device=device, dtype=dtype))
+                        if sd == 0:
+                            rc_c[L][1][r_i, j] = 0.0
+                        else:
+                            rc_c[L][0][r_i, j] = 0.0
+                sb_c = _ibp_forward_graph_batched(
+                    xl_c, xh_c, gg, device, dtype,
+                    relu_clamps=rc_c or None, root_sb=sb_root_d)
+                for L, (lo_c, hi_c) in sb_c.items():
+                    if alpha_init is not None and L in alpha_init:
+                        al_c[L] = alpha_init[L].detach().to(dtype) \
+                            .unsqueeze(0).expand(Bc, -1)
+                lbs_c = _spec_backward_graph_batched(
+                    sb_c, xl_c, xh_c, gg, spec_ew_q, device, dtype,
+                    alpha_at_layer=al_c or None)[:, 0]
+                child_lbs[c0:c0 + Bc] = lbs_c.detach().cpu()
+            # Pick per-domain best candidate (max over candidates of
+            # min(child lbs)); push its children with evaluated lbs.
+            slot_of = {}
+            for slot, bi, key in cand_specs:
+                slot_of.setdefault(bi, []).append((slot, key))
+            for bi, slot_keys in slot_of.items():
+                best_val, best_slot, best_key = -float('inf'), None, None
+                for slot, key in slot_keys:
+                    v = float(torch.minimum(child_lbs[2 * slot],
+                                            child_lbs[2 * slot + 1]))
+                    if v > best_val:
+                        best_val, best_slot, best_key = v, slot, key
+                clamps = batch_doms[bi][2]
                 for side in (0, 1):
+                    lb_child = float(child_lbs[2 * best_slot + side])
+                    if lb_child > 0:
+                        continue   # pruned at candidate-eval time
                     counter += 1
                     child = dict(clamps)
                     child[best_key] = side
-                    heapq.heappush(frontier, (lb_d, counter, child))
+                    heapq.heappush(frontier, (lb_child, counter, child))
         if print_progress and n_domains >= n_report + 2048:
             n_report = n_domains
             wl = min((d[0] for d in frontier), default=0.0)
@@ -2853,6 +2925,58 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
             and still_open_disj and time_left() > 5.0):
         t_a15 = time.perf_counter()
         from . import alpha_crown as ac
+        # Targeted per-target α-CROWN tightening of layers TOO BIG to be
+        # α start nodes (above milp_graph_alpha_start_cap). Without
+        # this, those layers keep raw Phase-1 bounds and stay looser
+        # than ABC's (cct idx7018: L3 3940 unstable vs ABC 2618; after
+        # this pass every layer beats ABC: 7464/2295/2546 vs
+        # 7472/2307/2618). Chunked over target neurons so the per-target
+        # backward (chunk x sum-of-prior-layer-sizes) stays ~1 GB.
+        if bool(getattr(settings, 'milp_graph_tighten_big_layers', False)):
+            from .alpha_tighten import tighten_layer_alpha_crown
+            _cap_b = int(getattr(settings,
+                                 'milp_graph_alpha_start_cap', 32768))
+            _bbr_np = {li: (sb[li][0].detach().cpu().numpy().astype(np.float64),
+                            sb[li][1].detach().cpu().numpy().astype(np.float64))
+                       for li in sb}
+            _sizes = {li: len(_bbr_np[li][0]) for li in _bbr_np}
+            for _Lb in sorted(_bbr_np):
+                if _Lb == 0 or _sizes[_Lb] <= _cap_b:
+                    continue   # L0 pre-relu bounds are exact (first affine)
+                lo_b, hi_b = _bbr_np[_Lb]
+                _unb = np.where((lo_b < 0) & (hi_b > 0))[0]
+                if len(_unb) == 0 or time_left() <= 30.0:
+                    continue
+                _prior = sum(_sizes[k] for k in _sizes if k < _Lb) \
+                    + int(np.prod(spec.x_lo.shape))
+                _chunk = max(256, min(2048, int(3.0e8 // max(1, _prior))))
+                t_bl = time.perf_counter()
+                new_lo, new_hi = lo_b.copy(), hi_b.copy()
+                for _c0 in range(0, len(_unb), _chunk):
+                    if time_left() <= 30.0:
+                        break
+                    _idx = _unb[_c0:_c0 + _chunk]
+                    _tl, _th = tighten_layer_alpha_crown(
+                        gg, spec.x_lo.flatten(), spec.x_hi.flatten(),
+                        _bbr_np, _Lb, device=device, dtype=dtype,
+                        n_iters=int(getattr(
+                            settings, 'milp_graph_tighten_big_iters', 15)),
+                        lr=0.05, target_indices=_idx, per_target=True)
+                    new_lo[_idx] = np.maximum(new_lo[_idx], _tl[_idx])
+                    new_hi[_idx] = np.minimum(new_hi[_idx], _th[_idx])
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                _bbr_np[_Lb] = (new_lo, new_hi)
+                sb[_Lb] = (torch.as_tensor(new_lo, device=device,
+                                           dtype=dtype),
+                           torch.as_tensor(new_hi, device=device,
+                                           dtype=dtype))
+                if print_progress:
+                    _un2 = int(((new_lo < 0) & (new_hi > 0)).sum())
+                    print(f'Phase 1.5 big-layer tighten L{_Lb}: '
+                          f'{len(_unb)} -> {_un2} unstable '
+                          f'({time.perf_counter() - t_bl:.1f}s, '
+                          f'chunk {_chunk})', flush=True)
         open_q = [(qi, w, b) for di in sorted(still_open_disj)
                   for (qi, w, b) in disj_queries[di]
                   if spec_lbs.get(qi, -1.0) <= 0]
