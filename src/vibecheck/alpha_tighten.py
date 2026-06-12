@@ -24,7 +24,8 @@ import torch.nn.functional as F
 
 def _walk_backward_per_target(
         gg, xl_t, xh_t, alpha_per_layer, bbr_t, start_op_name,
-        ew_init, n_targets, device, dtype, mode='lb', per_target=True):
+        ew_init, n_targets, device, dtype, mode='lb', per_target=True,
+        extra_out=None):
     """Generic CROWN-style backward walk through gg ops with per-target α.
 
     Args:
@@ -48,6 +49,22 @@ def _walk_backward_per_target(
                       if op['name'] == start_op_name)
     ew_at = {start_op_name: ew_init}
     acc = torch.zeros(n_targets, device=device, dtype=dtype)
+    if extra_out is not None:
+        # INVPROP-style output-constraint rows: the objective gains
+        # gamma_j * (w_j . y + b_j) terms (gamma >= 0), seeded at the
+        # OUTPUT op and walked back through the net. On the assumed SAT
+        # region every w_j.y+b_j <= 0, so for any gamma >= 0 the bound
+        # stays a valid LB of the constrained min (Lagrangian duality).
+        # NOTE: ew_out is NOT sign-flipped for mode='ub' — the caller's
+        # gamma always multiplies the constraint rows with + sign in the
+        # minimized objective.
+        out_op_name, ew_out, acc0 = extra_out
+        out_idx = next(i for i, op in enumerate(ops)
+                       if op['name'] == out_op_name)
+        ew_at[out_op_name] = (ew_at.get(out_op_name, 0) + ew_out
+                              if out_op_name in ew_at else ew_out)
+        acc = acc + acc0
+        start_idx = max(start_idx, out_idx)
 
     for i in range(start_idx, -1, -1):
         op = ops[i]; name = op['name']
@@ -159,7 +176,8 @@ def _walk_backward_per_target(
 def tighten_layer_alpha_crown(
         gg, xl, xh, bbr, target_layer, *, device, dtype,
         n_iters=50, lr=0.05, target_indices=None,
-        per_target=True, return_timing=False):
+        per_target=True, return_timing=False,
+        output_constraints=None):
     """Tighten unstable neurons at `target_layer` via per-target α-CROWN.
 
     Args:
@@ -195,15 +213,19 @@ def tighten_layer_alpha_crown(
     xl_t = torch.as_tensor(np.asarray(xl).flatten(), device=device, dtype=dtype)
     xh_t = torch.as_tensor(np.asarray(xh).flatten(), device=device, dtype=dtype)
 
-    # bbr tensors for prior layers (and target layer for slope at it isn't
-    # needed since walk stops AT target's pre-relu).
+    # bbr tensors for prior layers; with output_constraints the
+    # gamma-weighted output rows also walk back through every layer AT or
+    # AFTER the target (including the target's own ReLU), so those layers
+    # need bounds + alpha too.
+    oc = output_constraints
+    _max_L = (max(bbr.keys()) + 1) if oc is not None else target_layer
     bbr_t = {L: (torch.as_tensor(bbr[L][0], device=device, dtype=dtype),
                   torch.as_tensor(bbr[L][1], device=device, dtype=dtype))
-              for L in bbr if L < target_layer}
+              for L in bbr if L < _max_L}
 
-    # Per-prior-layer unstable indices and α params.
+    # Per-layer unstable indices and α params.
     alpha_lb = {}; alpha_ub = {}
-    for L in range(target_layer):
+    for L in range(_max_L):
         lo_l = bbr_t[L][0]; hi_l = bbr_t[L][1]
         un = ((lo_l < 0) & (hi_l > 0)).nonzero().flatten()
         if un.numel() == 0:
@@ -224,34 +246,78 @@ def tighten_layer_alpha_crown(
     ew_init = torch.zeros(n_targets, n_at_target, device=device, dtype=dtype)
     ew_init[torch.arange(n_targets, device=device), target_idx_t] = 1.0
 
+    # INVPROP-style output constraints: rows (W_spec, b_spec) with
+    # W_spec.y + b_spec <= 0 assumed (the SAT region being refuted).
+    # gamma >= 0 per target/constraint joins the Adam loop; gamma = 0
+    # recovers the unconstrained bound, so the best-of over iters can
+    # only improve on plain alpha-CROWN.
+    gamma_lb = gamma_ub = None
+    W_spec_t = b_spec_t = out_op_name = None
+    if oc is not None:
+        W_spec, b_spec = oc
+        W_spec_t = torch.as_tensor(np.asarray(W_spec, np.float64),
+                                   device=device, dtype=dtype)
+        b_spec_t = torch.as_tensor(np.asarray(b_spec, np.float64).ravel(),
+                                   device=device, dtype=dtype)
+        m_c = W_spec_t.shape[0]
+        out_op_name = gg['ops'][-1]['name']
+        gamma_lb = torch.zeros(n_targets, m_c, device=device, dtype=dtype,
+                               requires_grad=True)
+        gamma_ub = torch.zeros(n_targets, m_c, device=device, dtype=dtype,
+                               requires_grad=True)
+
+    def _extra(gamma):
+        if gamma is None:
+            return None
+        return (out_op_name, gamma @ W_spec_t, gamma @ b_spec_t)
+
     t0 = time.perf_counter()
     # Optimize LB
-    if alpha_lb:
-        opt = torch.optim.Adam(list(alpha_lb.values()), lr=lr)
+    if alpha_lb or gamma_lb is not None:
+        _params = list(alpha_lb.values())
+        if gamma_lb is not None:
+            _params = _params + [gamma_lb]
+        opt = torch.optim.Adam(_params, lr=lr)
         best_lbs = torch.full((n_targets,), -float('inf'), device=device,
                                 dtype=dtype)
+        import os as _os
+        _conv_log = _os.environ.get('VC_LOG_ALPHA_CONV', '')
         for it in range(n_iters):
             opt.zero_grad()
             lb = _walk_backward_per_target(
                 gg, xl_t, xh_t, alpha_lb, bbr_t, target_pre_op,
                 ew_init, n_targets, device, dtype, mode='lb',
-                per_target=per_target)
+                per_target=per_target, extra_out=_extra(gamma_lb))
             (-lb.sum()).backward()
             opt.step()
             with torch.no_grad():
                 for p in alpha_lb.values():
                     p.clamp_(0, 1)
+                if gamma_lb is not None:
+                    gamma_lb.clamp_(min=0)
                 best_lbs = torch.maximum(best_lbs, lb.detach())
+                if _conv_log and (it < 3 or it == n_iters - 1
+                                  or it % max(1, n_iters // 5) == 0):
+                    # Convergence trace: worst (min) LB across targets +
+                    # mean per-iter improvement of best_lbs. If still rising
+                    # at the last iter, n_iters is too small.
+                    _wl = float(best_lbs.min().item())
+                    _ml = float(best_lbs.mean().item())
+                    print(f'    [alpha-conv lb] iter {it}/{n_iters}: '
+                          f'worst={_wl:+.4f} mean={_ml:+.4f}', flush=True)
     else:
         with torch.no_grad():
             best_lbs = _walk_backward_per_target(
                 gg, xl_t, xh_t, alpha_lb, bbr_t, target_pre_op,
                 ew_init, n_targets, device, dtype, mode='lb',
-                per_target=per_target).detach()
+                per_target=per_target, extra_out=_extra(gamma_lb)).detach()
 
     # Optimize UB
-    if alpha_ub:
-        opt = torch.optim.Adam(list(alpha_ub.values()), lr=lr)
+    if alpha_ub or gamma_ub is not None:
+        _params = list(alpha_ub.values())
+        if gamma_ub is not None:
+            _params = _params + [gamma_ub]
+        opt = torch.optim.Adam(_params, lr=lr)
         best_ubs = torch.full((n_targets,), float('inf'), device=device,
                                 dtype=dtype)
         for it in range(n_iters):
@@ -259,19 +325,21 @@ def tighten_layer_alpha_crown(
             ub = _walk_backward_per_target(
                 gg, xl_t, xh_t, alpha_ub, bbr_t, target_pre_op,
                 ew_init, n_targets, device, dtype, mode='ub',
-                per_target=per_target)
+                per_target=per_target, extra_out=_extra(gamma_ub))
             (ub.sum()).backward()
             opt.step()
             with torch.no_grad():
                 for p in alpha_ub.values():
                     p.clamp_(0, 1)
+                if gamma_ub is not None:
+                    gamma_ub.clamp_(min=0)
                 best_ubs = torch.minimum(best_ubs, ub.detach())
     else:
         with torch.no_grad():
             best_ubs = _walk_backward_per_target(
                 gg, xl_t, xh_t, alpha_ub, bbr_t, target_pre_op,
                 ew_init, n_targets, device, dtype, mode='ub',
-                per_target=per_target).detach()
+                per_target=per_target, extra_out=_extra(gamma_ub)).detach()
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
