@@ -600,6 +600,9 @@ def default_settings(**overrides):
         # where the MILP cannot finish (wide conv nets) — it overruns
         # the CLI deadline and numeric trouble aborts cases.
         milp_graph_escalation_enabled=True,
+        # Route through the graph path even for pairwise no-fork nets
+        # (keeps the zonotope Phase 1; pair with the alpha/BaB knobs).
+        milp_force_graph_path=False,
         # Multi-pass cascade: each pass loops L=0..max_layer applying
         # MILP+α-CROWN refresh. Pass N starts from bounds tightened by
         # pass N-1, so MILPs get a closer starting point and α-CROWN

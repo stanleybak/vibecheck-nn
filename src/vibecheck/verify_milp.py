@@ -3693,8 +3693,16 @@ def milp_verify(graph, spec, settings=None):
     _ibp_thresh = int(getattr(settings, 'phase1_ibp_input_dim_threshold', 0))
     _use_ibp = (_ibp_thresh > 0
                 and int(np.prod(spec.x_lo.shape)) >= _ibp_thresh)
+    # `milp_force_graph_path`: route through the graph path with the
+    # normal zonotope Phase 1 — for benchmarks whose hard cases need the
+    # graph path's α/BaB phases and clean deadline behavior while their
+    # input is small enough for the (tighter) zonotope forward
+    # (challenging_certified_training cifar10: IBP Phase 1 starts at
+    # worst -8.6 where zono is near-verifying).
+    _force_graph = bool(getattr(settings, 'milp_force_graph_path', False))
 
-    if graph.fork_points() or spec.as_pairwise() is None or _use_ibp:
+    if (graph.fork_points() or spec.as_pairwise() is None or _use_ibp
+            or _force_graph):
         return _milp_verify_graph(graph, spec, settings, device, dtype,
                                    deadline, total_timeout)
 
