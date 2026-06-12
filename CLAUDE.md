@@ -107,7 +107,7 @@ Two GPU machines available. Pick based on availability — neither is preferred 
 
 ### server1 (RTX 3080, 10 GB)
 
-Connect: `ssh stan@100.107.254.48` (RTX 3080 / 10 GB, 64 GB RAM, 16-thread i9;
+Connect: `ssh stan@100.83.144.97` (RTX 3080 / 10 GB, 64 GB RAM, 16-thread i9;
 hostname `reliablesystems-ubuntu`). This is a Tailscale IP — only reachable
 inside the owner's tailnet, so it's fine to keep in git. `$SERVER1_HOST` also
 works if set. Steady-state α-CROWN throughput ~1 s/freeze when healthy.

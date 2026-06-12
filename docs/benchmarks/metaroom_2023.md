@@ -66,4 +66,36 @@ Wall: 93 s vs AB-CROWN's 892 s — **~10× faster** at parity.
 1 case: `6cnn_ry_39_6 / spec_idx_119_eps_0.00000436` — ABC also
 times out (217 s wall vs 210 s budget). Algorithmic plateau, not
 budget on our side: 4 open disjuncts at LB ∈ {-21, -33, -44, -21}
-even with full 210 s budget.
+even with full 210 s budget. The net is a 6-Conv CNN, **~172 K ReLUs**,
+on a **wide input box** (161 of 5376 dims vary, width up to 0.52 — the
+camera-pose perturbation; `eps_…436` is unrelated). Confirmed **UNSAT**:
+2000-restart × 500-iter PGD (both α, per-restart-disjunct) finds no CEX.
+
+### Dual-ascent experiment (2026-06-08, `bench/metaroom_dual_ascent`)
+
+Routed this case through the GPU dual-ascent Phase-8 BnB instead of the
+default conv→`milp_verify` auto-route (`auto_route_milp_for_conv: false`
++ `phase8_use_dual_ascent_gpu: true` + the cifar100 lean-Phase-1 knobs).
+Result: **strict improvement but still not solved** — `timeout` (honest)
+vs the default `milp_verify` path which on the local 7.5 GB GPU *crashes*
+with `GurobiNumericTrouble`. Dual-ascent **closes 13/19 disjuncts**; the
+5 hardest (q2/q4/q8/q10/q16) hit `stop=oom` on the frontier (~5–7.6 M
+nodes) with LBs stuck at −35 … −76, and the high-bin MILP fallback also
+times out there. Raising `phase8_dual_ascent_max_iter` 1→20 and the
+line-search `K` 256→512 did not change the frontier blow-up.
+
+**Re-run on a 24 GB A10G (AWS) settles it: relaxation-bound, NOT
+memory-bound.** With 3–4× the GPU memory the frontier grew ~5× before
+OOM (q8: 67 M nodes / 33.5 M frontier vs 6.9 M on the 7.5 GB card), yet
+the verdict is unchanged — **still 13/19, the same 5 disjuncts open**,
+and 10× more explored nodes moved the bounds by ≈3 (q2 LB −42→−39, q4
+−63→−61). So BnB is at diminishing returns: the α-zonotope relaxation
+gap on these 5 disjuncts is too large for branching to close at any GPU
+size. Closing this case needs a *tighter relaxation / intermediate
+bounds* (the per-layer MILP-tighten path, which here crashes with
+`GurobiNumericTrouble` and is slow), not more nodes.
+
+**No production config change.** Dual-ascent does not *solve* the case;
+switching metaroom's routing risks the 99 already-solved instances; and
+ABC times out too, so there is no scoring upside. Recorded as a
+documented dead end — the open lever is bound *tightness*, not compute.

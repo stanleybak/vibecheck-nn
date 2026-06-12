@@ -487,6 +487,13 @@ def verify_query_dual_ascent_bab(
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Env-gated dump of the per-query box+halfspace BnB instance (one pkl per
+    # query) for the local optimizer harness. Off unless VC_DUMP_BNB_DIR set.
+    import os as _os
+    _dump_dir = _os.environ.get('VC_DUMP_BNB_DIR', '')
+    if _dump_dir:
+        from .fast_dual_ascent.fast_verify_dual import _dump_bnb_instance
+        _dump_bnb_instance(state, qw, qb, scored_keys, _dump_dir)
     if device.type == 'cuda':
         torch.cuda.empty_cache()
     # Disable autograd for the entire BaB. Standalone runs are 9× faster

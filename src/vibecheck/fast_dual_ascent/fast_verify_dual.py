@@ -148,7 +148,7 @@ def parse_problem_gpu(state, qw, qb, scored_keys, device) -> Problem:
         c_in=cinS, z_lo=z_lo[sidx], z_hi=z_hi[sidx])
 
 
-def node_bound_dual(F: dict, sides: torch.Tensor, K: int, Kb: int = 256) -> torch.Tensor:
+def node_bound_dual(F: dict, sides: torch.Tensor, K: int, Kb: int = 256, use_farprobe: bool = False) -> torch.Tensor:
     """K-step factored dual-ascent bound g (B,). Each split contributes 2 halfspace rows
     (±a_g[j]); λ0,λ1 are their multipliers. rc = d_base + (ρ + sign·(λ0−λ1))·a_g stays a
     GEMM against the shared a_g. Bucket (O(n)) exact line search; per-node early-stop freezes
@@ -168,7 +168,8 @@ def node_bound_dual(F: dict, sides: torch.Tensor, K: int, Kb: int = 256) -> torc
         x = torch.where(rc < 0, eh.expand(B, n), el.expand(B, n))
         g = c0_path + (rc * x).sum(-1) - (lam0 * b0 + lam1 * b1).sum(-1)
         best = torch.maximum(best, g)
-        if k == K - 1:
+        last = (k == K - 1)
+        if last and not use_farprobe:
             break
         pend = (best <= _TOL).to(a_g.dtype)                    # 1 while uncertified, else 0 (freeze)
         p = x @ a_g.t()                                        # (B,D)  a_g[j]·x*
@@ -197,7 +198,18 @@ def node_bound_dual(F: dict, sides: torch.Tensor, K: int, Kb: int = 256) -> torc
         eta = emin + (crossed.float().argmax(-1).to(a_g.dtype) + 0.5) * binw
         eta = torch.where(crossed.any(-1), eta, emax)
         eta = torch.where(slope0 > _TOL, eta, torch.zeros_like(eta))
-        eta = torch.minimum(eta, torch.where(torch.isfinite(ebnd), ebnd, eta)).clamp_min(0.0) * pend
+        eta = torch.minimum(eta, torch.where(torch.isfinite(ebnd), ebnd, eta)).clamp_min(0.0)
+        if last:        # FAR PROBE on the last sweep: jump to the furthest sound point, fold g_far into best
+            far = torch.where(torch.isfinite(ebnd), ebnd, emax * 1e6)
+            eta_c = torch.where((slope0 > _TOL), torch.where(crossed.any(-1), eta, far), torch.zeros_like(eta))
+            rc_f = rc + eta_c.unsqueeze(-1) * da
+            x_f = torch.where(rc_f < 0, eh.expand(B, n), el.expand(B, n))
+            l0f = (lam0 + eta_c.unsqueeze(-1) * sp0).clamp_min(0.0)
+            l1f = (lam1 + eta_c.unsqueeze(-1) * sp1).clamp_min(0.0)
+            g_far = c0_path + (rc_f * x_f).sum(-1) - (l0f * b0 + l1f * b1).sum(-1)
+            best = torch.maximum(best, g_far)
+            break
+        eta = eta * pend
         lam0 = (lam0 + eta.unsqueeze(-1) * sp0).clamp_min(0.0)
         lam1 = (lam1 + eta.unsqueeze(-1) * sp1).clamp_min(0.0)
         rc = rc + eta.unsqueeze(-1) * da
@@ -211,7 +223,9 @@ class Verifier:
         # more B×n temporaries (rc/x/da/eta_j/decr/...) so fewer nodes fit per call.
         torch.backends.cuda.matmul.allow_tf32 = False
         self.device = torch.device(device); self.chunk = chunk; self.K = K
-        kern = (lambda F, s: node_bound_dual(F, s, K))
+        # VC_FARPROBE: add a sound g(λ_far)>0 infeasibility/bound cert on the last sweep (default ON).
+        use_farprobe = os.environ.get('VC_FARPROBE', '1') not in ('0', 'false', 'False')
+        kern = (lambda F, s: node_bound_dual(F, s, K, use_farprobe=use_farprobe))
         self._kernel = torch.compile(kern, dynamic=True) if compile else kern
         self._warm_depths = warm_depths if compile else ()
 
@@ -258,8 +272,12 @@ class Verifier:
             raise NotImplementedError(
                 'sibling halfspaces: the K-step kernel does not dualize hs rows; '
                 "use the default 1-step verifier (ls='logbucket')")
+        _dump_dir = os.environ.get('VC_DUMP_BNB_DIR', '')
+        if _dump_dir:
+            _dump_bnb_instance(state, qw, qb, scored_keys, _dump_dir)
         return self.verify(parse_problem(state, qw, qb, scored_keys),
                            time_limit=time_limit, frontier_cap=frontier_cap)
+
 
     def verify(self, prob, *, time_limit=120.0, frontier_cap=None):
         dev = self.device; G = self._upload(prob)
@@ -299,3 +317,35 @@ class Verifier:
                                        open=open_n, reason='oom', wall=elapsed())
             frontier = next_frontier; depth += 1
         return 'unsat', dict(nodes=nodes_total, depth=depth, peak_frontier=peak, wall=elapsed())
+
+
+# --- debug helper (env-gated via VC_DUMP_BNB_DIR) -------------------------------
+_DUMP_BNB_COUNTER = [0]
+
+
+def _dump_bnb_instance(state, qw, qb, scored_keys, out_dir, query_id=None):
+    """Dump the parsed Phase-8 BnB instance to ``out_dir`` as a pickle, for
+    offline experimentation (split-order strategies, LP cross-checks). Captures
+    the full box+halfspace problem plus the raw spec/relaxation extras so a
+    standalone script can rebuild splits exactly. Gated by VC_DUMP_BNB_DIR; never
+    runs in production sweeps."""
+    os.makedirs(out_dir, exist_ok=True)
+    prob = parse_problem(state, qw, qb, scored_keys)
+    ul = state['unstable_list']
+    idx_by_key = {(u['layer_idx'], u['neuron_idx']): j for j, u in enumerate(ul)}
+    sidx = [idx_by_key[k] for k in scored_keys]
+    extras = dict(
+        spec_qw=np.asarray(qw, float), spec_qb=float(qb), c0=prob.c0,
+        d_t=prob.d_t, scored_keys=list(scored_keys),
+        lam=np.array([float(ul[j]['lam']) for j in sidx]),
+        mu=np.array([float(ul[j]['mu']) for j in sidx]),
+        e_new_col=prob.e_new_col,
+        layer_idx=np.array([int(ul[j]['layer_idx']) for j in sidx]),
+        neuron_idx=np.array([int(ul[j]['neuron_idx']) for j in sidx]),
+    )
+    n = _DUMP_BNB_COUNTER[0]; _DUMP_BNB_COUNTER[0] += 1
+    tag = query_id if query_id is not None else n
+    path = os.path.join(out_dir, f'bnb_{tag}.pkl')
+    with open(path, 'wb') as f:
+        pickle.dump(dict(problem=prob, extras=extras), f)
+    return path

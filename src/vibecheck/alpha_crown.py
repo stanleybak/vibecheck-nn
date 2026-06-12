@@ -1261,17 +1261,39 @@ def run_alpha_crown_fixed_intermediate_batched(
     spec_alpha = {}
     slopes_cache = {}
     unstable_idx_per_layer = {}
+    # α-init basin (non-convex opt — start point matters). VC_ALPHA_INIT:
+    #   'lo_s' (default, the lower-slope line) | 'area' (min-area adaptive:
+    #   slope 1 on the larger side, 0 otherwise — α,β-CROWN's adaptive init) |
+    #   'one' | 'zero' | 'rand:SEED' (uniform [0,1], seeded per restart).
+    import os as _os
+    _ainit = _os.environ.get('VC_ALPHA_INIT', 'lo_s')
+    _aseed = 0
+    if _ainit.startswith('rand:'):
+        _aseed = int(_ainit.split(':', 1)[1]); _ainit = 'rand'
     for L in all_relu_layers:
         lo_t = bbr_tensors_fixed[L][0]
         hi_t = bbr_tensors_fixed[L][1]
         lo_s, up_s, up_t, active, dead, unstable = _make_slopes(lo_t, hi_t)
         slopes_cache[L] = (active, dead)
+        if _ainit == 'area':
+            init_full = (hi_t >= -lo_t).to(dtype)
+        elif _ainit == 'one':
+            init_full = torch.ones_like(lo_t)
+        elif _ainit == 'zero':
+            init_full = torch.zeros_like(lo_t)
+        elif _ainit == 'rand':
+            _g = torch.Generator(device=lo_t.device)
+            _g.manual_seed(_aseed * 100003 + L * 7919)
+            init_full = torch.rand(lo_t.shape, generator=_g,
+                                   device=lo_t.device, dtype=dtype)
+        else:
+            init_full = lo_s
         if sparse_alpha:
             un_idx = torch.nonzero(
                 unstable, as_tuple=False).flatten().to(
                 device=device, dtype=torch.long)
             unstable_idx_per_layer[L] = un_idx
-            alpha_un = lo_s[un_idx].clone().detach()
+            alpha_un = init_full[un_idx].clone().detach()
             if per_spec_alpha:
                 # Per-spec sparse α: shape (n_q, n_unstable) — each query
                 # optimizes its own α. `_crown_backward_matrix` densifies
@@ -1284,7 +1306,7 @@ def run_alpha_crown_fixed_intermediate_batched(
         else:
             alpha = torch.zeros_like(lo_t)
             alpha = alpha + active.to(dtype) * 1.0
-            alpha = alpha + unstable.to(dtype) * lo_s
+            alpha = alpha + unstable.to(dtype) * init_full
             alpha = alpha.clone().detach()
             if per_spec_alpha:
                 # Per-spec dense α: shape (n_q, n_neurons). Broadcasts
@@ -1446,6 +1468,23 @@ def run_alpha_crown_fixed_intermediate_batched(
         L: (bbr_tensors_fixed[L][0].clone(), bbr_tensors_fixed[L][1].clone())
         for L in bbr_tensors_fixed
     }
+    import os as _os
+    if _os.environ.get('VC_LOG_ALPHA_CONV', '') and n_q:
+        # Spec-LB convergence trace per query: checkpoints + last-step delta.
+        # If |last_delta| is non-trivial the optimization is STILL RISING at
+        # n_iters → more iters (or a better init / restart) would help.
+        _wq = int(np.argmin(best_lbs))   # worst (most negative) query = the binding one
+        for q in range(n_q):
+            h = histories[q]
+            if not h:
+                continue
+            _chk = sorted(set([0, len(h)//4, len(h)//2, 3*len(h)//4, len(h)-1]))
+            _traj = ' '.join(f'i{i}={h[i]:+.3f}' for i in _chk)
+            _dl = (h[-1] - h[-2]) if len(h) >= 2 else 0.0
+            _tag = 'RISING' if abs(_dl) > 1e-3 else 'flat'
+            _mk = ' <-WORST' if q == _wq else ''
+            print(f'    [alpha-conv q{q}/{n_q}] niter={len(h)} {_traj}  '
+                  f'last_delta={_dl:+.5f} [{_tag}]{_mk}', flush=True)
     return best_lbs, {'spec': spec_alpha}, best_bounds, histories
 
 
