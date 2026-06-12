@@ -870,6 +870,169 @@ def _build_spec_ew_graph(gg, pred, comps, device, dtype):
     return spec_ew
 
 
+def _ibp_forward_graph(xl, xh, gg, device, dtype):
+    """Interval (IBP) forward over gpu_graph ops.
+
+    Memory-light alternative to `_forward_zonotope_graph` for nets whose
+    input-identity generator tensors don't fit GPU memory (e.g.
+    challenging_certified_training tinyimagenet CNN7: 12 288 input gens
+    x 262 144 first-layer activations = 12 GiB per layer at fp32, two
+    consecutive such layers exceed a 24 GB card). IBP carries only
+    (lo, hi) per activation — O(activations) total.
+
+    Returns `sb`: {relu layer_idx: (lo, hi)} flattened PRE-activation
+    bounds, the same contract as `_forward_zonotope_graph`'s first
+    return value, so `_spec_backward_graph` (CROWN backward) and the
+    per-layer bound consumers work unchanged (= CROWN-IBP overall).
+
+    Sound by interval arithmetic: every op maps input enclosures to
+    output enclosures (affine ops via mid/rad with |W|, monotone ops
+    endpoint-wise).
+    """
+    lo = {gg['input_name']: xl.flatten()}
+    hi = {gg['input_name']: xh.flatten()}
+    sb = {}
+    for op in gg['ops']:
+        t = op['type']
+        name = op['name']
+        l, h = lo[op['inputs'][0]], hi[op['inputs'][0]]
+        if t == 'conv':
+            mid, rad = (l + h) / 2, (h - l) / 2
+            mid4 = mid.reshape(1, *op['in_shape'])
+            rad4 = rad.reshape(1, *op['in_shape'])
+            mc = F.conv2d(mid4, op['kernel'], op['bias'],
+                          stride=op['stride'], padding=op['padding'])
+            rc = F.conv2d(rad4, op['kernel'].abs(), None,
+                          stride=op['stride'], padding=op['padding'])
+            lo[name], hi[name] = (mc - rc).flatten(), (mc + rc).flatten()
+        elif t == 'fc':
+            W, b = op['W'], op['bias']
+            mid, rad = (l + h) / 2, (h - l) / 2
+            mc = W @ mid + (b if b is not None else 0)
+            rc = W.abs() @ rad
+            lo[name], hi[name] = mc - rc, mc + rc
+        elif t == 'relu':
+            if 'layer_idx' in op:
+                sb[op['layer_idx']] = (l.clone(), h.clone())
+            lo[name], hi[name] = l.clamp(min=0), h.clamp(min=0)
+        elif t == 'reshape':
+            lo[name], hi[name] = l, h
+        elif t == 'add':
+            if op.get('is_merge'):
+                l2, h2 = lo[op['inputs'][1]], hi[op['inputs'][1]]
+                lo[name], hi[name] = l + l2, h + h2
+            else:
+                b = torch.as_tensor(op['bias'], dtype=dtype, device=device)
+                lo[name], hi[name] = l + b, h + b
+        elif t == 'sub':
+            b = torch.as_tensor(op['bias'], dtype=dtype, device=device)
+            lo[name], hi[name] = l - b, h - b
+        elif t == 'mul':
+            s = torch.as_tensor(op['scale'], dtype=dtype, device=device)
+            a, b2 = s * l, s * h
+            lo[name], hi[name] = torch.minimum(a, b2), torch.maximum(a, b2)
+        elif t == 'max_pool':
+            kH, kW = op['kernel']
+            lo4 = lo[op['inputs'][0]].reshape(1, *op['in_shape'])
+            hi4 = hi[op['inputs'][0]].reshape(1, *op['in_shape'])
+            lo[name] = F.max_pool2d(lo4, (kH, kW), stride=op['stride'],
+                                    padding=op['padding']).flatten()
+            hi[name] = F.max_pool2d(hi4, (kH, kW), stride=op['stride'],
+                                    padding=op['padding']).flatten()
+        else:
+            raise NotImplementedError(
+                f'_ibp_forward_graph: unsupported op {t!r} at {name!r} — '
+                f'silently skipping would certify unsound bounds')
+    return sb
+
+
+def _ibp_forward_graph_batched(xl, xh, gg, device, dtype,
+                               relu_clamps=None, root_sb=None):
+    """Batched interval forward over gpu_graph ops (B domains at once).
+
+    Same op semantics as `_ibp_forward_graph` but every tensor carries a
+    leading batch dim. Used by the IBP-route ReLU-split BaB: each domain
+    refreshes ALL intermediate bounds under its split clamps (an IBP
+    forward costs ~ms, unlike the zonotope forward this trades against).
+
+    Args:
+        xl, xh: (B, n_in) per-domain input bounds.
+        relu_clamps: optional {layer_idx: (cl, ch)} of (B, n_layer)
+            pre-activation clamp tensors (±inf where unclamped). A ReLU
+            split z_j <= 0 / z_j >= 0 is expressed as ch[b, j] = 0 /
+            cl[b, j] = 0. Sound: on the subdomain the true pre-activation
+            satisfies the clamp, so intersecting enclosures stays valid.
+        root_sb: optional {layer_idx: (lo, hi)} flat (n_layer,) ROOT
+            pre-activation bounds to intersect (broadcast over B) —
+            domain bounds can never be looser than the root's.
+
+    Returns `sb`: {relu layer_idx: (lo, hi)} of (B, n_layer) PRE-activation
+    bounds (after clamp/root intersection — consumers see the bounds the
+    ReLU relaxation will actually use).
+    """
+    B = xl.shape[0]
+    lo = {gg['input_name']: xl}
+    hi = {gg['input_name']: xh}
+    sb = {}
+    for op in gg['ops']:
+        t = op['type']
+        name = op['name']
+        l, h = lo[op['inputs'][0]], hi[op['inputs'][0]]
+        if t == 'conv':
+            mid, rad = (l + h) / 2, (h - l) / 2
+            mid4 = mid.reshape(B, *op['in_shape'])
+            rad4 = rad.reshape(B, *op['in_shape'])
+            mc = F.conv2d(mid4, op['kernel'], op['bias'],
+                          stride=op['stride'], padding=op['padding'])
+            rc = F.conv2d(rad4, op['kernel'].abs(), None,
+                          stride=op['stride'], padding=op['padding'])
+            lo[name] = (mc - rc).reshape(B, -1)
+            hi[name] = (mc + rc).reshape(B, -1)
+        elif t == 'fc':
+            W, b = op['W'], op['bias']
+            mid, rad = (l + h) / 2, (h - l) / 2
+            mc = mid @ W.T + (b if b is not None else 0)
+            rc = rad @ W.T.abs()
+            lo[name], hi[name] = mc - rc, mc + rc
+        elif t == 'relu':
+            L = op.get('layer_idx')
+            if L is not None:
+                if root_sb is not None and L in root_sb:
+                    l = torch.maximum(l, root_sb[L][0].unsqueeze(0))
+                    h = torch.minimum(h, root_sb[L][1].unsqueeze(0))
+                if relu_clamps is not None and L in relu_clamps:
+                    cl, ch = relu_clamps[L]
+                    l = torch.maximum(l, cl)
+                    h = torch.minimum(h, ch)
+                # Clamp crossings from intersecting independent
+                # enclosures (empty boxes round to a point — sound:
+                # an empty subdomain has no counterexample).
+                h = torch.maximum(h, l)
+                sb[L] = (l.clone(), h.clone())
+            lo[name], hi[name] = l.clamp(min=0), h.clamp(min=0)
+        elif t == 'reshape':
+            lo[name], hi[name] = l, h
+        elif t == 'add':
+            if op.get('is_merge'):
+                l2, h2 = lo[op['inputs'][1]], hi[op['inputs'][1]]
+                lo[name], hi[name] = l + l2, h + h2
+            else:
+                b = torch.as_tensor(op['bias'], dtype=dtype, device=device)
+                lo[name], hi[name] = l + b, h + b
+        elif t == 'sub':
+            b = torch.as_tensor(op['bias'], dtype=dtype, device=device)
+            lo[name], hi[name] = l - b, h - b
+        elif t == 'mul':
+            s = torch.as_tensor(op['scale'], dtype=dtype, device=device)
+            a, b2 = s * l, s * h
+            lo[name], hi[name] = torch.minimum(a, b2), torch.maximum(a, b2)
+        else:
+            raise NotImplementedError(
+                f'_ibp_forward_graph_batched: unsupported op {t!r} at '
+                f'{name!r} — silently skipping would certify unsound bounds')
+    return sb
+
+
 def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
                              relu_lambdas=None, op_bounds=None,
@@ -3114,6 +3277,7 @@ def _crown_intermediate_batched(gg, xl, xh, device, dtype):
 def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                                    return_input_linear=False,
                                    alpha_at_layer=None,
+                                   relu_split_beta=None,
                                    alpha_mccormick=None,
                                    alpha_recip=None,
                                    bilinear_op_bounds=None,
@@ -3261,6 +3425,18 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                 else:
                     lo_s = lo_s_def
                     ew_back = ep * lo_s.unsqueeze(1) + en * up_s.unsqueeze(1)
+                # β-CROWN split enforcement: for a ReLU-split constraint
+                # in the form s(x) <= 0 on the subdomain (OFF: z_j <= 0
+                # → s = +z; ON: z_j >= 0 → s = -z), adding β·s (β >= 0)
+                # to the objective keeps a valid lower bound by weak
+                # duality: min_relaxed(f + β·s) <= min_feas(f + β·s)
+                # <= min_feas(f). The caller passes the SIGNED β
+                # (sign·β, zero at non-split neurons); it adds to the
+                # PRE-activation coefficient so the constraint couples
+                # linearly through all earlier layers (the part the box
+                # clamp alone cannot capture).
+                if relu_split_beta is not None and L in relu_split_beta:
+                    ew_back = ew_back + relu_split_beta[L].unsqueeze(1)
             else:
                 ew_back = ew
             inp = op['inputs'][0]

@@ -892,7 +892,8 @@ def run_alpha_crown(gg, xl, xh, bbr_init, w_q, b_q,
                      device, dtype, n_iters=20, lr=0.25, lr_decay=1.0,
                      max_iters=None, early_stop_eps_spec=None,
                      early_stop_eps_bounds=None, early_stop_patience=3,
-                     early_stop_on_positive=False):
+                     early_stop_on_positive=False,
+                     track_best_alpha=False):
     """Run α-CROWN for a single query direction (w_q, b_q).
 
     Parameters per-(start_node, L) with start_node ∈ {intermediate_start_nodes, 'spec'}:
@@ -946,6 +947,7 @@ def run_alpha_crown(gg, xl, xh, bbr_init, w_q, b_q,
     w_t = torch.as_tensor(w_q, dtype=dtype, device=device)
 
     best_lb = -float('inf'); history = []
+    best_alpha_snap = None
     best_bounds = {
         L: (torch.as_tensor(bbr_init[L][0], dtype=dtype, device=device).clone(),
             torch.as_tensor(bbr_init[L][1], dtype=dtype, device=device).clone())
@@ -1062,7 +1064,18 @@ def run_alpha_crown(gg, xl, xh, bbr_init, w_q, b_q,
 
         val = float(spec_lb.detach())
         history.append(val)
-        if val > best_lb: best_lb = val
+        if val > best_lb:
+            best_lb = val
+            if track_best_alpha:
+                # Snapshot the α that PRODUCED the best lb. The final-iter
+                # α can be far off the best when joint intermediate
+                # refinement keeps moving the landscape (cct idx7018 q86:
+                # best lb -0.342, final-iter α re-evaluates to -0.646) —
+                # callers warm-starting BaB domains need the best one.
+                best_alpha_snap = {
+                    S: {L: a.detach().clone()
+                        for L, a in alpha_params[S].items()}
+                    for S in alpha_params}
 
         if early_stop_on_positive and best_lb > 0:
             break
@@ -1098,7 +1111,14 @@ def run_alpha_crown(gg, xl, xh, bbr_init, w_q, b_q,
         if final_val > best_lb:
             best_lb = final_val
             history.append(final_val)
+            if track_best_alpha:
+                best_alpha_snap = {
+                    S: {L: a.detach().clone()
+                        for L, a in alpha_params[S].items()}
+                    for S in alpha_params}
 
+    if track_best_alpha and best_alpha_snap is not None:
+        return best_lb, best_alpha_snap, best_bounds, history
     return best_lb, alpha_params, best_bounds, history
 
 

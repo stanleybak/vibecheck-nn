@@ -84,7 +84,8 @@ from .zonotope import TorchZonotope
 from .verify_zono_bnb import (
     _make_slopes, _build_spec_ew, _spec_backward, _evaluate_region,
     _pgd_attack, _forward_batch,
-    _forward_zonotope_graph, _forward_batch_graph,
+    _forward_zonotope_graph, _forward_batch_graph, _ibp_forward_graph,
+    _ibp_forward_graph_batched, _spec_backward_graph_batched,
     _spec_backward_graph, _build_spec_ew_graph,
     _pgd_attack_graph,
 )
@@ -2528,6 +2529,169 @@ def _racing_escalation_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
 # Graph-aware verification pipeline (ResNets / skip connections)
 # ---------------------------------------------------------------------------
 
+def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
+                   time_left, ew_w=None, batch=64, alpha_iters=8,
+                   lr=0.25, max_domains=500000, print_progress=False,
+                   alpha_init=None):
+    """ReLU-split BaB with per-domain IBP intermediate refresh for ONE query.
+
+    The IBP-route counterpart of `attn_crown.attn_beta_bab`. That kernel
+    is no-reforward (root intermediates + split clamps only) because the
+    vit zonotope forward is expensive; here an IBP forward costs ~ms, so
+    every domain REFRESHES all intermediate bounds under its split clamps
+    (`_ibp_forward_graph_batched`) — each split tightens every downstream
+    layer, which is what makes splits productive on deep conv nets
+    (measured on cct tinyimagenet idx7018 q86: no-reforward β-BaB crept
+    -0.36 → -0.15 in 13 343 domains/468 s; ABC with per-domain bound
+    refresh closed it in 1 108 domains).
+
+    Per batched step: pop the `batch` worst domains, batched IBP refresh,
+    `alpha_iters` Adam steps of per-domain α-CROWN
+    (`_spec_backward_graph_batched(alpha_at_layer=...)`), prune lb > 0,
+    split the rest on the highest ew-weighted-width unstable neuron
+    (clamped neurons read stable in the refreshed bounds, so they are
+    never re-picked).
+
+    Soundness: split clamps hold on each child's subdomain; intersecting
+    the root enclosure, the parent IBP enclosure and the clamp is still an
+    enclosure; the two children cover the parent; a domain is pruned only
+    when its best α-CROWN lb > 0. fp arithmetic follows the caller's
+    dtype — same convention as the rest of the milp graph path.
+
+    Returns (closed, n_domains, reason): closed=True iff every domain was
+    pruned (query verified on the whole box).
+    """
+    import heapq
+    w_t = (w_q if torch.is_tensor(w_q)
+           else torch.as_tensor(np.asarray(w_q), device=device, dtype=dtype))
+    spec_ew_q = {0: (w_t, float(b_q))}
+    sb_root_d = {L: (lo.detach(), hi.detach())
+                 for L, (lo, hi) in sb_root.items()}
+    counter = 0
+    frontier = [(-float('inf'), counter, {})]   # (lb, tiebreak, clamps)
+    n_domains = 0
+    n_report = 0
+    while frontier:
+        if time_left() <= 3.0:
+            return False, n_domains, 'time'
+        if n_domains >= max_domains:
+            return False, n_domains, 'max_domains'
+        batch_doms = [heapq.heappop(frontier)
+                      for _ in range(min(batch, len(frontier)))]
+        B = len(batch_doms)
+        n_domains += B
+        xl_b = xl.unsqueeze(0).expand(B, -1).contiguous()
+        xh_b = xh.unsqueeze(0).expand(B, -1).contiguous()
+        relu_clamps = {}
+        for bi, (_, _, clamps) in enumerate(batch_doms):
+            for (L, j), side in clamps.items():
+                if L not in relu_clamps:
+                    n_L = sb_root_d[L][0].numel()
+                    relu_clamps[L] = (
+                        torch.full((B, n_L), -np.inf, device=device,
+                                   dtype=dtype),
+                        torch.full((B, n_L), np.inf, device=device,
+                                   dtype=dtype))
+                if side == 0:
+                    relu_clamps[L][1][bi, j] = 0.0   # OFF: z_j <= 0
+                else:
+                    relu_clamps[L][0][bi, j] = 0.0   # ON:  z_j >= 0
+        with torch.no_grad():
+            sb_b = _ibp_forward_graph_batched(
+                xl_b, xh_b, gg, device, dtype,
+                relu_clamps=relu_clamps or None, root_sb=sb_root_d)
+        # Per-domain α-CROWN, warm-started from the converged ROOT α
+        # when provided (`alpha_init`: {L: (n,)}). Without the warm
+        # start the min-area init needs many more Adam iters than the
+        # per-domain budget allows and domains evaluate LOOSER than the
+        # root bound — measured on cct idx7018 q86: 46 847 domains, 0
+        # pruned, frontier == domains (every child stuck near the
+        # min-area bound -0.65 while the root α gave -0.356).
+        alpha_at_layer = {}
+        for L, (lo_b, hi_b) in sb_b.items():
+            if alpha_init is not None and L in alpha_init:
+                init_a = alpha_init[L].detach().to(dtype).unsqueeze(0) \
+                    .expand(lo_b.shape[0], -1)
+            else:
+                _, up_s, _, _, _, unstable = _make_slopes(lo_b, hi_b)
+                init_a = (up_s > 0.5).to(dtype) * unstable.to(dtype)
+            alpha_at_layer[L] = init_a.detach().clone().requires_grad_(True)
+        # β for the split halfspaces (β-CROWN): sign +1 for OFF
+        # (constraint z <= 0), -1 for ON (-z <= 0); β >= 0 learnable.
+        # The IBP clamp only captures the BOX consequence of a split;
+        # β couples the halfspace linearly through earlier layers —
+        # without it deep domains plateau (24k domains at lb ~-0.05
+        # with zero prunes on cct idx7018 q86).
+        beta_sign = {}
+        beta_params = {}
+        for L, (cl, ch) in relu_clamps.items():
+            sgn = torch.zeros_like(cl)
+            sgn[ch == 0] = 1.0
+            sgn[cl == 0] = -1.0
+            beta_sign[L] = sgn
+            beta_params[L] = torch.zeros_like(cl).requires_grad_(True)
+        opt = torch.optim.Adam(
+            list(alpha_at_layer.values()) + list(beta_params.values()),
+            lr=lr)
+        best_lbs = None
+        for _it in range(max(1, alpha_iters)):
+            opt.zero_grad()
+            rsb = ({L: beta_params[L] * beta_sign[L] for L in beta_params}
+                   or None)
+            lbs = _spec_backward_graph_batched(
+                sb_b, xl_b, xh_b, gg, spec_ew_q, device, dtype,
+                alpha_at_layer=alpha_at_layer, relu_split_beta=rsb)[:, 0]
+            with torch.no_grad():
+                best_lbs = (lbs.detach().clone() if best_lbs is None
+                            else torch.maximum(best_lbs, lbs.detach()))
+            if (best_lbs > 0).all() or time_left() <= 3.0:
+                break
+            (-lbs.sum()).backward()
+            opt.step()
+            with torch.no_grad():
+                for L in alpha_at_layer:
+                    alpha_at_layer[L].clamp_(0.0, 1.0)
+                for L in beta_params:
+                    beta_params[L].clamp_(min=0.0)
+        with torch.no_grad():
+            for bi, (_, _, clamps) in enumerate(batch_doms):
+                lb_d = float(best_lbs[bi])
+                if lb_d > 0:
+                    continue
+                # Split on highest ew-weighted unstable width.
+                best_score, best_key = -1.0, None
+                for L, (lo_b, hi_b) in sb_b.items():
+                    lo_d, hi_d = lo_b[bi], hi_b[bi]
+                    unstable = (lo_d < 0) & (hi_d > 0)
+                    if not bool(unstable.any()):
+                        continue
+                    width = torch.minimum(-lo_d, hi_d)
+                    score = width * unstable.to(dtype)
+                    if ew_w is not None and L in ew_w:
+                        score = score * ew_w[L]
+                    j = int(torch.argmax(score))
+                    s = float(score[j])
+                    if s > best_score:
+                        best_score, best_key = s, (L, j)
+                if best_key is None:
+                    # Fully split ReLU pattern, bound still <= 0: the
+                    # backward bound over a fixed pattern is exact for
+                    # the affine composition — cannot improve by
+                    # splitting further.
+                    return False, n_domains, 'exhausted_pattern'
+                for side in (0, 1):
+                    counter += 1
+                    child = dict(clamps)
+                    child[best_key] = side
+                    heapq.heappush(frontier, (lb_d, counter, child))
+        if print_progress and n_domains >= n_report + 2048:
+            n_report = n_domains
+            wl = min((d[0] for d in frontier), default=0.0)
+            print(f'    [ibp-bab] {n_domains} domains, frontier '
+                  f'{len(frontier)}, worst lb {wl:.4f}', flush=True)
+    return True, n_domains, 'closed'
+
+
 def _milp_verify_graph(graph, spec, settings, device, dtype,
                         deadline, total_timeout):
     """Verification pipeline for networks with skip connections.
@@ -2578,11 +2742,28 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
     xh_g = torch.tensor(x_hi_f32, dtype=dtype, device=device)
 
     # --- Phase 1: GPU zonotope forward + CROWN ---
+    # (or IBP forward — CROWN-IBP — for large-input nets where the
+    # zonotope generator tensors cannot fit GPU memory; see
+    # settings.phase1_ibp_input_dim_threshold.)
+    _ibp_thresh = int(getattr(settings, 'phase1_ibp_input_dim_threshold', 0))
+    _use_ibp = (_ibp_thresh > 0
+                and int(np.prod(spec.x_lo.shape)) >= _ibp_thresh)
     t0 = time.perf_counter()
-    try:
+    if _use_ibp:
         with torch.no_grad():
-            sb, z_final = _forward_zonotope_graph(
-                xl_g, xh_g, gg, device, dtype)
+            sb = _ibp_forward_graph(xl_g, xh_g, gg, device, dtype)
+        if print_progress:
+            print('[phase1] IBP forward (CROWN-IBP): input dim '
+                  f'{int(np.prod(spec.x_lo.shape))} >= '
+                  f'{_ibp_thresh}', flush=True)
+        _phase1_skip_zono = True
+    else:
+        _phase1_skip_zono = False
+    try:
+        if not _phase1_skip_zono:
+            with torch.no_grad():
+                sb, z_final = _forward_zonotope_graph(
+                    xl_g, xh_g, gg, device, dtype)
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
         # CPU fallback silently masks real regressions (a forward that
         # used to fit suddenly doesn't). Require explicit opt-in via
@@ -2659,6 +2840,180 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
             'phase': 'crown_graph_timeout',
             'remaining': len(still_open_disj)}, stats)
 
+    # --- Phase 1.5: batched joint α-CROWN on open queries (graph path) ---
+    # Mirrors the layers-path `milp_alpha_tighten` block: optimize shared
+    # α slopes (spec + size-capped intermediate start nodes) on the
+    # still-open queries, prune what closes, and merge tightened
+    # intermediate bounds into `sb` for the later phases. Default OFF —
+    # other milp-graph benchmarks keep their measured behavior; enabled
+    # per-benchmark (challenging_certified_training tinyimagenet: CROWN-IBP
+    # leaves ~9-12 open queries at worst lb ~-2 that the MILP tightener
+    # provably cannot close — 546 s for -1.80 -> -1.79 on idx7018_sample4).
+    if (bool(getattr(settings, 'milp_graph_alpha_enabled', False))
+            and still_open_disj and time_left() > 5.0):
+        t_a15 = time.perf_counter()
+        from . import alpha_crown as ac
+        open_q = [(qi, w, b) for di in sorted(still_open_disj)
+                  for (qi, w, b) in disj_queries[di]
+                  if spec_lbs.get(qi, -1.0) <= 0]
+        if open_q:
+            w_qs_a = np.stack([w for _, w, _ in open_q])
+            b_qs_a = np.array([b for _, _, b in open_q], dtype=np.float64)
+            bbr_a = {li: (sb[li][0].detach().cpu().numpy().astype(np.float64),
+                          sb[li][1].detach().cpu().numpy().astype(np.float64))
+                     for li in sb}
+            # Memory guard: intermediate start nodes only for layers small
+            # enough that the per-target backward fits (the first conv
+            # layers of a 64x64-input CNN7 have 262k neurons — backward
+            # to input would be the same 12 GiB tensor the IBP route
+            # exists to avoid).
+            _cap = int(getattr(settings,
+                               'milp_graph_alpha_start_cap', 32768))
+            start_nodes_a = [
+                L for L in sorted(bbr_a) if L > 0
+                and len(bbr_a[L][0]) <= _cap
+                and bool(((bbr_a[L][0] < 0) & (bbr_a[L][1] > 0)).any())]
+            un_idx_a = {L: np.where((bbr_a[L][0] < 0)
+                                    & (bbr_a[L][1] > 0))[0].tolist()
+                        for L in bbr_a}
+            n_iters_a = int(getattr(settings, 'milp_graph_alpha_iters', 20))
+            best_lbs_a, _, best_bounds_a, _ = ac.run_alpha_crown_batched(
+                gg, xl_g, xh_g, bbr_a, w_qs_a, b_qs_a,
+                start_nodes_a, un_idx_a, device, dtype,
+                n_iters=n_iters_a, lr=0.25, lr_decay=0.98,
+                early_stop_on_positive=True, sparse_alpha=True,
+                time_left_fn=time_left)
+            for k, (qi, _, _) in enumerate(open_q):
+                lb_q = float(best_lbs_a[k])
+                if lb_q > spec_lbs.get(qi, -float('inf')):
+                    spec_lbs[qi] = lb_q
+            # Merge tightened intermediates into sb (max lo / min hi).
+            for Lk, (lo_t, hi_t) in best_bounds_a.items():
+                if Lk in sb:
+                    lo_old, hi_old = sb[Lk]
+                    sb[Lk] = (torch.maximum(lo_old, lo_t.detach().to(lo_old)),
+                              torch.minimum(hi_old, hi_t.detach().to(hi_old)))
+            verified_disj_a = {
+                di for di in still_open_disj
+                if all(spec_lbs.get(qi, -1.0) > 0
+                       for qi, _, _ in disj_queries[di])}
+            still_open_disj -= verified_disj_a
+            dt_a15 = time.perf_counter() - t_a15
+            stats.record_timing('alpha_crown_graph', dt_a15)
+            if print_progress:
+                worst_a = (float(np.min(best_lbs_a))
+                           if len(best_lbs_a) else 0.0)
+                print(f'Phase 1.5 (joint α-CROWN graph, {n_iters_a} iters, '
+                      f'{len(start_nodes_a)} start nodes): {dt_a15:.2f}s  '
+                      f'open queries {len(open_q)} -> '
+                      f'{sum(1 for qi, _, _ in open_q if spec_lbs.get(qi, -1.0) <= 0)}  '
+                      f'worst={worst_a:.4f}', flush=True)
+            if not still_open_disj:
+                return _make_result('verified', {
+                    'time': time.perf_counter() - (deadline - total_timeout),
+                    'phase': 'alpha_crown_graph'}, stats)
+
+    # --- Phase 1.6: IBP-refresh ReLU-split BaB on remaining queries ---
+    # Per open query: `_ibp_crown_bab` (per-domain IBP intermediate
+    # refresh + batched per-domain α-CROWN). Default OFF; enabled by the
+    # benchmarks that route Phase 1 through IBP. Runs before Phase 2 —
+    # on wide conv nets it is strictly stronger per second than the
+    # per-neuron MILP tightener.
+    if (bool(getattr(settings, 'milp_graph_ibp_bab_enabled', False))
+            and still_open_disj and time_left() > 10.0):
+        t_b16 = time.perf_counter()
+        open_q16 = [(qi, w, b) for di in sorted(still_open_disj)
+                    for (qi, w, b) in disj_queries[di]
+                    if spec_lbs.get(qi, -1.0) <= 0]
+        _bab_batch = int(getattr(settings, 'milp_graph_ibp_bab_batch', 64))
+        _bab_iters = int(getattr(settings, 'milp_graph_ibp_bab_alpha_iters', 8))
+        n_closed_16 = 0
+        from . import alpha_crown as ac16
+        _root_iters = int(getattr(settings,
+                                  'milp_graph_ibp_bab_root_alpha_iters', 50))
+        _cap16 = int(getattr(settings, 'milp_graph_alpha_start_cap', 32768))
+        for k16, (qi, w, b) in enumerate(open_q16):
+            if time_left() <= 10.0:
+                break
+            # Converged per-query ROOT α: often closes the query without
+            # any splitting, and otherwise warm-starts every BaB
+            # domain's α (without it the per-domain Adam budget can't
+            # recover the root bound — see `_ibp_crown_bab` docstring).
+            bbr16 = {li: (sb[li][0].detach().cpu().numpy().astype(np.float64),
+                          sb[li][1].detach().cpu().numpy().astype(np.float64))
+                     for li in sb}
+            start16 = [L for L in sorted(bbr16) if L > 0
+                       and len(bbr16[L][0]) <= _cap16
+                       and bool(((bbr16[L][0] < 0)
+                                 & (bbr16[L][1] > 0)).any())]
+            un16 = {L: np.where((bbr16[L][0] < 0)
+                                & (bbr16[L][1] > 0))[0].tolist()
+                    for L in bbr16}
+            root_lb, root_alpha, root_bounds, _ = ac16.run_alpha_crown(
+                gg, xl_g, xh_g, bbr16, w, float(b), start16, un16,
+                device, dtype, n_iters=_root_iters, lr=0.25,
+                lr_decay=0.98, early_stop_on_positive=True,
+                track_best_alpha=True)
+            # Intermediate bounds tightened during the per-query α run
+            # are query-independent enclosures — fold them into sb.
+            for Lk, (lo_t, hi_t) in root_bounds.items():
+                if Lk in sb:
+                    sb[Lk] = (torch.maximum(sb[Lk][0],
+                                            lo_t.detach().to(sb[Lk][0])),
+                              torch.minimum(sb[Lk][1],
+                                            hi_t.detach().to(sb[Lk][1])))
+            if print_progress:
+                print(f'Phase 1.6 root α q{qi}: lb={root_lb:.4f}',
+                      flush=True)
+            if root_lb > 0:
+                spec_lbs[qi] = float(root_lb)
+                n_closed_16 += 1
+                continue
+            alpha_init16 = {
+                L: t.detach() for L, t in root_alpha.get('spec', {}).items()}
+            # Split score is width-only (ew_w=None). Measured on cct
+            # idx7018 q86: |ew|-weighted scores pick layer-0 neurons
+            # whose clamps shift bounds across the whole net, which
+            # invalidates the root-α warm start (CROWN under FIXED α is
+            # not monotone in intermediate-bound tightness) — children
+            # evaluated 0.2-0.3 LOOSER than the root and nothing pruned.
+            # Width-only picks local low-impact splits the root α stays
+            # near-optimal for: -0.342 -> -0.200 within 6k domains.
+            closed, n_dom, reason = _ibp_crown_bab(
+                gg, xl_g, xh_g, sb, w, float(b), device, dtype,
+                time_left=lambda: time_left() - 5.0, ew_w=None,
+                batch=_bab_batch, alpha_iters=_bab_iters,
+                print_progress=print_progress,
+                alpha_init=alpha_init16 or None)
+            if closed:
+                spec_lbs[qi] = 1e-9   # marker: closed by BaB
+                n_closed_16 += 1
+            if print_progress:
+                print(f'Phase 1.6 (ibp-bab) q{qi}: '
+                      f'{"closed" if closed else "open"} '
+                      f'domains={n_dom} ({reason})', flush=True)
+            if not closed:
+                # Worst-first: if the worst query won't close, siblings
+                # in the same disjunct can't rescue the disjunct alone —
+                # but other disjuncts might still close; keep going only
+                # while time is plentiful.
+                continue
+        verified_disj_16 = {
+            di for di in still_open_disj
+            if all(spec_lbs.get(qi, -1.0) > 0
+                   for qi, _, _ in disj_queries[di])}
+        still_open_disj -= verified_disj_16
+        stats.record_timing('ibp_bab', time.perf_counter() - t_b16)
+        if print_progress:
+            print(f'Phase 1.6 (ibp-bab): '
+                  f'{time.perf_counter() - t_b16:.2f}s  closed '
+                  f'{n_closed_16}/{len(open_q16)} queries  still-open '
+                  f'disjuncts={len(still_open_disj)}', flush=True)
+        if not still_open_disj:
+            return _make_result('verified', {
+                'time': time.perf_counter() - (deadline - total_timeout),
+                'phase': 'ibp_bab_graph'}, stats)
+
     # --- Phase 2: Per-layer tightening ---
     t_phase2_start = time.perf_counter()
     bounds_by_relu = {}
@@ -2714,7 +3069,13 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
     total_build_time = 0.0
     total_solve_time = 0.0
 
-    for li in range(nh):
+    # Per-layer MILP tightening can be disabled per-benchmark: on nets
+    # with very wide conv layers it burns the whole budget for no bound
+    # movement (cct tinyimagenet: 546 s, worst lb -1.80 -> -1.79) — the
+    # α phase above is the effective tightener there.
+    _tighten_on = bool(getattr(settings, 'milp_graph_tighten_enabled', True))
+
+    for li in range(nh if _tighten_on else 0):
         if time_left() <= 1:
             break
 
@@ -3194,7 +3555,14 @@ def milp_verify(graph, spec, settings=None):
     # the sequential path requires (e.g. acasxu prop_2 has 4 different
     # preds with comp=0 — "COC is maximal" form). The graph path uses
     # `spec.as_linear_queries` which handles arbitrary DNF specs.
-    if graph.fork_points() or spec.as_pairwise() is None:
+    # IBP routing: large-input nets whose zonotope forward cannot fit GPU
+    # memory go through the graph path, where Phase 1 swaps in
+    # `_ibp_forward_graph` (see settings.phase1_ibp_input_dim_threshold).
+    _ibp_thresh = int(getattr(settings, 'phase1_ibp_input_dim_threshold', 0))
+    _use_ibp = (_ibp_thresh > 0
+                and int(np.prod(spec.x_lo.shape)) >= _ibp_thresh)
+
+    if graph.fork_points() or spec.as_pairwise() is None or _use_ibp:
         return _milp_verify_graph(graph, spec, settings, device, dtype,
                                    deadline, total_timeout)
 

@@ -571,6 +571,27 @@ def default_settings(**overrides):
         # unstables. Default ON.
         milp_alpha_tighten=True,
         milp_alpha_tighten_iters=10,
+        # Graph-path (`_milp_verify_graph`) counterparts. Phase 1.5
+        # joint α-CROWN on open queries — default OFF so existing
+        # milp-graph benchmarks keep their measured behavior; enable
+        # per-benchmark (challenging_certified_training_2026). The
+        # start-cap bounds the largest layer used as an α intermediate
+        # start node (per-target backward from a 262k-neuron conv layer
+        # to a 12k input would re-create the 12 GiB tensors the IBP
+        # route avoids).
+        milp_graph_alpha_enabled=False,
+        milp_graph_alpha_iters=20,
+        milp_graph_alpha_start_cap=32768,
+        # Graph-path per-layer MILP tightening (Phase 2). Disable on
+        # nets where it cannot move bounds (very wide conv layers).
+        milp_graph_tighten_enabled=True,
+        # Phase 1.6: IBP-refresh ReLU-split BaB (`_ibp_crown_bab`) on
+        # queries still open after Phase 1.5. Default OFF — pair with
+        # phase1_ibp_input_dim_threshold benchmarks.
+        milp_graph_ibp_bab_enabled=False,
+        milp_graph_ibp_bab_batch=64,
+        milp_graph_ibp_bab_alpha_iters=8,
+        milp_graph_ibp_bab_root_alpha_iters=50,
         # Multi-pass cascade: each pass loops L=0..max_layer applying
         # MILP+α-CROWN refresh. Pass N starts from bounds tightened by
         # pass N-1, so MILPs get a closer starting point and α-CROWN
@@ -1229,6 +1250,17 @@ def default_settings(**overrides):
         # workloads (sequential FC nets, stride-2-from-input ResNets like
         # the 'medium' variant) see no measurable change.
         zono_impl='patches',
+        # Phase-1 IBP forward (CROWN-IBP): when > 0 and the flat input
+        # dimension is >= this threshold, milp_verify routes to the
+        # graph path and Phase 1 computes pre-ReLU bounds via
+        # `_ibp_forward_graph` (interval arithmetic, O(activations)
+        # memory) instead of the zonotope forward (O(input_dim x
+        # activations) generator tensors — 12 GiB/layer on
+        # challenging_certified_training tinyimagenet CNN7, OOMs a
+        # 24 GB card). 0 = disabled (always zonotope). IBP bounds are
+        # looser than zono bounds, so only large-input nets where the
+        # zonotope cannot fit should set this.
+        phase1_ibp_input_dim_threshold=0,
     )
     s.update(overrides)
     assert s.tighten_formulation in _TIGHTEN_FORMULATIONS, (

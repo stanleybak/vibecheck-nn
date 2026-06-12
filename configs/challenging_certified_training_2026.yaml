@@ -1,0 +1,30 @@
+# challenging_certified_training_2026 — IBP-trained CNN7s (5 Conv + 2 Gemm,
+# pure ReLU, linear chain), cifar10 eps2/eps8 + tinyimagenet eps1, each in a
+# normal and a wide variant. 60 instances, timeouts 30/120/550 s.
+#
+# cifar10 models (3072-dim input): default machinery already beats ABC
+# (probe 2026-06-12: 3.8 vs 7.6 s, 6.1 vs 8.6 s, 11.4 vs 51 s) — the
+# settings below leave that path untouched.
+#
+# tinyimagenet models (12288-dim input): the zonotope forward's
+# input-identity generators (12288 gens x 262144 first-layer acts) need
+# ~12 GiB per layer at fp32 — two consecutive layers OOM a 24 GB A10G.
+# Route inputs >= 8000 dims through the IBP forward (CROWN-IBP):
+# O(activations) memory, and on these IBP-trained nets the backward CROWN
+# over IBP intermediates is tight (verified ABC's unsat@15.4s case
+# outright in the prototype).
+phase1_ibp_input_dim_threshold: 8000
+# After CROWN-IBP, ~9-12 queries stay open at worst lb ~-2 on the 550 s
+# tinyimagenet cases. The per-layer MILP tightener cannot move these
+# (measured: 546 s for -1.80 -> -1.79 on idx7018_sample4, probe3 0612);
+# joint α-CROWN (spec + intermediate start nodes <= 32k neurons) is the
+# effective tightener. These two knobs only affect the milp graph path,
+# which on this benchmark only the tinyimagenet models reach.
+milp_graph_alpha_enabled: true
+milp_graph_tighten_enabled: false
+# Queries that survive α (1 of 199 on idx7018_sample4, lb -0.36) need
+# ReLU-split BaB with per-domain bound refresh — IBP re-forward costs ~ms
+# here, so each split tightens all downstream layers (the no-reforward
+# β-BaB plateaued: -0.36 -> -0.15 in 13k domains; ABC closes in ~1.1k
+# domains with refresh).
+milp_graph_ibp_bab_enabled: true
