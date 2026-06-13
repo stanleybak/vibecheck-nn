@@ -2692,9 +2692,33 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
             # kfsb mechanism.
             cand_specs = []   # (slot, bi, (L, j))
             dom_cands = {}    # bi -> [(L, j), ...]
+            # Per-domain BaBSR ew: recompute the backward coefficients with
+            # THIS domain's (split-tightened) bounds when no_reforward is
+            # on. Using the stale ROOT ew_w for deep domains picks the
+            # wrong neurons and plateaus (measured 9566: stale-root ew ->
+            # -0.004 plateau; per-domain ew -> CLOSES in 45 domains). When
+            # reforward is on (loose-root nets) the passed ew_w is fine.
+            ew_per_dom = None
+            if no_reforward and ew_w is not None:
+                ew_per_dom = []
+                for bi in range(B):
+                    sb_bi = {L: (sb_b[L][0][bi], sb_b[L][1][bi])
+                             for L in sb_b}
+                    try:
+                        _, _, _ewd = _spec_backward_graph(
+                            sb_bi, xl, xh, gg, spec_ew_q, {0}, len(sb_bi),
+                            device, dtype, return_ew=True)
+                        ew_per_dom.append({
+                            L: torch.as_tensor(
+                                np.abs(np.asarray(e, np.float64)),
+                                device=device, dtype=dtype)
+                            for L, e in _ewd.get(0, {}).items()})
+                    except NotImplementedError:
+                        ew_per_dom.append(ew_w)
             for bi, (_, _, clamps) in enumerate(batch_doms):
                 if float(best_lbs[bi]) > 0:
                     continue
+                ew_bi = ew_per_dom[bi] if ew_per_dom is not None else ew_w
                 # Optionally restrict candidates to the DEEPEST layer
                 # with unstable neurons: splits near the output have a
                 # short backward path where β couples strongest — ABC
@@ -2724,8 +2748,8 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                     denom = (hi_d - lo_d).clamp(min=1e-12)
                     gap = (-lo_d * hi_d) / denom
                     score = gap * unstable.to(dtype)
-                    if ew_w is not None and L in ew_w:
-                        score = score * ew_w[L]
+                    if ew_bi is not None and L in ew_bi:
+                        score = score * ew_bi[L]
                     kk = min(kfsb_k, int(unstable.sum()))
                     vals, idxs = torch.topk(score, kk)
                     for v, j in zip(vals.tolist(), idxs.tolist()):
