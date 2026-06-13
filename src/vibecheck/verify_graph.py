@@ -7641,6 +7641,22 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     continue
                 state_q = (state_by_qi.get(qi, gen_lp_state)
                            if state_by_qi else gen_lp_state)
+                # Both dual-ascent paths (fast `verify_query` and
+                # `verify_query_dual_ascent_bab`) read each unstable
+                # entry's `lam`/`mu` — they require an alpha_zono/phase1
+                # state. When the per-query α-zono build is FULLY
+                # budget-truncated, `state_by_qi` is empty and the
+                # fallback `gen_lp_state` may be an 'alpha'-form state
+                # (e_new col coeff 1.0, no lam/mu — see
+                # `precompute_gen_state`). Handing that to the DA
+                # crashes on `u['lam']` (cifar10 cct2026 idx4226). Skip
+                # the DA for this query; the high-bin MILP fallback below
+                # is form-aware (`build_gen_lp_from_state`) and still
+                # gets its shot.
+                _ul_q = state_q.get('unstable_list', []) if state_q else []
+                if _ul_q and 'lam' not in _ul_q[0]:
+                    raw.append((qi, 'unknown', [], None))
+                    continue
                 # BUGFIX: query_specs was built with lp_ew_frac scoring at
                 # phase 8 start; bh_scores reranking later updates
                 # per_query_scored but query_specs holds stale reference.
