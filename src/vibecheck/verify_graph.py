@@ -6520,6 +6520,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                   f'attacked, {_per:.2f}s each): '
                   f'{timing["phase2p6_pgd_per_spec"]:.2f}s  '
                   f'sat={_p26_sat}', flush=True)
+        from . import heartbeat as _hb
+        _hb.set_phase('phase7/8 gen-LP state + dual-ascent')
         if _p26_sat:
             _r = _sat_or_fallthrough('pgd_per_spec', pgd_witness)
             if _r is not None:
@@ -7283,9 +7285,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     if print_progress:
                         print(f'  [batched reverse] {len(_bq)} directions built',
                               flush=True)
+            from . import heartbeat as _hb
             for qi in sorted(still_needs_milp):
                 if qi in _batched_rev_done:
                     continue
+                _hb.set_phase(f'alpha-zono state build q{qi}')
                 if time_left() <= _pq_reserve:
                     if print_progress:
                         print(f'  Per-query α-zono state: {time_left():.1f}s left '
@@ -7628,7 +7632,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+            from . import heartbeat as _hb
             for (qi, qw_q, qb_q, scored_keys_q) in query_specs:
+                _hb.set_phase(f'phase8 dual-ascent BnB q{qi}')
                 if time_left() <= 0:
                     raw.append((qi, 'unknown', [], None))
                     continue

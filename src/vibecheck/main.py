@@ -58,6 +58,11 @@ def main():
                              'used, the verdict, and a phase-timing summary '
                              'print regardless; --verbose adds the per-phase '
                              'blow-by-blow. Useful for competition logs.')
+    parser.add_argument('--heartbeat', type=float, default=0.0,
+                        help='Print a [heartbeat] line every N seconds with '
+                             'the current phase, its in-phase elapsed time, '
+                             'and GPU memory. 0 = off. Pinpoints a phase that '
+                             'hangs (its end-of-phase print never fires).')
     parser.add_argument('--allow-unsafe-pkl-loading', action='store_true',
                         help='Allow loading a pre-parsed graph/spec from a '
                              'sidecar .pkl cache (written by prepare_instance.sh). '
@@ -134,6 +139,10 @@ def _verify(args):
     print(f'  {spec.n_constraints} constraint(s), '
           f'{len(spec.disjuncts)} disjunct(s)')
 
+    from . import heartbeat as _hb
+    if args.heartbeat and args.heartbeat > 0:
+        _hb.start(float(args.heartbeat))
+
     if args.mode == 'bnb':
         from .settings import default_settings
         from .verify_zono_bnb import zonotope_bnb_verify
@@ -204,6 +213,7 @@ def _verify(args):
         print('Running zonotope analysis...')
         result, details = zonotope_verify(graph, spec)
 
+    _hb.stop()
     t_total = time.time() - t_start
 
     print(f'\nResult: {result}')
