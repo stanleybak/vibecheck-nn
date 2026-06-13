@@ -21,7 +21,22 @@ phase8_min_budget_frac: 0.5
 pgd_middle_enabled: false
 max_tighten_layer: 0
 parallel_pgd_enabled: false
-pgd_restarts: 100
+# Lean PGD: the 30s UNSAT cases were starved — Phase 0 PGD (3.5s) + Phase
+# 2.6 PGD (8s) ate the budget before the dual-ascent state could build
+# (needs ~10s), so they timed out. Trimming PGD frees that window:
+# eps2_cnn7 idx5913_sample1 timeout@31s -> unsat@18s, with the SAT cases
+# (eps8 s1) still found in 4-5s. (measured cct2026_v2_0613)
+pgd_restarts: 30
+phase26_pre_cascade_total_frac: 0.03
+phase26_pre_cascade_per_spec_cap: 1.0
+phase26_pgd_per_spec_min_per_spec: 0.1
+# High-bin MILP fallback off: on the wide nets a query can have ~10k
+# unstable, and the fallback builds that giant Gurobi model without
+# checking the deadline mid-build — it overran the 30s timeout to a
+# 60s shell-kill (NOFILE). The dual-ascent is the workhorse here; the
+# fallback can't solve a 10k-binary query in the leftover seconds
+# anyway. Off => the wide hard case returns a clean unknown@timeout.
+phase8_high_bin_fallback: false
 #
 # 2) tinyimagenet (12288-dim): milp graph path with the CROWN-IBP Phase 1.
 #    The zono forward's input-identity generators need ~12 GiB per layer at
