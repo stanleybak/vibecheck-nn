@@ -1,41 +1,38 @@
 # challenging_certified_training_2026 — IBP-trained CNN7s (5 Conv + 2 Gemm,
 # pure ReLU, linear chain), cifar10 eps2/eps8 + tinyimagenet eps1, each in a
 # normal and a wide variant. 60 instances, timeouts 30/120/550 s.
+# instances.csv ships CRLF line endings (bash sweeps need `tr -d '\r'`).
 #
-# cifar10 models (3072-dim input): default machinery already beats ABC
-# (probe 2026-06-12: 3.8 vs 7.6 s, 6.1 vs 8.6 s, 11.4 vs 51 s) — the
-# settings below leave that path untouched.
+# Two routes by input size (gate in verify_graph.py auto-route block):
 #
-# ALL models route through the graph path (clean deadline behavior +
-# alpha/BaB phases; the legacy layers path failed cifar10's harder cases:
-# GurobiNumericTrouble aborts on eps8, OOM in the tightener on eps8_wide,
-# deadline overruns/NOFILE on eps2 s3/s5 — probe4). Phase 1 stays the
-# tight zonotope forward for cifar10 (3072-dim, fits, near-verifying);
-# only tinyimagenet (12288-dim) swaps in IBP — its zono generators need
-# ~12 GiB per layer at fp32 and OOM a 24 GB A10G (probe5: IBP phase 1 on
-# cifar10 started at worst -8.6 and wasted 44s of alpha recovering it).
-milp_force_graph_path: true
+# 1) cifar10 (3072-dim): graph PIPELINE with phase-8 dual-ascent BaB.
+#    The zonotope state fits comfortably, and the dual-ascent BnB closes
+#    the queries that survive alpha in ~50 nodes / 0.01 s (measured
+#    eps2_cnn7 idx5507_sample3: unsat 26 s vs ABC 22 s — the milp-path
+#    custom BaB plateaued on the same queries for 5 orders of magnitude
+#    more domains). Settings below mirror tinyimagenet_2024.yaml's lean
+#    all-GPU profile.
+auto_route_milp_for_conv: false
+phase8_use_dual_ascent_gpu: true
+phase8_dual_ascent_max_iter: 1
+zono_lift_enabled: false
+phase2_crown_enabled: false
+phase8_min_budget_frac: 0.5
+pgd_middle_enabled: false
+max_tighten_layer: 0
+parallel_pgd_enabled: false
+pgd_restarts: 100
+#
+# 2) tinyimagenet (12288-dim): milp graph path with the CROWN-IBP Phase 1.
+#    The zono forward's input-identity generators need ~12 GiB per layer at
+#    fp32 (12288 gens x 262144 acts), two consecutive layers OOM a 24 GB
+#    A10G — no pipeline fits a zonotope here. IBP Phase 1 + chunked
+#    per-target big-layer tightening + joint alpha + ibp-BaB solve 5 of the
+#    6 probe classes (the 550s eps1 UNSAT tail needs more — see README).
 phase1_ibp_input_dim_threshold: 8000
-# After CROWN-IBP, ~9-12 queries stay open at worst lb ~-2 on the 550 s
-# tinyimagenet cases. The per-layer MILP tightener cannot move these
-# (measured: 546 s for -1.80 -> -1.79 on idx7018_sample4, probe3 0612);
-# joint α-CROWN (spec + intermediate start nodes <= 32k neurons) is the
-# effective tightener. These two knobs only affect the milp graph path,
-# which on this benchmark only the tinyimagenet models reach.
 milp_graph_alpha_enabled: true
 milp_graph_tighten_enabled: false
-# Queries that survive α (1 of 199 on idx7018_sample4, lb -0.36) need
-# ReLU-split BaB with per-domain bound refresh — IBP re-forward costs ~ms
-# here, so each split tightens all downstream layers (the no-reforward
-# β-BaB plateaued: -0.36 -> -0.15 in 13k domains; ABC closes in ~1.1k
-# domains with refresh).
-milp_graph_ibp_bab_enabled: true
-# Layers above the alpha start cap (L1-L3, 131k-262k neurons) keep raw
-# IBP bounds without this; targeted per-target alpha tightening of their
-# unstable neurons makes every layer tighter than ABC's alpha-CROWN init
-# (measured idx7018: 7464/2295/2546 vs ABC 7472/2307/2618) and moved the
-# open query's root lb -0.34 -> -0.18.
 milp_graph_tighten_big_layers: true
-# Spec-MILP escalation cannot finish on these nets and overruns the CLI
-# deadline (NOFILE verdicts at ext-kill in probe4); end cleanly instead.
+milp_graph_ibp_bab_enabled: true
+milp_graph_ibp_bab_split_deepest: true
 milp_graph_escalation_enabled: false

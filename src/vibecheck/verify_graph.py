@@ -8937,6 +8937,20 @@ def verify_graph(graph, spec, settings):
     #      verifies the same case in ~55 s)
     n_in = (int(np.prod(spec.x_lo.shape))
             if hasattr(spec, 'x_lo') else 10**9)
+    # CROWN-IBP route: inputs at/above the IBP threshold go to
+    # milp_verify's graph path unconditionally — their zonotope
+    # generator tensors don't fit GPU memory in ANY pipeline, and the
+    # IBP Phase 1 lives there (challenging_certified_training
+    # tinyimagenet). Takes precedence over auto_route_milp_for_conv so
+    # a benchmark can route small inputs to the graph pipeline
+    # (dual-ascent phase 8) and big ones to CROWN-IBP with one config.
+    _ibp_thr = int(getattr(settings, 'phase1_ibp_input_dim_threshold', 0))
+    if _ibp_thr > 0 and n_in >= _ibp_thr:
+        from .verify_milp import milp_verify
+        if getattr(settings, 'print_progress', False):
+            print('[verify_graph] routing large-input net to milp_verify '
+                  f'CROWN-IBP path (n_in={n_in} >= {_ibp_thr})', flush=True)
+        return milp_verify(graph, spec, settings)
     _split_max = int(getattr(settings, 'input_split_max_dims', 20))
     if (bool(getattr(settings, 'auto_route_milp_for_conv', True))
             and bool(getattr(settings, 'input_split_enabled', True))
