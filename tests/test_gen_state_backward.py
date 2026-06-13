@@ -181,7 +181,9 @@ def _dense_forward_state(gg, xl, xh, bbr, alpha_per_layer):
             center[name], G[name] = c, Gm
         else:
             raise NotImplementedError(t)
-    return state['unstable'], n_gens, n_in
+    last = gg['ops'][-1]['name']
+    out_G = _grow(G[last], n_gens)               # (n_gens × n_out)
+    return state['unstable'], n_gens, n_in, out_G.T.clone(), center[last]
 
 
 @pytest.mark.parametrize('net_seed,in_seed', [(1, 3), (2, 7), (5, 11)])
@@ -197,7 +199,8 @@ def test_backward_matches_dense_forward(tmp_path, net_seed, in_seed):
     # full-size α per layer (random in [0,1]) — both builders must use it
     alpha = {L: rng.uniform(0.0, 1.0, len(bbr[L][0])) for L in bbr}
 
-    gt, n_gens_gt, n_in_gt = _dense_forward_state(gg, xl, xh, bbr, alpha)
+    gt, n_gens_gt, n_in_gt, out_G_gt, out_c_gt = _dense_forward_state(
+        gg, xl, xh, bbr, alpha)
     st = build_alpha_zono_state_backward(
         gg, xl.numpy(), xh.numpy(), bbr,
         {L: torch.tensor(a, dtype=DT) for L, a in alpha.items()},
@@ -221,6 +224,15 @@ def test_backward_matches_dense_forward(tmp_path, net_seed, in_seed):
         assert np.allclose(row, gt_row, atol=1e-9), (
             f"row mismatch at {(e['layer_idx'], e['neuron_idx'])}: "
             f"max |Δ|={np.abs(row - gt_row).max():.2e}")
+
+    # Objective: obj_c_out and obj_G_out_csr must match the dense forward —
+    # the dual-ascent reads d_t = qw @ obj_G_out_csr and c0 = qw·obj_c_out.
+    assert np.allclose(st['obj_c_out'], out_c_gt.cpu().numpy(), atol=1e-9)
+    obj_dense = st['obj_G_out_csr'].toarray()
+    assert obj_dense.shape == tuple(out_G_gt.shape)
+    assert np.allclose(obj_dense, out_G_gt.cpu().numpy(), atol=1e-9), (
+        f"obj_G_out mismatch: max |Δ|="
+        f"{np.abs(obj_dense - out_G_gt.cpu().numpy()).max():.2e}")
 
 
 if __name__ == '__main__':

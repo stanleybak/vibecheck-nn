@@ -106,7 +106,10 @@ def _forward_center(gg, xl, xh, bbr, alpha_per_layer, device, dtype):
             raise NotImplementedError(
                 f'gen_state_backward._forward_center: unsupported op {t!r} '
                 f'at {name!r}')
-    return c_pre
+    # output center = the final op's centre (no ReLU after the spec layer)
+    c_out = cen[gg['ops'][-1]['name']].detach().cpu().numpy().astype(
+        np.float64)
+    return c_pre, c_out
 
 
 def _resolve_alpha(alpha_per_layer, L, lo):
@@ -176,7 +179,8 @@ def build_alpha_zono_state_backward(gg, xl, xh, bbr, alpha_per_layer, *,
         running += len(un)
     n_gens = running
 
-    c_pre = _forward_center(gg, xl, xh, bbr, alpha_per_layer, device, dtype)
+    c_pre, c_out = _forward_center(gg, xl, xh, bbr, alpha_per_layer,
+                                   device, dtype)
 
     half_t = torch.as_tensor(half, device=device, dtype=dtype)
     # Precompute per-layer (lam, mu) tensors and the relu op lookup.
@@ -223,12 +227,32 @@ def build_alpha_zono_state_backward(gg, xl, xh, bbr, alpha_per_layer, *,
                     'mu': float(mu_j[j]),
                     'form': 'alpha_zono',
                 })
+
+    # Objective: output centre + output generator rows (n_out × n_gens,
+    # sparse). Each output neuron is a backward target — `d_t = qw @
+    # obj_G_out_csr` and `c0 = qw·obj_c_out + qb` are what the dual-ascent
+    # reads. Output op has no ReLU after it, so it is a plain linear target.
+    import scipy.sparse as _sp
+    out_op = gg['ops'][-1]
+    n_out = _op_out_size(out_op)
+    blocks = []
+    for c0 in range(0, n_out, chunk):
+        tgt = np.arange(c0, min(c0 + chunk, n_out))
+        G = _backward_rows(gg, out_op, tgt, relu_layers, None, lam_mu,
+                           half_t, new_col_start, unstable_by_layer,
+                           n_gens, n_input, device, dtype)
+        blocks.append(_sp.csr_matrix(
+            G.detach().cpu().numpy().astype(np.float64)))
+    obj_G_out_csr = _sp.vstack(blocks).tocsr() if blocks else None
+
     return {
         'n_input': n_input,
         'n_gens': n_gens,
         'formulation': 'alpha_zono',
         'unstable_list': unstable_list,
         'stable_list': [],
+        'obj_c_out': c_out,
+        'obj_G_out_csr': obj_G_out_csr,
     }
 
 
