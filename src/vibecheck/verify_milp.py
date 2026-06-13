@@ -2714,8 +2714,16 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                     unstable = (lo_d < 0) & (hi_d > 0)
                     if not bool(unstable.any()):
                         continue
-                    width = torch.minimum(-lo_d, hi_d)
-                    score = width * unstable.to(dtype)
+                    # BaBSR score: |lA| × the ReLU triangle intercept
+                    # (-lo·hi/(hi-lo), the max relaxation gap), NOT width.
+                    # This is ABC's babsr_score intercept term — it ranks
+                    # by how much a neuron's upper relaxation loosens the
+                    # bound, and is far better than width (measured 9566:
+                    # width plateaus / explodes; intercept climbs to
+                    # -0.004). ew_w carries |lA| (backward coeffs).
+                    denom = (hi_d - lo_d).clamp(min=1e-12)
+                    gap = (-lo_d * hi_d) / denom
+                    score = gap * unstable.to(dtype)
                     if ew_w is not None and L in ew_w:
                         score = score * ew_w[L]
                     kk = min(kfsb_k, int(unstable.sum()))
@@ -3132,17 +3140,28 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 continue
             alpha_init16 = {
                 L: t.detach() for L, t in root_alpha.get('spec', {}).items()}
-            # Split score is width-only (ew_w=None). Measured on cct
-            # idx7018 q86: |ew|-weighted scores pick layer-0 neurons
-            # whose clamps shift bounds across the whole net, which
-            # invalidates the root-α warm start (CROWN under FIXED α is
-            # not monotone in intermediate-bound tightness) — children
-            # evaluated 0.2-0.3 LOOSER than the root and nothing pruned.
-            # Width-only picks local low-impact splits the root α stays
-            # near-optimal for: -0.342 -> -0.200 within 6k domains.
+            # BaBSR branching needs |lA| (backward coeffs) for the score.
+            # The earlier "ew_w=None / width-only" note applied to the
+            # IBP-REFORWARD path (where |ew|-weighted splits at layer 0
+            # invalidated the warm-start α). With no_reforward the root
+            # α-tight bounds are kept, so BaBSR (|lA|·intercept-gap) is
+            # the right score and climbs the bound like ABC.
+            ew_w16 = None
+            if bool(getattr(settings, 'milp_graph_ibp_bab_no_reforward',
+                            False)):
+                try:
+                    _, _, _ewb = _spec_backward_graph(
+                        sb, xl_g, xh_g, gg, {qi: spec_ew[qi]}, {qi}, nh,
+                        device, dtype, return_ew=True)
+                    ew_w16 = {L: torch.as_tensor(
+                                np.abs(np.asarray(e, np.float64)),
+                                device=device, dtype=dtype)
+                              for L, e in _ewb.get(qi, {}).items()}
+                except NotImplementedError:
+                    pass
             closed, n_dom, reason = _ibp_crown_bab(
                 gg, xl_g, xh_g, sb, w, float(b), device, dtype,
-                time_left=lambda: time_left() - 5.0, ew_w=None,
+                time_left=lambda: time_left() - 5.0, ew_w=ew_w16,
                 batch=_bab_batch, alpha_iters=_bab_iters,
                 print_progress=print_progress,
                 alpha_init=alpha_init16 or None,
