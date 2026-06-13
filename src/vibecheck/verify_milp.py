@@ -2532,7 +2532,7 @@ def _racing_escalation_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
 def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                    time_left, ew_w=None, batch=64, alpha_iters=8,
                    lr=0.25, max_domains=500000, print_progress=False,
-                   alpha_init=None, kfsb_k=4):
+                   alpha_init=None, kfsb_k=4, split_deepest=False):
     """ReLU-split BaB with per-domain IBP intermediate refresh for ONE query.
 
     The IBP-route counterpart of `attn_crown.attn_beta_bab`. That kernel
@@ -2669,8 +2669,21 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
             for bi, (_, _, clamps) in enumerate(batch_doms):
                 if float(best_lbs[bi]) > 0:
                     continue
+                # Optionally restrict candidates to the DEEPEST layer
+                # with unstable neurons: splits near the output have a
+                # short backward path where β couples strongest — ABC
+                # closes cct s3 cases with ~10 splits, ALL at the last
+                # ReLU (their log: every decision at /input-40).
+                if split_deepest:
+                    deep_layers = [L for L in sorted(sb_b)
+                                   if bool(((sb_b[L][0][bi] < 0)
+                                            & (sb_b[L][1][bi] > 0)).any())]
+                    layer_pool = deep_layers[-1:] if deep_layers else []
+                else:
+                    layer_pool = list(sb_b)
                 scored = []
-                for L, (lo_b, hi_b) in sb_b.items():
+                for L in layer_pool:
+                    lo_b, hi_b = sb_b[L]
                     lo_d, hi_d = lo_b[bi], hi_b[bi]
                     unstable = (lo_d < 0) & (hi_d > 0)
                     if not bool(unstable.any()):
@@ -3108,7 +3121,9 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 time_left=lambda: time_left() - 5.0, ew_w=None,
                 batch=_bab_batch, alpha_iters=_bab_iters,
                 print_progress=print_progress,
-                alpha_init=alpha_init16 or None)
+                alpha_init=alpha_init16 or None,
+                split_deepest=bool(getattr(
+                    settings, 'milp_graph_ibp_bab_split_deepest', False)))
             if closed:
                 spec_lbs[qi] = 1e-9   # marker: closed by BaB
                 n_closed_16 += 1

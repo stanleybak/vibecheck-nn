@@ -592,6 +592,9 @@ def default_settings(**overrides):
         milp_graph_ibp_bab_batch=64,
         milp_graph_ibp_bab_alpha_iters=8,
         milp_graph_ibp_bab_root_alpha_iters=50,
+        # Restrict BaB split candidates to the deepest unstable layer
+        # (short backward path; ABC's pattern on cct).
+        milp_graph_ibp_bab_split_deepest=False,
         # Targeted per-target α-CROWN tightening of layers above the
         # start cap (chunked; see Phase 1.5). Off by default.
         milp_graph_tighten_big_layers=False,
