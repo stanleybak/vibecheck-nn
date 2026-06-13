@@ -595,6 +595,11 @@ def default_settings(**overrides):
         # Restrict BaB split candidates to the deepest unstable layer
         # (short backward path; ABC's pattern on cct).
         milp_graph_ibp_bab_split_deepest=False,
+        # No-reforward BaB: keep the root α-tight bounds + split clamps
+        # instead of an IBP re-forward per domain (which loosens deeper
+        # layers on tight-root nets). On => bound climbs like ABC
+        # (9566: -0.065 -> +0.002 in 23 domains / 6.7s).
+        milp_graph_ibp_bab_no_reforward=False,
         # Targeted per-target α-CROWN tightening of layers above the
         # start cap (chunked; see Phase 1.5). Off by default.
         milp_graph_tighten_big_layers=False,

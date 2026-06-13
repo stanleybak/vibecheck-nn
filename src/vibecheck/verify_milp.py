@@ -2532,7 +2532,8 @@ def _racing_escalation_graph(gg_ops, x_lo, x_hi, bounds_by_relu,
 def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                    time_left, ew_w=None, batch=64, alpha_iters=8,
                    lr=0.25, max_domains=500000, print_progress=False,
-                   alpha_init=None, kfsb_k=4, split_deepest=False):
+                   alpha_init=None, kfsb_k=4, split_deepest=False,
+                   no_reforward=False):
     """ReLU-split BaB with per-domain IBP intermediate refresh for ONE query.
 
     The IBP-route counterpart of `attn_crown.attn_beta_bab`. That kernel
@@ -2567,6 +2568,33 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
     spec_ew_q = {0: (w_t, float(b_q))}
     sb_root_d = {L: (lo.detach(), hi.detach())
                  for L, (lo, hi) in sb_root.items()}
+
+    def _sb_for_domains(relu_clamps, Bn):
+        """Per-domain pre-ReLU bounds. `no_reforward`: broadcast the ROOT
+        α-tight bounds and intersect the split clamps (no IBP forward) —
+        the IBP refresh LOOSENS deeper layers on tight-root nets
+        (measured 9566: split -0.065 -> -0.8); keeping root bounds + β
+        propagating the split lets the bound climb like ABC (-0.065 ->
+        +0.002, 23 domains). Else the IBP refresh (helps loose-root
+        nets where re-forward tightens)."""
+        if no_reforward:
+            sb_b = {}
+            for L, (lo_r, hi_r) in sb_root_d.items():
+                lo = lo_r.unsqueeze(0).expand(Bn, -1).clone()
+                hi = hi_r.unsqueeze(0).expand(Bn, -1).clone()
+                if relu_clamps and L in relu_clamps:
+                    cl, ch = relu_clamps[L]
+                    lo = torch.maximum(lo, cl)
+                    hi = torch.minimum(hi, ch)
+                    hi = torch.maximum(hi, lo)   # crossing repair
+                sb_b[L] = (lo, hi)
+            return sb_b
+        xl_b = xl.unsqueeze(0).expand(Bn, -1).contiguous()
+        xh_b = xh.unsqueeze(0).expand(Bn, -1).contiguous()
+        return _ibp_forward_graph_batched(
+            xl_b, xh_b, gg, device, dtype,
+            relu_clamps=relu_clamps or None, root_sb=sb_root_d)
+
     counter = 0
     frontier = [(-float('inf'), counter, {})]   # (lb, tiebreak, clamps)
     n_domains = 0
@@ -2597,9 +2625,7 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                 else:
                     relu_clamps[L][0][bi, j] = 0.0   # ON:  z_j >= 0
         with torch.no_grad():
-            sb_b = _ibp_forward_graph_batched(
-                xl_b, xh_b, gg, device, dtype,
-                relu_clamps=relu_clamps or None, root_sb=sb_root_d)
+            sb_b = _sb_for_domains(relu_clamps, B)
         # Per-domain α-CROWN, warm-started from the converged ROOT α
         # when provided (`alpha_init`: {L: (n,)}). Without the warm
         # start the min-area init needs many more Adam iters than the
@@ -2737,9 +2763,7 @@ def _ibp_crown_bab(gg, xl, xh, sb_root, w_q, b_q, device, dtype, *,
                             rc_c[L][1][r_i, j] = 0.0
                         else:
                             rc_c[L][0][r_i, j] = 0.0
-                sb_c = _ibp_forward_graph_batched(
-                    xl_c, xh_c, gg, device, dtype,
-                    relu_clamps=rc_c or None, root_sb=sb_root_d)
+                sb_c = _sb_for_domains(rc_c, Bc)
                 for L, (lo_c, hi_c) in sb_c.items():
                     if alpha_init is not None and L in alpha_init:
                         al_c[L] = alpha_init[L].detach().to(dtype) \
@@ -3123,7 +3147,9 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 print_progress=print_progress,
                 alpha_init=alpha_init16 or None,
                 split_deepest=bool(getattr(
-                    settings, 'milp_graph_ibp_bab_split_deepest', False)))
+                    settings, 'milp_graph_ibp_bab_split_deepest', False)),
+                no_reforward=bool(getattr(
+                    settings, 'milp_graph_ibp_bab_no_reforward', False)))
             if closed:
                 spec_lbs[qi] = 1e-9   # marker: closed by BaB
                 n_closed_16 += 1
