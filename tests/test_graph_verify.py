@@ -1027,10 +1027,12 @@ class TestMilpVerifyGraph:
         settings = default_settings(device='cpu', total_timeout=20,
                                     print_progress=False)
         result, details = milp_verify(g, spec, settings)
-        # ab-CROWN verifies this, we at least shouldn't crash
-        assert result in ('verified', 'unknown', 'sat')
+        # ab-CROWN verifies this, we at least shouldn't crash.
+        # 'timeout' = budget-exhausted (the milp-graph path now reports a
+        # deadline-reached result as 'timeout', not 'unknown').
+        assert result in ('verified', 'unknown', 'timeout', 'sat')
         # Should verify most specs
-        if result == 'unknown':
+        if result in ('unknown', 'timeout'):
             assert details.get('remaining', 99) < 10  # at most ~5 unverified
 
 

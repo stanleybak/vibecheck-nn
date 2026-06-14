@@ -65,6 +65,20 @@ CASES = [
         vnnlib='vnnlib/cifar10_eps8_cnn7/cifar10_eps8_cnn7_idx1247_sample9.vnnlib',
         expected='sat', timeout=120, max_wall_s=20.0,
     ),
+    dict(
+        # The hardest UNSAT we close — a case ABC also solves and we used to
+        # miss. ABC ablation proved our root bounds MATCH ABC's (-0.175 vs
+        # -0.172) and interm-refresh is NOT the lever; the gap was pure BaB
+        # throughput. The route-based high-throughput params for large-input
+        # nets (n_in 12288 >= 8000: batch=192, α-iters=8, cand=2) reach the
+        # ~3549 domains it needs (bound climbs monotone, frontier collapses
+        # 1048->8). Pins the route-based BaB throughput config.
+        desc='tinyimagenet eps1_cnn7 idx7018_s4 (hard UNSAT, route-based fast BaB)',
+        net='onnx/tinyimagenet_eps1_cnn7.onnx',
+        vnnlib='vnnlib/tinyimagenet_eps1_cnn7/'
+               'tinyimagenet_eps1_cnn7_idx7018_sample4.vnnlib',
+        expected='verified', timeout=550, max_wall_s=460.0,
+    ),
 ]
 
 

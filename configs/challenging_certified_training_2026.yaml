@@ -71,6 +71,18 @@ milp_graph_ibp_bab_root_alpha_iters: 60
 milp_graph_ibp_bab_cand_iters: 8
 milp_graph_ibp_bab_prefilter: 12
 milp_graph_ibp_bab_multilevel: 3
+# Route-based BaB: the small tight-root eps8 cnn7s keep the params above
+# (few domains, tight per-domain bounds — fewer iters TIMES OUT 9566_s3).
+# Large-input tinyimagenet (n_in 12288 >= 8000) needs MANY FAST domains
+# instead (idx7018_s4 closes only at ~3549 domains with batch=192/iters=8),
+# so it switches to the high-throughput params below. Closes idx7018_s4
+# (ABC-only win, unsat ~385s) without regressing 9566_s3/8231_s3.
+milp_graph_ibp_bab_large_net_dim: 8000
+milp_graph_ibp_bab_large_batch: 192
+milp_graph_ibp_bab_large_alpha_iters: 8
+milp_graph_ibp_bab_large_cand_iters: 2
+milp_graph_ibp_bab_large_prefilter: 6
+milp_graph_ibp_bab_large_multilevel: 2
 
 # --- targeted SAT-finding PGD (milp graph path: tinyimagenet + eps8) ---
 # The default joint-loss PGD over all 199 disjuncts dilutes the few open

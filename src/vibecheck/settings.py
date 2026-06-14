@@ -635,6 +635,18 @@ def default_settings(**overrides):
         milp_graph_ibp_bab_cand_iters=8,
         milp_graph_ibp_bab_prefilter=12,
         milp_graph_ibp_bab_multilevel=2,
+        # Route-based BaB params for LARGE-input nets (tinyimagenet 12288-d):
+        # high-throughput (big batch + few per-domain iters) so the BaB reaches
+        # the thousands of domains those cases need (idx7018 closes at ~3549
+        # domains), while the small tight-root eps8 nets keep the defaults
+        # above (few domains, tight bounds — fewer iters times them out). Used
+        # when n_in >= milp_graph_ibp_bab_large_net_dim (0 = off/default).
+        milp_graph_ibp_bab_large_net_dim=0,
+        milp_graph_ibp_bab_large_batch=192,
+        milp_graph_ibp_bab_large_alpha_iters=8,
+        milp_graph_ibp_bab_large_cand_iters=2,
+        milp_graph_ibp_bab_large_prefilter=6,
+        milp_graph_ibp_bab_large_multilevel=2,
         # Targeted SAT-finding PGD in the milp graph path. The default
         # Phase-1 PGD is one joint-loss attack over EVERY disjunct; when a
         # few disjuncts remain open among many verified (cct2026 idx5613:
@@ -653,6 +665,28 @@ def default_settings(**overrides):
         # start cap (chunked; see Phase 1.5). Off by default.
         milp_graph_tighten_big_layers=False,
         milp_graph_tighten_big_iters=15,
+        # Sliding-window depth for the per-neuron sparse conv MILP tightener
+        # (`_tighten_layer_parallel`/`_build_sparse_neuron_model`). None =
+        # exact (all unstable in the cone binarized — deep cones time out and
+        # fall back to LP). K>0 binarizes only the last K upstream ReLU layers
+        # per cone; deeper unstable use the sound LP-triangle, keeping the
+        # MILP small enough to solve.
+        milp_graph_tighten_window=None,
+        # Pre-BaB MILP tightening: when >0, run the per-neuron sparse conv
+        # MILP on the first K ReLU layers BEFORE the no-reforward BaB and fold
+        # the result into the BaB base (`sb_bab_base`), so the BaB branches on
+        # a tighter root. 0 (default) = off (the per-layer MILP tightener runs
+        # only as the post-BaB Phase 2, never reaching the BaB).
+        milp_graph_pretighten_max_layer=0,
+        # Fast GPU dual-ascent BaB for the milp-graph path: build the
+        # alpha_zono state from sb_q + per-spec α slopes
+        # (`build_alpha_zono_state_backward`, chunked) and run the compiled
+        # dual-ascent verifier instead of the slow `_crown_bab_noreforward`.
+        # CUDA-only; 0/False = off (default). `phase8_state_backward_chunk`
+        # caps the state-builder's resident (chunk, n_gens) matrix — lower it
+        # if construction OOMs at high unstable counts (~12k on tinyimagenet).
+        milp_graph_fast_da_bab=False,
+        phase8_state_backward_chunk=256,
         # Graph-path Phase 3 spec-MILP escalation. Disable on benchmarks
         # where the MILP cannot finish (wide conv nets) — it overruns
         # the CLI deadline and numeric trouble aborts cases.

@@ -133,21 +133,43 @@ keeps idx5613 at 5/5 — so the config sets 256. Still batched + sub-second.
 
 | Solver | Solved / 60 | breakdown |
 | --- | --- | --- |
-| **vibecheck** | **31** | 12 sat + 19 unsat; 17 timeout, 9 unknown, 3 NOFILE |
+| **vibecheck** | **32** | 13 sat + 19 unsat (incl. idx7018_s4); the rest timeout/unknown |
 | **AB-CROWN** | **33** | 12 sat + 21 unsat; 9 timeout, 18 NONE (OOM) |
 
-**Head-to-head (both swept on the A10G):** 31 ties · 27 both-fail · **0
-we-win · 2 ABC-win**. We are **behind ABC by 2** — the gap is exactly the 2
-ABC-wins (`cct2026_fullsweep_final` vs `cct2026_abc_fullsweep`):
-- **idx9074_s6** (eps2_wide): ABC unsat 78 s; us NOFILE (dual-ascent
-  frontier-explodes; the NOFILE fix makes it a clean timeout, still unsolved).
-- **idx7018_s4** (tinyimagenet_cnn7): ABC unsat 70 s; us unknown
-  (no-reforward BaB explodes; root -0.18, 521 domains, didn't close).
+**Head-to-head (both swept on the A10G):** 32 ties · 27 both-fail · **0
+we-win · 1 ABC-win**. We are **behind ABC by 1** (`cct2026_fullsweep_final`
++ the idx7018 fix vs `cct2026_abc_fullsweep`):
+- **idx9074_s6** (eps2_wide): ABC unsat 78 s; us timeout. Investigated by
+  ABC ablation like idx7018, but it's the OPPOSITE problem — a **root-bound
+  gap**, not throughput: our dual-ascent root is -0.69 vs ABC's -0.37 (1.9×
+  looser), so its frontier explodes. Re-routing idx9074 to the milp-graph
+  IBP+α engine DOES recover ABC's tight root (-0.37, and q2 of 2 closes), but
+  the remaining query q6's BaB frontier still **explodes** (4800+ domains,
+  growing) where ABC keeps its bounded (≤159) via β-CROWN + last-2-layer
+  kfsb — a branching/β-strength gap our no-reforward BaB can't match even
+  from the tight root, with fast throughput, or with split_deepest. Genuine
+  limitation; left unsolved (this is the 1 remaining ABC win).
 
-Both are cases ABC closes via β-CROWN BaB with per-domain
-`optimize_interm_bounds` that our engines explode on. ABC also OOMs 18
+**idx7018_s4 — CLOSED (the ABC ablation paid off).** I twice wrongly
+concluded it needs ABC's per-domain `optimize_interm_bounds` (interm-refresh).
+A rigorous ABC ablation **refuted that**: disabling ABC's `clip_interm_domain`
+left its node count unchanged (1109→1114) and 20 s faster. Our ROOT BOUNDS
+already MATCH ABC's (per-layer unstable counts identical, root lb -0.175 vs
+-0.172). ABC closes in ~1110 domains via β-CROWN + last-2-layer kfsb; our
+`_crown_bab_noreforward` is the SAME kind of engine but was ~17× slower per
+domain (batch 16 + 20 α-iters) so it only reached 521 domains before timing
+out. **Speed-tuning it (batch 192, α-iters 8, cand 2) closes idx7018 in
+~383 s / 3545 domains** — the bound climbs monotonically and the frontier
+collapses (1048→8). Wired as a **route-based config**
+(`milp_graph_ibp_bab_large_net_dim: 8000` + `_large_*` params): tinyimagenet
+(n_in 12288) gets the high-throughput params; the small tight-root eps8 cnn7s
+keep the default tight params (fewer iters TIMED OUT 9566_s3 — they need few
+domains + tight per-domain bounds, the opposite of idx7018). Verified: 9566_s3
+unsat 92 s, 8231_s3 unsat 44 s (no regression), idx7018_s4 unsat 383 s.
+
+Both ABC-wins were cases ABC closes via β-CROWN BaB. ABC also OOMs 18
 wide/large cases that we can't solve either (both-fail), so neither tool is
-complete on this benchmark. **The "beat ABC" goal is not met at 31 < 33**;
+complete on this benchmark. **At 32 < 33 we are 1 short of ABC** (idx9074_s6);
 closing idx7018 + idx9074 would tie. See the closeability investigation.
 
 By family (vibecheck solved / 10): eps2_cnn7 5, eps2_wide 4, eps8_cnn7 5,
@@ -182,10 +204,39 @@ full sweep — idx7018_s4 is among those, hence the loss above.)
 | eps8_cnn7 | idx1742_s4/s5/s6, idx4051_s8, idx8570_s7 | 5× timeout (555–558 s) |
 | eps8_cnn7 | **idx1247_s9** | **sat 8 s → FIXED (we sat ~1 s)** |
 
-So after the fixes, **vibecheck loses zero cases that ABC solves** on
-cct2026. The eps2_cnn7 timeouts are the dual-ascent frontier explosion
-(16.7 M nodes, still growing → `stop=oom`); ABC's own timeout on them
-confirms they need a tighter per-node bound than either tool currently has.
+(That table was the original 15-case misscheck; the full 60-case ABC sweep
+later surfaced idx7018_s4 and idx9074_s6 as the two real ABC wins — idx7018
+is now closed, idx9074 remains the one loss. See the Final score above.)
+
+## Lessons learned (worth carrying to the next benchmark)
+
+1. **Ablate the reference before claiming "X is the difference."** Twice I
+   concluded idx7018 needed ABC's per-domain `optimize_interm_bounds`
+   (a multi-day feature). A direct ABC ablation — disable that knob, re-run —
+   showed the node count was *unchanged* and it was 20 s *faster*. The claim
+   was speculation; the ablation cost ~6 min and turned a dead-end into a
+   one-config win. Same method then diagnosed idx9074 as the *opposite*
+   problem. Instrument the reference; don't infer from behavior.
+2. **"Bounds gap" vs "search gap" is the first fork — measure both roots.**
+   idx7018: our root bounds *matched* ABC's (same per-layer unstable counts,
+   root -0.175 vs -0.172) → the gap was purely BaB throughput (we were 17×
+   slower per domain). idx9074: our root was 1.9× looser (-0.69 vs -0.37) →
+   a root gap. Dump per-layer unstable counts + root lb for both tools first;
+   it tells you whether to fix bounding or search.
+3. **One config can't fit opposite case shapes — route by structure.** The
+   tight-root eps8 cnn7s need *few domains + tight per-domain bounds* (high
+   α-iters); large-input tinyimagenet needs *many fast domains* (big batch,
+   few iters) — fewer iters TIMED OUT 9566. The fix was a route gate
+   (`milp_graph_ibp_bab_large_net_dim`) by input dim, not a compromise config.
+4. **Report `timeout` vs `unknown` honestly at the source.** A complete BaB
+   that runs out of budget is a timeout, not an "unknown"; emit it where the
+   deadline is detected, not via a brittle elapsed-vs-budget threshold in the
+   CLI.
+5. **Dead ends, with evidence (so they aren't re-litigated):** per-neuron MILP
+   tightening ≤ α-CROWN here (the ReLU relaxation isn't the dominant looseness
+   — exact L1 MILP beat α by 3 of 7464 neurons); the GPU dual-ascent swept
+   65.7 M nodes without closing idx7018 (the *per-node bound*, not node count,
+   was the wall — until we matched ABC's bound by routing to the β-CROWN BaB).
 
 ## Knobs (`configs/challenging_certified_training_2026.yaml`)
 

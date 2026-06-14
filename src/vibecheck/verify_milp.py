@@ -129,6 +129,9 @@ _shared_model = None
 _shared_layer_np = None
 _shared_prev_layer_idx = None
 _shared_sparse_args = None
+# Sliding-window depth for the sparse per-neuron conv MILP (None = exact/all
+# binarized). Inherited by Pool workers at fork, like `_shared_sparse_args`.
+_shared_window = None
 
 
 # ---------------------------------------------------------------------------
@@ -476,12 +479,20 @@ def _compute_crown_layer_weights(bounds_np, layers_np, spec_ew, pred, comp, nh):
 # ---------------------------------------------------------------------------
 
 def _build_sparse_neuron_model(layers_np, x_lo, x_hi, bounds,
-                                target_layer, target_neuron):
+                                target_layer, target_neuron, window=None):
     """Build a sparse Gurobi model for a single neuron's bounds.
 
     Only includes neurons in the receptive field chain from the target
     neuron back to the input. For conv layers this is much smaller than
     the full model.
+
+    `window` (int or None): sliding-window depth. When set, only unstable
+    ReLU neurons within `window` layers upstream of the target
+    (`target_layer - l <= window`) get an exact binary; deeper unstable
+    neurons use the sound LP-triangle relaxation (no binary). This keeps a
+    deep cone's MILP small enough to actually solve in the per-neuron time
+    limit (the full-binary cone times out at L3+ on wide conv nets ->
+    LP-fallback). None (default) = exact (all unstable binarized).
 
     Returns (model, env) with a '_target' variable for the neuron's
     pre-ReLU value.
@@ -564,12 +575,14 @@ def _build_sparse_neuron_model(layers_np, x_lo, x_hi, bounds,
                              name=f'a_{l}_{j}')
                 layer_vars[(l, j)] = v
             else:
-                # Unstable: z, a, s
+                # Unstable: z, a (+ binary s if within the sliding window,
+                # else a sound LP-triangle is used in the constraints below)
                 zv = m.addVar(lb=float(lo[j]), ub=float(hi[j]),
                               name=f'z_{l}_{j}')
                 av = m.addVar(lb=0.0, ub=float(hi[j]),
                               name=f'a_{l}_{j}')
-                sv = m.addVar(vtype=grb.GRB.BINARY, name=f's_{l}_{j}')
+                if window is None or (target_layer - l) <= window:
+                    sv = m.addVar(vtype=grb.GRB.BINARY, name=f's_{l}_{j}')
                 layer_vars[(l, j)] = av
         m.update()
 
@@ -616,8 +629,14 @@ def _build_sparse_neuron_model(layers_np, x_lo, x_hi, bounds,
                 m.addConstr(z == expr + b_j)
                 m.addConstr(a >= 0)
                 m.addConstr(a >= z)
-                m.addConstr(a <= hi_j * s)
-                m.addConstr(a <= z - lo_j * (1 - s))
+                if s is not None:
+                    # exact ReLU (binary) — in-window
+                    m.addConstr(a <= hi_j * s)
+                    m.addConstr(a <= z - lo_j * (1 - s))
+                else:
+                    # out-of-window: sound LP-triangle hull upper edge
+                    # a <= hi*(z - lo)/(hi - lo)  (valid for lo<0<hi)
+                    m.addConstr(a <= (hi_j / (hi_j - lo_j)) * (z - lo_j))
         m.update()
 
     # Add target variable
@@ -796,7 +815,8 @@ def _solve_neuron(args):
     if _shared_sparse_args is not None:
         layers_np, x_lo, x_hi, bounds, target_layer = _shared_sparse_args
         model, env = _build_sparse_neuron_model(
-            layers_np, x_lo, x_hi, bounds, target_layer, idx)
+            layers_np, x_lo, x_hi, bounds, target_layer, idx,
+            window=_shared_window)
         target_var = model.getVarByName('_target')
     else:
         model = _shared_model.copy()
@@ -954,7 +974,8 @@ def _solve_neuron_both(args):
         else:
             layers_np, x_lo, x_hi, bounds, target_layer = sparse_args
             model, env = _build_sparse_neuron_model(
-                layers_np, x_lo, x_hi, bounds, target_layer, idx)
+                layers_np, x_lo, x_hi, bounds, target_layer, idx,
+                window=_shared_window)
             target_var = model.getVarByName('_target')
     else:
         model = _shared_model.copy()
@@ -1053,7 +1074,7 @@ def _solve_neuron_both(args):
 def _tighten_layer_parallel(layers_np, x_lo, x_hi, bounds, l,
                              use_milp, timeout, n_cores,
                              neuron_subset=None, lp_per_worker=False,
-                             witness_n_random=8, deadline=None):
+                             witness_n_random=8, deadline=None, window=None):
     """Tighten unstable neurons at layer l using parallel LP or MILP.
 
     For conv layers, uses sparse per-neuron models (much faster).
@@ -1065,7 +1086,8 @@ def _tighten_layer_parallel(layers_np, x_lo, x_hi, bounds, l,
     Returns (new_lo, new_hi, any_timeout).
     """
     global _shared_model, _shared_layer_np, _shared_prev_layer_idx
-    global _shared_sparse_args
+    global _shared_sparse_args, _shared_window
+    _shared_window = window
 
     lo, hi = bounds[l]
     if neuron_subset is not None:
@@ -3053,6 +3075,120 @@ def _alpha_start_cap(settings, max_layer_neurons):
     return int(getattr(settings, 'milp_graph_alpha_start_cap', 32768))
 
 
+def _serialize_gg_ops(gg):
+    """Serialize the GPU graph's ops into numpy-only dicts for the MILP
+    workers (picklable; no torch tensors). Query-independent."""
+    gg_ops_ser = []
+    for op in gg['ops']:
+        d = {'name': op['name'], 'type': op['type'], 'inputs': op['inputs']}
+        if op['type'] == 'conv':
+            d['kernel_np'] = op['kernel_np']
+            d['bias_np'] = op['bias_np']
+            d['in_shape'] = op['in_shape']
+            d['out_shape'] = op['out_shape']
+            d['stride'] = op['stride']
+            d['padding'] = op['padding']
+            d['n_out'] = op['n_out']
+        elif op['type'] == 'fc':
+            d['W_np'] = op['W_np']
+            d['bias_np'] = op['bias_np']
+        elif op['type'] == 'relu':
+            if 'layer_idx' in op:
+                d['layer_idx'] = op['layer_idx']
+        elif op['type'] == 'add':
+            d['is_merge'] = op.get('is_merge', False)
+            # Carry the bias for non-merge bias-adds (ACASXU / safenlp
+            # ONNXes export `Gemm → Add(bias)` separately). Dropping this
+            # used to silently encode the network bias-less in MILP workers
+            # → falsely-infeasible spec LPs.
+            d['bias'] = op.get('bias')
+        elif op['type'] == 'sub':
+            d['bias'] = op.get('bias')
+        elif op['type'] == 'reshape':
+            pass    # flat passthrough; consumers alias the input vars
+        else:
+            raise NotImplementedError(
+                f"milp serializer: unsupported op {op['type']!r} at "
+                f"{op['name']!r} — serializing without its params would "
+                f"make the MILP encode a different network")
+        gg_ops_ser.append(d)
+    return gg_ops_ser
+
+
+def _seq_subgraph_for_relu(gg_ops_ser, li, bounds_by_relu):
+    """Sequential ancestor subgraph up to ReLU layer `li` for the per-neuron
+    MILP/LP tightener. Returns (layers_np_seq, seq_li, seq_bounds, is_conv),
+    or None when the subgraph to `li` contains a merge-Add (not purely
+    sequential — the sparse sequential tightener does not apply there)."""
+    for op in gg_ops_ser:
+        if op['type'] == 'relu' and op.get('layer_idx') == li:
+            break
+        if op['type'] == 'add' and op.get('is_merge'):
+            return None
+
+    target_relu_name = None
+    for op in gg_ops_ser:
+        if op['type'] == 'relu' and op.get('layer_idx') == li:
+            target_relu_name = op['name']
+            break
+
+    # Walk backward from the target relu to find ancestor ops
+    ancestors = set()
+    stack = [target_relu_name]
+    op_by_name = {op['name']: op for op in gg_ops_ser}
+    while stack:
+        n = stack.pop()
+        if n in ancestors:
+            continue
+        ancestors.add(n)
+        op = op_by_name.get(n)
+        if op:
+            for inp in op['inputs']:
+                stack.append(inp)
+
+    layers_np_seq = []
+    for op in gg_ops_ser:
+        if op['name'] not in ancestors:
+            continue
+        if op['type'] == 'relu' and op.get('layer_idx') == li:
+            break
+        if op['type'] == 'conv':
+            layers_np_seq.append({
+                'type': 'conv', 'kernel': op['kernel_np'],
+                'bias': op['bias_np'].copy(),
+                'in_shape': op['in_shape'],
+                'stride': op['stride'], 'padding': op['padding']})
+        elif op['type'] == 'fc':
+            layers_np_seq.append({
+                'type': 'fc', 'W': op['W_np'],
+                'bias': op['bias_np'].copy()})
+        elif (op['type'] == 'add' and not op.get('is_merge')
+                and op.get('bias') is not None
+                and layers_np_seq):
+            # Fold a constant bias-Add into the preceding fc/conv bias
+            # (ONNX `Gemm(no bias) -> Add(bias) -> ReLU`); without this the
+            # sequential tightener sees a bias-less net -> UNSOUND bounds.
+            bias_add = np.asarray(op['bias']).flatten().astype(
+                layers_np_seq[-1]['bias'].dtype)
+            layers_np_seq[-1]['bias'] = (
+                layers_np_seq[-1]['bias'] + bias_add)
+    seq_li = len(layers_np_seq) - 1
+    seq_bounds = {}
+    rc = 0
+    for op in gg_ops_ser:
+        if op['name'] not in ancestors:
+            continue
+        if op['type'] == 'relu' and 'layer_idx' in op:
+            if op['layer_idx'] < li:
+                seq_bounds[rc] = bounds_by_relu[op['layer_idx']]
+                rc += 1
+            elif op['layer_idx'] == li:
+                seq_bounds[rc] = bounds_by_relu[li]
+                break
+    is_conv = layers_np_seq[seq_li]['type'] == 'conv'
+    return layers_np_seq, seq_li, seq_bounds, is_conv
+
+
 def _milp_verify_graph(graph, spec, settings, device, dtype,
                         deadline, total_timeout):
     """Verification pipeline for networks with skip connections.
@@ -3233,7 +3369,10 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 'phase': 'pgd_graph', 'witness': pgd_witness}, stats)
 
     if time_left() <= 0:
-        return _make_result('unknown', {'time': total_timeout,
+        # Deadline reached with disjuncts still open -> 'timeout', not
+        # 'unknown' (a complete BaB that ran out of time IS a timeout; the
+        # verdict file should say so).
+        return _make_result('timeout', {'time': total_timeout,
             'phase': 'crown_graph_timeout',
             'remaining': len(still_open_disj)}, stats)
 
@@ -3381,6 +3520,59 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                     'time': time.perf_counter() - (deadline - total_timeout),
                     'phase': 'alpha_crown_graph'}, stats)
 
+    # --- Pre-BaB MILP tightening: feed a tighter root to the BaB ---
+    # The per-layer MILP tightener (Phase 2 below) runs AFTER the BaB, so it
+    # never tightens the bounds the BaB branches on. When
+    # `milp_graph_pretighten_max_layer > 0`, run the sparse per-neuron conv
+    # MILP on the first K ReLU layers HERE and fold the result into
+    # `sb_bab_base`, so the BaB's root-α and per-domain bounds start tighter.
+    # Sliding-window (`milp_graph_tighten_window`) keeps each deep cone's MILP
+    # small enough to solve in `milp_sample_timeout`.
+    _pre_max = int(getattr(settings, 'milp_graph_pretighten_max_layer', 0))
+    if _pre_max > 0 and still_open_disj and time_left() > 20.0:
+        _pre_ops = _serialize_gg_ops(gg)
+        _pre_xlo = spec.x_lo.astype(np.float64)
+        _pre_xhi = spec.x_hi.astype(np.float64)
+        _pre_nc = multiprocessing.cpu_count()
+        _pre_to = float(getattr(settings, 'milp_sample_timeout', 5.0))
+        _pre_win = getattr(settings, 'milp_graph_tighten_window', None)
+        _pre_win = (int(_pre_win)
+                    if isinstance(_pre_win, (int, float)) and _pre_win > 0
+                    else None)
+        _pre_bbr = {li: (sb[li][0].detach().cpu().numpy().astype(np.float64),
+                         sb[li][1].detach().cpu().numpy().astype(np.float64))
+                    for li in sb}
+        for _pli in range(1, min(_pre_max + 1, nh)):
+            if time_left() <= 20.0:
+                break
+            _plo, _phi = _pre_bbr[_pli]
+            _pun = np.where((_plo < 0) & (_phi > 0))[0]
+            if len(_pun) == 0:
+                continue
+            _pseq = _seq_subgraph_for_relu(_pre_ops, _pli, _pre_bbr)
+            if _pseq is None or not _pseq[3]:   # not sequential / not conv
+                continue
+            _plnp, _psl, _psb, _ = _pseq
+            t_pt = time.perf_counter()
+            _pnlo, _pnhi, _pto = _tighten_layer_parallel(
+                _plnp, _pre_xlo, _pre_xhi, _psb, _psl,
+                use_milp=True, timeout=_pre_to, n_cores=_pre_nc,
+                witness_n_random=_wnr, deadline=deadline, window=_pre_win)
+            # Sound intersection with the prior bounds, fold into sb +
+            # sb_bab_base (the BaB base) so the BaB branches on tighter bounds.
+            _pnlo = np.maximum(_plo, _pnlo)
+            _pnhi = np.minimum(_phi, _pnhi)
+            _pre_bbr[_pli] = (_pnlo, _pnhi)
+            _pt = (torch.tensor(_pnlo, dtype=dtype, device=device),
+                   torch.tensor(_pnhi, dtype=dtype, device=device))
+            sb[_pli] = _pt
+            sb_bab_base[_pli] = (_pt[0].clone(), _pt[1].clone())
+            if print_progress:
+                _pnu = int(((_pnlo < 0) & (_pnhi > 0)).sum())
+                print(f'Pre-BaB MILP tighten L{_pli}: {len(_pun)} -> {_pnu} '
+                      f'unstable ({time.perf_counter() - t_pt:.1f}s, '
+                      f'win={_pre_win}, to={_pre_to})', flush=True)
+
     # --- Phase 1.6: IBP-refresh ReLU-split BaB on remaining queries ---
     # Per open query: `_ibp_crown_bab` (per-domain IBP intermediate
     # refresh + batched per-domain α-CROWN). Default OFF; enabled by the
@@ -3395,6 +3587,28 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                     if spec_lbs.get(qi, -1.0) <= 0]
         _bab_batch = int(getattr(settings, 'milp_graph_ibp_bab_batch', 64))
         _bab_iters = int(getattr(settings, 'milp_graph_ibp_bab_alpha_iters', 8))
+        _bab_cand = int(getattr(settings, 'milp_graph_ibp_bab_cand_iters', 8))
+        _bab_pref = int(getattr(settings, 'milp_graph_ibp_bab_prefilter', 12))
+        _bab_ml = int(getattr(settings, 'milp_graph_ibp_bab_multilevel', 2))
+        # Route-based BaB throughput. Large-input nets (tinyimagenet, 12288-d)
+        # need MANY FAST domains — idx7018 closes only at ~3549 domains, which
+        # needs a big batch + few per-domain iters. The small tight-root eps8
+        # nets need the OPPOSITE (few domains, tight per-domain bounds; fewer
+        # iters TIMES OUT 9566). Both route here, so switch params by input
+        # dim: n_in >= `milp_graph_ibp_bab_large_net_dim` -> high-throughput.
+        _n_in_bab = int(np.prod(spec.x_lo.shape))
+        _large_dim = int(getattr(settings, 'milp_graph_ibp_bab_large_net_dim', 0))
+        if _large_dim > 0 and _n_in_bab >= _large_dim:
+            _bab_batch = int(getattr(settings, 'milp_graph_ibp_bab_large_batch', _bab_batch))
+            _bab_iters = int(getattr(settings, 'milp_graph_ibp_bab_large_alpha_iters', _bab_iters))
+            _bab_cand = int(getattr(settings, 'milp_graph_ibp_bab_large_cand_iters', _bab_cand))
+            _bab_pref = int(getattr(settings, 'milp_graph_ibp_bab_large_prefilter', _bab_pref))
+            _bab_ml = int(getattr(settings, 'milp_graph_ibp_bab_large_multilevel', _bab_ml))
+            if print_progress:
+                print(f'[ibp-bab] large-net route (n_in={_n_in_bab} >= '
+                      f'{_large_dim}): batch={_bab_batch} iters={_bab_iters} '
+                      f'cand={_bab_cand} pref={_bab_pref} ml={_bab_ml}',
+                      flush=True)
         n_closed_16 = 0
         from . import alpha_crown as ac16
         _root_iters = int(getattr(settings,
@@ -3459,24 +3673,64 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                 continue
             alpha_init16 = {
                 L: t.detach() for L, t in root_alpha.get('spec', {}).items()}
+            closed, n_dom, reason = False, 0, ''
+            # --- Fast GPU dual-ascent BaB (optional, CUDA) ---
+            # Build the alpha_zono gen-LP state from sb_q + the per-spec α
+            # slopes (NO forward zono — `build_alpha_zono_state_backward` is
+            # chunked/memory-bounded) and run the compiled GPU dual-ascent
+            # verifier, which sweeps millions of nodes/s vs the slow CPU
+            # `_crown_bab_noreforward` (~hundreds of domains). 'unsat' closes.
+            if (bool(getattr(settings, 'milp_graph_fast_da_bab', False))
+                    and device.type == 'cuda'):
+                from .gen_state_backward import build_alpha_zono_state_backward
+                from .verify_graph import _get_fast_da_verifier
+                _bbr_st = {L: (sb_q[L][0].detach().cpu().numpy().astype(np.float64),
+                               sb_q[L][1].detach().cpu().numpy().astype(np.float64))
+                           for L in sb_q}
+                _state_q = build_alpha_zono_state_backward(
+                    gg, spec.x_lo.astype(np.float64),
+                    spec.x_hi.astype(np.float64), _bbr_st, alpha_init16,
+                    device=device, dtype=dtype,
+                    chunk=int(getattr(settings,
+                                      'phase8_state_backward_chunk', 256)))
+                _sk = sorted(
+                    [(u['layer_idx'], u['neuron_idx'])
+                     for u in _state_q['unstable_list']],
+                    key=lambda k: _bbr_st[k[0]][1][k[1]]
+                    * abs(_bbr_st[k[0]][0][k[1]]) / 2.0, reverse=True)
+                _fv = _get_fast_da_verifier(
+                    device,
+                    str(getattr(settings, 'phase8_fast_dual_ascent_ls',
+                                'logbucket')),
+                    int(getattr(settings, 'phase8_fast_dual_ascent_K', 256)),
+                    bool(getattr(settings,
+                                 'phase8_fast_dual_ascent_compile', True)),
+                    int(getattr(settings,
+                                'phase8_fast_dual_ascent_sweeps', 1)))
+                _vd, _info = _fv.verify_query(
+                    _state_q, w, float(b), _sk,
+                    time_limit=max(1.0, time_left() - 5.0), extra_hs=())
+                closed = (_vd == 'unsat')
+                n_dom = int(_info.get('nodes', 0))
+                reason = f'fast-da:{_vd}'
+                if print_progress:
+                    print(f'Phase 1.6 (fast-da) q{qi}: {_vd} nodes={n_dom} '
+                          f'peak={_info.get("peak_frontier", 0)} '
+                          f'wall={_info.get("wall", 0.0):.1f}s '
+                          f'stop={_info.get("reason", "")}', flush=True)
             # no_reforward routes to the validated `_crown_bab_noreforward`
             # (its own per-domain-ew BaBSR branching + kfsb/multilevel);
             # `_ibp_crown_bab` is kept for the IBP-reforward / loose-root
             # path (per-domain IBP intermediate refresh, width-only split).
-            if bool(getattr(settings, 'milp_graph_ibp_bab_no_reforward',
-                            False)):
+            if not closed and bool(getattr(
+                    settings, 'milp_graph_ibp_bab_no_reforward', False)):
                 closed, n_dom, reason = _crown_bab_noreforward(
                     gg, xl_g, xh_g, sb_q, alpha_init16, w, float(b),
                     device, dtype, time_left=lambda: time_left() - 5.0,
                     batch=_bab_batch, main_iters=_bab_iters,
-                    cand_iters=int(getattr(
-                        settings, 'milp_graph_ibp_bab_cand_iters', 8)),
-                    prefilter=int(getattr(
-                        settings, 'milp_graph_ibp_bab_prefilter', 12)),
-                    multilevel=int(getattr(
-                        settings, 'milp_graph_ibp_bab_multilevel', 2)),
-                    print_progress=print_progress)
-            else:
+                    cand_iters=_bab_cand, prefilter=_bab_pref,
+                    multilevel=_bab_ml, print_progress=print_progress)
+            elif not closed:
                 closed, n_dom, reason = _ibp_crown_bab(
                     gg, xl_g, xh_g, sb_q, w, float(b), device, dtype,
                     time_left=lambda: time_left() - 5.0, ew_w=None,
@@ -3523,41 +3777,9 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
         bounds_by_relu[li] = (lo.cpu().numpy().astype(np.float64),
                                hi.cpu().numpy().astype(np.float64))
 
-    # Serialize ops for MILP workers
-    gg_ops_ser = []
-    for op in gg['ops']:
-        d = {'name': op['name'], 'type': op['type'], 'inputs': op['inputs']}
-        if op['type'] == 'conv':
-            d['kernel_np'] = op['kernel_np']
-            d['bias_np'] = op['bias_np']
-            d['in_shape'] = op['in_shape']
-            d['out_shape'] = op['out_shape']
-            d['stride'] = op['stride']
-            d['padding'] = op['padding']
-            d['n_out'] = op['n_out']
-        elif op['type'] == 'fc':
-            d['W_np'] = op['W_np']
-            d['bias_np'] = op['bias_np']
-        elif op['type'] == 'relu':
-            if 'layer_idx' in op:
-                d['layer_idx'] = op['layer_idx']
-        elif op['type'] == 'add':
-            d['is_merge'] = op.get('is_merge', False)
-            # Carry the bias for non-merge bias-adds (ACASXU / safenlp
-            # ONNXes export `Gemm → Add(bias)` separately). Dropping
-            # this used to silently encode the network bias-less in
-            # MILP workers → falsely-infeasible spec LPs.
-            d['bias'] = op.get('bias')
-        elif op['type'] == 'sub':
-            d['bias'] = op.get('bias')
-        elif op['type'] == 'reshape':
-            pass    # flat passthrough; consumers alias the input vars
-        else:
-            raise NotImplementedError(
-                f"milp serializer: unsupported op {op['type']!r} at "
-                f"{op['name']!r} — serializing without its params would "
-                f"make the MILP encode a different network")
-        gg_ops_ser.append(d)
+    # Serialize ops for MILP workers (reuse the pre-BaB serialization if it
+    # already ran — `_serialize_gg_ops` is query-independent and idempotent).
+    gg_ops_ser = _serialize_gg_ops(gg)
 
     x_lo_64 = spec.x_lo.astype(np.float64)
     x_hi_64 = spec.x_hi.astype(np.float64)
@@ -3671,6 +3893,17 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
             lp_pw = getattr(settings, 'milp_lp_per_worker', True)
             is_conv = layers_np_seq[seq_li]['type'] == 'conv'
 
+            # Sliding-window MILP: binarize only the last K upstream ReLU
+            # layers in each neuron's cone (deeper unstable -> LP-triangle),
+            # so a deep cone's MILP stays small enough to actually solve in
+            # `sample_timeout` instead of timing out -> LP-fallback. None =
+            # exact (all binarized; the old behavior).
+            _tight_window = getattr(settings, 'milp_graph_tighten_window', None)
+            if isinstance(_tight_window, (int, float)) and _tight_window > 0:
+                _tight_window = int(_tight_window)
+            else:
+                _tight_window = None
+
             # Probe MILP vs LP
             n_samp = min(n_cores, len(unstable))
             samp = np.random.RandomState(li).choice(unstable, n_samp, replace=False)
@@ -3681,13 +3914,15 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                     layers_np_seq, x_lo_64, x_hi_64, seq_bounds, seq_li,
                     use_milp=True, timeout=sample_timeout,
                     n_cores=n_cores, neuron_subset=samp[:half],
-                    witness_n_random=_wnr, deadline=deadline)
+                    witness_n_random=_wnr, deadline=deadline,
+                    window=_tight_window)
 
             if not milp_to and is_conv:
                 new_lo, new_hi, _ = _tighten_layer_parallel(
                     layers_np_seq, x_lo_64, x_hi_64, seq_bounds, seq_li,
                     use_milp=True, timeout=sample_timeout, n_cores=n_cores,
-                    witness_n_random=_wnr, deadline=deadline)
+                    witness_n_random=_wnr, deadline=deadline,
+                    window=_tight_window)
                 method_label = 'MILP-sparse'
             else:
                 new_lo, new_hi, _ = _tighten_layer_parallel(
@@ -3851,7 +4086,13 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
     # finish, overruns the CLI deadline (observed NOFILE verdicts at
     # ext-kill: vc6/probe4), and Gurobi numeric trouble aborts the case.
     if not bool(getattr(settings, 'milp_graph_escalation_enabled', True)):
-        return _make_result('unknown', {
+        # Reached the end of the pipeline (PGD + α + BaB) with disjuncts
+        # still open. If the budget is spent (the BaB loops while
+        # time_left>10), this is a 'timeout'; only call it 'unknown' if the
+        # pipeline genuinely stopped early with time left (which would itself
+        # be a bug worth surfacing rather than masking as 'timeout').
+        _verdict_ne = 'timeout' if time_left() <= 10.0 else 'unknown'
+        return _make_result(_verdict_ne, {
             'time': time.perf_counter() - (deadline - total_timeout),
             'phase': 'no_escalation',
             'remaining': len(still_open_disj)}, stats)
