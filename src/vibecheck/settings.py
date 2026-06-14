@@ -489,6 +489,12 @@ def default_settings(**overrides):
         # progressing on benchmarks that DO have low-impact tail
         # neurons (most cases).
         bab_refine_layer_budget=30.0,
+        # Memory cap (peak elements) on the α-CROWN intermediate-bound
+        # refresh start nodes in `_phase1_bab_refine`: a layer is a start
+        # node only if n_targets × max_layer <= this (the per-target backward
+        # peak). None = uncapped (legacy; other benchmarks unaffected). Set
+        # on wide conv nets whose big layers' backward OOMs the GPU.
+        phase1_alpha_refresh_mem_elems=None,
         # Topk filter — only the K most-impactful unstable neurons per
         # layer get an MILP-tightening pass; the rest stay at the
         # forward-zono / α-CROWN bound. 0 = no filter (default). With
@@ -581,6 +587,27 @@ def default_settings(**overrides):
         # route avoids).
         milp_graph_alpha_enabled=False,
         milp_graph_alpha_iters=20,
+        # Which layers are FULL-BATCH α-CROWN start nodes (per-target
+        # backward) vs routed to the chunked, memory-safe
+        # `tighten_layer_alpha_crown`. The (non-chunked) per-target backward
+        # materializes a PEAK tensor of ~n_targets × max_layer_size
+        # elements (measured exactly: cifar10 normal L1 = 65536 × 65536 ×
+        # 4 B = 17.2 GB), so the cut is a MEMORY budget on that peak, not a
+        # fixed neuron count: a layer is a start node iff
+        # n_targets × max_layer ≤ milp_graph_alpha_start_mem_elems. At 2.5 G
+        # elems (≈10 GB peak) this fits the layers that fit on a 24 GB GPU
+        # and routes the wide-cnn7 / tinyimagenet big layers to the chunked
+        # tightener — with no per-net magic constant. Set mem_elems to
+        # None/0 to fall back to the fixed `milp_graph_alpha_start_cap`.
+        # 5 G elems (≈20 GB peak) keeps cifar10's 65536-neuron L1 a
+        # full-batch start node (its 4.3 G-elem / 17 GB backward fits) —
+        # which is load-bearing: that layer's intermediate bounds and the
+        # spec α must come from the SAME root-α optimization (self-
+        # consistent) or the no-reforward BaB destabilizes (9566 q6: L1 as
+        # start node → 97 domains; L1 via the separate `tighten_big_layers`
+        # → 449 / timeout). The wider cnn7 / tinyimagenet layers (8.6 G+)
+        # still exceed the budget → chunked tightener (memory-safe).
+        milp_graph_alpha_start_mem_elems=5_000_000_000,
         milp_graph_alpha_start_cap=32768,
         # Graph-path per-layer MILP tightening (Phase 2). Disable on
         # nets where it cannot move bounds (very wide conv layers).
@@ -600,6 +627,28 @@ def default_settings(**overrides):
         # layers on tight-root nets). On => bound climbs like ABC
         # (9566: -0.065 -> +0.002 in 23 domains / 6.7s).
         milp_graph_ibp_bab_no_reforward=False,
+        # `_crown_bab_noreforward` knobs (used when no_reforward is on):
+        # per open domain, evaluate the top-`prefilter` BaBSR candidates
+        # per layer with a `cand_iters`-step α+β bound, branch the top
+        # `multilevel` simultaneously. Validated on cct2026 9566 (closes
+        # in ~45 domains / 40s; `scratch/cct2026/NOTES.md`).
+        milp_graph_ibp_bab_cand_iters=8,
+        milp_graph_ibp_bab_prefilter=12,
+        milp_graph_ibp_bab_multilevel=2,
+        # Targeted SAT-finding PGD in the milp graph path. The default
+        # Phase-1 PGD is one joint-loss attack over EVERY disjunct; when a
+        # few disjuncts remain open among many verified (cct2026 idx5613:
+        # 4 open of 199) the open disjuncts' gradient is diluted and the
+        # CE is missed. When 0 < n_open <= `_targeted_pgd_max_open`, the
+        # attack restricts to the open disjuncts with per-restart targeting
+        # (each open disjunct gets dedicated restarts). max_open=0 disables
+        # (default → behavior unchanged for every other benchmark). The
+        # small-open gate is a SAT signal: a hard UNSAT case with many open
+        # disjuncts skips the focused sweep, and the time cap bounds the
+        # cost on a few-open UNSAT case so it never starves the BaB.
+        milp_graph_targeted_pgd_max_open=0,
+        milp_graph_targeted_pgd_restarts=0,   # 0 → use pgd_restarts
+        milp_graph_targeted_pgd_budget=8.0,
         # Targeted per-target α-CROWN tightening of layers above the
         # start cap (chunked; see Phase 1.5). Off by default.
         milp_graph_tighten_big_layers=False,
@@ -611,6 +660,22 @@ def default_settings(**overrides):
         # Route through the graph path even for pairwise no-fork nets
         # (keeps the zonotope Phase 1; pair with the alpha/BaB knobs).
         milp_force_graph_path=False,
+        # Force IBP forward in milp_verify's Phase 1 regardless of input dim
+        # (for nets routed here by the perturbation gate whose α-CROWN root
+        # is tighter on IBP than the zonotope forward).
+        milp_force_ibp_phase1=False,
+        # Structural routing gate (verify_graph): conv nets with mean input
+        # box width > this go to milp_verify (IBP + α + ReLU-split BaB); the
+        # rest stay on the graph pipeline (zono + dual-ascent), tighter on
+        # small perturbations. None = off (all conv nets → milp_verify).
+        milp_route_pert_threshold=None,
+        # Within the LOW-uncertainty branch: instances whose per-instance
+        # budget (total_timeout) >= this go to the graph pipeline's zono +
+        # phase-8 dual-ascent BaB (closes the loose-root small-eps cluster);
+        # shorter-budget (easy) ones stay on the fast layers-path Phase 1.
+        # The benchmark assigns longer budgets to harder instances, so the
+        # budget is a difficulty proxy. None = always layers path for low-pert.
+        milp_route_dualascent_min_budget=None,
         # Multi-pass cascade: each pass loops L=0..max_layer applying
         # MILP+α-CROWN refresh. Pass N starts from bounds tightened by
         # pass N-1, so MILPs get a closer starting point and α-CROWN

@@ -3,51 +3,95 @@
 # normal and a wide variant. 60 instances, timeouts 30/120/550 s.
 # instances.csv ships CRLF line endings (bash sweeps need `tr -d '\r'`).
 #
-# Two routes by input size (gate in verify_graph.py auto-route block):
+# A STRUCTURAL routing gate on input uncertainty (verify_graph
+# perturbation-width gate, milp_route_pert_threshold) picks the engine:
 #
-# 1) cifar10 (3072-dim): graph PIPELINE with phase-8 dual-ascent BaB.
-#    The zonotope state fits comfortably, and the dual-ascent BnB closes
-#    the queries that survive alpha in ~50 nodes / 0.01 s (measured
-#    eps2_cnn7 idx5507_sample3: unsat 26 s vs ABC 22 s — the milp-path
-#    custom BaB plateaued on the same queries for 5 orders of magnitude
-#    more domains). Settings below mirror tinyimagenet_2024.yaml's lean
-#    all-GPU profile.
-auto_route_milp_for_conv: false
+#  - HIGH input uncertainty (large mean box width — cifar10 eps8, ~0.31) →
+#    milp_verify's GRAPH path: IBP Phase 1 + α-CROWN + no-reforward β-CROWN
+#    BaB. The large perturbation loosens the zonotope enough that CROWN's
+#    triangle relaxation + per-domain β-CROWN BaB wins; it closes the hard
+#    eps8 UNSAT queries (9566_s3 unsat 91s, 8231_s3 39s) that nothing else
+#    here closes. tinyimagenet (12288-dim) routes to the same engine via the
+#    input-dim gate (its zono generators OOM a 24 GB GPU) and keeps the
+#    config's force-graph/force-IBP flags (the pert gate only fires for the
+#    smaller-input conv nets).
+#
+#  - LOW input uncertainty (cifar10 eps2, ~0.078) → milp_verify's sequential
+#    LAYERS path with the plain zonotope+CROWN forward, tight enough to
+#    verify these outright (Phase 1 closes them at +1.3 in ~3s). Routing eps2
+#    through the IBP+BaB engine regressed them (IBP root far looser → timeout).
+#
+# eps8 (~0.31) vs eps2 (~0.078) separate with a 4× gap; threshold 0.15 sits
+# safely between. The gate OVERRIDES milp_force_graph_path / _ibp_phase1
+# per-instance for the conv nets; the config values below are the
+# tinyimagenet (input-dim-gated) defaults.
+auto_route_milp_for_conv: true
+milp_route_pert_threshold: 0.15
+# LOW-eps sub-gate: long-budget (>=60s, i.e. the 120s/550s harder samples)
+# low-eps instances → graph-pipeline dual-ascent (closes the loose-root
+# eps2 cluster: s2/s3 unsat in 36-87s, recovering ABC wins). Short-budget
+# (30s, easy) low-eps stay on the fast layers Phase 1.
+milp_route_dualascent_min_budget: 60
+phase1_ibp_input_dim_threshold: 8000
+milp_force_graph_path: true
+milp_force_ibp_phase1: true
+
+# --- LOW-eps long-budget engine: graph pipeline zono + phase-8 dual-ascent ---
+# Closes the loose-root small-eps cluster the β-CROWN BaB explodes on. KEEP
+# CROWN (do NOT set phase2_crown_enabled:false — that returned worst=-inf on
+# the wide net, a confirmed bug). max_tighten_layer:0 + zono_lift off trim the
+# (unused-here) tightening; the dual-ascent's far-probe cert is sound.
 phase8_use_dual_ascent_gpu: true
-phase8_dual_ascent_max_iter: 1
-zono_lift_enabled: false
-phase2_crown_enabled: false
-phase8_min_budget_frac: 0.5
-pgd_middle_enabled: false
+phase8_fast_dual_ascent: true
 max_tighten_layer: 0
-parallel_pgd_enabled: false
-# Lean PGD: the 30s UNSAT cases were starved — Phase 0 PGD (3.5s) + Phase
-# 2.6 PGD (8s) ate the budget before the dual-ascent state could build
-# (needs ~10s), so they timed out. Trimming PGD frees that window:
-# eps2_cnn7 idx5913_sample1 timeout@31s -> unsat@18s, with the SAT cases
-# (eps8 s1) still found in 4-5s. (measured cct2026_v2_0613)
+zono_lift_enabled: false
+# Cap the α-refresh start nodes by a 5 G-elem peak budget: the wide cnn7's
+# 131072-neuron layers' per-target backward OOMs the 24 GB GPU (measured
+# eps2_wide idx4031_s9). At 5 G the wide big layers are excluded (keep their
+# Phase-1 bounds); the normal cnn7's 65536-neuron L1 (4.3 G) still fits.
+phase1_alpha_refresh_mem_elems: 5000000000
+
+# --- IBP + α-CROWN + no-reforward β-CROWN BaB (high-uncertainty engine) ---
+milp_graph_alpha_enabled: true
+milp_graph_tighten_enabled: false
+milp_graph_tighten_big_layers: true
+milp_graph_escalation_enabled: false
+# α start-node selection is a MAX-LAYER memory budget (settings:
+# milp_graph_alpha_start_mem_elems = 5e9 ≈ 20 GB peak), keeping cifar10's
+# 65536-neuron L1 a self-consistent full-batch start node and routing the
+# wide cnn7 / tinyimagenet giant layers to the chunked tightener. Phase 1.6
+# uses the batched (chunked) α-CROWN so the L1 backward peaks at ~13 GB
+# (the non-batched version peaks at 17 GB and OOMs under pressure).
+milp_graph_ibp_bab_enabled: true
+milp_graph_ibp_bab_no_reforward: true
+milp_graph_ibp_bab_split_deepest: false
+milp_graph_ibp_bab_batch: 16
+milp_graph_ibp_bab_alpha_iters: 20
+milp_graph_ibp_bab_root_alpha_iters: 60
+milp_graph_ibp_bab_cand_iters: 8
+milp_graph_ibp_bab_prefilter: 12
+milp_graph_ibp_bab_multilevel: 3
+
+# --- targeted SAT-finding PGD (milp graph path: tinyimagenet + eps8) ---
+# The default joint-loss PGD over all 199 disjuncts dilutes the few open
+# ones and misses CEs (idx5613_s3: 4 open, ABC finds sat in 16s, we missed
+# it). When <=16 disjuncts are open (a SAT signal), restrict the attack to
+# the open disjuncts with per-restart targeting and a larger restart pool.
+# Gated on the small open count + an 8s cap so hard UNSAT cases (many open,
+# or few-open-but-real) don't lose budget — each focused iter is ~50x
+# cheaper (4 disjuncts vs 199) and the plateau give-up cuts it short anyway.
+# restarts=256 (not 128): the saturated eps8 nets have narrow CE basins —
+# idx1247_s9 was only ~4/5 reliable at 128 (and OSI init did NOT help: 6/8),
+# but 256 restarts gives 8/8 (CE in ~1s). Still batched + sub-second.
+milp_graph_targeted_pgd_max_open: 16
+milp_graph_targeted_pgd_restarts: 256
+milp_graph_targeted_pgd_budget: 8.0
+
+# --- shared: lean PGD + no hanging MILP fallback ---
+# phase8_high_bin_fallback off: the high-bin MILP fallback builds a giant
+# Gurobi model without a mid-build deadline check and overruns the timeout.
+phase8_high_bin_fallback: false
 pgd_restarts: 30
 phase26_pre_cascade_total_frac: 0.03
 phase26_pre_cascade_per_spec_cap: 1.0
 phase26_pgd_per_spec_min_per_spec: 0.1
-# High-bin MILP fallback off: on the wide nets a query can have ~10k
-# unstable, and the fallback builds that giant Gurobi model without
-# checking the deadline mid-build — it overran the 30s timeout to a
-# 60s shell-kill (NOFILE). The dual-ascent is the workhorse here; the
-# fallback can't solve a 10k-binary query in the leftover seconds
-# anyway. Off => the wide hard case returns a clean unknown@timeout.
-phase8_high_bin_fallback: false
-#
-# 2) tinyimagenet (12288-dim): milp graph path with the CROWN-IBP Phase 1.
-#    The zono forward's input-identity generators need ~12 GiB per layer at
-#    fp32 (12288 gens x 262144 acts), two consecutive layers OOM a 24 GB
-#    A10G — no pipeline fits a zonotope here. IBP Phase 1 + chunked
-#    per-target big-layer tightening + joint alpha + ibp-BaB solve 5 of the
-#    6 probe classes (the 550s eps1 UNSAT tail needs more — see README).
-phase1_ibp_input_dim_threshold: 8000
-milp_graph_alpha_enabled: true
-milp_graph_tighten_enabled: false
-milp_graph_tighten_big_layers: true
-milp_graph_ibp_bab_enabled: true
-milp_graph_ibp_bab_split_deepest: true
-milp_graph_escalation_enabled: false

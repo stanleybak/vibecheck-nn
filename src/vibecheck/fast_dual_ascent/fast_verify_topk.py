@@ -37,7 +37,8 @@ import os
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import time
 import torch
-from .fast_verify_dual import parse_problem, parse_problem_gpu, Problem  # geometry with c_in/z_lo/z_hi
+from .fast_verify_dual import (parse_problem, parse_problem_gpu, Problem,  # geometry with c_in/z_lo/z_hi
+                               _DeadlineExceeded)
 
 _TOL = 1e-9
 
@@ -244,12 +245,14 @@ class Verifier:
         F['hs_a'] = G['hs_a']; F['hs_b'] = G['hs_b']
         return F
 
-    def _bounds(self, F, sides, lam0, lam1, nu):
+    def _bounds(self, F, sides, lam0, lam1, nu, deadline=None):
         B = sides.shape[0]
         best = torch.empty(B, device=self.device)
         o0 = torch.empty_like(lam0); o1 = torch.empty_like(lam1)
         onu = torch.empty_like(nu); i = 0
         while i < B:
+            if deadline is not None and time.perf_counter() > deadline:
+                raise _DeadlineExceeded()
             step = min(self.chunk, B - i)
             while True:
                 try:
@@ -295,6 +298,7 @@ class Verifier:
                 self._warmed.add(D)
         if dev.type == 'cuda': torch.cuda.synchronize()
         t0 = time.perf_counter(); elapsed = lambda: time.perf_counter() - t0
+        deadline = t0 + time_limit
         if prob.root_bound > 0:
             return 'unsat', dict(nodes=0, depth=0, peak_frontier=0, wall=0.0)
         sides = torch.tensor([[0], [1]], device=dev, dtype=torch.int8)
@@ -310,7 +314,8 @@ class Verifier:
                 return _unknown(sides.shape[0], 'time_limit')
             nodes_total += sides.shape[0]; peak = max(peak, sides.shape[0])
             try:
-                best, o0, o1, onu = self._bounds(self._F(G, depth), sides, lam0, lam1, nu)
+                best, o0, o1, onu = self._bounds(self._F(G, depth), sides, lam0, lam1, nu,
+                                                 deadline=deadline)
                 keep = best <= _TOL
                 ss = sides[keep]; l0 = o0[keep]; l1 = o1[keep]; nk = onu[keep]
                 if ss.shape[0] == 0:
@@ -323,6 +328,8 @@ class Verifier:
                 lam0 = torch.cat([torch.cat([l0, zf], 1), torch.cat([l0, zf], 1)], 0)
                 lam1 = torch.cat([torch.cat([l1, zf], 1), torch.cat([l1, zf], 1)], 0)
                 nu = torch.cat([nk, nk], 0)
+            except _DeadlineExceeded:
+                return _unknown(sides.shape[0], 'time_limit')
             except torch.cuda.OutOfMemoryError:
                 open_n = int(sides.shape[0]); sides = lam0 = lam1 = nu = best = o0 = o1 = None
                 torch.cuda.empty_cache()

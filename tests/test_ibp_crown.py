@@ -19,7 +19,7 @@ import torch
 from onnx import TensorProto, helper
 
 from vibecheck.onnx_loader import load_onnx
-from vibecheck.verify_milp import _ibp_crown_bab
+from vibecheck.verify_milp import _crown_bab_noreforward, _ibp_crown_bab
 from vibecheck.verify_zono_bnb import (
     _ibp_forward_graph,
     _ibp_forward_graph_batched,
@@ -323,6 +323,59 @@ def test_ibp_crown_bab_closes_and_exhausts(tmp_path):
         max_domains=64)
     assert not closed2
     assert reason2 in ('exhausted_pattern', 'max_domains', 'time')
+
+
+def test_crown_bab_noreforward_closes_and_exhausts(tmp_path):
+    from vibecheck import alpha_crown as ac
+    g = _conv_relu_fc_net(tmp_path)
+    xl, xh = _box(g, eps=0.1, seed=2)
+    gg, sb, _ = _spec_setup(g, xl, xh)
+    w = np.array([1.0, -1.0])
+    w_t = torch.tensor(w, dtype=DT)
+    # Plain (min-area) CROWN root lb vs the true min by sampling: craft a
+    # bias so the plain bound is negative but the true min positive — the
+    # BaB must split to close.
+    sbb = {L: (lo.unsqueeze(0), hi.unsqueeze(0)) for L, (lo, hi) in sb.items()}
+    lb0 = float(_spec_backward_graph_batched(
+        sbb, xl.unsqueeze(0), xh.unsqueeze(0), gg, {0: (w_t, 0.0)},
+        DEV, DT)[0, 0])
+    rng = np.random.default_rng(4)
+    true_min = np.inf
+    for _ in range(2000):
+        t = torch.tensor(rng.uniform(0, 1, xl.numel()), dtype=DT)
+        x = xl + t * (xh - xl)
+        y, _ = _point_forward(g, x)
+        true_min = min(true_min, float(w_t @ y))
+    assert lb0 < true_min                          # there is a CROWN gap
+    b_mid = -(lb0 + true_min) / 2                  # plain lb<0, true min>0
+    # Build sb + per-query spec α exactly as the production caller does
+    # (root α-CROWN, merge root_bounds into sb, warm-start from spec α).
+    bbr = {L: (lo.numpy(), hi.numpy()) for L, (lo, hi) in sb.items()}
+    un = {L: np.where((bbr[L][0] < 0) & (bbr[L][1] > 0))[0].tolist()
+          for L in bbr}
+    _, alpha_p, root_bounds, _ = ac.run_alpha_crown(
+        gg, xl, xh, bbr, w, b_mid, [], un, DEV, DT, n_iters=20,
+        track_best_alpha=True)
+    sb_m = dict(sb)
+    for L, (lo_t, hi_t) in root_bounds.items():
+        if L in sb_m:
+            sb_m[L] = (torch.maximum(sb_m[L][0], lo_t.detach().to(DT)),
+                       torch.minimum(sb_m[L][1], hi_t.detach().to(DT)))
+    alpha_spec = {L: a.detach() for L, a in alpha_p.get('spec', {}).items()}
+    closed, n_dom, reason = _crown_bab_noreforward(
+        gg, xl, xh, sb_m, alpha_spec, w, b_mid, DEV, DT,
+        time_left=lambda: 60.0, batch=8, main_iters=6, cand_iters=4,
+        prefilter=4, multilevel=2)
+    assert closed and reason == 'closed', (closed, n_dom, reason)
+    # Truly violated query (b far below the true min): cannot close; the
+    # search must terminate (exhausted / max_domains / time) and NEVER
+    # report closed — a false close here is a soundness bug.
+    closed2, _, reason2 = _crown_bab_noreforward(
+        gg, xl, xh, sb_m, alpha_spec, w, -true_min - 10.0, DEV, DT,
+        time_left=lambda: 20.0, batch=8, main_iters=2, cand_iters=2,
+        prefilter=4, multilevel=2, max_domains=64)
+    assert not closed2
+    assert reason2 in ('exhausted', 'max_domains', 'time')
 
 
 def test_run_alpha_crown_track_best_alpha(tmp_path):

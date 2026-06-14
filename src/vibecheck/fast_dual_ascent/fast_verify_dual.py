@@ -24,6 +24,16 @@ import torch
 _TOL = 1e-9
 
 
+class _DeadlineExceeded(Exception):
+    """Raised mid-bound when the wall deadline is crossed, so a single depth's
+    chunked bound over a huge frontier cannot overrun the verifier's
+    time_limit. Without this the deadline is only checked at the top of each
+    BFS depth, so a depth that STARTS just under the limit and spends ~45 s
+    bounding a 16 M-node frontier finishes ~45 s late — past the sweep
+    wrapper's grace, so the process is SIGKILL'd before writing a verdict
+    (cct2026 eps2_wide idx2558/idx8961: 550 s -> 596 s -> NOFILE)."""
+
+
 @dataclass
 class Problem:
     n_gens: int
@@ -245,13 +255,19 @@ class Verifier:
         F['c0'] = G['_c0']; F['el'] = G['e_lb']; F['eh'] = G['e_hi']
         return F
 
-    def _bounds(self, F, sides):
+    def _bounds(self, F, sides, deadline=None):
         """Bound the frontier in chunks; if a chunk OOMs, halve the chunk size and retry
-        (auto-fits the GPU). Raises only if even a tiny chunk can't fit."""
+        (auto-fits the GPU). Raises only if even a tiny chunk can't fit.
+
+        `deadline` (absolute perf_counter time): checked before each chunk so a
+        large frontier cannot overrun the verifier's wall budget; raises
+        `_DeadlineExceeded` (caught by `verify` -> clean 'time_limit' verdict)."""
         B = sides.shape[0]
         out = torch.empty(B, device=self.device)
         i = 0
         while i < B:
+            if deadline is not None and time.perf_counter() > deadline:
+                raise _DeadlineExceeded()
             step = min(self.chunk, B - i)
             while True:
                 try:
@@ -287,6 +303,7 @@ class Verifier:
         if dev.type == 'cuda':
             torch.cuda.synchronize()
         t0 = time.perf_counter(); elapsed = lambda: time.perf_counter() - t0
+        deadline = t0 + time_limit
         if prob.root_bound > 0:
             return 'unsat', dict(nodes=0, depth=0, peak_frontier=0, wall=0.0)
         frontier = torch.tensor([[0], [1]], device=dev, dtype=torch.int8)
@@ -301,7 +318,8 @@ class Verifier:
                 return _unknown(frontier.shape[0], 'time_limit')
             nodes_total += frontier.shape[0]; peak = max(peak, frontier.shape[0])
             try:
-                uncertified = frontier[self._bounds(self._F(G, depth), frontier) <= _TOL]
+                uncertified = frontier[self._bounds(self._F(G, depth), frontier,
+                                                    deadline=deadline) <= _TOL]
                 if uncertified.shape[0] == 0:
                     return 'unsat', dict(nodes=nodes_total, depth=depth, peak_frontier=peak, wall=elapsed())
                 if depth >= prob.n_splits:
@@ -310,6 +328,8 @@ class Verifier:
                     return _unknown(2 * uncertified.shape[0], 'frontier_cap')
                 z = torch.zeros(uncertified.shape[0], 1, device=dev, dtype=torch.int8)
                 next_frontier = torch.cat([torch.cat([uncertified, z], 1), torch.cat([uncertified, z + 1], 1)], 0)
+            except _DeadlineExceeded:
+                return _unknown(frontier.shape[0], 'time_limit')
             except torch.cuda.OutOfMemoryError:
                 open_n = int(frontier.shape[0]); uncertified = next_frontier = frontier = None
                 torch.cuda.empty_cache()

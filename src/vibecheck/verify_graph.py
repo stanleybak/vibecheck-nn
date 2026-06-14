@@ -3851,8 +3851,24 @@ def _phase1_bab_refine(
     # 3. open_qis = queries with spec_lb still <= 0 after step 2
     # The post-Phase-0.5 bbr feeds the ew sweep, and `open_qis` restricts
     # the AB-CROWN `remove_unstable_neurons` filter to un-proved queries.
+    # Memory cap on the α-refresh start nodes: the per-target backward in
+    # `_alpha_refresh_best_bounds` materializes a peak tensor of ~n_targets ×
+    # max_layer elements, so on a wide net (131072-neuron layers) the big
+    # layers OOM the GPU (measured: eps2_wide idx4031_s9). Cap by a peak-
+    # element budget (`phase1_alpha_refresh_mem_elems`, None = uncapped so
+    # other benchmarks are unaffected) — the excluded big layers keep their
+    # Phase-1 bounds; the spec α-CROWN + the dual-ascent BaB still run.
+    _max_layer_refresh = max(len(bounds_by_relu[L][0])
+                             for L in bounds_by_relu)
+    _refresh_mem = getattr(settings, 'phase1_alpha_refresh_mem_elems', None)
+
+    def _refresh_fits(L):
+        if not _refresh_mem:
+            return True
+        return len(bounds_by_relu[L][0]) * _max_layer_refresh <= int(
+            _refresh_mem)
     intermediate_start_nodes_init = [
-        Lk for Lk in bounds_by_relu if Lk > 0 and
+        Lk for Lk in bounds_by_relu if Lk > 0 and _refresh_fits(Lk) and
         ((bounds_by_relu[Lk][0] < 0)
          & (bounds_by_relu[Lk][1] > 0)).any()]
     unstable_indices_init = {
@@ -4177,9 +4193,9 @@ def _phase1_bab_refine(
             # (b) Joint α-CROWN refresh (only if we still have time).
             if time_left() > 0.5:
                 intermediate_start_nodes = [
-                    Lk for Lk in bounds_by_relu if Lk > 0 and
-                    ((bounds_by_relu[Lk][0] < 0)
-                     & (bounds_by_relu[Lk][1] > 0)).any()]
+                    Lk for Lk in bounds_by_relu if Lk > 0 and _refresh_fits(Lk)
+                    and ((bounds_by_relu[Lk][0] < 0)
+                         & (bounds_by_relu[Lk][1] > 0)).any()]
                 unstable_indices = {
                     Lk: np.where((bounds_by_relu[Lk][0] < 0)
                                   & (bounds_by_relu[Lk][1] > 0))[0].tolist()
@@ -8981,11 +8997,61 @@ def verify_graph(graph, spec, settings):
                        for n in graph.nodes.values())
         if has_conv and not graph.fork_points():
             from .verify_milp import milp_verify
-            if getattr(settings, 'print_progress', False):
-                print('[verify_graph] auto-routing conv net to milp_verify '
-                      '(historical pipeline tuned for oval21/cifar conv)',
-                      flush=True)
-            return milp_verify(graph, spec, settings)
+            # Structural difficulty gate (settings.milp_route_pert_threshold):
+            # route HIGH input-uncertainty instances (large mean input box
+            # width) to milp_verify's IBP + α-CROWN + ReLU-split BaB, and
+            # leave LOW-uncertainty ones on the graph pipeline's zono +
+            # dual-ascent BaB, which is tighter per-direction on small
+            # perturbations. Larger input uncertainty loosens the forward
+            # zonotope enough that the CROWN triangle relaxation + per-domain
+            # β-CROWN BaB wins; smaller keeps the zono state tight. The
+            # threshold is the only knob and scales to any benchmark whose
+            # difficulty tracks input-box width (default None = off → all
+            # conv nets to milp_verify, the historical behavior).
+            _pert_thr = getattr(settings, 'milp_route_pert_threshold', None)
+            _vb = getattr(settings, 'print_progress', False)
+            if _pert_thr is None or not hasattr(spec, 'x_lo'):
+                # gate off → all conv nets to milp_verify (historical).
+                if _vb:
+                    print('[verify_graph] auto-routing conv net to '
+                          'milp_verify', flush=True)
+                return milp_verify(graph, spec, settings)
+            _pw = float(np.mean(spec.x_hi - spec.x_lo))
+            if _pw > float(_pert_thr):
+                # HIGH uncertainty (large eps) → milp_verify's graph path:
+                # IBP + α-CROWN + no-reforward β-CROWN BaB. Closes the hard
+                # tight-root eps8 queries (CROWN's triangle beats the zono).
+                settings.milp_force_graph_path = True
+                settings.milp_force_ibp_phase1 = True
+                if _vb:
+                    print(f'[verify_graph] pert-gate: {_pw:.4f} > '
+                          f'{_pert_thr} -> milp_verify IBP+BaB', flush=True)
+                return milp_verify(graph, spec, settings)
+            # LOW uncertainty. Budget sub-gate: the benchmark assigns longer
+            # budgets to harder instances, so a long-budget low-eps instance
+            # is the LOOSE-ROOT cluster the per-direction-tight β-CROWN BaB
+            # can't close fast — send it to the graph pipeline's zono +
+            # phase-8 dual-ascent BaB (~3 µs/node brute-forces the looser
+            # frontier; closes eps2 s2/s3 in 36–87 s). Short-budget (easy)
+            # low-eps instances stay on the fast layers-path zono+CROWN
+            # Phase 1 (verifies them in seconds; the dual-ascent's heavier
+            # Phase 1+2 would blow their 30 s budget).
+            _min_b = getattr(settings, 'milp_route_dualascent_min_budget', None)
+            _budget = float(getattr(settings, 'total_timeout', 0.0))
+            if _min_b is not None and _budget >= float(_min_b):
+                if _vb:
+                    print(f'[verify_graph] pert-gate: {_pw:.4f} <= '
+                          f'{_pert_thr}, budget {_budget:.0f} >= {_min_b} '
+                          f'-> graph pipeline (dual-ascent)', flush=True)
+                # fall through to the graph pipeline below
+            else:
+                settings.milp_force_graph_path = False
+                settings.milp_force_ibp_phase1 = False
+                if _vb:
+                    print(f'[verify_graph] pert-gate: {_pw:.4f} <= '
+                          f'{_pert_thr}, budget {_budget:.0f} -> '
+                          f'milp_verify zono layers', flush=True)
+                return milp_verify(graph, spec, settings)
 
     # Auto-route SMALL FC nets (few ReLU layers, no conv, no bilinear) to
     # milp_verify, where the exact per-neuron MILP both attacks (PGD) and

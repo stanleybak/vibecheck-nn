@@ -77,6 +77,18 @@ def main():
                              'via --allow-unsafe-pkl-loading.')
     args = parser.parse_args()
 
+    if args.verbose:
+        # Line-buffer stdout so per-phase progress flushes on every newline.
+        # Without this, a redirected stdout is block-buffered and a hung/
+        # SIGKILL'd run (e.g. a timed-out MILP build) loses its entire
+        # buffered log → an undiagnosable empty file. The flushed marker
+        # below also confirms logging is live before any heavy work starts.
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except AttributeError:   # pre-3.7 / non-TextIOWrapper stdout
+            pass
+        print('[verbose] line-buffered logging enabled', flush=True)
+
     if args.write_pkl:
         # Prepare step: parse + cache, no verification.
         from .preparse import write_cache
