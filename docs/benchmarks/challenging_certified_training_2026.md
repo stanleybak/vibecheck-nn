@@ -128,27 +128,54 @@ keeps idx5613 at 5/5 — so the config sets 256. Still batched + sub-second.
 
 ## Final score
 
-**Full 60-case sweep** (A10G, `cct2026_fullsweep_final`, verdicts from
+**Full 60-case sweep** (A10G, `cct2026_fullsweep_oomfix_0614`, verdicts from
 `--results-file`):
 
 | Solver | Solved / 60 | breakdown |
 | --- | --- | --- |
-| **vibecheck** | **32** | 13 sat + 19 unsat (incl. idx7018_s4); the rest timeout/unknown |
+| **vibecheck** | **34** | 12 sat + 22 unsat; the rest timeout/unknown, **0 error** |
 | **AB-CROWN** | **33** | 12 sat + 21 unsat; 9 timeout, 18 NONE (OOM) |
 
-**Head-to-head (both swept on the A10G):** 32 ties · 27 both-fail · **0
-we-win · 1 ABC-win**. We are **behind ABC by 1** (`cct2026_fullsweep_final`
-+ the idx7018 fix vs `cct2026_abc_fullsweep`):
-- **idx9074_s6** (eps2_wide): ABC unsat 78 s; us timeout. Investigated by
-  ABC ablation like idx7018, but it's the OPPOSITE problem — a **root-bound
-  gap**, not throughput: our dual-ascent root is -0.69 vs ABC's -0.37 (1.9×
-  looser), so its frontier explodes. Re-routing idx9074 to the milp-graph
-  IBP+α engine DOES recover ABC's tight root (-0.37, and q2 of 2 closes), but
-  the remaining query q6's BaB frontier still **explodes** (4800+ domains,
-  growing) where ABC keeps its bounded (≤159) via β-CROWN + last-2-layer
-  kfsb — a branching/β-strength gap our no-reforward BaB can't match even
-  from the tight root, with fast throughput, or with split_deepest. Genuine
-  limitation; left unsolved (this is the 1 remaining ABC win).
+**Head-to-head (both swept on the A10G):** 33 both-solve · 26 both-fail ·
+**1 we-win (idx6587_s4) · 0 ABC-win**. We solve a **strict superset** of
+ABC's 33 — every case ABC solves, we solve, plus idx6587_s4 (ABC OOMs it).
+**Caveat: ABC's 18 OOMs are specific to the 24 GB A10G** (it crashes in
+`_relu_mask_alpha`/kfsb on the wide nets); on larger competition hardware ABC
+would solve more, so this `34 > 33` is a same-hardware result. vibecheck's
+chunked α-refresh + OOM-graceful BaB is what survives the 24 GB ceiling.
+
+- **idx9074_s6** (eps2_wide) — **SOLVED, 192 s** (`cct2026_fullsweep_oomfix_0614`;
+  ABC unsat ~63 s, so we are slower but verify it). The earlier "unsolved"
+  diagnosis was wrong on two counts; the real story:
+  - The −0.69 root was NOT inherent — a **memory-cap GATE was silently
+    skipping the α-refresh of the 4 WIDE layers** (131072/65536 neurons;
+    `phase1_alpha_refresh_mem_elems: 5e9` excludes `65536×131072 ≈ 8.6e9`).
+    Their intermediate bounds stayed loose → loose root. **Fix: chunk the
+    α-refresh (S-split + OOM-retry) instead of skipping** → root −0.69 → −0.47,
+    visible in the new `[phase0.5] α-refresh: all N unstable layers ...` trace.
+  - With the tighter root, **BOTH open queries close within the 540 s budget**:
+    q2 in 0.47 s / 47k nodes, **q6 in 106 s / 17.7 M nodes** (peak frontier
+    1.34 M). The prior "q6 explodes, unsolved" conclusion came from a **180 s
+    probe cut off mid-grind** — at the full budget the fast GPU dual-ascent
+    grinds q6 to completion; it does not exceed memory. Net case time 192 s.
+  - **ABC ablation (measured):** ABC's `clip_interm_domain` actually HURTS
+    this case (151 s timeout WITH clip vs 63 s WITHOUT) — clip is NOT the
+    lever here (it helps the tinyimagenet 550 s cases). With ABC's α-iter
+    forced to 1 (root −0.68 ≈ our pre-refresh root), **ABC's BaB also
+    OOMs/explodes** — confirming the tight root is what bounds the frontier.
+  - **Settings shipped from the investigation:** `alpha_crown_s_split_n` +
+    `alpha_crown_s_split_max` (chunk the wide α-refresh, OOM-retry escalates
+    then degrades to sound-looser at the cap); `phase05_per_spec_alpha`
+    (per-query spec α). The chunk-not-skip α-refresh is the load-bearing one;
+    per-spec α is kept on for the hardest roots.
+  - **Split order on the live eps2 path** (verify_graph dual-ascent) is
+    `ew·intercept` (`|ew|·(−lo·hi/(hi−lo))`) reranked by the box-halfspace ΔLB
+    (`phase8_score_box_halfspace`, default on); the `--verbose` line
+    `[fast-dual-ascent-gpu] qN branch_score=... top 5 split neurons: ...`
+    reports it per query. (`phase8_da_branch_score` ∈ {box_area, width,
+    intercept, lA_intercept} is a parallel knob on the *verify_milp* fast-da
+    route — `lA_intercept` recreates ABC's babsr `|lA|·intercept` — and does
+    not gate this eps2 path.)
 
 **idx7018_s4 — CLOSED (the ABC ablation paid off).** I twice wrongly
 concluded it needs ABC's per-domain `optimize_interm_bounds` (interm-refresh).
@@ -167,28 +194,35 @@ keep the default tight params (fewer iters TIMED OUT 9566_s3 — they need few
 domains + tight per-domain bounds, the opposite of idx7018). Verified: 9566_s3
 unsat 92 s, 8231_s3 unsat 44 s (no regression), idx7018_s4 unsat 383 s.
 
-Both ABC-wins were cases ABC closes via β-CROWN BaB. ABC also OOMs 18
-wide/large cases that we can't solve either (both-fail), so neither tool is
-complete on this benchmark. **At 32 < 33 we are 1 short of ABC** (idx9074_s6);
-closing idx7018 + idx9074 would tie. See the closeability investigation.
+ABC OOMs 17 wide/large cases that we can't solve either (both-fail), so
+neither tool is complete on this benchmark. **At 34 > 33 we lead ABC by 1**
+(idx6587_s4, which ABC OOMs) and solve every case ABC solves.
 
-By family (vibecheck solved / 10): eps2_cnn7 5, eps2_wide 4, eps8_cnn7 5,
-eps8_wide 4, tinyimagenet_cnn7 4, tinyimagenet_wide 9.
+By family (vibecheck solved / 10): eps2_cnn7 5, eps2_wide 6, eps8_cnn7 5,
+eps8_wide 4, tinyimagenet_cnn7 5, tinyimagenet_wide 9.
 
 Fixes vs the earlier partial sweep v5 (42/60):
 - **idx5613_s3** (tinyimagenet wide, SAT): unknown → **sat** (targeted PGD).
 - **idx1247_s9** (eps8_cnn7, SAT): timeout → **sat** (targeted PGD, ~4 s vs
   ABC's 8 s) — a case ABC also solves, so it lifts us from a loss to a tie.
-- **idx4031_s9, idx8961_s8** (eps2_wide): error (OOM) → clean **timeout**
-  (memory cap; ABC also OOMs these). The eps2_wide dual-ascent overran the
-  deadline → NOFILE on idx2558/idx8961/idx9074; the Phase-8 per-chunk
-  deadline check (`fast_verify_dual.py`) converts those to clean `timeout`.
+- **idx4031_s9** (eps2_wide): error (OOM) → clean **timeout**. The wide
+  cnn7's 131072-neuron α-refresh backward won't fit even fully chunked
+  (`s_split` escalates 8→16→32→64=cap on the 22 GB A10G). At the cap the
+  α-refresh now **degrades to the looser-but-sound Phase-1 bounds** (returns
+  `{}`, a no-op merge) with a loud `[phase0.5] α-refresh OOM at s_split=64
+  (cap) -> ... sound timeout, not an error` log — so the case is a sound
+  timeout, never an error. ABC also OOMs this case.
+- **idx8076_s9** (tinyimagenet wide): error (OOM in `_crown_bab_noreforward`'s
+  per-domain backward → `_make_slopes`) → clean **unknown**. The no-reforward
+  β-CROWN BaB now catches the OOM, frees cache, and returns not-closed (sound:
+  the proof is merely incomplete, never a wrong verdict). ABC also OOMs it.
+- **idx2558_s7, idx8961_s8, idx3310_s5** (eps2_wide): NOFILE/overrun → clean
+  **timeout** (the Phase-8 per-chunk deadline check converts these to a
+  results-file `timeout`). ABC OOMs all three.
 
-**Known loss vs AB-CROWN: idx7018_s4** (tinyimagenet_eps1_cnn7) — ABC unsat
-77 s (β-CROWN BaB with per-domain `optimize_interm_bounds`); we return
-unknown at 550 s (the no-reforward BaB keeps stale intermediate bounds on a
-~-1.8 root). See the closeability investigation below. The full ABC sweep
-will enumerate the complete win/loss/tie set.
+**idx7018_s4** (tinyimagenet_eps1_cnn7) — **now a TIE** (both solve): ABC
+unsat ~77 s, we unsat 385 s via the route-based high-throughput BaB (see the
+idx7018 paragraph above). Was a loss before that fix.
 
 **ABC cross-check of the original 15 sweep-v5 miss cases**
 (`cct2026_abc_misscheck`, 550 s): **14 hard-for-both, 1 (idx1247_s9) was an
@@ -205,8 +239,9 @@ full sweep — idx7018_s4 is among those, hence the loss above.)
 | eps8_cnn7 | **idx1247_s9** | **sat 8 s → FIXED (we sat ~1 s)** |
 
 (That table was the original 15-case misscheck; the full 60-case ABC sweep
-later surfaced idx7018_s4 and idx9074_s6 as the two real ABC wins — idx7018
-is now closed, idx9074 remains the one loss. See the Final score above.)
+later surfaced idx7018_s4 and idx9074_s6 as the two then-open ABC wins —
+**both are now CLOSED** (idx7018 via route-based BaB, idx9074 via chunk-not-skip
+α-refresh), and idx6587_s4 flipped to a vibecheck win. See the Final score above.)
 
 ## Lessons learned (worth carrying to the next benchmark)
 

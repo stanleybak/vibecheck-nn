@@ -45,11 +45,18 @@ phase8_use_dual_ascent_gpu: true
 phase8_fast_dual_ascent: true
 max_tighten_layer: 0
 zono_lift_enabled: false
-# Cap the α-refresh start nodes by a 5 G-elem peak budget: the wide cnn7's
-# 131072-neuron layers' per-target backward OOMs the 24 GB GPU (measured
-# eps2_wide idx4031_s9). At 5 G the wide big layers are excluded (keep their
-# Phase-1 bounds); the normal cnn7's 65536-neuron L1 (4.3 G) still fits.
-phase1_alpha_refresh_mem_elems: 5000000000
+# α-refresh ALL unstable layers (no skip). The wide cnn7's 131072-neuron
+# layers' per-target backward would OOM, so chunk via the S-split: start at 8
+# (fits the 24 GB A10G), and the OOM-retry escalates further if needed. The
+# old mem-cap skipped these wide layers, leaving their intermediate bounds
+# loose → loose root (idx9074 −0.69 vs −0.44 refreshed) → BaB frontier blew up.
+alpha_crown_s_split_n: 8
+# Per-spec α in the Phase-0.5 spec α-CROWN (separate α per open query). On the
+# hard cifar10 eps2 UNSAT cases the root has few open queries pulling α in
+# different directions, so per-spec is tighter than a shared α. (Measured
+# small on idx9074 q6 — the chunked intermediate refresh above is the bigger
+# lever — but kept on so the hardest cases get the tightest available root.)
+phase05_per_spec_alpha: true
 
 # --- IBP + α-CROWN + no-reforward β-CROWN BaB (high-uncertainty engine) ---
 milp_graph_alpha_enabled: true

@@ -481,12 +481,8 @@ def default_settings(**overrides):
         # progressing on benchmarks that DO have low-impact tail
         # neurons (most cases).
         bab_refine_layer_budget=30.0,
-        # Memory cap (peak elements) on the α-CROWN intermediate-bound
-        # refresh start nodes in `_phase1_bab_refine`: a layer is a start
-        # node only if n_targets × max_layer <= this (the per-target backward
-        # peak). None = uncapped (legacy; other benchmarks unaffected). Set
-        # on wide conv nets whose big layers' backward OOMs the GPU.
-        phase1_alpha_refresh_mem_elems=None,
+        # (Retired `phase1_alpha_refresh_mem_elems`: the α-refresh now chunks
+        # wide layers via the S-split OOM-retry instead of skipping them.)
         # Topk filter — only the K most-impactful unstable neurons per
         # layer get an MILP-tightening pass; the rest stay at the
         # forward-zono / α-CROWN bound. 0 = no filter (default). With
@@ -541,6 +537,12 @@ def default_settings(**overrides):
         # per-neuron MIP refinement, so its ew sign is irrelevant.
         bab_refine_phase05_alpha_iters=10,
         bab_refine_phase05_spec_iters=20,
+        # Per-spec α in the Phase-0.5 spec α-CROWN: a separate α per open
+        # query instead of one shared α. Much tighter when few queries
+        # remain open and pull α in different directions (cct2026 idx9074
+        # q2/q6). Default False — other benchmarks' shared α already
+        # matched α,β-CROWN, so leave them on the cheaper shared path.
+        phase05_per_spec_alpha=False,
         # Auto-route conv-heavy networks (oval21 cifar_base/deep/wide_kw,
         # cifar_biasfield) to the historical milp_verify pipeline at the
         # top of verify_graph(). bab_refine + alpha-zono Phase 8 was
@@ -906,6 +908,13 @@ def default_settings(**overrides):
         phase8_fast_dual_ascent=True,
         phase8_fast_dual_ascent_ls='logbucket',  # 'logbucket' (default) | 'topk'
         phase8_fast_dual_ascent_K=256,           # line-search width
+        # Dual-ascent BaB branch (split) ORDER score. The static order the
+        # GPU dual-ascent splits in. 'box_area' = legacy hi·|lo|/2; 'width' =
+        # hi−lo; 'intercept' = −lo·hi/(hi−lo); 'lA_intercept' = |lA|·intercept
+        # (recreates α,β-CROWN's kfsb babsr_score using the ROOT spec
+        # backward coefficient). On cct2026 idx9074 q6 the box-area order
+        # explodes the frontier where ABC's lA-weighted order stays bounded.
+        phase8_da_branch_score='box_area',
         phase8_fast_dual_ascent_compile=True,    # False = eager (skip ~3s warmup for one-off cold cases)
         # >1 routes Phase-8 to the K-step dual-ascent GPU kernel (sweeps λ-ascent
         # iterations per BaB node, warm-started) instead of the 1-step logbucket.
@@ -1341,6 +1350,10 @@ def default_settings(**overrides):
         # retry); ~7% wall overhead on cases that fit either, recovers
         # cifar100_resnet_large cases that need s_split≥2.
         alpha_crown_s_split_n=2,
+        # Max S-split the α-refresh escalates to on OOM before re-raising
+        # (each doubling cuts peak autograd retention ~1/N; replaces the old
+        # mem-cap layer-skip — wide layers are chunked, never skipped).
+        alpha_crown_s_split_max=64,
         # OOM-handling policy. True (default) = re-raise any CUDA/CPU OOM
         # so the user sees the real failure. False = callers that have an
         # explicit fallback path (e.g. benchmarking loops recording "OOM"

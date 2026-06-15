@@ -2995,55 +2995,71 @@ def _crown_bab_noreforward(gg, xl, xh, sb, alpha_spec, w_q, b_q, device,
                 for _ in range(min(batch, len(frontier)))]
         clamp_list = [d[2] for d in doms]
         n_domains += len(doms)
-        best = bound(clamp_list, main_iters)
-        sb_b, _ = make_sb(clamp_list)
-        for bi, clamps in enumerate(clamp_list):
-            if float(best[bi]) > 0:
-                continue
-            # PER-DOMAIN ew: recompute backward coeffs with THIS domain's
-            # split-tightened bounds (stale root ew plateaus at -0.004).
-            sb_bi = {L: (sb_b[L][0][bi], sb_b[L][1][bi]) for L in sb_b}
-            _, _, ewb = _spec_backward_graph(
-                sb_bi, xl, xh, gg, spec_ew, {0}, len(sb_bi),
-                device, dtype, return_ew=True)
-            # Candidates: top-`prefilter` unstable per layer by the BaBSR
-            # triangle-intercept score, excluding already-split neurons.
-            cand = []
-            for L in LS:
-                lo_d, hi_d = sb_b[L][0][bi], sb_b[L][1][bi]
-                umask = (lo_d < 0) & (hi_d > 0)
-                e = ewb.get(0, {}).get(L)
-                ew = (torch.as_tensor(np.asarray(e, np.float64),
-                                      device=device, dtype=dtype)
-                      if e is not None else torch.zeros_like(lo_d))
-                gap = (-lo_d * hi_d) / torch.clamp(hi_d - lo_d, min=1e-12)
-                score = torch.clamp(ew, max=0).abs() * gap * umask.to(dtype)
-                k = min(prefilter, int(umask.sum()))
-                if k > 0:
-                    vals, idxs = torch.topk(score, k)
-                    for vv, j in zip(vals.tolist(), idxs.tolist()):
-                        if vv > 0 and (L, int(j)) not in clamps:
-                            cand.append((L, int(j)))
-            if not cand:
-                # Fully split (or all-stable) pattern, bound still <= 0:
-                # the backward bound over a fixed pattern is exact for the
-                # affine composition — cannot improve by splitting further.
-                return False, n_domains, 'exhausted'
-            # Evaluate each candidate's 2 children (cheap α+β), pick the
-            # top-`multilevel` by worst child, branch all picks at once.
-            trial = [{**clamps, key: side}
-                     for key in cand for side in (0, 1)]
-            tb = bound(trial, cand_iters)
-            csc = [(min(float(tb[2 * i]), float(tb[2 * i + 1])), cand[i])
-                   for i in range(len(cand))]
-            csc.sort(reverse=True)
-            picks = [key for _, key in csc[:multilevel]]
-            for combo in itertools.product([0, 1], repeat=len(picks)):
-                counter += 1
-                child = dict(clamps)
-                for key, side in zip(picks, combo):
-                    child[key] = side
-                heapq.heappush(frontier, (float(best[bi]), counter, child))
+        try:
+            best = bound(clamp_list, main_iters)
+            sb_b, _ = make_sb(clamp_list)
+            for bi, clamps in enumerate(clamp_list):
+                if float(best[bi]) > 0:
+                    continue
+                # PER-DOMAIN ew: recompute backward coeffs with THIS domain's
+                # split-tightened bounds (stale root ew plateaus at -0.004).
+                sb_bi = {L: (sb_b[L][0][bi], sb_b[L][1][bi]) for L in sb_b}
+                _, _, ewb = _spec_backward_graph(
+                    sb_bi, xl, xh, gg, spec_ew, {0}, len(sb_bi),
+                    device, dtype, return_ew=True)
+                # Candidates: top-`prefilter` unstable per layer by the BaBSR
+                # triangle-intercept score, excluding already-split neurons.
+                cand = []
+                for L in LS:
+                    lo_d, hi_d = sb_b[L][0][bi], sb_b[L][1][bi]
+                    umask = (lo_d < 0) & (hi_d > 0)
+                    e = ewb.get(0, {}).get(L)
+                    ew = (torch.as_tensor(np.asarray(e, np.float64),
+                                          device=device, dtype=dtype)
+                          if e is not None else torch.zeros_like(lo_d))
+                    gap = (-lo_d * hi_d) / torch.clamp(hi_d - lo_d, min=1e-12)
+                    score = (torch.clamp(ew, max=0).abs() * gap
+                             * umask.to(dtype))
+                    k = min(prefilter, int(umask.sum()))
+                    if k > 0:
+                        vals, idxs = torch.topk(score, k)
+                        for vv, j in zip(vals.tolist(), idxs.tolist()):
+                            if vv > 0 and (L, int(j)) not in clamps:
+                                cand.append((L, int(j)))
+                if not cand:
+                    # Fully split (or all-stable) pattern, bound still <= 0:
+                    # the backward bound over a fixed pattern is exact for the
+                    # affine composition — cannot improve by splitting further.
+                    return False, n_domains, 'exhausted'
+                # Evaluate each candidate's 2 children (cheap α+β), pick the
+                # top-`multilevel` by worst child, branch all picks at once.
+                trial = [{**clamps, key: side}
+                         for key in cand for side in (0, 1)]
+                tb = bound(trial, cand_iters)
+                csc = [(min(float(tb[2 * i]), float(tb[2 * i + 1])), cand[i])
+                       for i in range(len(cand))]
+                csc.sort(reverse=True)
+                picks = [key for _, key in csc[:multilevel]]
+                for combo in itertools.product([0, 1], repeat=len(picks)):
+                    counter += 1
+                    child = dict(clamps)
+                    for key, side in zip(picks, combo):
+                        child[key] = side
+                    heapq.heappush(
+                        frontier, (float(best[bi]), counter, child))
+        except torch.cuda.OutOfMemoryError:
+            # The per-domain backward over this batch won't fit. BaB cannot
+            # continue, but the proof is simply INCOMPLETE — returning
+            # not-closed is SOUND (the case degrades to unknown/timeout, never
+            # a wrong verdict). Mirrors the phase-0.5 α-refresh OOM fallback
+            # (cct2026 tinyimagenet idx8076_s9 used to crash here with an
+            # `error` verdict; now it's a clean unknown/timeout).
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            print(f'    [crown-bab-nr] CUDA OOM at {n_domains} domains '
+                  f'(frontier {len(frontier)}) -> stop BaB, return unknown '
+                  f'(sound: not a verified verdict)', flush=True)
+            return False, n_domains, 'oom'
         if print_progress and n_domains >= n_report + 128:
             n_report = n_domains
             wl = min((d[0] for d in frontier), default=0.0)
@@ -3693,11 +3709,50 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
                     device=device, dtype=dtype,
                     chunk=int(getattr(settings,
                                       'phase8_state_backward_chunk', 256)))
-                _sk = sorted(
-                    [(u['layer_idx'], u['neuron_idx'])
-                     for u in _state_q['unstable_list']],
-                    key=lambda k: _bbr_st[k[0]][1][k[1]]
-                    * abs(_bbr_st[k[0]][0][k[1]]) / 2.0, reverse=True)
+                # Dual-ascent branch (split) ORDER. Selectable via
+                # `phase8_da_branch_score` because the right heuristic is
+                # case-dependent (a static box-area order explodes the q6
+                # frontier on cct2026 idx9074 where ABC's lA-weighted kfsb
+                # stays bounded). Options:
+                #   'box_area'      hi·|lo|/2            (legacy default)
+                #   'width'         hi − lo
+                #   'intercept'     −lo·hi/(hi−lo)       (ReLU-triangle gap)
+                #   'lA_intercept'  |lA|·intercept       (ABC kfsb, root lA)
+                # 'lA_intercept' recreates α,β-CROWN's babsr_score using the
+                # ROOT spec backward coefficient lA = (qw @ obj_G_out_csr) at
+                # each unstable neuron's generator column e_new_col. (Static —
+                # ABC recomputes lA per domain; this is the cheap root proxy.)
+                _bscore = str(getattr(
+                    settings, 'phase8_da_branch_score', 'box_area'))
+                _ul = _state_q['unstable_list']
+                if _bscore == 'lA_intercept' and _state_q.get(
+                        'obj_G_out_csr') is not None:
+                    _dvec = np.asarray(
+                        w, dtype=np.float64) @ _state_q['obj_G_out_csr']
+                    _dvec = np.asarray(_dvec).flatten()
+
+                def _branch_key(u):
+                    L = u['layer_idx']; n = u['neuron_idx']
+                    lo = float(_bbr_st[L][0][n]); hi = float(_bbr_st[L][1][n])
+                    _w = max(hi - lo, 1e-12)
+                    _icpt = (-lo * hi) / _w
+                    if _bscore == 'width':
+                        return _w
+                    if _bscore == 'intercept':
+                        return _icpt
+                    if _bscore == 'lA_intercept' and _state_q.get(
+                            'obj_G_out_csr') is not None:
+                        return abs(float(_dvec[u['e_new_col']])) * _icpt
+                    return hi * abs(lo) / 2.0   # 'box_area' (default)
+                _sk_u = sorted(_ul, key=_branch_key, reverse=True)
+                _sk = [(u['layer_idx'], u['neuron_idx']) for u in _sk_u]
+                if print_progress:
+                    _top = ', '.join(
+                        f'L{u["layer_idx"]}n{u["neuron_idx"]}'
+                        f'={_branch_key(u):.4g}' for u in _sk_u[:5])
+                    print(f'  [fast-dual-ascent-gpu] q{qi} branch_score='
+                          f'{_bscore} ({len(_ul)} unstable); top 5 split '
+                          f'neurons: {_top}', flush=True)
                 _fv = _get_fast_da_verifier(
                     device,
                     str(getattr(settings, 'phase8_fast_dual_ascent_ls',

@@ -3819,20 +3819,55 @@ def _phase1_bab_refine(
         Returns `best_bounds: dict {L: (lo_t, hi_t)}` from
         `run_alpha_crown_batched` (shared α across queries with a
         spec-LB loss).
+
+        On a wide net the per-target backward can OOM. Rather than SKIP the
+        wide layers (a gate that leaves their bounds loose — the old
+        `phase1_alpha_refresh_mem_elems` behavior), CHUNK harder: catch the
+        OOM and retry with double the S-split (which cuts peak autograd
+        retention ~1/N), up to a cap. The trace records each step.
         """
         _dir_mode = str(settings.alpha_crown_dir_mode
                          if 'alpha_crown_dir_mode' in settings
                          else 'auto')
-        _s_split = int(settings.alpha_crown_s_split_n
-                        if 'alpha_crown_s_split_n' in settings
-                        else 1)
-        _, _, best_bounds, _ = ac.run_alpha_crown_batched(
-            gg, xl, xh, bbr_now, w_qs, b_qs, S_nodes, un_idx,
-            device, dtype, n_iters=n_iters, lr=alpha_lr,
-            lr_decay=0.98, early_stop_on_positive=False,
-            dir_mode=_dir_mode, s_split_n=_s_split,
-            time_left_fn=time_left)
-        return best_bounds
+        _s_split = max(1, int(settings.alpha_crown_s_split_n
+                              if 'alpha_crown_s_split_n' in settings
+                              else 1))
+        _s_split_cap = int(getattr(
+            settings, 'alpha_crown_s_split_max', 64))
+        while True:
+            try:
+                _, _, best_bounds, _ = ac.run_alpha_crown_batched(
+                    gg, xl, xh, bbr_now, w_qs, b_qs, S_nodes, un_idx,
+                    device, dtype, n_iters=n_iters, lr=alpha_lr,
+                    lr_decay=0.98, early_stop_on_positive=False,
+                    dir_mode=_dir_mode, s_split_n=_s_split,
+                    time_left_fn=time_left)
+                return best_bounds
+            except torch.cuda.OutOfMemoryError:
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                if _s_split >= _s_split_cap:
+                    # Even fully chunked (s_split == cap) the per-target
+                    # backward won't fit. The α-refresh is a pure TIGHTENING
+                    # step: returning {} leaves the caller's merge loop a no-op,
+                    # so `bounds_by_relu` keeps its SOUND (looser) Phase-1
+                    # intermediate bounds. Degrade to looser-but-sound rather
+                    # than erroring — the case becomes a sound timeout, never a
+                    # wrong verdict. This is NOT the banned silent-OOM-swallow
+                    # (that hides wrong RESULTS); the fallback is provably sound
+                    # and loudly logged. (cct2026 idx4031: cap=64 still OOMs a
+                    # 22 GB A10G on the wide cnn7's 131072-neuron layer.)
+                    print(f'  [phase0.5] α-refresh OOM at s_split='
+                          f'{_s_split} (cap) -> CANNOT chunk further; '
+                          f'keeping looser-but-sound Phase-1 bounds for '
+                          f'these layers (sound timeout, not an error)',
+                          flush=True)
+                    return {}
+                _s_split *= 2
+                if print_progress:
+                    print(f'  [phase0.5] α-refresh OOM at s_split='
+                          f'{_s_split // 2} -> chunk harder, retry '
+                          f's_split={_s_split}', flush=True)
 
     ew_score_per_layer = None
     min_ew_per_layer = None
@@ -3853,28 +3888,29 @@ def _phase1_bab_refine(
     # the AB-CROWN `remove_unstable_neurons` filter to un-proved queries.
     # Memory cap on the α-refresh start nodes: the per-target backward in
     # `_alpha_refresh_best_bounds` materializes a peak tensor of ~n_targets ×
-    # max_layer elements, so on a wide net (131072-neuron layers) the big
-    # layers OOM the GPU (measured: eps2_wide idx4031_s9). Cap by a peak-
-    # element budget (`phase1_alpha_refresh_mem_elems`, None = uncapped so
-    # other benchmarks are unaffected) — the excluded big layers keep their
-    # Phase-1 bounds; the spec α-CROWN + the dual-ascent BaB still run.
-    _max_layer_refresh = max(len(bounds_by_relu[L][0])
-                             for L in bounds_by_relu)
-    _refresh_mem = getattr(settings, 'phase1_alpha_refresh_mem_elems', None)
-
-    def _refresh_fits(L):
-        if not _refresh_mem:
-            return True
-        return len(bounds_by_relu[L][0]) * _max_layer_refresh <= int(
-            _refresh_mem)
-    intermediate_start_nodes_init = [
-        Lk for Lk in bounds_by_relu if Lk > 0 and _refresh_fits(Lk) and
+    # ALL unstable layers are refreshed (no mem-cap skip). Wide layers that
+    # would OOM the per-target backward are handled by CHUNKING harder inside
+    # `_alpha_refresh_best_bounds` (OOM → double the S-split), not by skipping
+    # them — skipping left their intermediate bounds loose, which gave a loose
+    # root and exploded the BaB frontier (cct2026 idx9074: cap-skip → root
+    # −0.69 / q6 explodes; refresh-all → root −0.44 / q2 closes). The legacy
+    # `phase1_alpha_refresh_mem_elems` cap is retired.
+    _unstable_layers = [
+        Lk for Lk in bounds_by_relu if Lk > 0 and
         ((bounds_by_relu[Lk][0] < 0)
          & (bounds_by_relu[Lk][1] > 0)).any()]
+    intermediate_start_nodes_init = list(_unstable_layers)
     unstable_indices_init = {
         Lk: np.where((bounds_by_relu[Lk][0] < 0)
                       & (bounds_by_relu[Lk][1] > 0))[0].tolist()
         for Lk in bounds_by_relu}
+    if print_progress:
+        _wid = {Lk: len(bounds_by_relu[Lk][0])
+                for Lk in intermediate_start_nodes_init}
+        print(f'  [phase0.5] α-refresh: all '
+              f'{len(intermediate_start_nodes_init)} unstable layers '
+              f'(widths {_wid}); wide layers chunked on OOM, not skipped',
+              flush=True)
     if intermediate_start_nodes_init and queries_flat:
         t_a = time.perf_counter()
         best_bounds = _alpha_refresh_best_bounds(
@@ -3898,12 +3934,19 @@ def _phase1_bab_refine(
     spec_alpha_phase05 = None  # captured for downstream ew sweep
     if queries_flat:
         t_a = time.perf_counter()
+        # per-spec α (a separate α per open query) is much tighter than a
+        # shared α when only a few queries remain open and they pull α in
+        # different directions (cct2026 idx9074 q2/q6: shared −0.58 vs ABC's
+        # per-spec −0.37). Gated by a setting so other benchmarks (where the
+        # shared α already matched ABC) are unchanged; default False.
+        _per_spec_a = bool(getattr(
+            settings, 'phase05_per_spec_alpha', False))
         spec_lbs_phase05, alpha_dict_p05, _, _ = (
             ac.run_alpha_crown_fixed_intermediate_batched(
                 gg, xl, xh, bounds_by_relu, w_qs, b_qs,
                 device, dtype, n_iters=phase05_spec_iters, lr=alpha_lr,
                 lr_decay=0.98, early_stop_on_positive=True,
-                per_spec_alpha=False, time_left_fn=time_left))
+                per_spec_alpha=_per_spec_a, time_left_fn=time_left))
         spec_alpha_phase05 = alpha_dict_p05.get('spec')
         open_qis = [qi for qi in range(len(queries_flat))
                     if float(spec_lbs_phase05[qi]) <= 0]
@@ -3922,8 +3965,15 @@ def _phase1_bab_refine(
         tb['spec_alpha_phase05'] = spec_alpha_phase05
         if print_progress:
             n_closed = len(queries_flat) - len(open_qis)
+            # Record the GAP on the open queries (their spec LB) — this is
+            # the root bound the BaB starts from. A loose root here (vs ABC's
+            # α-CROWN) is what makes the dual-ascent frontier explode; show it
+            # per open query so the trace pinpoints it without re-deriving.
+            _open_gaps = {queries_flat[qi][0]: round(float(spec_lbs_phase05[qi]), 4)
+                          for qi in open_qis}
             print(f'  [phase0.5] α-CROWN closed {n_closed}/'
-                  f'{len(queries_flat)} specs', flush=True)
+                  f'{len(queries_flat)} specs; open-query root LBs '
+                  f'{_open_gaps}', flush=True)
 
     # If Phase 0.5 closed every spec, exit Phase 1 immediately.
     if not open_qis:
@@ -4192,8 +4242,13 @@ def _phase1_bab_refine(
                               f'{type(_e).__name__}', flush=True)
             # (b) Joint α-CROWN refresh (only if we still have time).
             if time_left() > 0.5:
+                # All unstable layers (no mem-cap pre-filter): the chunked,
+                # OOM-graceful `_alpha_refresh_best_bounds` handles wide layers
+                # by escalating the S-split and degrading to sound-looser at the
+                # cap, so the old `_refresh_fits(Lk)` memory gate is retired
+                # (it was removed with `phase1_alpha_refresh_mem_elems`).
                 intermediate_start_nodes = [
-                    Lk for Lk in bounds_by_relu if Lk > 0 and _refresh_fits(Lk)
+                    Lk for Lk in bounds_by_relu if Lk > 0
                     and ((bounds_by_relu[Lk][0] < 0)
                          & (bounds_by_relu[Lk][1] > 0)).any()]
                 unstable_indices = {
@@ -7687,6 +7742,19 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 _latest_keys = per_query_scored.get(qi, scored_keys_q)
                 if list(_latest_keys) != list(scored_keys_q):
                     scored_keys_q = _latest_keys
+                if print_progress:
+                    # Branch (split) ORDER the dual-ascent BaB will follow.
+                    # The score is ew·intercept (|ew|·(-lo·hi/(hi-lo))) reranked
+                    # by the box-halfspace ΔLB when `phase8_score_box_halfspace`
+                    # is on (default); else the raw ew·intercept / box-area.
+                    _bsrc = ('box_halfspace' if bool(getattr(
+                        settings, 'phase8_score_box_halfspace', True))
+                        else 'ew·intercept')
+                    _top5 = ', '.join(
+                        f'L{k[0]}n{k[1]}' for k in list(scored_keys_q)[:5])
+                    print(f'  [fast-dual-ascent-gpu] q{qi} branch_score='
+                          f'{_bsrc}, {len(scored_keys_q)} unstable; '
+                          f'top 5 split neurons: {_top5}', flush=True)
                 # DEBUG: dump state passed to dual-ascent BaB if env var set
                 import os as _os
                 _dump = _os.environ.get('DA_BAB_DUMP_DIR')

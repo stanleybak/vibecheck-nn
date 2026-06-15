@@ -79,6 +79,23 @@ CASES = [
                'tinyimagenet_eps1_cnn7_idx7018_sample4.vnnlib',
         expected='verified', timeout=550, max_wall_s=460.0,
     ),
+    dict(
+        # The eps2 dual-ascent route's hard UNSAT (ABC unsat ~63 s; we ~192 s).
+        # Was a MISS until the chunk-not-skip α-refresh: a mem-cap gate was
+        # silently SKIPPING the α-refresh of the 4 wide layers (131072/65536
+        # neurons), leaving loose intermediate bounds → a loose −0.69 root that
+        # exploded the BaB frontier. Chunking the refresh (S-split + OOM-retry,
+        # degrading to sound-looser only at the cap) tightens the root to −0.47;
+        # then BOTH open queries close in the budget (q2 0.5 s, q6 ~106 s /
+        # 17.7 M nodes). Pins the eps2 route (chunked α-refresh +
+        # `phase05_per_spec_alpha` + fast GPU dual-ascent) that no other case
+        # here exercises. Wide max_wall (BaB node counts vary run-to-run).
+        desc='cifar10 eps2_wide_cnn7 idx9074_s6 (hard UNSAT, chunk-not-skip α-refresh)',
+        net='onnx/cifar10_eps2_wide_cnn7.onnx',
+        vnnlib='vnnlib/cifar10_eps2_wide_cnn7/'
+               'cifar10_eps2_wide_cnn7_idx9074_sample6.vnnlib',
+        expected='verified', timeout=550, max_wall_s=380.0,
+    ),
 ]
 
 
