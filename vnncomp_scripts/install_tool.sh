@@ -13,7 +13,15 @@ if [ "$1" != "${VERSION_STRING}" ]; then
 fi
 
 TOOL_DIR=$(dirname "$(dirname "$(realpath "$0")")")
-echo "Installing vibecheck into $TOOL_DIR/.venv"
+
+# END-on-failure banner: `set -e` would otherwise abort mid-install with no
+# closing marker. parse_log.py keys off these [vibecheck:install_tool] anchors.
+T_START=$(date +%s.%N)
+trap 'rc=$?; echo "================================================================"; echo "[vibecheck:install_tool] END status=fail rc=$rc"; echo "================================================================"' ERR
+
+echo "================================================================"
+echo "[vibecheck:install_tool] BEGIN version=$VERSION_STRING tool_dir=$TOOL_DIR"
+echo "================================================================"
 
 # psmisc provides killall (used by prepare_instance.sh).
 if command -v apt-get >/dev/null 2>&1; then
@@ -37,4 +45,8 @@ uv venv --python 3.12 .venv
 VIRTUAL_ENV="$TOOL_DIR/.venv" uv pip install -e ".[dev]"
 VIRTUAL_ENV="$TOOL_DIR/.venv" uv pip install gurobipy
 
-echo "vibecheck install complete."
+trap - ERR
+ELAPSED=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $T_START}")
+echo "================================================================"
+echo "[vibecheck:install_tool] END status=ok elapsed=${ELAPSED}s"
+echo "================================================================"

@@ -75,3 +75,19 @@ its CROWN/zono first pass.
 ## Known unsolved cases
 
 None. All 62/62 verified in <1 s/case.
+
+## Soundness note (fixed)
+
+A 2026-05-31 soundness sweep found **16 false-verifies** here (the
+`robustness_{2,4,16}perturbations_delta{5,10,20,40}_epsilon10_w{20,40}` cases across
+`NN_rul_{small,full}_window_*`). Root cause: `_solve_spec_graph_worker` (`verify_milp.py`)
+imposed the pre-ReLU interval bounds `(lo, hi)` as **hard variable bounds** but recomputed the
+affine in float64 while the bounds came from float32 zono/CROWN. collins's spec box perturbs
+only 4 of 400 inputs, so ~90% of neurons are near-constant with **degenerate bounds**
+(width ~1e-9) — tighter than the float32→float64 gap. A genuinely reachable point then landed
+just outside `[lo,hi]`, making the spec LP falsely infeasible → `feas UNSAT → verified`
+(confirmed by Gurobi IIS). **Fix:** outward FP-soundness inflation `lo-=tol, hi+=tol` with
+`tol = atol + rtol·max|bound|` (`milp_bound_inflation_atol/rtol`, default 1e-5/1e-5) where
+`bounds_by_relu` becomes spec-MILP variable bounds — inflation can only make the feasibility LP
+*less* infeasible, never create a false-verify. Validated: 16/16 fixed, 39/39 UNSAT still
+verify, no completeness loss.

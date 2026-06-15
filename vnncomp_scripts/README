@@ -17,7 +17,29 @@
        writes verdict (unsat/sat/unknown/timeout) on line 1; for `sat`, the
        counterexample s-expression follows.
 
+   Each script brackets its stdout with banner lines that VNNCOMP captures and
+   that the local parser keys off:
+       [vibecheck:<script>] BEGIN <key=val ...>
+       [vibecheck:<script>] END   verdict=... elapsed=...s ...
+   vibecheck runs --verbose by DEFAULT (per-phase progress, line-buffered so a
+   timed-out/SIGKILL'd run still flushes its trace instead of leaving an empty
+   log). The verdict in the run END banner comes from <results_file> and is
+   authoritative.
+
    Env overrides: VNNCOMP_PYTHON_PATH (dir of the python to use; default the
    repo .venv), VIBECHECK_PKL_CACHE_DIR (pre-parse cache location; default
-   /tmp/vibecheck_pkl), VIBECHECK_GPU_RESET=1 (do a GPU power-mode reset in
-   prepare; needs passwordless sudo, off by default).
+   /tmp/vibecheck_pkl), VIBECHECK_GPU_RESET=1 (GPU power-mode reset in prepare;
+   needs passwordless sudo, off by default), VIBECHECK_QUIET=1 (drop --verbose),
+   VIBECHECK_HEARTBEAT=N (emit a per-phase "[heartbeat]" line every N seconds so
+   a STALLED phase is visible in the captured log — the way to localize a hang
+   before the timeout kill; --verbose alone only prints at phase boundaries).
+
+5. Local helpers (NOT used by the competition harness):
+   - run_benchmarks.py <category|all|regular> [--bench-version 1.0]
+       Replays prepare+run over a benchmark's instances.csv into a results.csv.
+       Handles the VNNCOMP 2026 versioned layout (benchmarks/<cat>/<version>/);
+       --bench-version selects 1.0 (v1 specs; default) or 2.0 (v2; not yet
+       parseable). --log-dir DIR saves each instance's stdout for inspection.
+   - parse_log.py LOG|DIR  (or pipe a log on stdin)
+       Summarizes captured run logs: verdict, timing, net/spec shape, and — for
+       a run that was killed/timed out — the last heartbeat phase it hung in.
