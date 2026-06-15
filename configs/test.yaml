@@ -1,0 +1,17 @@
+# test — VNNCOMP "test" smoke category (toolchain check, not scored).
+#
+# Five instances (v1 / 1.0 specs): three tiny 1-D ReLU nets (nano/tiny/small)
+# plus ACAS Xu property 3 on nets 1-7 (sat) and 1-6 (unsat). Purpose is to
+# confirm the install + run pipeline produces correct verdicts, not performance.
+#
+# The default profile already returns all five correct verdicts, so this config
+# carries no tuning — it exists so run_instance.sh selects an explicit, stable
+# profile for the `test` category and pins the one behavior the set depends on.
+#
+# v2 (2.0) specs use the new `declare-network` / `X[0]` syntax that
+# vnnlib_loader.py does not yet parse — use the 1.0 instances for now. See
+# docs/benchmarks/test.md.
+
+# Phase-0 PGD must stay on: it's what finds the test_sat (ACAS Xu 1-7) witness.
+# Everything else is default_settings().
+disable_sat_finding: false
