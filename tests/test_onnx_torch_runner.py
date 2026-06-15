@@ -58,6 +58,44 @@ def test_runner_slice_tensor_inputs():
     assert torch.equal(out, data[1:3, 0:5:2])
 
 
+def test_pgd_no_false_sat_on_near_miss(tmp_path):
+    """pgd_via_onnx must accept a witness only for a REAL violation (margin<=0),
+    not a near-miss 1e-6 outside the unsafe region (the ml4acopf prop3 false-sat
+    class). Identity net Y=X, unsafe if Y_0 >= 1.0."""
+    import onnx
+    from onnx import helper, TensorProto
+    from vibecheck.onnx_torch_runner import pgd_via_onnx
+    from vibecheck.spec import VNNSpec, Conjunct, Constraint
+
+    W = helper.make_tensor('W', TensorProto.FLOAT, [1, 1], [1.0])
+    b = helper.make_tensor('b', TensorProto.FLOAT, [1], [0.0])
+    node = helper.make_node('Gemm', ['X', 'W', 'b'], ['Y'])
+    graph = helper.make_graph(
+        [node], 'identity',
+        [helper.make_tensor_value_info('X', TensorProto.FLOAT, [1, 1])],
+        [helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 1])],
+        [W, b])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 13)])
+    p = tmp_path / 'identity.onnx'
+    onnx.save(model, str(p))
+    dev = torch.device('cpu')
+
+    # Near-miss box: max Y = 1 - 5e-7 -> worst margin (1.0 - Y) is in (0, 1e-6].
+    # Old `<= 1e-6` falsely returned sat here; `<= 0` must return no-sat.
+    near = VNNSpec(np.array([0.0], np.float32), np.array([np.float32(1.0 - 5e-7)]),
+                   [Conjunct([Constraint(0, '>=', 1.0)])])
+    sat, wit = pgd_via_onnx(str(p), near, n_restarts=16, n_iter=80,
+                            device=dev, dtype=torch.float32, simplify=False)
+    assert sat is False and wit is None, 'near-miss must NOT be a false-sat'
+
+    # Real violation reachable (box up to 2.0): margin <= 0 -> sat.
+    real = VNNSpec(np.array([0.0], np.float32), np.array([2.0], np.float32),
+                   [Conjunct([Constraint(0, '>=', 1.0)])])
+    sat2, wit2 = pgd_via_onnx(str(p), real, n_restarts=16, n_iter=80,
+                              device=dev, dtype=torch.float32, simplify=False)
+    assert sat2 is True and wit2 is not None, 'real violation must be sat'
+
+
 def test_runner_slice_negative_axis_and_attr_form():
     data = torch.arange(12).reshape(3, 4).float()
     # negative axis (-1), default steps

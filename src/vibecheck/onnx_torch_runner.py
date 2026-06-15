@@ -342,7 +342,16 @@ def pgd_via_onnx(onnx_path, spec, n_restarts=256, n_iter=100, lr=0.1,
                     dim=1)
                 min_m, _ = stacked.min(dim=1)
                 with torch.no_grad():
-                    sat_mask = min_m <= 1e-6
+                    # Accept only a REAL violation (margin <= 0 — the unsafe
+                    # region, >= boundary inclusive). The old `<= 1e-6` accepted
+                    # near-misses 1e-6 OUTSIDE the unsafe region (the witness is
+                    # actually safe), producing false-`sat` on boundary cases
+                    # (ml4acopf 14_ieee prop3: witness margin +1e-6, ABC=unsat,
+                    # no real violation reachable). A genuine counterexample has
+                    # min_m <= 0; if PGD only reaches a positive near-miss it
+                    # keeps searching and ultimately returns no-sat (-> unknown),
+                    # never a false-sat.
+                    sat_mask = min_m <= 0.0
                     if sat_mask.any():
                         idx = int(sat_mask.nonzero()[0].item())
                         return True, x[idx].detach().cpu().numpy().reshape(spec.x_lo.shape)
