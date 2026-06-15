@@ -1354,6 +1354,12 @@ def default_settings(**overrides):
         # (each doubling cuts peak autograd retention ~1/N; replaces the old
         # mem-cap layer-skip — wide layers are chunked, never skipped).
         alpha_crown_s_split_max=64,
+        # Allocate the α-refresh α (+Adam state) only for UNSTABLE neurons per
+        # layer (ABC's `sparse_alpha`). Same bounds as dense (stable slopes are
+        # fixed regardless — measured identical on cct2026 idx9074) but shrinks
+        # the dominant memory ~n/n_unstable×, fitting wide-net refreshes that
+        # would otherwise OOM (cct2026 idx4031: error→sound). Default on.
+        alpha_refresh_sparse_alpha=True,
         # OOM-handling policy. True (default) = re-raise any CUDA/CPU OOM
         # so the user sees the real failure. False = callers that have an
         # explicit fallback path (e.g. benchmarking loops recording "OOM"

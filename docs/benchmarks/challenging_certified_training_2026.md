@@ -163,10 +163,12 @@ chunked α-refresh + OOM-graceful BaB is what survives the 24 GB ceiling.
     lever here (it helps the tinyimagenet 550 s cases). With ABC's α-iter
     forced to 1 (root −0.68 ≈ our pre-refresh root), **ABC's BaB also
     OOMs/explodes** — confirming the tight root is what bounds the frontier.
-  - **Settings shipped from the investigation:** `alpha_crown_s_split_n` +
-    `alpha_crown_s_split_max` (chunk the wide α-refresh, OOM-retry escalates
-    then degrades to sound-looser at the cap); `phase05_per_spec_alpha`
-    (per-query spec α). The chunk-not-skip α-refresh is the load-bearing one;
+  - **Settings shipped from the investigation:** `alpha_refresh_sparse_alpha`
+    (default on) — the memory lever: α only for unstable neurons, fitting the
+    wide refresh without OOM (see idx4031 below); `alpha_crown_s_split_n` +
+    `alpha_crown_s_split_max` (a secondary OOM-retry chunk, rarely needed once
+    sparse_alpha is on); `phase05_per_spec_alpha` (per-query spec α). The
+    refresh-all (no mem-cap skip) + sparse_alpha combination is load-bearing;
     per-spec α is kept on for the hardest roots.
   - **Split order on the live eps2 path** (verify_graph dual-ascent) is
     `ew·intercept` (`|ew|·(−lo·hi/(hi−lo))`) reranked by the box-halfspace ΔLB
@@ -206,12 +208,18 @@ Fixes vs the earlier partial sweep v5 (42/60):
 - **idx1247_s9** (eps8_cnn7, SAT): timeout → **sat** (targeted PGD, ~4 s vs
   ABC's 8 s) — a case ABC also solves, so it lifts us from a loss to a tie.
 - **idx4031_s9** (eps2_wide): error (OOM) → clean **timeout**. The wide
-  cnn7's 131072-neuron α-refresh backward won't fit even fully chunked
-  (`s_split` escalates 8→16→32→64=cap on the 22 GB A10G). At the cap the
-  α-refresh now **degrades to the looser-but-sound Phase-1 bounds** (returns
-  `{}`, a no-op merge) with a loud `[phase0.5] α-refresh OOM at s_split=64
-  (cap) -> ... sound timeout, not an error` log — so the case is a sound
-  timeout, never an error. ABC also OOMs this case.
+  cnn7's 131072-neuron α-refresh backward OOMed a 24 GB A10G when α (+Adam
+  state) was allocated for **all** neurons. **Fix: `sparse_alpha`
+  (`alpha_refresh_sparse_alpha`, default on) — allocate α only for the
+  ~19k UNSTABLE neurons** (ABC's `sparse_alpha: true`), shrinking the dominant
+  memory ~n/n_unstable× so the **full refresh fits** (58 s, roots tightened to
+  {2: −0.55, 3: −0.06, 5: −1.36, 6: −0.94}). Same math as dense (stable slopes
+  are fixed regardless — measured identical roots on idx9074). idx4031 still
+  times out (q5 −1.36 too loose for BaB) but the refresh now **works** instead
+  of erroring; if it ever OOMs even with sparse_alpha, the log points to the
+  unbuilt top-K target cap (ABC `select_unstable_idx`) as the next lever. ABC
+  also OOMs this case (it refreshes all unstable — `max_crown_size: 1e9` —
+  hence no top-K cap there either; our sparse_alpha is the more frugal default).
 - **idx8076_s9** (tinyimagenet wide): error (OOM in `_crown_bab_noreforward`'s
   per-domain backward → `_make_slopes`) → clean **unknown**. The no-reforward
   β-CROWN BaB now catches the OOM, frees cache, and returns not-closed (sound:

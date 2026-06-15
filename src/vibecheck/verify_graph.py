@@ -3834,6 +3834,13 @@ def _phase1_bab_refine(
                               else 1))
         _s_split_cap = int(getattr(
             settings, 'alpha_crown_s_split_max', 64))
+        # sparse_alpha (ABC's `sparse_alpha: true`): allocate α (+Adam state)
+        # only for UNSTABLE neurons per layer, not all n. The α/Adam state is
+        # the dominant memory here, so this shrinks it ~n/n_unstable× and fits
+        # the wide cnn7's 131072-neuron refresh with no target cap — same math
+        # as dense (stable neurons' slopes are fixed regardless), measured
+        # identical roots on idx9074. Default on.
+        _sparse_a = bool(getattr(settings, 'alpha_refresh_sparse_alpha', True))
         while True:
             try:
                 _, _, best_bounds, _ = ac.run_alpha_crown_batched(
@@ -3841,27 +3848,31 @@ def _phase1_bab_refine(
                     device, dtype, n_iters=n_iters, lr=alpha_lr,
                     lr_decay=0.98, early_stop_on_positive=False,
                     dir_mode=_dir_mode, s_split_n=_s_split,
-                    time_left_fn=time_left)
+                    sparse_alpha=_sparse_a, time_left_fn=time_left)
                 return best_bounds
             except torch.cuda.OutOfMemoryError:
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
                 if _s_split >= _s_split_cap:
-                    # Even fully chunked (s_split == cap) the per-target
-                    # backward won't fit. The α-refresh is a pure TIGHTENING
-                    # step: returning {} leaves the caller's merge loop a no-op,
-                    # so `bounds_by_relu` keeps its SOUND (looser) Phase-1
-                    # intermediate bounds. Degrade to looser-but-sound rather
-                    # than erroring — the case becomes a sound timeout, never a
-                    # wrong verdict. This is NOT the banned silent-OOM-swallow
-                    # (that hides wrong RESULTS); the fallback is provably sound
-                    # and loudly logged. (cct2026 idx4031: cap=64 still OOMs a
-                    # 22 GB A10G on the wide cnn7's 131072-neuron layer.)
-                    print(f'  [phase0.5] α-refresh OOM at s_split='
-                          f'{_s_split} (cap) -> CANNOT chunk further; '
-                          f'keeping looser-but-sound Phase-1 bounds for '
-                          f'these layers (sound timeout, not an error)',
-                          flush=True)
+                    # Even fully chunked (s_split == cap) and with sparse_alpha
+                    # the per-target backward won't fit. The α-refresh is a pure
+                    # TIGHTENING step: returning {} leaves the caller's merge
+                    # loop a no-op, so `bounds_by_relu` keeps its SOUND (looser)
+                    # Phase-1 intermediate bounds. Degrade to looser-but-sound
+                    # rather than erroring — a sound timeout, never a wrong
+                    # verdict. NOT the banned silent-OOM-swallow (that hides
+                    # wrong RESULTS); the fallback is provably sound + logged.
+                    # NEXT LEVER IF THIS EVER FIRES (not implemented): cap the
+                    # refresh to the top-K widest-gap (loosest) unstable neurons
+                    # per layer (ABC's select_unstable_idx / max_crown_size) —
+                    # fewer targets = less α state. sparse_alpha alone fit every
+                    # cct2026 case so far, so it's unbuilt.
+                    print(f'  [phase0.5] α-refresh OOM at s_split={_s_split} '
+                          f'(cap) even with sparse_alpha -> keeping looser-but-'
+                          f'sound Phase-1 bounds (sound timeout, not an error). '
+                          f'To go further, cap targets to top-K widest-gap '
+                          f'unstable neurons (ABC select_unstable_idx; '
+                          f'not implemented).', flush=True)
                     return {}
                 _s_split *= 2
                 if print_progress:
