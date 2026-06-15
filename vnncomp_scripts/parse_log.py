@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize vibecheck VNNCOMP run logs — the stdout the competition captures
+"""Summarize vibecheck VNNCOMP run logs - the stdout the competition captures
 per instance (and what `run_benchmarks.py --log-dir` saves locally).
 
 The install/prepare/run scripts emit stable banner anchors:
@@ -11,7 +11,7 @@ The install/prepare/run scripts emit stable banner anchors:
 plus vibecheck's own `Result:`, `Time:`, the `N ops, N ReLU layers` net line,
 `N constraint(s), N disjunct(s)`, and `[heartbeat] phase=...` lines. This reads
 one log, a directory tree (the --log-dir layout), or stdin, and prints status:
-verdict, timing, the net/spec shape, and — crucially for a run that timed out —
+verdict, timing, the net/spec shape, and - crucially for a run that timed out -
 whether it CLOSED (saw its END banner) or was KILLED, and the last heartbeat
 phase it was stuck in.
 
@@ -133,7 +133,7 @@ def fmt_instance(run, prep=None, full=False):
         out.append(f'         ^ hung in phase={run["last_phase"]} '
                    f'in-phase={run["last_inphase"]} (last heartbeat before kill)')
     elif st == 'KILLED':
-        out.append('         ^ no END banner and no heartbeat — died before/at load '
+        out.append('         ^ no END banner and no heartbeat - died before/at load '
                    '(enable VIBECHECK_HEARTBEAT=N to localize a hang)')
     if run['errors']:
         out.append(f'         ! {run["errors"][-1]}')
@@ -201,7 +201,7 @@ def summarize(runs, preps, full=False):
                   f'{_stem(runs[k], "onnx")}')
     if issues:
         print(f'needs-attention: {len(issues)} '
-              f'(KILLED / ERROR / unknown / timeout — listed first above)')
+              f'(KILLED / ERROR / unknown / timeout - listed first above)')
     else:
         print('needs-attention: none')
 
@@ -226,7 +226,7 @@ def main():
     runs = [b for b in blocks if b['script'] == 'run_instance']
     preps = [b for b in blocks if b['script'] == 'prepare_instance']
     if not runs and not blocks:
-        sys.exit('no [vibecheck:*] banner blocks found — was the log captured '
+        sys.exit('no [vibecheck:*] banner blocks found - was the log captured '
                  'with the run/prepare scripts (verbose, banners on)?')
     if not runs:  # only prepare/install blocks present
         for b in blocks:

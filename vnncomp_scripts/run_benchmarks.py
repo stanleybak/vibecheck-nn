@@ -3,8 +3,8 @@
 in the same format the other tools use in the vnncomp results repos.
 
 For each instance (onnx, vnnlib, timeout) in a benchmark's instances.csv this
-runs the competition scripts faithfully — prepare_instance.sh (pkl + warmup)
-then run_instance.sh — and records one results.csv row:
+runs the competition scripts faithfully - prepare_instance.sh (pkl + warmup)
+then run_instance.sh - and records one results.csv row:
 
     <category>,<onnx_path>,<vnnlib_path>,<prepare_s>,<verdict>,<runtime_s>
 
@@ -33,7 +33,7 @@ chosen version; `regular` runs the 2026 regular-track list below.
 
 Debug logs: pass `--log-dir DIR` to capture each instance's prepare+run output
 (with vibecheck `--verbose` enabled) to `DIR/<cat>/<net>__<prop>.{prepare,run}.log`
-instead of discarding it — handy for diagnosing a verdict. Add `--heartbeat N`
+instead of discarding it - handy for diagnosing a verdict. Add `--heartbeat N`
 to also emit per-phase heartbeat lines (stall detection).
 
 Env:
@@ -91,7 +91,7 @@ def _ce_stem(cat, onnx_rel, vnnlib_rel):
 
 def _drop_instance_pkl(onnx_abs, vnnlib_abs):
     """Delete this instance's pre-parse .pkl cache (disk hygiene). Best-effort:
-    import lazily and ignore any failure — a stale cache only wastes space."""
+    import lazily and ignore any failure - a stale cache only wastes space."""
     try:
         import numpy as np
         from vibecheck.preparse import pkl_cache_path

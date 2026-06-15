@@ -48,12 +48,12 @@ export OPENBLAS_NUM_THREADS=1
 # most need to debug). VIBECHECK_QUIET=1 silences it; VIBECHECK_HEARTBEAT=N adds
 # periodic in-phase "[heartbeat]" lines so a STALLED phase is visible in the log
 # (plain --verbose only prints at phase boundaries, so a phase that never returns
-# never prints — the heartbeat is what surfaces a hang before the timeout-kill).
+# never prints - the heartbeat is what surfaces a hang before the timeout-kill).
 DEBUG_ARGS="--verbose"
 [ "${VIBECHECK_QUIET:-0}" = "1" ] && DEBUG_ARGS=""
 [ -n "${VIBECHECK_HEARTBEAT:-}" ] && DEBUG_ARGS="$DEBUG_ARGS --heartbeat $VIBECHECK_HEARTBEAT"
 
-# BEGIN banner — a visual divider in the captured stdout that also serves as the
+# BEGIN banner - a visual divider in the captured stdout that also serves as the
 # stable parse anchor for parse_log.py (`[vibecheck:run_instance] BEGIN key=val`).
 echo "================================================================"
 echo "[vibecheck:run_instance] BEGIN category=$CATEGORY timeout=${TIMEOUT}s"
@@ -80,7 +80,7 @@ ELAPSED=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $T_START}")
 VERDICT=$(head -n1 "$RESULTS_FILE" 2>/dev/null | tr -d '[:space:]')
 [ -z "$VERDICT" ] && VERDICT=unknown
 
-# END banner — closing divider + parse anchor with the authoritative verdict.
+# END banner - closing divider + parse anchor with the authoritative verdict.
 echo "================================================================"
 echo "[vibecheck:run_instance] END verdict=$VERDICT elapsed=${ELAPSED}s rc=$RUN_RC category=$CATEGORY"
 echo "================================================================"
