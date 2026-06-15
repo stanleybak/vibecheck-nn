@@ -3260,7 +3260,10 @@ def _crown_intermediate_batched(gg, xl, xh, device, dtype):
     relu_op_by_L = {op['layer_idx']: op for op in gg['ops']
                      if op['type'] == 'relu' and 'layer_idx' in op}
     B = xl.shape[0]
-    for L in sorted(tight):
+    # `tight` also holds string-keyed bilinear/pool boxes (kept for the
+    # backward McCormick pass); iterate ONLY the int ReLU-layer keys so
+    # sorted() doesn't choke on mixed str/int (lsnc_relu quadratic forms).
+    for L in sorted(L for L in tight if isinstance(L, int)):
         if L not in relu_op_by_L:
             continue
         feed = relu_op_by_L[L]['inputs'][0]
@@ -3338,6 +3341,22 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
         last_name = ops[-1]['name']
         ew_at = {last_name: W_q.unsqueeze(0).expand(B, -1, -1).clone()}
         acc = b_q.unsqueeze(0).expand(B, -1).clone()  # (B, Q)
+
+    # Bilinear (mul_bilinear) backward needs each product's per-leaf input
+    # boxes to build the SOUND McCormick envelope. Every caller computes
+    # `tight` via `_forward_zonotope_graph_batched(xl, xh, ...)` immediately
+    # before this backward, and that forward stashes the boxes on
+    # `.last_bilinear_op_bounds` for exactly the same (xl, xh). Pull them in
+    # when the caller didn't pass them explicitly — otherwise the
+    # mul_bilinear branch falls to a point-linearization that is a TANGENT,
+    # not a bound: it omits the product's `-a*·b*` constant and so DOUBLE-
+    # counts, putting the "lower bound" ABOVE the true value. That silently
+    # false-verified lsnc_relu SAT cases (the quadratic Lyapunov value Y_1's
+    # `<= b` query came back +0.83 when the true value was -0.01, refuting
+    # the level-set band that the real counterexample lives in).
+    if bilinear_op_bounds is None:
+        bilinear_op_bounds = getattr(
+            _forward_zonotope_graph_batched, 'last_bilinear_op_bounds', None)
 
     import os as _os_gdbg
     _grad_dbg = _os_gdbg.environ.get('DEBUG_GRAD_FLOW', '') == '1'
@@ -3924,17 +3943,18 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
         elif t == 'mul_bilinear' and t != 'mul_bilinear_box_relax':
             # Will fall through to box-relax below if needed.
             # For point-side, similar to div but multiplication.
-            from .alpha_crown import (
-                _compute_point_centers_batched, _sum_to_shape)
-            x_centers = ((xl + xh) / 2)
+            from .alpha_crown import _sum_to_shape
             sh_in = op.get('in_shapes_nd', [None, None])
             sh_out = op.get('out_shape_nd')
             ia, ib = op['inputs'][0], op['inputs'][1]
-            if '_pcs_batched' not in locals() or _pcs_batched is None:
-                _pcs_batched = _compute_point_centers_batched(
-                    gg, x_centers, device, dtype)
-            c_a_batched = _pcs_batched[ia]
-            c_b_batched = _pcs_batched[ib]
+            # NOTE: the SOUND McCormick path below uses only the per-leaf
+            # input BOXES (bilinear_op_bounds), never the input point
+            # centers. The point-center forward (`_compute_point_centers_
+            # batched`) is only needed by the legacy point-linearization,
+            # which is now an unsound dead branch (raises). Computing it
+            # eagerly was a full redundant forward pass per spec backward —
+            # ~20% of the bound cost on lsnc. Compute it lazily ONLY in the
+            # else branch (which immediately raises, so in practice never).
             if (bilinear_op_bounds is not None
                     and ia in bilinear_op_bounds
                     and ib in bilinear_op_bounds):
@@ -3979,16 +3999,24 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                 ew_a = ew_a_nd.reshape(B, Q, -1)
                 ew_b = ew_b_nd.reshape(B, Q, -1)
             else:
-                # Legacy point-linearization (kept for back-compat).
-                ew_nd = ew.reshape(B, Q, *sh_out)
-                a_nd = c_a_batched.reshape(B, *sh_in[0])
-                b_nd = c_b_batched.reshape(B, *sh_in[1])
-                ew_a_nd_full = ew_nd * b_nd.unsqueeze(1)
-                ew_b_nd_full = ew_nd * a_nd.unsqueeze(1)
-                ew_a_nd = _sum_to_shape(ew_a_nd_full, (B, Q), sh_in[0])
-                ew_b_nd = _sum_to_shape(ew_b_nd_full, (B, Q), sh_in[1])
-                ew_a = ew_a_nd.reshape(B, Q, -1)
-                ew_b = ew_b_nd.reshape(B, Q, -1)
+                # No per-leaf input boxes -> the only alternative is a point
+                # linearization at the centers (ew_a = ew·b_c, ew_b = ew·a_c).
+                # That is a TANGENT to the bilinear surface, NOT a sound
+                # bound: it drops the `-a_c·b_c` constant, so at the center it
+                # evaluates to 2·a_c·b_c instead of a_c·b_c and the resulting
+                # "lower bound" can sit ABOVE the true value. Using it as a
+                # CROWN lower bound silently false-verifies (lsnc_relu). The
+                # forward always stashes these boxes, and this function pulls
+                # them above when the caller passes None — so reaching here
+                # means the boxes are genuinely missing. Fail loudly rather
+                # than certify an unsound bound.
+                raise NotImplementedError(
+                    f'mul_bilinear backward at {name!r}: missing per-leaf '
+                    f'input boxes (bilinear_op_bounds) for inputs '
+                    f'{ia!r}, {ib!r}. A point linearization here is unsound '
+                    f'(tangent, not a bound). Ensure the forward zono ran on '
+                    f'this box so .last_bilinear_op_bounds is populated, or '
+                    f'pass bilinear_op_bounds explicitly.')
             ea = ew_at.get(ia)
             eb = ew_at.get(ib)
             ew_at[ia] = ew_a.clone() if ea is None else ea + ew_a

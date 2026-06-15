@@ -190,6 +190,52 @@ def test_parse_or_and_multiple_disjuncts():
     spec = parse_vnnlib_text(text)
     assert len(spec.disjuncts) == 2
 
+
+def test_parse_or_and_trailing_global_y_threshold():
+    """Top-level Y asserts beside an (or ...) AND into EVERY disjunct.
+
+    Mirrors lsnc_relu's Lyapunov band: an output disjunction plus a
+    trailing `Y_1 in [a,b]` level-set band. Dropping the band enlarges
+    the unsafe region -> false-SAT, so the loader must conjoin it.
+    """
+    text = """
+    (assert (>= X_0 -1)) (assert (<= X_0 1))
+    (assert (or
+        (and (>= Y_0 1e-06))
+        (and (<= Y_2 -0.7))
+    ))
+    (assert (<= Y_1 0.41))
+    (assert (>= Y_1 0.35))
+    """
+    spec = parse_vnnlib_text(text)
+    assert len(spec.disjuncts) == 2
+    for conj in spec.disjuncts:
+        # Each disjunct keeps its own constraint PLUS both band bounds.
+        vals = {(c.index, c.op, c.value) for c in conj.constraints
+                if isinstance(c, Constraint)}
+        assert (1, '<=', 0.41) in vals
+        assert (1, '>=', 0.35) in vals
+    # disjunct 0 still has its own Y_0 >= 1e-06
+    assert any(c.index == 0 and c.op == '>=' for c in spec.disjuncts[0].constraints
+               if isinstance(c, Constraint))
+
+
+def test_parse_or_and_trailing_global_y_pairwise():
+    """Trailing top-level PAIRWISE Y assert also conjoins into each disjunct."""
+    text = """
+    (assert (>= X_0 -1)) (assert (<= X_0 1))
+    (assert (or
+        (and (>= Y_0 1.0))
+        (and (<= Y_2 -1.0))
+    ))
+    (assert (>= Y_3 Y_4))
+    """
+    spec = parse_vnnlib_text(text)
+    assert len(spec.disjuncts) == 2
+    for conj in spec.disjuncts:
+        pw = [c for c in conj.constraints if isinstance(c, PairwiseConstraint)]
+        assert any(c.comp == 3 and c.pred == 4 for c in pw)
+
 def test_parse_x_bounds_fallback_format():
     """X bounds in X_i lo hi format."""
     text = """

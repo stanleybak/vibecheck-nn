@@ -2592,6 +2592,23 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
+            elif node.op_type == 'Neg':
+                # Negation y = -x is an exact linear map. Emit the
+                # scalar `mul` op with scale=-1.0 so every downstream
+                # chain (zono forward, CROWN backward) handles it with no
+                # new handler (same move as the Softmax max-shift negate
+                # at __nshift). Used in lsnc_relu's controller saturation
+                # (u - relu(u - hi) - relu(... )), where Neg flips the
+                # sign of a ReLU-clamp residual.
+                inp_names = [node.inputs[0]
+                              if node.inputs[0] in computed
+                              else '__input__']
+                ops.append({
+                    'name': name, 'type': 'mul',
+                    'inputs': inp_names, 'scale': -1.0,
+                })
+                computed.add(name)
+
             # Known-safe passthrough ops (Identity / Dropout / Cast /
             # Shape / Unsqueeze) get aliased to their input. Any OTHER
             # op silently aliased here is a soundness hazard: e.g. Pow

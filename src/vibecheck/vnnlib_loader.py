@@ -149,6 +149,44 @@ def _parse_block_x_bounds(block):
 # (or (and ...)) parsing
 # ---------------------------------------------------------------------------
 
+def _parse_top_level_y_constraints(text, or_body):
+    """Output constraints asserted at TOP LEVEL, outside the (or ...) block.
+
+    By VNNLIB semantics every top-level `(assert ...)` is a conjunct of the
+    property, so a `(assert (<= Y_i v))` sitting beside an `(assert (or ...))`
+    output disjunction must be ANDed into EVERY disjunct:
+        P = (OR_k disj_k) AND (global_Y conjuncts)
+          = OR_k (disj_k AND global_Y).
+    Dropping these ENLARGES the unsafe region -> latent false-SAT. lsnc_relu
+    quadrotor2d encodes a Lyapunov level-set band `Y_1 in [0.3554, 0.4055]`
+    as two trailing top-level asserts; without them a witness with Y_1 far
+    outside the band (e.g. 28.3) falsely satisfied the OR and we returned a
+    spurious `sat`. The in-OR constraints are wrapped in `(and ...)`, the
+    global ones directly in `(assert ...)`, so anchoring the regex on
+    `(assert (op ...` matches only the latter; an in-(and ...) constraint
+    never matches. (or_body is accepted for signature symmetry with the
+    X-bound parser and to document the in/out-of-OR distinction.)
+    """
+    cons = []
+    # Threshold: (assert (>= Y_i const)) / (assert (<= Y_i const)).
+    for m in re.finditer(
+            r'\(assert\s+\(>=\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)\s*\)', text):
+        cons.append(Constraint(int(m.group(1)), '>=', float(m.group(2))))
+    for m in re.finditer(
+            r'\(assert\s+\(<=\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)\s*\)', text):
+        cons.append(Constraint(int(m.group(1)), '<=', float(m.group(2))))
+    # Pairwise: (assert (>= Y_i Y_j)) / (assert (<= Y_i Y_j)).
+    for m in re.finditer(
+            r'\(assert\s+\(>=\s+Y_(\d+)\s+Y_(\d+)\s*\)\s*\)', text):
+        cons.append(PairwiseConstraint(
+            pred=int(m.group(2)), comp=int(m.group(1))))
+    for m in re.finditer(
+            r'\(assert\s+\(<=\s+Y_(\d+)\s+Y_(\d+)\s*\)\s*\)', text):
+        cons.append(PairwiseConstraint(
+            pred=int(m.group(1)), comp=int(m.group(2))))
+    return cons
+
+
 def _parse_or_and(text, or_body, dtype=np.float32):
     """Parse (or (and ...) (and ...) ...) blocks."""
     # Find all (and ...) blocks
@@ -247,11 +285,19 @@ def _parse_or_and(text, or_body, dtype=np.float32):
 
     assert disjuncts, "No output constraints found in (or (and ...)) blocks"
 
+    # GLOBAL output conjuncts asserted at top level beside the (or ...)
+    # block (e.g. lsnc_relu's level-set band `Y_1 in [0.3554, 0.4055]`).
+    # By VNNLIB semantics these AND into EVERY disjunct; dropping them
+    # enlarges the unsafe region and yields false-SAT. Prepend so they
+    # apply to every conjunct below.
+    global_y = _parse_top_level_y_constraints(text, or_body)
+
     # Build Conjuncts with their per-disjunct X subbox (merged with
     # top-level X bounds). The subbox is stored on the Conjunct so
     # witness validation can check `x in subbox AND y violates`.
     conj_list = []
     for constraints, block_x in disjuncts:
+        constraints = list(constraints) + list(global_y)
         # Combined per-disjunct bounds: intersect block_x with top_x_bounds
         # (both apply simultaneously per disjunct). Where unconstrained,
         # fall back to the UNION bounding box so x_satisfied uses

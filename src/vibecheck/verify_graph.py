@@ -8921,10 +8921,14 @@ def verify_graph(graph, spec, settings):
             _many_varying_dims = n_var > 8
             # Split arity. K=2 (4-way) is the sweet spot when n_var is large:
             # K=4 (16-way) over-splits high-dim boxes (measured 56k leaves/39s
-            # at K=4 → 9.8k/11s at K=2, 5.7× fewer leaves), while K=1 (2-way)
-            # is too slow (per-iter overhead × hundreds of iters). When
-            # n_var ≤ 8 the arity is irrelevant (K=2 == K=4, measured) → K=4.
-            _default_K = 2 if _many_varying_dims else 4
+            # at K=4 → 9.8k/11s at K=2, 5.7× fewer leaves). When n_var ≤ 8 the
+            # arity is irrelevant to the LEAF COUNT (K=1 == K=2 == K=4, measured)
+            # — so use K=1, which takes the VECTORIZED GPU 2-way split. K>1 goes
+            # through a per-leaf Python loop that is catastrophic on the huge
+            # queues these large-batch bilinear cases build (lsnc q2: K=4 33s vs
+            # K=1 6.4s, same verdict). The old "K=1 too slow" note predates the
+            # chunk worklist + vectorized split that made K=1 the fast path.
+            _default_K = 2 if _many_varying_dims else 1
             settings.bab_split_depth = int(
                 _os_ksd.environ.get('BAB_SPLIT_DEPTH', str(_default_K)))
             # Split-dim boost EXPONENT. The boost
@@ -10980,32 +10984,62 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
     crown_intermediate = bool(getattr(
         settings, 'input_split_crown_intermediate', False))
     # Serialize ops once (for MILP escalation; cheap, no torch tensors).
+    # Only the per-leaf MILP-escalation path (gated by
+    # input_split_batched_milp_escalate, default OFF) consumes this list —
+    # the batched zono/CROWN BaB itself runs straight off the torch `gg`.
+    # The MILP builder only supports fc/conv/relu/add/sub layers, so for a
+    # graph with non-LP ops (mul/div_bilinear/reduce_sum/concat/slice/...
+    # — lsnc_relu's quadratic Lyapunov forms) there is no sound MILP
+    # encoding anyway. Build the serialized list ONLY when escalation is
+    # requested; then the NotImplementedError still fires loudly for an
+    # op the MILP builder can't honor (no silent skip). With escalation
+    # off the list stays empty and the consumer at the bottom short-
+    # circuits on `gg_ops_ser` being falsy.
+    _milp_escalate_serialize = bool(getattr(
+        settings, 'input_split_batched_milp_escalate', False))
     gg_ops_ser = []
-    for op in gg['ops']:
-        d = {'name': op['name'], 'type': op['type'],
-             'inputs': op['inputs']}
-        if op['type'] == 'fc':
-            d['W_np'] = op['W_np']; d['bias_np'] = op['bias_np']
-        elif op['type'] == 'relu' and 'layer_idx' in op:
-            d['layer_idx'] = op['layer_idx']
-        elif op['type'] == 'add':
-            d['is_merge'] = op.get('is_merge', False)
-            d['bias'] = op.get('bias')
-        elif op['type'] == 'sub':
-            d['bias'] = op.get('bias')
-        elif op['type'] == 'reshape':
-            pass    # flat passthrough; consumers alias the input vars
-        elif op['type'] == 'conv':
-            d['kernel_np'] = op['kernel_np']; d['bias_np'] = op['bias_np']
-            d['in_shape'] = op['in_shape']; d['out_shape'] = op['out_shape']
-            d['stride'] = op['stride']; d['padding'] = op['padding']
-            d['n_out'] = op['n_out']
-        else:
-            raise NotImplementedError(
-                f"gg serializer (dual-ascent): unsupported op "
-                f"{op['type']!r} at {op['name']!r} — serializing without "
-                f"its params would make consumers run a different network")
-        gg_ops_ser.append(d)
+    if _milp_escalate_serialize:
+        for op in gg['ops']:
+            d = {'name': op['name'], 'type': op['type'],
+                 'inputs': op['inputs']}
+            if op['type'] == 'fc':
+                d['W_np'] = op['W_np']; d['bias_np'] = op['bias_np']
+            elif op['type'] == 'relu' and 'layer_idx' in op:
+                d['layer_idx'] = op['layer_idx']
+            elif op['type'] == 'add':
+                d['is_merge'] = op.get('is_merge', False)
+                d['bias'] = op.get('bias')
+            elif op['type'] == 'sub':
+                d['bias'] = op.get('bias')
+            elif op['type'] == 'reshape':
+                pass    # flat passthrough; consumers alias the input vars
+            elif op['type'] == 'conv':
+                d['kernel_np'] = op['kernel_np']; d['bias_np'] = op['bias_np']
+                d['in_shape'] = op['in_shape']; d['out_shape'] = op['out_shape']
+                d['stride'] = op['stride']; d['padding'] = op['padding']
+                d['n_out'] = op['n_out']
+            else:
+                raise NotImplementedError(
+                    f"gg serializer (dual-ascent): unsupported op "
+                    f"{op['type']!r} at {op['name']!r} — serializing without "
+                    f"its params would make consumers run a different network")
+            gg_ops_ser.append(d)
+
+    # True network output width, from a single point-forward through gg.
+    # The "last fc op" heuristic used below for the BaB queries is WRONG
+    # for concat-output nets (lsnc_relu's output is
+    # Concat(dV, V, next_state)=8 wide, but the last Gemm is the 6-wide
+    # dynamics layer; nn4sys pensieve concats too). A zero-width input box
+    # (lo==hi==center) propagates with NO error generators, so this is a
+    # pure point eval — cheapest possible — and robust to any output
+    # topology (concat / slice / reduce). Both the SAT-finder PGD and the
+    # BaB queries below use it.
+    _xc = ((torch.as_tensor(spec.x_lo, dtype=dtype, device=device)
+            + torch.as_tensor(spec.x_hi, dtype=dtype, device=device)) / 2
+           ).reshape(1, -1)
+    _, (_c_probe, _) = _forward_zonotope_graph_batched(
+        _xc, _xc, gg, device, dtype)
+    n_output_true = int(_c_probe.shape[-1])
 
     # Root-level PGD attack — same as `_input_split_verify`.
     if (not bool(getattr(settings, 'disable_sat_finding', False))
@@ -11030,21 +11064,16 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         # latter doesn't reduce loss across disjuncts.
         try:
             from .verify_hybrid_acasxu import _simple_pgd
-            n_out_pgd = None
-            for op in reversed(gg['ops']):
-                if op.get('type') == 'fc':
-                    n_out_pgd = int(op['W'].shape[0]); break
-                if op.get('type') in ('conv', 'conv_transpose'):
-                    n_out_pgd = op['n_out']; break
-            if n_out_pgd is not None:
-                xl_pgd2 = xl_pgd.flatten().unsqueeze(0)
-                xh_pgd2 = xh_pgd.flatten().unsqueeze(0)
-                sat_simple, w_simple = _simple_pgd(
-                    xl_pgd2, xh_pgd2, spec, gg, n_out_pgd, device, dtype,
-                    n_restarts=10000, n_iter=50)
-                if sat_simple:
-                    return 'sat', {'phase': 'batched_simple_pgd',
-                                    'witness': w_simple}
+            # n_output_true (point-forward width) is robust to concat/slice
+            # output topologies where the "last fc op" width is wrong.
+            xl_pgd2 = xl_pgd.flatten().unsqueeze(0)
+            xh_pgd2 = xh_pgd.flatten().unsqueeze(0)
+            sat_simple, w_simple = _simple_pgd(
+                xl_pgd2, xh_pgd2, spec, gg, n_output_true, device, dtype,
+                n_restarts=10000, n_iter=50)
+            if sat_simple:
+                return 'sat', {'phase': 'batched_simple_pgd',
+                                'witness': w_simple}
         except (RuntimeError, torch.cuda.OutOfMemoryError, ImportError):
             # Simple-PGD: GPU runtime/OOM or missing hybrid_acasxu deps.
             pass
@@ -11068,35 +11097,39 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
             # through to the regular BAB pipeline.
             pass
 
-    # Find n_output (mirror `_input_split_fast_leaf`).
-    n_output = None
-    for op in reversed(gg['ops']):
-        if op.get('type') == 'fc':
-            W = op.get('W_np') if 'W_np' in op else op.get('W')
-            if W is not None:
-                n_output = int(W.shape[0]); break
-        if op.get('type') == 'conv':
-            n_output = int(op.get('n_out', 0))
-            if n_output > 0:
-                break
-    if n_output is None:
+    # True output width from the point-forward probe above (robust to
+    # concat/slice/reduce output topologies, unlike the "last fc" heuristic).
+    n_output = n_output_true
+    if n_output is None or n_output <= 0:
         return 'unknown', {'phase': 'batched_no_output'}
 
     queries = spec.as_linear_queries(n_output)
     if not queries:
         return 'verified', {'phase': 'batched_no_queries'}
-    disj_queries = {}
-    for qi, (di, w, b) in enumerate(queries):
-        disj_queries.setdefault(di, []).append((qi, w, b))
-    spec_ew = {qi: (torch.as_tensor(w, dtype=dtype, device=device).flatten(),
-                      float(b))
-                for qi, (di, w, b) in enumerate(queries)}
-    qids_sorted = sorted(spec_ew.keys())
-    # Index of each query within the sorted batch order.
-    q_index = {qi: i for i, qi in enumerate(qids_sorted)}
-    # Pre-build per-disjunct query-index sets for the batched closure.
-    disj_q_idx = {di: [q_index[qi] for qi, _, _ in qlist]
-                   for di, qlist in disj_queries.items()}
+    # DEDUPLICATE identical (w, b) halfspaces. A global conjunct ANDed into
+    # every disjunct (e.g. lsnc_relu's level-set band Y_1 in [a,b]) appears
+    # once per disjunct — 26 of 39 queries are the 2 band halfspaces repeated
+    # across 13 disjuncts. The CROWN spec backward cost scales with the number
+    # of queries Q, so computing each UNIQUE halfspace once (Q: 39 → 15) cuts
+    # the backward ~2.6x with identical verdicts. Each disjunct maps to the
+    # shared unique-query batch positions; closure (any query lb > 0) is
+    # unchanged because duplicate queries have identical lbs by construction.
+    uniq_key_to_pos = {}
+    uniq_ew = []        # (w_tensor, b) in batch order = unique position
+    disj_q_idx = {}     # di -> [unique batch positions]
+    for di, w, b in queries:
+        w_arr = np.asarray(w, dtype=np.float64).flatten()
+        key = (w_arr.tobytes(), round(float(b), 12))
+        pos = uniq_key_to_pos.get(key)
+        if pos is None:
+            pos = len(uniq_ew)
+            uniq_key_to_pos[key] = pos
+            uniq_ew.append(
+                (torch.as_tensor(w_arr, dtype=dtype, device=device), float(b)))
+        disj_q_idx.setdefault(di, []).append(pos)
+    # spec_ew keys are 0..Q-1, so the backward's sorted-key batch order IS the
+    # unique position order — disj_q_idx already indexes the batch directly.
+    spec_ew = {pos: ew for pos, ew in enumerate(uniq_ew)}
 
     # Build per-disjunct query-index tensors for multi-disjunct clipping.
     # Single-disjunct case: clip via AND of halfspaces directly.
@@ -11111,8 +11144,45 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
     xl0 = torch.as_tensor(spec.x_lo, dtype=dtype, device=device).flatten()
     xh0 = torch.as_tensor(spec.x_hi, dtype=dtype, device=device).flatten()
     n_in = xl0.numel()
-    worklist_xl = [xl0]
-    worklist_xh = [xh0]
+    # CHUNK-based worklist: each entry is a 2D (m, n_in) GPU tensor, not a
+    # single row. The old per-row list (extend(xl_u.unbind(0)) on push,
+    # torch.stack(wl[-B:]) on pop) churned MILLIONS of 1-row tensors through
+    # Python on lsnc's huge queues — ~40% of wall (split+stack). Pushing and
+    # popping whole chunks keeps the data on-GPU and the Python list short
+    # (~2 chunks per iteration). `_wl_size` is O(#chunks) (a few hundred),
+    # negligible. Correctness is identical — same boxes, LIFO order.
+    worklist_xl = [xl0.reshape(1, -1)]
+    worklist_xh = [xh0.reshape(1, -1)]
+
+    def _wl_size(wl):
+        return sum(int(c.shape[0]) for c in wl)
+
+    def _wl_pop(wl_xl, wl_xh, n):
+        """Pop exactly `n` rows from the END (LIFO). Caller guarantees
+        n <= total size. Returns (xl_batch, xh_batch) 2D tensors."""
+        got = 0
+        parts_xl = []
+        parts_xh = []
+        while got < n:
+            cxl = wl_xl[-1]
+            cxh = wl_xh[-1]
+            m = int(cxl.shape[0])
+            if got + m <= n:
+                parts_xl.append(cxl)
+                parts_xh.append(cxh)
+                wl_xl.pop()
+                wl_xh.pop()
+                got += m
+            else:
+                need = n - got
+                parts_xl.append(cxl[-need:])
+                parts_xh.append(cxh[-need:])
+                wl_xl[-1] = cxl[:-need]
+                wl_xh[-1] = cxh[:-need]
+                got = n
+        xl_b = parts_xl[0] if len(parts_xl) == 1 else torch.cat(parts_xl, 0)
+        xh_b = parts_xh[0] if len(parts_xh) == 1 else torch.cat(parts_xh, 0)
+        return xl_b, xh_b
     # Branch-aware SB precomputation: for parallel architectures
     # (pensieve_big_parallel), our backward-CROWN lA underestimates the
     # impact of input dims feeding parallel branches with non-linear
@@ -11142,7 +11212,13 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                     xl0.unsqueeze(0), xh0.unsqueeze(0), gg, device, dtype)
                 # Restrict to "shallow" relu layers (closer to input).
                 # Heuristic: layers with layer_idx in first half of relus.
-                _all_Ls = sorted(_sb_root.keys())
+                # The forward also stashes string-keyed bilinear/pool boxes
+                # (e.g. '<name>__mul_bilinear_box') for backward McCormick;
+                # keep only int ReLU layer indices so sorted() doesn't choke
+                # on mixed str/int keys (lsnc_relu's quadratic Lyapunov forms
+                # add such string boxes).
+                _all_Ls = sorted(L for L in _sb_root.keys()
+                                 if isinstance(L, int))
                 _shallow_cutoff = max(1, len(_all_Ls) // 2)
                 _shallow_Ls = _all_Ls[:_shallow_cutoff]
                 _root_w = {L: ((_sb_root[L][1][0] - _sb_root[L][0][0])
@@ -11209,21 +11285,18 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         _pt[key] += time.perf_counter() - t_ref
         return time.perf_counter()
     while worklist_xl:
+        _wl_n = _wl_size(worklist_xl)
         if time.perf_counter() - t_start > total_budget - 0.5:
-            n_open_at_timeout = len(worklist_xl)
+            n_open_at_timeout = _wl_n
             break
-        # Pop a batch (LIFO — depth-first; cheap as Python list ops).
-        B = min(batch_size, len(worklist_xl))
+        # Pop a batch (LIFO — depth-first) of whole chunks.
+        B = min(batch_size, _wl_n)
         if _dbg_isb and (n_iters < 20 or n_iters % 50 == 0):
-            print(f'[is-batched] iter={n_iters} worklist={len(worklist_xl)} '
+            print(f'[is-batched] iter={n_iters} worklist={_wl_n} '
                   f'B={B} leaves_visited={n_leaves_visited} '
                   f't_elapsed={time.perf_counter()-t_start:.2f}s',
                   flush=True)
-        xl_list = worklist_xl[-B:]
-        xh_list = worklist_xh[-B:]
-        del worklist_xl[-B:]; del worklist_xh[-B:]
-        xl_batch = torch.stack(xl_list)  # (B, n_in)
-        xh_batch = torch.stack(xh_list)
+        xl_batch, xh_batch = _wl_pop(worklist_xl, worklist_xh, B)  # (B, n_in)
 
         # Batched bound.
         if _phase_timing:
@@ -11270,7 +11343,9 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                     raise
                 return 'unknown', {'phase': 'batched_oom',
                                     'batch_size': batch_size}
-            worklist_xl.extend(xl_list); worklist_xh.extend(xh_list)
+            # Push the popped batch back as a chunk and retry with a
+            # smaller batch_size.
+            worklist_xl.append(xl_batch); worklist_xh.append(xh_batch)
             batch_size = new_bs
             continue
 
@@ -11612,18 +11687,17 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                     bbr_l = {L: (sb_b[L][0][full_idx].cpu().numpy().astype(np.float64),
                                   sb_b[L][1][full_idx].cpu().numpy().astype(np.float64))
                              for L in sb_b}
-                    # Per-disjunct best-lb query ordering.
+                    # Per-disjunct best-lb query ordering. disj_q_idx maps
+                    # each disjunct to its (deduplicated) unique-query batch
+                    # positions; spec_ew is keyed by that same position.
                     per_disj_queries = []
-                    for di, qlist in disj_queries.items():
-                        q_idxs = [qids_list.index(qi) for qi, _, _ in qlist]
-                        q_order = sorted(q_idxs,
-                                         key=lambda qix: -spec_lbs_b[full_idx, qix].item())
-                        ordered = []
-                        for qix in q_order:
-                            qi = qids_list[qix]
-                            ordered.append((
-                                spec_ew[qi][0].cpu().numpy().astype(np.float64),
-                                float(spec_ew[qi][1])))
+                    for di, positions in disj_q_idx.items():
+                        q_order = sorted(
+                            positions,
+                            key=lambda pos: -spec_lbs_b[full_idx, pos].item())
+                        ordered = [(
+                            spec_ew[pos][0].cpu().numpy().astype(np.float64),
+                            float(spec_ew[pos][1])) for pos in q_order]
                         per_disj_queries.append(ordered)
                     tasks.append((int(ci), gg_ops_ser, xl_l_np, xh_l_np,
                                    bbr_l, last_op_name, per_disj_queries,
@@ -11662,7 +11736,12 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         sb_enabled = bool(getattr(
             settings, 'input_split_batched_branch_sb', True))
         if xl_split.numel() > 0:
-            widths = (xh_split - xl_split).cpu()
+            # SB scoring stays ON GPU — a per-iteration `.cpu()` sync here
+            # was ~30% of wall on lsnc's millions of small leaves (every
+            # iteration blocked on a host transfer of widths+sens). The
+            # split-dim argmax/topk run on GPU; only the final indices feed
+            # the GPU gather/scatter below, no host round-trip.
+            widths = (xh_split - xl_split)
             if sb_enabled and A_lin is not None:
                 # Recover surviving indices in xl_split's coordinate
                 # frame. `unclosed`→A_u; clip restricts to feasible_idx
@@ -11678,10 +11757,10 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 # underestimate L2-branch lA on pensieve_big_parallel and
                 # pick all 4 splits in less-unstable L0/L1/L3 branches,
                 # missing the bound improvement (mean -7.42 vs +0.16).
-                sens = A_split.abs().sum(dim=1).cpu()  # (B, n_in)
+                sens = A_split.abs().sum(dim=1)  # (B, n_in)
                 scores = widths * sens
                 if _branch_boost is not None:
-                    scores = scores * _branch_boost.cpu().unsqueeze(0)
+                    scores = scores * _branch_boost.to(scores.device).unsqueeze(0)
                 ax = scores.argmax(dim=1)
             else:
                 ax = widths.argmax(dim=1)
@@ -11704,6 +11783,23 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
             # gives 16 children per leaf, reaching depth-24 box volume
             # in 6 iters instead of 24).
             K_max = int(getattr(settings, 'bab_split_depth', 1))
+            # Adaptive arity: K>1 (2^K children/leaf) exists only to GROW a
+            # SMALL queue up to the batch size fast (pensieve starts with a
+            # handful of leaves). Its per-leaf Python loop below is fine for
+            # a small queue but catastrophic once the queue is huge — it was
+            # 97% of wall on lsnc's million-leaf queues (22s split vs 0.5s
+            # bound). Once the remaining worklist already exceeds the batch
+            # size, the queue is full, so drop to K=1 and take the vectorized
+            # GPU 2-way split. Preserves pensieve's grow-the-queue behavior
+            # (queue small → K_max) while uncapping lsnc throughput.
+            # Gate on the size of the batch we just popped (B), NOT the
+            # post-pop remaining worklist: when B == batch_size the queue was
+            # already full before the pop, so we are in steady state and K=1
+            # (vectorized GPU split) suffices. Using the post-pop size was a
+            # bug — a leaf set that pops the WHOLE queue each iteration leaves
+            # 0 behind and would stay on the slow K>1 Python loop forever.
+            if B >= batch_size:
+                K_max = 1
             # Pick top-K dims per leaf via the same width×sens score.
             if K_max > 1 and sb_enabled and A_lin is not None:
                 top_k_dims = torch.topk(scores, K_max, dim=1).indices  # (B,K)
@@ -11738,15 +11834,16 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                     # low child = [xl_u, xh with ax=mid]; high = [xl with ax=mid, xh_u]
                     xh_low = xh_u.clone().scatter_(1, ax_u, mid_u)
                     xl_high = xl_u.clone().scatter_(1, ax_u, mid_u)
-                    worklist_xl.extend(xl_u.unbind(0))
-                    worklist_xh.extend(xh_low.unbind(0))
-                    worklist_xl.extend(xl_high.unbind(0))
-                    worklist_xh.extend(xh_u.unbind(0))
+                    # Append both child sets as 2D chunks (no per-row unbind).
+                    worklist_xl.append(xl_u); worklist_xh.append(xh_low)
+                    worklist_xl.append(xl_high); worklist_xh.append(xh_u)
             else:
                 top_k_dims_cpu = top_k_dims.cpu()
                 xl_cpu = xl_split.cpu()
                 xh_cpu = xh_split.cpu()
                 n_children = 1 << K_eff
+                _kids_xl = []
+                _kids_xh = []
                 for i in range(n):
                     xl_i = xl_cpu[i]
                     xh_i = xh_cpu[i]
@@ -11771,14 +11868,22 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                                 xl_c[dk] = mids_k[k_idx]  # high half
                             else:
                                 xh_c[dk] = mids_k[k_idx]  # low half
-                        worklist_xl.append(xl_c.to(device, dtype=dtype))
-                        worklist_xh.append(xh_c.to(device, dtype=dtype))
-            if len(worklist_xl) > max_worklist:
+                        _kids_xl.append(xl_c)
+                        _kids_xh.append(xh_c)
+                # Stack all children of this batch into one 2D chunk (the
+                # K>1 path is only used for SMALL queues — pensieve's grow
+                # phase — so a single stack per iter is cheap).
+                if _kids_xl:
+                    worklist_xl.append(
+                        torch.stack(_kids_xl, 0).to(device, dtype=dtype))
+                    worklist_xh.append(
+                        torch.stack(_kids_xh, 0).to(device, dtype=dtype))
+            if _wl_size(worklist_xl) > max_worklist:
                 return 'unknown', {
                     'phase': 'batched_worklist_overflow',
                     'batched_n_leaves': n_leaves_visited,
                     'batched_n_iters': n_iters,
-                    'worklist_size': len(worklist_xl)}
+                    'worklist_size': _wl_size(worklist_xl)}
         if _phase_timing:
             _pt['crown_closed'] += n_verified_by_crown_iter
             _pt['clip_closed'] += n_verified_by_clip_iter
@@ -11811,7 +11916,7 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
         'phase': 'batched_timeout',
         'batched_n_leaves': n_leaves_visited,
         'batched_n_iters': n_iters,
-        'batched_worklist_left': len(worklist_xl),
+        'batched_worklist_left': _wl_size(worklist_xl),
         'batched_open_degenerate': n_open_at_timeout,
         'batched_batch_size': batch_size}
 

@@ -1,0 +1,57 @@
+# lsnc_relu — Lyapunov stable neural control (quadrotor2d_state).
+# VNNCOMP 2026 (extended track). 80 instances, ONE net (6-in / 8-out):
+# a ReLU controller + ReLU residual dynamics, plus a CONVEX quadratic
+# Lyapunov value V(x)=u^T P u (P symmetric PSD) and the decrease dV.
+#
+# Spec: (OR of 13 box-violation disjuncts) AND a level-set band
+# Y_1=V(x) in [a,b]. The band is a global conjunct ANDed into EVERY
+# disjunct (see vnnlib_loader `_parse_top_level_y_constraints`).
+#
+# ALGORITHM: batched input-split BaB (6-D input). The only nonlinearity
+# beyond ReLU is the two quadratic forms (sound McCormick backward, via
+# `bilinear_op_bounds` — see verify_zono_bnb `_spec_backward_graph_batched`).
+# These convex cases converge on DOMAIN THROUGHPUT, not bound tightness:
+# ABC brute-forces them at ~670k domains/s (clip_n_verify input-split,
+# constant-time bounding + a 1e6 batch, ~28 iters). We match it (~660k/s,
+# q0 ~10s) after fixing the split bottlenecks — see docs/benchmarks/lsnc_relu.md.
+
+use_hybrid_acasxu: false
+input_split_batched_enabled: true
+
+# Throughput knobs (the whole game here):
+#  - big batch + big worklist so the GPU stays saturated and the queue can
+#    grow to the millions of domains these cases need (q0 ~6.7M leaves).
+#  - forward-zono intermediate bounds (cheap): backward-CROWN intermediate
+#    (crown_intermediate) does NOT reduce the leaf count here (both converge
+#    at ~12M pre-dedup) but costs ~17% more per leaf, so it loses.
+input_split_batch_size: 65536
+input_split_batched_max_worklist: 40000000
+input_split_crown_intermediate: false
+
+# SAT side: root (phase-0) PGD finds all 12 SAT witnesses in <2s (the
+# counterexamples fill a large fraction of the root box). The acasxu-style
+# per-leaf PGD is pure waste here AND starves the UNSAT BaB throughput, so
+# it is OFF; the root PGD budget is trimmed to 2s to give the BaB headroom.
+pgd_init_mode: osi
+pgd_time_budget_phase0: 2.0
+# PER-OPEN-SPEC root PGD: divide the restarts across the 13 disjuncts so each
+# violation+band basin gets DEDICATED restarts, instead of one joint loss all
+# restarts share. Recovers q34/q74 at the root (~2s) with a MODERATE restart
+# count — no GPU-memory blowup (a flat 1e4-restart joint attack recovered only
+# those two and slowed the UNSAT BaB, a net loss 67/80).
+pgd_per_restart_disjunct: true
+pgd_restarts: 130
+# LIGHT per-leaf PGD for the two NARROWEST-basin SAT cases (q43/q45): their CE
+# fills a tiny fraction of the root box (no root PGD finds it, even 1e4
+# restarts) but a large fraction of a deep BaB leaf. every=40 is the sweet
+# spot — it catches q43/q45 by ~10s yet adds only <1s to the UNSAT BaB, so the
+# tightest UNSAT (q3) still lands at ~24.8s under the 25s budget. (every=20
+# pushed q3 to 25.3s, over.)
+input_split_leaf_pgd_every: 40
+input_split_leaf_pgd_max_leaves: 64
+input_split_leaf_pgd_restarts: 256
+input_split_leaf_pgd_iters: 50
+
+# Per-leaf α-CROWN (acasxu's degenerate-leaf closer) is OFF: it throttles
+# throughput and these convex cases don't need it (no degenerate tail).
+input_split_batched_alpha_iters: 0
