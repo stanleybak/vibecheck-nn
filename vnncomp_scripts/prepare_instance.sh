@@ -64,9 +64,9 @@ if [ -n "$gpu_alarm" ]; then
 	echo "################################################################"
 	echo "## GPU ALARM: $gpu_alarm"
 	echo "## Configs assume a CUDA GPU; on CPU the timed runs will TIME OUT."
-	echo "## On a base Ubuntu AMI, install the driver via vnncomp_scripts/"
-	echo "## post_install.sh and enable 'restart after post-install' so the"
-	echo "## kernel module loads before benchmark execution."
+	echo "## On a base Ubuntu AMI, install_tool.sh installs the driver (gated on"
+	echo "## VIBECHECK_INSTALL_DRIVER) and loads it without a reboot. If it could"
+	echo "## not load in place, reboot the instance so the kernel module loads."
 	echo "################################################################"
 	if [ "${VIBECHECK_REQUIRE_GPU:-0}" = "1" ]; then
 		echo "[vibecheck:prepare_instance] END status=fail ($gpu_alarm)"
