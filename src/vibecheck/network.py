@@ -1401,16 +1401,16 @@ class ComputeGraph:
     def optimize(self, settings):
         """Apply semantics-preserving rewrites gated by settings flags."""
         from .onnx_optimizer import (drop_identity_pads,
-                                     fold_relusplitter,
-                                     fold_relusplitter_gemm,
+                                     fold_conv,
+                                     fold_gemm,
                                      fuse_gemm_reshape_conv)
         # Ungated: removing all-zero Pad nodes is an exact identity (TinyYOLO
         # carries Pad(pads=[0]*8) no-ops that otherwise hit gpu_graph's loud
         # NotImplementedError). Non-zero pads are kept and still raise.
         drop_identity_pads(self)
         if settings.optimize_relu_relation:
-            fold_relusplitter(self)
-            fold_relusplitter_gemm(self)
+            fold_conv(self)
+            fold_gemm(self)
         if settings.fuse_gemm_conv:
             fuse_gemm_reshape_conv(self)
 

@@ -1,18 +1,23 @@
 """Semantics-preserving graph optimizations applied after ONNX loading.
 
-Two passes:
+Passes:
 
-- `fold_relusplitter(graph)` folds the expanded
-  `Conv(C→2C) → ReLU → Conv(2C→C, 1×1) → ReLU` pattern (used by some
+- `fold_conv(graph)` folds the expanded
+  `Conv(C→2C, k×k) → ReLU → Conv(2C→C, 1×1) → ReLU` pattern (used by some
   exporters to make every neuron pairwise-symmetric) back into a single
-  `Conv(C→C) → ReLU`. Exact because ReLU(z) − ReLU(−z) = z. Mirrors
+  `Conv(C→C, k×k) → ReLU`. Exact because ReLU(z) − ReLU(−z) = z. Mirrors
   auto_LiRPA / α,β-CROWN's `optimize_relu_relation`.
+
+- `fold_gemm(graph)` is the fully-connected analogue: it folds
+  `Gemm(C→C+S) → ReLU → Gemm(C+S→C) → ReLU` (S split neurons added as
+  ±-paired rows, plus passthrough rows) back into a single
+  `Gemm(C→C) → ReLU`, exact by the same ReLU(z) − ReLU(−z) = z identity.
 
 - `fuse_gemm_reshape_conv(graph)` fuses `Gemm → Reshape → Conv` into a
   single equivalent FC layer, so the backward pass operates on fewer,
   larger layers (matches what CROWN-style tightening expects).
 
-Both are called from `ComputeGraph.optimize(settings)`.
+All are called from `ComputeGraph.optimize(settings)`.
 """
 
 import numpy as np
@@ -138,7 +143,7 @@ def fuse_gemm_reshape_conv(graph):
     return fused_any
 
 
-def fold_relusplitter(graph):
+def fold_conv(graph):
     """Fold ReLU-split pattern back into a single Conv → ReLU.
 
     Detects: Conv(C_in → 2C, k×k) → ReLU → Conv(2C → C, 1×1) → ReLU
@@ -264,7 +269,7 @@ def fold_relusplitter(graph):
     return folded_any
 
 
-def fold_relusplitter_gemm(graph):
+def fold_gemm(graph):
     """Fold ReLU-split pattern back into a single Gemm → ReLU.
 
     Detects: Gemm(C_in → C+S) → ReLU → Gemm(C+S → C) → ReLU
