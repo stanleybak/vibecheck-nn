@@ -1883,7 +1883,23 @@ class ComputeGraph:
                 _mm_in_shape = (self.nodes[node.inputs[0]].output_shape
                                 if node.inputs[0] in self.nodes
                                 else self.input_shape)
-                if (_mm_in_shape is not None and len(_mm_in_shape) >= 3
+                W = np.asarray(W)
+                if W.ndim == 1:
+                    # 1-D weight (k,): ONNX MatMul(A[...,k], W[k]) contracts the
+                    # last input dim to ONE output per leading row. Emit as a
+                    # (k,1) FC; for N-D input apply the same block-diagonal kron
+                    # tiling the 2-D N-D path uses (batched over leading rows).
+                    # Without this, `W.shape[1]` below raised IndexError on the
+                    # ml4acopf residual-constraint MatMuls (W shape e.g. (54,)).
+                    W = W.reshape(-1, 1).astype(np.float64)
+                    b = (np.atleast_1d(np.asarray(b, np.float64))
+                         if b is not None else np.zeros(1, np.float64))
+                    if (_mm_in_shape is not None and len(_mm_in_shape) >= 3
+                            and int(np.prod(_mm_in_shape[:-1])) > 1):
+                        T = int(np.prod(_mm_in_shape[:-1]))
+                        W = np.kron(np.eye(T), W)
+                        b = np.tile(b, T)
+                elif (_mm_in_shape is not None and len(_mm_in_shape) >= 3
                         and int(np.prod(_mm_in_shape[:-1])) > 1
                         and _mm_in_shape[-1] == W.shape[1]):
                     # N-D MatMul (e.g. vit tokens (1, T, K) @ W): ONNX
