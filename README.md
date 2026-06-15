@@ -1,8 +1,8 @@
-# vibecheck: a vibe-coded neural network verification toolkit
+# vibecheck: a vibe-coded neural network verifier
 
-`vibecheck` is a tool for solving neural network verification problems. Given an ONNX neural network and a VNNLIB property, it tries to decide whether the property is provably true or refuted by a counterexample. It solves the same problem as established verifiers like [α,β-CROWN](https://github.com/Verified-Intelligence/alpha-beta-CROWN) and [Marabou](https://github.com/NeuralNetworkVerification/Marabou), hopefully faster and on larger networks.
+Given an ONNX network and a VNNLIB property, **vibecheck** tries to prove the property or find a counterexample. It solves the same problem as established verifiers like [α,β-CROWN](https://github.com/Verified-Intelligence/alpha-beta-CROWN) and [Marabou](https://github.com/NeuralNetworkVerification/Marabou), hopefully faster and on larger networks.
 
-The underlying verification algorithms in `vibecheck` are complementary, and are selected in configuration files based on a problem's difficulty and timeout. They include Gurobi LP/MILP for tight neuron bounds, zonotope abstract interpretation combined with CROWN / α-CROWN slopes for tight overapproximations, and a high-performance GPU-enabled branch-and-bound search with an optimal-step dual-ascent solver that can explore millions of splits per second.
+The underlying verification algorithms in vibecheck are complementary, specified in configuration files based on a problem's complexity and timeout. They include Gurobi LP/MILP for tight neuron bounds, zonotope abstract interpretation combined with CROWN / α-CROWN slopes for tight overapproximations, and a high-performance GPU-enabled branch-and-bound search with an optimal-step dual-ascent solver that can explore millions of splits per second.
 
 ## Setup
 
