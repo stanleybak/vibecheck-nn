@@ -156,6 +156,50 @@ def _torch_op(op_type, inputs, attrs):
     if op_type == 'Gather':
         axis = int(attrs.get('axis', 0))
         return inputs[0].index_select(axis, inputs[1].long())
+    if op_type == 'Sin':
+        return torch.sin(inputs[0])
+    if op_type == 'Cos':
+        return torch.cos(inputs[0])
+    if op_type == 'Pow':
+        return torch.pow(inputs[0], inputs[1])
+    if op_type == 'Floor':
+        return torch.floor(inputs[0])
+    if op_type == 'Equal':
+        return torch.eq(inputs[0], inputs[1])
+    if op_type == 'Where':
+        return torch.where(inputs[0].bool(), inputs[1], inputs[2])
+    if op_type == 'Expand':
+        # ONNX Expand: bidirectional broadcast of data to `shape`.
+        shape = [int(s) for s in inputs[1].tolist()]
+        return inputs[0] * torch.ones(shape, dtype=inputs[0].dtype,
+                                      device=inputs[0].device)
+    if op_type == 'ConstantOfShape':
+        shape = [int(s) for s in inputs[0].tolist()]
+        v = attrs.get('value')
+        fill = float(numpy_helper.to_array(v).flatten()[0]) if v is not None else 0.0
+        return torch.full(shape, fill)
+    if op_type == 'Slice':
+        # ONNX 10+: starts/ends/axes/steps are tensor inputs; <10: attributes.
+        data = inputs[0]
+        if len(inputs) > 1:
+            starts = [int(s) for s in inputs[1].tolist()]
+            ends = [int(e) for e in inputs[2].tolist()]
+            axes = ([int(a) for a in inputs[3].tolist()]
+                    if len(inputs) > 3 and inputs[3] is not None
+                    else list(range(len(starts))))
+            steps = ([int(s) for s in inputs[4].tolist()]
+                     if len(inputs) > 4 and inputs[4] is not None
+                     else [1] * len(starts))
+        else:
+            starts = list(attrs.get('starts', []))
+            ends = list(attrs.get('ends', []))
+            axes = list(attrs.get('axes', list(range(len(starts)))))
+            steps = [1] * len(starts)
+        sl = [slice(None)] * data.ndim
+        for ax, s, e, st in zip(axes, starts, ends, steps):
+            ax = ax if ax >= 0 else ax + data.ndim
+            sl[ax] = slice(s, e, st)
+        return data[tuple(sl)]
     raise NotImplementedError(f'onnx_torch_runner: unsupported op {op_type!r}')
 
 
