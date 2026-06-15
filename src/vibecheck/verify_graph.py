@@ -11565,66 +11565,12 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
             else:
                 xl_split = xl_u[:0]
                 xh_split = xh_u[:0]
-
-            # Clip → re-CROWN cycles: the old CROWN bounds were
-            # computed on the LARGER pre-clip box, so they're still
-            # valid (just loose). Re-running CROWN on the clipped box
-            # gives TIGHTER per-query lbs that may close the leaf
-            # without splitting. AB-CROWN-style inner iteration.
-            # Each cycle is one extra forward zono + spec backward
-            # (~5-20 ms per iter for the whole batch); pays off if it
-            # closes leaves that would otherwise become 2 children +
-            # next-iter CROWN.
-            n_recrown_cycles = int(getattr(
-                settings, 'input_split_batched_clip_recrown_cycles', 0))
-            for _rc in range(n_recrown_cycles):
-                if xl_split.numel() == 0:
-                    break
-                sb_r, _ = _forward_zonotope_graph_batched(
-                    xl_split, xh_split, gg, device, dtype)
-                spec_lbs_r, A_r, b_r = _spec_backward_graph_batched(
-                    sb_r, xl_split, xh_split, gg, spec_ew, device, dtype,
-                    return_input_linear=True)
-                # Closure on re-CROWN
-                closed_r = []
-                for di, q_idxs in disj_q_idx.items():
-                    closed_r.append((spec_lbs_r[:, q_idxs] > 0).any(dim=1))
-                if closed_r:
-                    all_closed_r = torch.stack(closed_r, dim=1).all(dim=1)
-                else:
-                    all_closed_r = torch.ones(
-                        xl_split.shape[0], dtype=torch.bool, device=device)
-                n_verified_by_clip_iter += int(all_closed_r.sum().item())
-                # Drop closed leaves
-                still_open_r = (~all_closed_r).nonzero(as_tuple=True)[0]
-                if still_open_r.numel() == 0:
-                    xl_split = xl_split[:0]
-                    xh_split = xh_split[:0]
-                    break
-                # Clip the still-open leaves with the new tighter A, b
-                xl_o = xl_split[still_open_r]
-                xh_o = xh_split[still_open_r]
-                A_o = A_r[still_open_r]
-                b_o = b_r[still_open_r]
-                xl_r2, xh_r2, feas_r2 = _clip_box_by_halfspaces_batched(
-                    xl_o, xh_o, A_o, b_o)
-                n_verified_by_clip_iter += int((~feas_r2).sum().item())
-                feas_r2_idx = feas_r2.nonzero(as_tuple=True)[0]
-                if feas_r2_idx.numel() == 0:
-                    xl_split = xl_split[:0]
-                    xh_split = xh_split[:0]
-                    break
-                xl_new = xl_r2[feas_r2_idx]
-                xh_new = xh_r2[feas_r2_idx]
-                # Stop if no significant shrinkage on this cycle.
-                old_widths = (xh_split[still_open_r][feas_r2_idx]
-                              - xl_split[still_open_r][feas_r2_idx])
-                new_widths = xh_new - xl_new
-                if (new_widths / (old_widths + 1e-12)).min().item() > 0.99:
-                    xl_split = xl_new; xh_split = xh_new
-                    break
-                xl_split = xl_new
-                xh_split = xh_new
+            # (Removed: a clip -> re-CROWN inner-cycle path gated by
+            # `input_split_batched_clip_recrown_cycles`. It was UNSOUND on
+            # bilinear graphs — with cycles>0 it false-verified every SAT
+            # case at the root in 1 leaf (the re-CROWN closure declared the
+            # whole box safe). No config ever enabled it (default 0), so it
+            # was dead AND unsound; removed rather than masked.)
         else:
             xl_split = xl_batch[unclosed]
             xh_split = xh_batch[unclosed]

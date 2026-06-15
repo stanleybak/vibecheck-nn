@@ -284,14 +284,6 @@ def default_settings(**overrides):
         input_split_leaf_pgd_max_leaves=64,
         input_split_leaf_pgd_restarts=128,
         input_split_leaf_pgd_iters=50,
-        # Clip → re-CROWN inner cycles. After clipping a leaf, the OLD
-        # CROWN bounds are still sound on the smaller box but loose.
-        # Re-running CROWN on the clipped box gives tighter spec lbs
-        # that may close the leaf without splitting. Costs +1 forward
-        # zono + spec backward per cycle (~5-20 ms per batch). Stops
-        # early if clipping no longer shrinks. Default 0 (off);
-        # opt-in per benchmark.
-        input_split_batched_clip_recrown_cycles=0,
         # MILP escalation on stuck boundary leaves. After CROWN +
         # α-CROWN + clip, if a leaf still won't close AND its unstable
         # count ≤ `milp_max_unstable`, try the full triangle MILP
