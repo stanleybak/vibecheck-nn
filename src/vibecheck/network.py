@@ -1885,20 +1885,23 @@ class ComputeGraph:
                                 else self.input_shape)
                 W = np.asarray(W)
                 if W.ndim == 1:
-                    # 1-D weight (k,): ONNX MatMul(A[...,k], W[k]) contracts the
-                    # last input dim to ONE output per leading row. Emit as a
-                    # (k,1) FC; for N-D input apply the same block-diagonal kron
-                    # tiling the 2-D N-D path uses (batched over leading rows).
-                    # Without this, `W.shape[1]` below raised IndexError on the
-                    # ml4acopf residual-constraint MatMuls (W shape e.g. (54,)).
-                    W = W.reshape(-1, 1).astype(np.float64)
-                    b = (np.atleast_1d(np.asarray(b, np.float64))
-                         if b is not None else np.zeros(1, np.float64))
-                    if (_mm_in_shape is not None and len(_mm_in_shape) >= 3
-                            and int(np.prod(_mm_in_shape[:-1])) > 1):
-                        T = int(np.prod(_mm_in_shape[:-1]))
-                        W = np.kron(np.eye(T), W)
-                        b = np.tile(b, T)
+                    # 1-D weight (k,): ONNX MatMul(A[...,k], W[k]) contracts
+                    # the LAST input dim to ONE output per leading row:
+                    #   out[...] = Σ_j A[...,j] · W[j].
+                    # Per row this is a (1, k) linear map (out=1, in=k), NOT
+                    # (k, 1). For N-D batched input the existing batched-`fc`
+                    # forward (reshape to (prefix, k) → F.linear over the
+                    # last dim) handles the per-row contraction directly, so
+                    # emit the plain (1, k) weight and let that path batch it
+                    # — kron'ing here produced a (T·k, T) matrix that can't
+                    # even matmul the flat (T·k,) input (shape error on the
+                    # ml4acopf sigmoid/sin/cos delta-m contraction).
+                    W = W.reshape(1, -1).astype(np.float64)
+                    # A 1-D-weight MatMul has NO bias (out per row is a
+                    # single contracted scalar). The GemmNode default-fills
+                    # `b` to the contracted length (k,), which is the WRONG
+                    # size for the (1, k) emission — force a (1,) zero bias.
+                    b = np.zeros(1, np.float64)
                 elif (_mm_in_shape is not None and len(_mm_in_shape) >= 3
                         and int(np.prod(_mm_in_shape[:-1])) > 1
                         and _mm_in_shape[-1] == W.shape[1]):
@@ -2419,28 +2422,108 @@ class ComputeGraph:
                     computed.add(name)
                 else:
                     # All-live concat: every chain handles type 'concat' as
-                    # a FLAT concatenation (axis ignored). That is exact
-                    # iff all dims before the concat axis are singleton for
-                    # every input — verify it here instead of silently
-                    # producing a permuted (wrong) layout downstream.
+                    # a FLAT concatenation (axis ignored). That is exact iff
+                    # the row-major flat order of (flat-concat of inputs)
+                    # equals the row-major flat order of the true axis-`a`
+                    # concatenation — which holds iff the common leading
+                    # dim R (product of dims before `a`) is 1.
+                    #
+                    # When R > 1 the flat concat interleaves wrong: the true
+                    # output (R, C) lays out row r of every input contiguously
+                    # before row r+1, whereas flat-concat lays out ALL of
+                    # input0 then ALL of input1. We emit an exact 'permute'
+                    # (a pure index reordering of center+generators) that maps
+                    # flat-concat positions to the true row-major layout.
+                    #
+                    # Per-input element counts (numel) are reliable from the
+                    # metadata even when vibecheck's row/col split of the
+                    # shape is spurious (e.g. a (14,1) that ort reports as
+                    # (1,14) — same 14 elements, same flat order). R is taken
+                    # from the inputs whose leading dims are unambiguous.
+                    in_shapes_c = []
                     for inp in node.inputs:
                         sh = (self.nodes[inp].output_shape
                               if inp in self.nodes else self.input_shape)
+                        in_shapes_c.append(sh)
+                    # Derive R from any input with a known shape: R is the
+                    # product of all dims before the (positive) concat axis.
+                    # All ONNX-valid inputs share R; pick the first known one
+                    # and assert the rest agree where their metadata is
+                    # itself contiguous (leading dims account for the full
+                    # R without remainder).
+                    R = None
+                    for sh in in_shapes_c:
                         if sh is None:
                             continue
                         a = axis if axis >= 0 else len(sh) + axis
-                        if any(int(d) != 1 for d in sh[:a]):
+                        r_here = 1
+                        for d in sh[:a]:
+                            r_here *= int(d)
+                        if r_here == 1:
+                            # Unambiguous R=1 input pins the common R to 1.
+                            R = 1
+                            break
+                        if R is None:
+                            R = r_here
+                    if R is None:
+                        R = 1
+                    # Per-input column counts c_i = numel_i / R. numel comes
+                    # from prod(shape); spurious row/col splits keep numel.
+                    numels = []
+                    for sh in in_shapes_c:
+                        if sh is None:
                             raise NotImplementedError(
-                                f'Concat {name!r}: axis {axis} over shape '
-                                f'{sh} is not flat-contiguous — the flat '
-                                f"'concat' op would silently interleave "
-                                f'wrong positions')
-                    ops.append({
-                        'name': name, 'type': 'concat',
-                        'inputs': inp_names,
-                        'axis': axis,
-                    })
-                    computed.add(name)
+                                f'Concat {name!r}: missing input shape — '
+                                f'cannot build sound concat layout')
+                        numels.append(int(np.prod(sh)))
+                    if R == 1:
+                        # Flat concat already gives the correct row-major
+                        # layout — emit the cheap 'concat' op (no permute).
+                        ops.append({
+                            'name': name, 'type': 'concat',
+                            'inputs': inp_names,
+                            'axis': axis,
+                        })
+                        computed.add(name)
+                    else:
+                        cis = []
+                        for nu in numels:
+                            if nu % R != 0:
+                                raise NotImplementedError(
+                                    f'Concat {name!r}: input numel {nu} not '
+                                    f'divisible by leading dim R={R}; cannot '
+                                    f'recover axis-{axis} column count')
+                            cis.append(nu // R)
+                        C = sum(cis)
+                        n_out = R * C
+                        # perm maps OUTPUT flat index -> CONCAT flat index:
+                        #   out_flat[r*C + off_i + j] = concat[base_i + r*c_i + j]
+                        perm = np.empty(n_out, dtype=np.int64)
+                        base = 0
+                        off = 0
+                        for ci in cis:
+                            for r in range(R):
+                                src0 = base + r * ci
+                                dst0 = r * C + off
+                                perm[dst0:dst0 + ci] = np.arange(
+                                    src0, src0 + ci)
+                            base += R * ci
+                            off += ci
+                        assert sorted(perm.tolist()) == list(range(n_out)), (
+                            f'Concat {name!r}: permutation is not a bijection')
+                        # Emit flat concat into a synthetic name, then permute.
+                        cat_name = f'{name}__catflat'
+                        ops.append({
+                            'name': cat_name, 'type': 'concat',
+                            'inputs': inp_names, 'axis': axis,
+                        })
+                        computed.add(cat_name)
+                        ops.append({
+                            'name': name, 'type': 'permute',
+                            'inputs': [cat_name],
+                            'perm': perm,
+                        })
+                        computed.add(name)
 
             elif node.op_type in ('Split', 'SplitOutput'):
                 # Emit each Split chunk as an explicit Slice op. The

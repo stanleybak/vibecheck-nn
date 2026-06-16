@@ -127,3 +127,11 @@ def assert_interval_sound(relax, lo, hi, n_samples=50000, atol=1e-6):
     f = relax.func(xs)
     assert bool((f >= olo - atol).all()) and bool((f <= ohi + atol).all()), (
         f'INTERVAL NOT SOUND for {relax.onnx_op}')
+
+
+# Import the per-op relaxation modules so their @register decorators run and
+# populate REGISTRY on first import of this module. Done at the bottom to
+# avoid a circular import (each nl_* module imports `register` from here).
+# Without this, consumers (forward zono sin/cos/floor, pow) saw an empty
+# REGISTRY → KeyError on the first ml4acopf Floor/Sin/Cos/Pow op.
+from . import nl_sin, nl_cos, nl_floor, nl_pow  # noqa: E402,F401

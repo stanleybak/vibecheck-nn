@@ -427,12 +427,84 @@ def load_onnx(onnx_path, dtype=None, simplify=None):
                 if c_exp is not None:
                     params['exponent'] = float(c_exp)
 
-        elif op in ('ConstantOfShape',):
+        elif op == 'ConstantOfShape':
+            # ConstantOfShape(shape) -> tensor of `shape` filled with the
+            # `value` attr (default 0). The shape operand is (in ml4acopf)
+            # itself constant, so the whole node folds to a constant. Read
+            # the REAL fill value from the attr instead of hardcoding 0 —
+            # ml4acopf uses fill=1 to build a mask/index tensor.
+            c_shape = _const(node.input[0]) if node.input else None
+            fill = 0.0
+            fill_dtype = np.float32
+            for attr in node.attribute:
+                if attr.name == 'value':
+                    fv = numpy_helper.to_array(attr.t)
+                    fill = fv.flatten()[0] if fv.size else 0.0
+                    fill_dtype = fv.dtype
+            if c_shape is not None:
+                shp = tuple(int(s) for s in np.asarray(c_shape).flatten())
+                constants[out_name] = np.full(shp, fill, dtype=fill_dtype)
+                continue
+            # Non-constant shape: cannot fold. Keep as a live node carrying
+            # the fill value; gpu_graph has no handler, so this surfaces
+            # loudly (no silent passthrough).
             computed_inputs = [node.input[0]]
-            params['value'] = 0.0
+            params['value'] = float(fill)
 
-        elif op in ('Expand', 'Where', 'Equal', 'ScatterND', 'ArgMax',
-                     'Min', 'Max'):
+        elif op == 'Equal':
+            # Elementwise ==. Folds to a constant boolean array when both
+            # operands are constant (ml4acopf constraint-mask construction).
+            c0 = _const(node.input[0])
+            c1 = _const(node.input[1])
+            if c0 is not None and c1 is not None:
+                constants[out_name] = np.equal(c0, c1)
+                continue
+            computed_inputs = [i for i in node.input
+                               if _const(i) is None and i != '']
+            for idx, i in enumerate(node.input):
+                c = _const(i)
+                if c is not None:
+                    params[f'const_{idx}'] = c
+
+        elif op == 'Where':
+            # Where(cond, x, y) = cond ? x : y, elementwise w/ broadcast.
+            # Folds to a constant when all three operands are constant
+            # (ml4acopf constraint-mask selection — all const-derived).
+            cc = _const(node.input[0]) if len(node.input) > 0 else None
+            cx = _const(node.input[1]) if len(node.input) > 1 else None
+            cy = _const(node.input[2]) if len(node.input) > 2 else None
+            if cc is not None and cx is not None and cy is not None:
+                constants[out_name] = np.where(
+                    np.asarray(cc, dtype=bool), cx, cy)
+                continue
+            computed_inputs = [i for i in node.input
+                               if _const(i) is None and i != '']
+            for idx, i in enumerate(node.input):
+                c = _const(i)
+                if c is not None:
+                    params[f'const_{idx}'] = c
+
+        elif op == 'Expand':
+            # Expand(data, shape): broadcast `data` to broadcast(data.shape,
+            # shape). Folds to a constant when both are constant (ml4acopf
+            # reshapes a const param to (1, N) before subtracting it from a
+            # data-dependent tensor).
+            cd = _const(node.input[0]) if len(node.input) > 0 else None
+            cs = _const(node.input[1]) if len(node.input) > 1 else None
+            if cd is not None and cs is not None:
+                shp = tuple(int(s) for s in np.asarray(cs).flatten())
+                target = np.broadcast_shapes(np.asarray(cd).shape, shp)
+                constants[out_name] = np.broadcast_to(
+                    np.asarray(cd), target).copy()
+                continue
+            computed_inputs = [i for i in node.input
+                               if _const(i) is None and i != '']
+            for idx, i in enumerate(node.input):
+                c = _const(i)
+                if c is not None:
+                    params[f'const_{idx}'] = c
+
+        elif op in ('ScatterND', 'ArgMax', 'Min', 'Max'):
             computed_inputs = [i for i in node.input
                                if _const(i) is None and i != '']
             for idx, i in enumerate(node.input):

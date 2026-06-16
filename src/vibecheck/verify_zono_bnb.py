@@ -1039,6 +1039,68 @@ def _ibp_forward_graph_batched(xl, xh, gg, device, dtype,
     return sb
 
 
+def _zono_broadcast_const(z, const_t, op_sign, in_shape_nd, out_shape_nd,
+                          device, dtype):
+    """Exact elementwise affine op  y = center op_sign*const  with full
+    numpy/ONNX bidirectional broadcast of BOTH the live tensor and the
+    constant to ``out_shape_nd``.
+
+    op_sign = +1 for Add, -1 for Sub. Returns a TorchZonotope whose
+    center is ``broadcast(c) + op_sign*broadcast(const)`` and whose
+    generators are ``broadcast(g)`` along every dim the live tensor is
+    stretched on (a constant has zero radius, so it adds no generators).
+    EXACT — no relaxation. Used by ml4acopf's piecewise-linear
+    Sigmoid/Sin/Cos decomposition (Sub of a (N,) tensor against an
+    (M,) breakpoint vector → (N, M)).
+
+    The live tensor's recorded N-D shape may have lost trailing-1 dims
+    (an Unsqueeze that was aliased away), so its broadcast position in
+    ``out_sh`` is reconstructed from the constant's shape: the constant
+    right-aligns into ``out_sh``; every out dim the constant does NOT
+    fully drive (const dim == 1) is a live dim, the rest are live-1.
+    The reconstruction is validated to preserve the live numel and to be
+    a sound numpy broadcast.
+    """
+    n_in = z.center.numel()
+    out_sh = (tuple(int(d) for d in out_shape_nd)
+              if out_shape_nd is not None else (n_in,))
+    rank = len(out_sh)
+    const_sh = tuple(int(d) for d in const_t.shape) if const_t.dim() > 0 \
+        else ()
+    const_aligned = (1,) * (rank - len(const_sh)) + const_sh
+    # Reconstruct the live broadcast shape: where the constant has a 1 at
+    # an out dim, that dim belongs to the live tensor (=out dim); where
+    # the constant fully drives the dim (==out dim != 1), the live tensor
+    # is 1 there. (If both const and live genuinely vary on the same dim,
+    # they must equal the out dim — handled by taking out dim when const
+    # is 1.)
+    live_sh = tuple(out_sh[d] if const_aligned[d] == 1 else 1
+                    for d in range(rank))
+    if int(np.prod(live_sh)) != n_in:
+        # Fall back to right-aligning the recorded in-shape; if THAT also
+        # mismatches, the broadcast layout is ambiguous → fail loudly
+        # rather than emit an unsound (wrong-layout) result.
+        in_sh = (tuple(int(d) for d in in_shape_nd)
+                 if in_shape_nd is not None else (n_in,))
+        live_sh = (1,) * (rank - len(in_sh)) + in_sh
+        if int(np.prod(live_sh)) != n_in:
+            raise NotImplementedError(
+                f'broadcast {("Add" if op_sign > 0 else "Sub")}: cannot '
+                f'place live numel {n_in} into out shape {out_sh} given '
+                f'const shape {const_sh} (in_shape={in_shape_nd})')
+    c_nd = z.center.reshape(live_sh)
+    const_nd = const_t.reshape(const_aligned) if const_t.dim() >= 0 \
+        else const_t
+    c_out = (c_nd + op_sign * const_nd).expand(out_sh).reshape(-1).clone()
+    K = z.generators.shape[1]
+    if K > 0:
+        g_nd = z.generators.reshape(live_sh + (K,))
+        g_out = g_nd.expand(out_sh + (K,)).reshape(-1, K).clone()
+    else:
+        g_out = z.generators.new_zeros(c_out.numel(), 0)
+    return TorchZonotope(c_out, g_out)
+
+
 def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
                              relu_lambdas=None, op_bounds=None,
@@ -1322,10 +1384,19 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             z = _get(op['inputs'][0])
             bias = op.get('bias')
             if bias is not None:
-                z = TorchZonotope(
-                    z.center - torch.tensor(bias.flatten(), dtype=dtype,
-                                            device=device),
-                    z.generators.clone())
+                bias_t = torch.as_tensor(bias, dtype=dtype, device=device)
+                n_in = z.center.numel()
+                if bias_t.numel() == 1 or bias_t.numel() == n_in:
+                    # Scalar or elementwise: no shape change.
+                    z = TorchZonotope(
+                        z.center - bias_t.flatten(), z.generators.clone())
+                else:
+                    # Genuine outer broadcast (ml4acopf sigmoid/sin/cos
+                    # piecewise decomposition: (N,) − (M,) → (N, M)).
+                    z = _zono_broadcast_const(
+                        z, bias_t, -1.0,
+                        op.get('in_shapes_nd', [None])[0],
+                        op.get('out_shape_nd'), device, dtype)
             zono_state[name] = z
 
         elif t == 'sub_bilinear':
@@ -1361,6 +1432,22 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             if flat_idx is None:
                 raise ValueError("slice op missing 'flat_idx'")
             idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
+            c_flat = z.center.reshape(-1)
+            g_flat = z.generators.reshape(c_flat.numel(), -1)
+            zono_state[name] = TorchZonotope(
+                c_flat.index_select(0, idx_t),
+                g_flat.index_select(0, idx_t))
+
+        elif t == 'permute':
+            # Exact reordering of the element (row) dimension: a pure
+            # index permutation of center + generators. Used by the
+            # non-contiguous axis-1 Concat (flat-concat -> permute to the
+            # true row-major (R, C) layout). EXACT — no relaxation.
+            z = _get(op['inputs'][0])
+            perm = op.get('perm')
+            if perm is None:
+                raise ValueError("permute op missing 'perm'")
+            idx_t = torch.as_tensor(perm, dtype=torch.long, device=device)
             c_flat = z.center.reshape(-1)
             g_flat = z.generators.reshape(c_flat.numel(), -1)
             zono_state[name] = TorchZonotope(
