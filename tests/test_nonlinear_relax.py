@@ -37,3 +37,23 @@ def test_register_and_helpers():
                               n_samples=200)
     finally:
         del REGISTRY['TestOp']
+
+
+def test_zono_affine_transform_sound():
+    """The DeepZ affine transformer's output zonotope must over-approximate
+    f(z) for every point z in the input zonotope (box-soundness over samples)."""
+    import vibecheck.nl_sin  # noqa: F401  registers Sin
+    from vibecheck.nonlinear_relax import zono_affine_transform, REGISTRY
+    torch.manual_seed(0)
+    relax = REGISTRY['Sin']()
+    n, k = 6, 5
+    center = torch.randn(n, dtype=torch.float64) * 2.0
+    gens = 0.3 * torch.randn(n, k, dtype=torch.float64)
+    new_c, new_g = zono_affine_transform(relax, center, gens)
+    olo = new_c - new_g.abs().sum(1)
+    ohi = new_c + new_g.abs().sum(1)
+    e = 2 * torch.rand(40000, k, dtype=torch.float64) - 1
+    z = center.unsqueeze(0) + e @ gens.T
+    fz = torch.sin(z)
+    assert bool((fz >= olo - 1e-9).all()) and bool((fz <= ohi + 1e-9).all()), \
+        'transformer output zonotope does not over-approximate f(z)'

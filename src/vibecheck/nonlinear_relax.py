@@ -63,6 +63,38 @@ class ScalarNonlinearRelax:
         raise NotImplementedError
 
 
+def zono_affine_transform(relax, center, generators, rel_pad=1e-6):
+    """Sound DeepZ elementwise transformer for f, using relax.affine_band.
+
+    Zonotope layout: center (n,), generators (n, k) [row i = element i's gens].
+    Returns (new_center (n,), new_gens (n, k+n)).
+
+    For z_i = center_i + generators_i . e (e in [-1,1]^k), with affine band
+    |f(x) - (lam_i x + mu_i)| <= delta_i over [lo_i, hi_i] = z_i's range:
+        f(z_i) = (lam_i center_i + mu_i) + lam_i (generators_i . e) + delta_i e'_i
+    i.e. scale the existing gens by lam (preserves input correlation, unlike a
+    box collapse) and add ONE fresh error generator of magnitude delta per
+    element. Sound for any noise assignment.
+
+    The band is computed in float64 then cast (avoids float32 rounding making
+    delta too small); `rel_pad` adds a small value-relative slack covering the
+    float32 rounding of lam*center+mu (sound inflation; ~1e-6 at ACOPF scales).
+    """
+    dt = center.dtype
+    rad = generators.abs().sum(dim=1)
+    lo = (center - rad).double()
+    hi = (center + rad).double()
+    lam, mu, delta = relax.affine_band(lo, hi)
+    lam = torch.as_tensor(lam, dtype=dt, device=center.device)
+    mu = torch.as_tensor(mu, dtype=dt, device=center.device)
+    delta = torch.as_tensor(delta, dtype=dt, device=center.device).clamp(min=0)
+    new_center = lam * center + mu
+    new_gens = lam.unsqueeze(-1) * generators
+    pad = rel_pad * (new_center.abs() + new_gens.abs().sum(dim=1) + 1.0)
+    err = torch.diag(delta + pad)
+    return new_center, torch.cat([new_gens, err], dim=1)
+
+
 def _as64(*ts):
     return tuple(torch.as_tensor(t, dtype=torch.float64) for t in ts)
 

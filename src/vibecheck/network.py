@@ -2568,6 +2568,29 @@ class ComputeGraph:
                 })
                 computed.add(name)
 
+            elif node.op_type in ('Sin', 'Cos'):
+                # Elementwise trig (ml4acopf AC power-flow). Forward zono
+                # dispatches to the sound affine-band relaxation in
+                # nonlinear_relax (chord slope + critical-point delta).
+                inp_names = [node.inputs[0]
+                             if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': node.op_type.lower(),
+                    'inputs': inp_names,
+                })
+                computed.add(name)
+
+            elif node.op_type == 'Floor':
+                # Elementwise floor (ml4acopf sin range-reduction). Sound
+                # affine band: within one integer -> exact constant; spanning
+                # -> x-0.5 +- 0.5.
+                inp_names = [node.inputs[0]
+                             if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': 'floor', 'inputs': inp_names,
+                })
+                computed.add(name)
+
             elif node.op_type == 'Gather':
                 # Constant-index Gather: output = input.flatten()[flat_idx]
                 # for indices resolved against the named axis. Used in

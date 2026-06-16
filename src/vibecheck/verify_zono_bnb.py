@@ -1402,6 +1402,24 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             if layer_idx is not None:
                 sb[layer_idx] = (lo_pre.clone(), hi_pre.clone())
 
+        elif t in ('sin', 'cos', 'floor'):
+            # Sound elementwise nonlinearity via the affine-band DeepZ
+            # transformer (nonlinear_relax): y = lam*x + mu (+ lam-scaled gens)
+            # + one fresh delta error generator per element. Preserves input
+            # correlation (tighter than the sigmoid box-collapse above) and is
+            # sound by the relaxation's band guarantee.
+            from .nonlinear_relax import REGISTRY, zono_affine_transform
+            z = _get(op['inputs'][0])
+            lo_pre, hi_pre = z.bounds()
+            relax = REGISTRY[{'sin': 'Sin', 'cos': 'Cos', 'floor': 'Floor'}[t]]()
+            new_c, new_g = zono_affine_transform(relax, z.center, z.generators)
+            zono_state[name] = TorchZonotope(new_c, new_g)
+            if op_bounds is not None:
+                op_bounds[name] = (lo_pre.detach().clone(), hi_pre.detach().clone())
+            layer_idx = op.get('layer_idx')
+            if layer_idx is not None:
+                sb[layer_idx] = (lo_pre.clone(), hi_pre.clone())
+
         elif t == 'mul':
             # Constant scalar / per-channel multiply: y = scale * x.
             z = _get(op['inputs'][0])
