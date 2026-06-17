@@ -12,6 +12,12 @@ build/
 # Local paths config
 tests/paths.yaml
 
+# Gurobi licensing is local-only -- never commit. The real node-locked license
+# lives solely in the VNNCOMP web form's post-install field, so post_install_tool.sh
+# (which holds it) is kept out of git entirely.
+gurobi.lic
+vnncomp_scripts/post_install_tool.sh
+
 # Pytest
 .pytest_cache/
 htmlcov/

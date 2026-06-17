@@ -149,6 +149,59 @@ print("    vibecheck import OK")
 PY
 
 trap - ERR
+
+# --- Gurobi license link printout (always runs) -------------------------------
+# Fetches grbprobe (pip gurobipy ships none) and prints the node-locked
+# HOSTID/HOSTNAME/USERNAME/CORES plus a Gurobi keyserver URL. For the license-
+# provisioning submission: open that URL from a university network to mint the
+# .lic, paste it into post_install_tool.sh, and upload that as the post-install
+# script in the VNNCOMP form. Harmless on non-Gurobi runs (just the 62 MB fetch
+# + printout); the hostid-mismatch line below only warns when the licensing ENI
+# (MAC 02:72:ca:20:72:87 -> hostid ca207287) is not the attached interface.
+echo "==> Gurobi license link"
+GRB_BIN=/tmp/gurobi1302/linux64/bin
+if [ ! -x "$GRB_BIN/grbprobe" ]; then
+	echo "Fetching grbprobe..."
+	curl -sL -o /tmp/gurobi1302.tar.gz https://packages.gurobi.com/13.0/gurobi13.0.2_linux64.tar.gz \
+		&& tar xzf /tmp/gurobi1302.tar.gz -C /tmp \
+			gurobi1302/linux64/bin/grbprobe gurobi1302/linux64/bin/gurobi_cl \
+		|| echo "WARNING: grbprobe fetch failed; skipping license link"
+fi
+
+grbprobe_output=$("$GRB_BIN/grbprobe" 2>/dev/null || true)
+echo "$grbprobe_output"
+
+HOSTNAME=$(echo $grbprobe_output | grep -Po "(?<=HOSTNAME=)(.*?)(?= )" || true)
+HOSTID=$(echo $grbprobe_output | grep -Po "(?<=HOSTID=)(.*?)(?= )" || true)
+USERNAME=$(echo $grbprobe_output | grep -Po "(?<=USERNAME=)(.*?)(?= )" || true)
+CORES=$(echo $grbprobe_output | grep -Po "(?<=CORES=)(.*?)(?= )" || true)
+LOCALDATE=$(date -u +%F)
+
+# The 2026 VNNCOMP vibecheck eval uses a fixed licensing ENI (MAC
+# 02:72:ca:20:72:87) -> hostid must be ca207287.
+EXPECTED_HOSTID=ca207287
+if [ "$HOSTID" != "$EXPECTED_HOSTID" ]; then
+	echo "WARNING: HOSTID=$HOSTID does not match the expected ENI hostid ($EXPECTED_HOSTID) for the 2026 VNNCOMP vibecheck eval -- the license in post_install_tool.sh will NOT match this machine."
+fi
+
+KEY=to-be-filled
+probe_url="https://portal.gurobi.com/keyserver?id=${KEY}&hostname=${HOSTNAME}&hostid=${HOSTID}&username=${USERNAME}&os=linux&localdate=${LOCALDATE}&version=13&cores=${CORES}"
+
+echo ""
+echo "Node-locked Gurobi license setup (one-time; reused on every run via the fixed ENI):"
+echo "  1. Get an academic Named-User license KEY (node-locked, NOT WLS) at:"
+echo "       https://portal.gurobi.com/iam/licenses/request/?type=academic"
+echo "  2. In the URL below, replace  id=to-be-filled  with your KEY."
+echo "  3. From a UNIVERSITY network (campus, or a laptop on the campus VPN), fetch"
+echo "     it with curl -- a browser does NOT work (it redirects to a login page):"
+echo "       curl \"<the URL, with your KEY in id=>\""
+echo "  4. curl returns the license text (TYPE=.../VERSION=13/HOSTID=ca207287/KEY=.../CKEY=...)."
+echo "  5. Paste that text into vnncomp_scripts/post_install_tool.sh between the EOF"
+echo "     markers, then upload that script as the post-install script in the web form."
+echo ""
+echo "  License-request URL (put your KEY in id=):"
+echo "$probe_url"
+
 ELAPSED=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $T_START}")
 echo "================================================================"
 echo "[vibecheck:install_tool] END status=ok elapsed=${ELAPSED}s"
