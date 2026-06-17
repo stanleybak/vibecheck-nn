@@ -1,6 +1,7 @@
 """CLI entry point for zonotope-based neural network verification."""
 
 import argparse
+import os
 import sys
 import time
 
@@ -88,6 +89,17 @@ def main():
         except AttributeError:   # pre-3.7 / non-TextIOWrapper stdout
             pass
         print('[verbose] line-buffered logging enabled', flush=True)
+        # Gurobi license visibility: graph mode uses Gurobi LP/MILP, so flag
+        # whether a real license file is installed vs the bundled size-limited
+        # one. Cheap filesystem check only (no Env init) -- this runs per timed
+        # instance under run_instance.sh's default --verbose.
+        _lic = os.environ.get('GRB_LICENSE_FILE')
+        _candidates = ([_lic] if _lic else []) + [
+            '/opt/gurobi/gurobi.lic', os.path.expanduser('~/gurobi.lic')]
+        _found = next((p for p in _candidates if p and os.path.isfile(p)), None)
+        print(f'[verbose] gurobi license file: {_found}' if _found
+              else '[verbose] gurobi license file: none found '
+                   '(gurobipy bundled size-limited license)', flush=True)
 
     if args.write_pkl:
         # Prepare step: parse + cache, no verification.
