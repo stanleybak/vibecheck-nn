@@ -94,7 +94,7 @@ class ScalarNonlinearRelax:
         return self.affine_band(lo, hi, lam=lam)
 
 
-def zono_affine_transform(relax, center, generators, rel_pad=1e-6,
+def zono_affine_transform(relax, center, generators, rel_pad=None,
                           tight_lo=None, tight_hi=None, alpha=None,
                           return_band=False):
     """Sound DeepZ elementwise transformer for f, using relax.affine_band.
@@ -129,6 +129,18 @@ def zono_affine_transform(relax, center, generators, rel_pad=1e-6,
     float32 rounding of lam*center+mu (sound inflation; ~1e-6 at ACOPF scales).
     """
     dt = center.dtype
+    if rel_pad is None:
+        # The pad is a sound inflation covering the FLOAT ROUNDING of
+        # lam*center+mu. It was sized ~1e-6 for float32 (eps~1.2e-7), but that
+        # is ~10 orders too large for the float64 path: a CONSTANT ~1e-6
+        # inflation (independent of lam/alpha) then dwarfs sub-1e-6 spec margins
+        # and caps the achievable bound — e.g. ml4acopf full prop3 plateaued at
+        # -1.56e-7 (within-tol sat) no matter how alpha tuned the slope, because
+        # no slope removes the pad. Scale the pad to the working dtype's epsilon:
+        # 1e-6 for float32, 1e-12 for float64 (still ~4 orders above float64
+        # eps~2.2e-16, so soundly covers float64 rounding while not swamping the
+        # margin). Callers may still pass an explicit rel_pad.
+        rel_pad = 1e-6 if dt == torch.float32 else 1e-12
     rad = generators.abs().sum(dim=1)
     lo = (center - rad).double()
     hi = (center + rad).double()

@@ -57,3 +57,45 @@ def test_zono_affine_transform_sound():
     fz = torch.sin(z)
     assert bool((fz >= olo - 1e-9).all()) and bool((fz <= ohi + 1e-9).all()), \
         'transformer output zonotope does not over-approximate f(z)'
+
+
+def test_zono_affine_transform_pad_is_dtype_aware():
+    """The rel_pad in zono_affine_transform is a sound inflation covering FLOAT
+    ROUNDING of lam*center+mu. A flat ~1e-6 (float32-sized) pad applied in
+    float64 is ~10 orders too large: it adds a CONSTANT symmetric bloat that no
+    slope/alpha can remove and that dwarfs sub-1e-6 spec margins (this was the
+    ml4acopf full prop3 within-tol-sat-instead-of-unsat root cause). The pad
+    default is now dtype-aware: ~1e-6 for float32, ~1e-12 for float64. Both stay
+    SOUND (over-approximate the exact monotonic range)."""
+    import vibecheck.nl_sigmoid_tanh  # noqa: F401  registers Sigmoid
+    from vibecheck.nonlinear_relax import zono_affine_transform, REGISTRY
+    relax = REGISTRY['Sigmoid']()
+    # Deep-saturation interval z in [14, 15]: sigmoid ~ 1, near-flat.
+    exact_hi = float(torch.sigmoid(torch.tensor(15.0, dtype=torch.float64)))
+
+    # float64 dtype-aware pad vs an explicit float32-sized pad: the dtype-aware
+    # default must be tighter by ~the removed ~1e-6 inflation. The residual
+    # overshoot is then only the band's OWN chord-relaxation gap (~6e-8 here),
+    # which the spec-time alpha-opt further shrinks by tuning lam — NOT the pad.
+    c64 = torch.tensor([14.5], dtype=torch.float64)
+    g64 = torch.tensor([[0.5]], dtype=torch.float64)
+    nc64, ng64 = zono_affine_transform(relax, c64, g64)               # dtype-aware ~1e-12
+    ub64 = float(nc64[0] + ng64[0].abs().sum())
+    nc_p6, ng_p6 = zono_affine_transform(relax, c64, g64, rel_pad=1e-6)  # old flat pad
+    ub_p6 = float(nc_p6[0] + ng_p6[0].abs().sum())
+    assert ub64 >= exact_hi - 1e-15, 'float64 band UB must be sound (>= true max)'
+    assert ub_p6 - ub64 > 5e-7, \
+        f'dtype-aware pad should drop the ~1e-6 float32 inflation (got {ub_p6 - ub64:.2e})'
+    assert ub64 - exact_hi < 5e-7, \
+        f'residual overshoot {ub64 - exact_hi:.2e} should be only the band chord gap'
+
+    # float32: the larger (~1e-6) pad is retained (sound for float32 rounding).
+    nc32, ng32 = zono_affine_transform(relax, c64.float(), g64.float())
+    ub32 = float(nc32[0] + ng32[0].abs().sum())
+    assert ub32 >= exact_hi - 1e-6, 'float32 band UB must be sound'
+    assert ub32 - exact_hi > 1e-7, 'float32 keeps the larger rounding pad'
+
+    # An explicit rel_pad still overrides the dtype-aware default.
+    nc_ex, ng_ex = zono_affine_transform(relax, c64, g64, rel_pad=1e-3)
+    ub_ex = float(nc_ex[0] + ng_ex[0].abs().sum())
+    assert ub_ex - exact_hi > 1e-4, 'explicit rel_pad must override the default'

@@ -9730,18 +9730,18 @@ def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
         # disjunct margin = max over its queries; spec margin = min over disjuncts
         dmar = torch.stack([qm[idx].max() for idx in grp_idx])
         spec_margin = dmar.min()
-        best = max(best, float(spec_margin))
-        if float(spec_margin) > 0:
+        _smf = float(spec_margin.detach())   # scalar for logging/checks
+        best = max(best, _smf)
+        if _smf > 0:
             _restore()
-            _m = float(spec_margin)
             if print_progress:
                 print(f'[acopf_alpha] verified at iter {it}, '
-                      f'margin={_m:.3e}', flush=True)
+                      f'margin={_smf:.3e}', flush=True)
             return 'verified', {'method': 'acopf_alpha', 'iter': it,
-                                'worst_margin': _m, 'margins': {0: _m}}
-        (-spec_margin).backward()
+                                'worst_margin': _smf, 'margins': {0: _smf}}
+        (-spec_margin).backward()   # spec_margin keeps grad for the α update
         opt.step()
-        sched.step(float(spec_margin))
+        sched.step(_smf)
         with torch.no_grad():
             for p_ in alphas.values():
                 p_.clamp_(0.0, 1.0)
@@ -9881,38 +9881,61 @@ def _verify_trig_graph(graph, spec, settings, t_start, total_timeout):
     # Budget: input-split is only tractable for a modest number of varying
     # dims. ml4acopf 14_ieee has ~22; the 118/300 specs have ~189 (cube blows
     # up) — for those we bound the work and return unknown rather than churn.
-    max_leaves = int(getattr(settings, 'trig_bab_max_leaves', 20000))
-    max_depth = int(getattr(settings, 'trig_bab_max_depth',
-                            max(40, 6 * max(1, n_var))))
+    # No early give-up at an arbitrary leaf/depth cap — keep splitting until the
+    # TIMEOUT (deadline) or OOM (handled gracefully -> unknown with the best
+    # bound so far). The caps default to effectively unbounded; the wall budget
+    # is the real stop. A branch that narrows to a degenerate (zero-width) box
+    # bottoms out (can't split) and is abandoned, so depth stays finite without
+    # a cap. An abandoned (unclosed, can't-split) leaf -> 'unknown' (can't prove
+    # unsat over it), NOT a give-up of the whole search.
+    max_leaves = int(getattr(settings, 'trig_bab_max_leaves', 10**9))
+    max_depth = int(getattr(settings, 'trig_bab_max_depth', 10**9))
     queue = [(xl0, xh0, 0)]
     closed = 0
     opened = 0
-    while queue:
-        if _time.perf_counter() >= deadline:
-            _restore()
-            return 'unknown', {'method': 'trig_input_split', 'reason': 'timeout',
-                               'leaves_closed': closed}
-        xl, xh, depth = queue.pop()
-        v, d, zf = _leaf(xl, xh)
-        if v == 'verified':
-            closed += 1
-            continue
-        opened += 1
-        if opened > max_leaves or depth > max_depth:
-            _restore()
-            if print_progress:
-                print(f'[trig_bab] gave up: opened={opened} depth={depth} '
-                      f'n_var={n_var} worst_margin={d.get("worst_margin")}',
-                      flush=True)
-            return 'unknown', {'method': 'trig_input_split',
-                               'reason': 'budget', 'leaves_closed': closed}
-        di = _split_dim(xl, xh, zf)
-        mid = 0.5 * (xl[di] + xh[di])
-        xh_l = xh.clone(); xh_l[di] = mid
-        xl_r = xl.clone(); xl_r[di] = mid
-        queue.append((xl, xh_l, depth + 1))
-        queue.append((xl_r, xh, depth + 1))
+    abandoned = 0
+    try:
+        while queue:
+            if _time.perf_counter() >= deadline:
+                _restore()
+                return 'unknown', {'method': 'trig_input_split',
+                                   'reason': 'timeout', 'leaves_closed': closed}
+            xl, xh, depth = queue.pop()
+            v, d, zf = _leaf(xl, xh)
+            if v == 'verified':
+                closed += 1
+                continue
+            opened += 1
+            di = _split_dim(xl, xh, zf)
+            # Can't split a (near-)degenerate box, or hit an optional cap:
+            # abandon this branch (keep exploring the rest), don't give up.
+            if (di is None or float(xh[di] - xl[di]) < 1e-9
+                    or opened > max_leaves or depth > max_depth):
+                abandoned += 1
+                continue
+            mid = 0.5 * (xl[di] + xh[di])
+            xh_l = xh.clone(); xh_l[di] = mid
+            xl_r = xl.clone(); xl_r[di] = mid
+            queue.append((xl, xh_l, depth + 1))
+            queue.append((xl_r, xh, depth + 1))
+    except (MemoryError, torch.cuda.OutOfMemoryError) as _oom:
+        # OOM-as-outcome (allowed by the no-swallow rule): record + return the
+        # best-so-far rather than crash. Re-raise only if explicitly requested.
+        if getattr(settings, 'raise_on_oom', False):
+            raise
+        _restore()
+        if print_progress:
+            print(f'[trig_bab] OOM after opened={opened} closed={closed} '
+                  f'-> unknown ({type(_oom).__name__})', flush=True)
+        return 'unknown', {'method': 'trig_input_split', 'reason': 'oom',
+                           'leaves_closed': closed}
     _restore()
+    if abandoned:
+        if print_progress:
+            print(f'[trig_bab] exhausted: closed={closed} abandoned={abandoned} '
+                  f'n_var={n_var}', flush=True)
+        return 'unknown', {'method': 'trig_input_split', 'reason': 'exhausted',
+                           'leaves_closed': closed, 'abandoned': abandoned}
     if print_progress:
         print(f'[trig_bab] verified: {closed} leaves', flush=True)
     return 'verified', {'method': 'trig_input_split', 'leaves_closed': closed}
@@ -10004,10 +10027,14 @@ def _verify_trig_nonlinear_split(graph, spec, settings, gg, xl0, xh0, dt,
                     di, float(xl[di]), float(xh[di])), score
         return best_kind, best_payload, best_score
 
-    max_leaves = int(getattr(settings, 'trig_nl_max_leaves', 6000))
-    max_depth = int(getattr(settings, 'trig_nl_max_depth', 120))
+    # No depth/leaf give-up: split until the TIMEOUT (deadline) or OOM (handled
+    # gracefully). Caps default to effectively unbounded. A leaf we can't split
+    # (no candidate / degenerate) is abandoned (-> unknown), the search keeps
+    # going on the rest rather than aborting the whole verification.
+    max_leaves = int(getattr(settings, 'trig_nl_max_leaves', 10**9))
+    max_depth = int(getattr(settings, 'trig_nl_max_depth', 10**9))
     queue = [(xl0, xh0, {}, 0)]
-    closed = 0; opened = 0
+    closed = 0; opened = 0; abandoned = 0
     while queue:
         if _time.perf_counter() >= deadline:
             _restore()
@@ -10017,7 +10044,17 @@ def _verify_trig_nonlinear_split(graph, spec, settings, gg, xl0, xh0, dt,
             return 'unknown', {'method': 'trig_nl_split', 'reason': 'timeout',
                                'leaves_closed': closed}
         xl, xh, clamps, depth = queue.pop()
-        v, d, ob, zf, cids, ofi = _leaf(xl, xh, clamps)
+        try:
+            v, d, ob, zf, cids, ofi = _leaf(xl, xh, clamps)
+        except (MemoryError, torch.cuda.OutOfMemoryError) as _oom:
+            if getattr(settings, 'raise_on_oom', False):
+                raise
+            _restore()
+            if print_progress:
+                print(f'[trig_nl] OOM (closed={closed}) -> unknown '
+                      f'({type(_oom).__name__})', flush=True)
+            return 'unknown', {'method': 'trig_nl_split', 'reason': 'oom',
+                               'leaves_closed': closed}
         if v == 'verified':
             closed += 1
             continue
@@ -10025,13 +10062,8 @@ def _verify_trig_nonlinear_split(graph, spec, settings, gg, xl0, xh0, dt,
         kind, payload, sw = _pick_split(xl, xh, ob, zf, cids, ofi)
         if (kind is None or sw <= 1e-12 or opened > max_leaves
                 or depth > max_depth):
-            _restore()
-            if print_progress:
-                print(f'[trig_nl] gave up: opened={opened} depth={depth} '
-                      f'worst_margin={d.get("worst_margin")} score={sw:.3g}',
-                      flush=True)
-            return 'unknown', {'method': 'trig_nl_split', 'reason': 'budget',
-                               'leaves_closed': closed}
+            abandoned += 1   # can't split / over optional cap — abandon, keep going
+            continue
         if kind == 'input':
             di, lo_i, hi_i = payload
             mid = 0.5 * (lo_i + hi_i)
@@ -10061,6 +10093,12 @@ def _verify_trig_nonlinear_split(graph, spec, settings, gg, xl0, xh0, dt,
             queue.append((xl, xh, _child(None, mid), depth + 1))
             queue.append((xl, xh, _child(mid, None), depth + 1))
     _restore()
+    if abandoned:
+        if print_progress:
+            print(f'[trig_nl] exhausted: closed={closed} abandoned={abandoned}',
+                  flush=True)
+        return 'unknown', {'method': 'trig_nl_split', 'reason': 'exhausted',
+                           'leaves_closed': closed, 'abandoned': abandoned}
     if print_progress:
         print(f'[trig_nl] verified: {closed} leaves', flush=True)
     return 'verified', {'method': 'trig_nl_split', 'leaves_closed': closed}
