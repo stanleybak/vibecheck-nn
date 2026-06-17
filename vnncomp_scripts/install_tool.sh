@@ -184,10 +184,22 @@ if [ "$HOSTID" != "$EXPECTED_HOSTID" ]; then
 	echo "WARNING: HOSTID=$HOSTID does not match the expected ENI hostid ($EXPECTED_HOSTID) for the 2026 VNNCOMP vibecheck eval -- the license in post_install_tool.sh will NOT match this machine."
 fi
 
-echo "Obtain an academic KEY: https://portal.gurobi.com/iam/licenses/request/?type=academic"
 KEY=to-be-filled
-# Open this URL from a university network to mint the node-locked license:
 probe_url="https://portal.gurobi.com/keyserver?id=${KEY}&hostname=${HOSTNAME}&hostid=${HOSTID}&username=${USERNAME}&os=linux&localdate=${LOCALDATE}&version=13&cores=${CORES}"
+
+echo ""
+echo "Node-locked Gurobi license setup (one-time; reused on every run via the fixed ENI):"
+echo "  1. Get an academic Named-User license KEY (node-locked, NOT WLS) at:"
+echo "       https://portal.gurobi.com/iam/licenses/request/?type=academic"
+echo "  2. In the URL below, replace  id=to-be-filled  with your KEY."
+echo "  3. From a UNIVERSITY network (campus, or a laptop on the campus VPN), fetch"
+echo "     it with curl -- a browser does NOT work (it redirects to a login page):"
+echo "       curl \"<the URL, with your KEY in id=>\""
+echo "  4. curl returns the license text (TYPE=.../VERSION=13/HOSTID=ca207287/KEY=.../CKEY=...)."
+echo "  5. Paste that text into vnncomp_scripts/post_install_tool.sh between the EOF"
+echo "     markers, then upload that script as the post-install script in the web form."
+echo ""
+echo "  License-request URL (put your KEY in id=):"
 echo "$probe_url"
 
 ELAPSED=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $T_START}")
