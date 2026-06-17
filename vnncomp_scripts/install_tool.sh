@@ -149,6 +149,49 @@ print("    vibecheck import OK")
 PY
 
 trap - ERR
+
+# --- Gurobi license probe (provisioning only; gated) --------------------------
+# Only runs with VIBECHECK_GUROBI_PROBE=1, so normal eval installs (and
+# non-Gurobi benchmarks like acasxu) don't download the 62 MB Gurobi tools or
+# print a spurious hostid-mismatch warning. Enable it for the one-time license-
+# provisioning submission: it fetches grbprobe (pip gurobipy ships none), prints
+# the node-locked HOSTID/HOSTNAME/USERNAME/CORES and a keyserver URL you open
+# from a university network to mint the .lic, which you paste into
+# post_install_tool.sh and upload as the post-install script in the VNNCOMP form.
+if [ "${VIBECHECK_GUROBI_PROBE:-0}" = "1" ]; then
+	echo "==> Gurobi license probe"
+	GRB_BIN=/tmp/gurobi1302/linux64/bin
+	if [ ! -x "$GRB_BIN/grbprobe" ]; then
+		echo "Fetching grbprobe..."
+		curl -sL -o /tmp/gurobi1302.tar.gz https://packages.gurobi.com/13.0/gurobi13.0.2_linux64.tar.gz \
+			&& tar xzf /tmp/gurobi1302.tar.gz -C /tmp \
+				gurobi1302/linux64/bin/grbprobe gurobi1302/linux64/bin/gurobi_cl \
+			|| echo "WARNING: grbprobe fetch failed; skipping license probe"
+	fi
+
+	grbprobe_output=$("$GRB_BIN/grbprobe" 2>/dev/null)
+	echo "$grbprobe_output"
+
+	HOSTNAME=$(echo $grbprobe_output | grep -Po "(?<=HOSTNAME=)(.*?)(?= )")
+	HOSTID=$(echo $grbprobe_output | grep -Po "(?<=HOSTID=)(.*?)(?= )")
+	USERNAME=$(echo $grbprobe_output | grep -Po "(?<=USERNAME=)(.*?)(?= )")
+	CORES=$(echo $grbprobe_output | grep -Po "(?<=CORES=)(.*?)(?= )")
+	LOCALDATE=$(date -u +%F)
+
+	# The 2026 VNNCOMP vibecheck eval uses a fixed licensing ENI (MAC
+	# 02:72:ca:20:72:87) -> hostid must be ca207287.
+	EXPECTED_HOSTID=ca207287
+	if [ "$HOSTID" != "$EXPECTED_HOSTID" ]; then
+		echo "WARNING: HOSTID=$HOSTID does not match the expected ENI hostid ($EXPECTED_HOSTID) for the 2026 VNNCOMP vibecheck eval -- the license in post_install_tool.sh will NOT match this machine."
+	fi
+
+	echo "Obtain an academic KEY: https://portal.gurobi.com/iam/licenses/request/?type=academic"
+	KEY=to-be-filled
+	# Open this URL from a university network to mint the node-locked license:
+	probe_url="https://portal.gurobi.com/keyserver?id=${KEY}&hostname=${HOSTNAME}&hostid=${HOSTID}&username=${USERNAME}&os=linux&localdate=${LOCALDATE}&version=13&cores=${CORES}"
+	echo "$probe_url"
+fi
+
 ELAPSED=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $T_START}")
 echo "================================================================"
 echo "[vibecheck:install_tool] END status=ok elapsed=${ELAPSED}s"
