@@ -72,8 +72,12 @@ class CosRelax(ScalarNonlinearRelax):
         out_lo = torch.where(has_trough, neg_one, ep_min)
         return out_lo, out_hi
 
-    def affine_band(self, lo, hi):
-        """Sound affine band around the chord.
+    def slope_at(self, x):
+        return -torch.sin(torch.as_tensor(x, dtype=torch.float64))
+
+    def affine_band(self, lo, hi, lam=None):
+        """Sound affine band around the chord (or a caller-supplied α-CROWN
+        slope — sound for ANY lam).
 
         Let lam be the chord slope and g(x) = cos(x) - lam*x. g is smooth, so on
         the closed interval [lo, hi] its extrema occur at the endpoints or at
@@ -101,10 +105,13 @@ class CosRelax(ScalarNonlinearRelax):
         width = hi - lo
         degenerate = width.abs() <= 0.0  # hi == lo
 
-        # Chord slope; guard hi == lo with the exact derivative -sin(lo).
-        safe_width = torch.where(degenerate, torch.ones_like(width), width)
-        lam_chord = (torch.cos(hi) - torch.cos(lo)) / safe_width
-        lam = torch.where(degenerate, -torch.sin(lo), lam_chord)
+        if lam is None:
+            # Chord slope; guard hi == lo with the exact derivative -sin(lo).
+            safe_width = torch.where(degenerate, torch.ones_like(width), width)
+            lam_chord = (torch.cos(hi) - torch.cos(lo)) / safe_width
+            lam = torch.where(degenerate, -torch.sin(lo), lam_chord)
+        else:
+            lam = torch.as_tensor(lam, dtype=work_dtype, device=lo.device)
 
         def g(x):
             return torch.cos(x) - lam * x

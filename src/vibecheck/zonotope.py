@@ -375,30 +375,38 @@ class TorchZonotope:
         assert 0 <= shared_gens <= K_b, (
             f"shared_gens={shared_gens} out of range [0, {K_b}] (K_b)")
 
+        # When any operand requires grad (α-CROWN / α-zono optimization), the
+        # in-place / out= ops below break autograd — use functional ops then.
+        _grad = (a.requires_grad or b.requires_grad
+                 or self.center.requires_grad or other.center.requires_grad)
+
         if K_b == shared_gens:
-            # Fast path: skip has no extras. Mutate self in place.
-            # Correctness: merged G = [a[:,:s] + b[:,:s] | a[:,s:]].
-            # Since K_b == s, the slow path's `out[:, K_a:] = b[:, s:]`
-            # branch would copy zero columns, so out == a with first s
-            # columns updated. In-place mutation of a gives the same.
+            # Fast path: skip has no extras. Merged G = [a[:,:s]+b[:,:s] | a[:,s:]].
             # Column ordering invariant is maintained statically by the
             # propagation ops (see module docstring).
+            if not _grad:
+                # mutate self in place (no-grad forward; perf)
+                if shared_gens > 0:
+                    a[:, :shared_gens].add_(b[:, :shared_gens])
+                self.center.add_(other.center)
+                return self
             if shared_gens > 0:
-                a[:, :shared_gens].add_(b[:, :shared_gens])
-            self.center.add_(other.center)
-            return self
+                g_out = torch.cat([a[:, :shared_gens] + b[:, :shared_gens],
+                                   a[:, shared_gens:]], dim=1)
+            else:
+                g_out = a
+            return TorchZonotope(self.center + other.center, g_out)
 
         # Slow path: skip has its own branch-specific generators.
-        K_out = K_a + K_b - shared_gens
-        out = torch.empty(n, K_out, dtype=a.dtype, device=a.device)
-        # Shared prefix: element-wise sum of first `shared_gens` cols
-        torch.add(a[:, :shared_gens], b[:, :shared_gens],
-                   out=out[:, :shared_gens])
-        # Branch extras: copy into the rest of `out`
+        parts = []
+        if shared_gens > 0:
+            parts.append(a[:, :shared_gens] + b[:, :shared_gens])
         if K_a > shared_gens:
-            out[:, shared_gens:K_a] = a[:, shared_gens:]
+            parts.append(a[:, shared_gens:])
         if K_b > shared_gens:
-            out[:, K_a:] = b[:, shared_gens:]
+            parts.append(b[:, shared_gens:])
+        out = (torch.cat(parts, dim=1) if parts
+               else a.new_zeros(n, 0))
         return TorchZonotope(self.center + other.center, out)
 
 
@@ -714,56 +722,87 @@ def _torch_zono_reduce_sum(center, gens, in_shape_nd, axes, keepdims):
 
 
 def _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b,
-                              shape_a=None, shape_b=None, shape_out=None):
-    """Element-wise Mul(a, b) where one side is a point zonotope
-    (zero generators). Supports ND broadcasting via optional shapes.
+                              shape_a=None, shape_b=None, shape_out=None,
+                              shared_gens=None):
+    """Element-wise Mul(a, b). Supports ND broadcasting via optional shapes.
 
-    If both sides have nonzero gens, raises NotImplementedError — the
-    product is bilinear (nonlinear) in the noise vars and cannot be
-    represented exactly as a zonotope without a sound over-approximation.
+    Both sides varying = a bilinear (nonlinear) product, soundly
+    over-approximated as a zonotope. CRITICAL noise bookkeeping: only the
+    first ``shared_gens`` generator columns of a and b are the SAME noise
+    symbols (the shared prefix from the common-ancestor fork). Columns beyond
+    that are BRANCH-SPECIFIC and INDEPENDENT.
+
+    Column layout of the returned generators (the forward handler assigns
+    column IDs to match — see verify_zono_bnb mul_bilinear):
+        [ shared (s) | a_extra (K_a-s) | b_extra (K_b-s) | box (fresh) ]
+    The FIRST-ORDER terms are EXACT and kept as linear columns (no boxing):
+        center:        ca⊙cb  + 0.5·Σ_{k<s} Ga[:,k]⊙Gb[:,k]   (diagonal shift)
+        shared k<s:    (Ga[:,k]⊙cb + ca⊙Gb[:,k]) e_k          (same noise both)
+        a_extra k≥s:   (Ga[:,k]⊙cb) e^a_k                     (a's own noise)
+        b_extra j≥s:   (ca⊙Gb[:,j]) e^b_j                     (b's own noise)
+    Keeping a_extra/b_extra linear (rather than boxing them) is sound because
+    the forward handler now tracks explicit per-column IDs: a downstream merge
+    aligns by ID (common-prefix), so a branch's own noise is never conflated
+    with a different branch's noise at the same position. The SECOND-ORDER
+    remainder is boxed into one fresh per-element column:
+        box_i = radA_i·radB_i − 0.5·Σ_{k<s}|Ga[i,k]·Gb[i,k]|
+    The subtraction is the shared-noise diagonal tightening: those terms are
+    Σ_{k<s} Ga_k Gb_k e_k² with e_k² ∈ [0,1] (NOT [−1,1]), so they have a
+    +0.5·Σ Ga_k Gb_k center shift and only ±0.5·Σ|Ga_k Gb_k| spread, vs the
+    ±Σ|Ga_k Gb_k| a symmetric box would charge. Reductions: s==0 → decorrelated
+    interval product (a/b extras = full gens, box = radA·radB); s==K_a==K_b →
+    full linear correlation + diagonal-tightened quadratic. ``shared_gens=None``
+    defaults to 0 (always sound; the merge handlers pass the real fork count).
     """
     a_is_point = (g_a.numel() == 0
                   or bool(g_a.abs().max() < 1e-12))
     b_is_point = (g_b.numel() == 0
                   or bool(g_b.abs().max() < 1e-12))
     if not (a_is_point or b_is_point):
-        # Both sides vary: sound zonotope product (same construction as
-        # the matmul_bilinear handler). With shared noise symbols e
-        # (columns aligned by the prefix invariant),
-        #   (ca + Ga e) ⊙ (cb + Gb e)
-        #     = ca⊙cb + Σ_i (Ga_i⊙cb + ca⊙Gb_i) e_i + R,
-        # linear terms exact; |R| ≤ radA ⊙ radB boxed into fresh
-        # diagonal columns. Supports ND broadcasting via the shapes.
         sa = shape_a if shape_a is not None else (c_a.numel(),)
         sb = shape_b if shape_b is not None else (c_b.numel(),)
-        K_a = g_a.shape[1] if g_a.numel() > 0 else 0
-        K_b = g_b.shape[1] if g_b.numel() > 0 else 0
-        K = max(K_a, K_b)
+        K_a = g_a.shape[1]
+        K_b = g_b.shape[1]
+        s = 0 if shared_gens is None else int(max(0, min(shared_gens, K_a, K_b)))
         dev = c_a.device; dt = c_a.dtype
-        GA = g_a
-        GB = g_b
-        if K_a < K:
-            GA = torch.cat([GA, torch.zeros(GA.shape[0], K - K_a,
-                                            dtype=dt, device=dev)], 1)
-        if K_b < K:
-            GB = torch.cat([GB, torch.zeros(GB.shape[0], K - K_b,
-                                            dtype=dt, device=dev)], 1)
         a_nd = c_a.reshape(*sa)
         b_nd = c_b.reshape(*sb)
-        GA_nd = GA.t().reshape(K, *sa)
-        GB_nd = GB.t().reshape(K, *sb)
         c_out_nd = a_nd * b_nd
-        lin = GA_nd * b_nd.unsqueeze(0) + a_nd.unsqueeze(0) * GB_nd
+        GA_nd = g_a.t().reshape(K_a, *sa)   # (K_a, *sa)
+        GB_nd = g_b.t().reshape(K_b, *sb)   # (K_b, *sb)
+        # Shared-noise diagonal: e_k² ∈ [0,1] → center shift + reduced spread.
+        if s > 0:
+            prod_s = GA_nd[:s] * GB_nd[:s]                  # (s, *out)
+            diag_sum = prod_s.sum(dim=0)                    # Σ Ga_k Gb_k
+            diag_abs = prod_s.abs().sum(dim=0)              # Σ|Ga_k Gb_k|
+            c_out_nd = c_out_nd + 0.5 * diag_sum * torch.ones_like(c_out_nd)
+        else:
+            diag_abs = torch.zeros_like(c_out_nd)
+        n_out = c_out_nd.numel()
+        cols = []
+        if s > 0:                                           # shared linear
+            lin_s = (GA_nd[:s] * b_nd.unsqueeze(0)
+                     + a_nd.unsqueeze(0) * GB_nd[:s]).expand(s, *c_out_nd.shape)
+            cols.append(lin_s.reshape(s, n_out).t())
+        if K_a > s:                                         # a's own noise
+            lin_a = (GA_nd[s:] * b_nd.unsqueeze(0)).expand(
+                K_a - s, *c_out_nd.shape)
+            cols.append(lin_a.reshape(K_a - s, n_out).t())
+        if K_b > s:                                         # b's own noise
+            lin_b = (a_nd.unsqueeze(0) * GB_nd[s:]).expand(
+                K_b - s, *c_out_nd.shape)
+            cols.append(lin_b.reshape(K_b - s, n_out).t())
+        G_lin = (torch.cat(cols, dim=1).contiguous() if cols
+                 else torch.zeros(n_out, 0, dtype=dt, device=dev))
         radA = GA_nd.abs().sum(dim=0)
         radB = GB_nd.abs().sum(dim=0)
-        R = (radA * radB) * torch.ones_like(c_out_nd)
-        n_out = c_out_nd.numel()
-        G_lin = lin.reshape(K, n_out).t().contiguous()
-        Rf = R.reshape(-1)
+        box = ((radA * radB) * torch.ones_like(c_out_nd)
+               - 0.5 * diag_abs * torch.ones_like(c_out_nd)).clamp_min(0.0)
+        Rf = box.reshape(-1)
         nz = torch.nonzero(Rf).flatten()
-        G_quad = torch.zeros(n_out, nz.numel(), dtype=dt, device=dev)
-        G_quad[nz, torch.arange(nz.numel(), device=dev)] = Rf[nz]
-        return c_out_nd.reshape(-1), torch.cat([G_lin, G_quad], dim=1)
+        G_box = torch.zeros(n_out, nz.numel(), dtype=dt, device=dev)
+        G_box[nz, torch.arange(nz.numel(), device=dev)] = Rf[nz]
+        return c_out_nd.reshape(-1), torch.cat([G_lin, G_box], dim=1)
 
     if shape_a is None and shape_b is None:
         # Plain element-wise (same shape both sides).
@@ -978,7 +1017,8 @@ def _torch_zono_div_bilinear(c_a, g_a, c_b, g_b, fallback='raise',
     return c_out, new_eye
 
 
-def _torch_zono_pow_int(c_in, g_in, exponent, relaxation='chord'):
+def _torch_zono_pow_int(c_in, g_in, exponent, relaxation='chord',
+                        tight_lo=None, tight_hi=None):
     """Element-wise x^p for integer p >= 2 as a sound zonotope.
 
     Returns (c_out, g_out). Two relaxation modes:
@@ -1008,6 +1048,17 @@ def _torch_zono_pow_int(c_in, g_in, exponent, relaxation='chord'):
     rad_in = g_in.abs().sum(dim=1) if K > 0 else torch.zeros_like(c_in)
     lo = c_in - rad_in
     hi = c_in + rad_in
+    # nonlinear-split clamp: relaxation built over the split sub-interval (the
+    # chord/box bound over [tight_lo,tight_hi] is valid for the sub-domain where
+    # x lies there; children of a split cover the parent — sound, same argument
+    # as the affine-band op_clamps path).
+    if tight_lo is not None:
+        lo = torch.maximum(lo, torch.as_tensor(
+            tight_lo, dtype=c_in.dtype, device=c_in.device))
+    if tight_hi is not None:
+        hi = torch.minimum(hi, torch.as_tensor(
+            tight_hi, dtype=c_in.dtype, device=c_in.device))
+        hi = torch.maximum(hi, lo)
     n = c_in.numel()
     if relaxation == 'box':
         return _pow_int_box(c_in, g_in, p, lo, hi, K)

@@ -16,6 +16,7 @@ A zonotope-based neural network verifier. Given an ONNX network and a VNNLIB spe
 
 - **Use `.venv/bin/python`** for everything (keeps the single-threaded BLAS set in `__init__.py` consistent). **Never `git commit`/`push`** — the user handles git.
 - **The verdict is the `--results-file` contents — NEVER the exit code or stdout.** Pass `--results-file`, read it after the subprocess, refuse to count a case whose file is missing or holds an unexpected value. A sweep once "verified 194/194 in 161 s" while running an empty no-op loop (the module body ran without `main()`); suspiciously uniform timings are the tell. Trust the file, nothing else. (Exit codes are only 0=verified, 1=unknown, 2=error.)
+- **Acceptable verdicts for a SAT-region property: both `unsat` (proof) and a within-tolerance `sat` are acceptable; prefer proving `unsat`.** A *within-tolerance counterexample* is a point whose spec margin is within `COUNTEREXAMPLE_ATOL` (1e-4) of violating — VNNCOMP's scorer accepts it. So on a tolerance-boundary instance (true margin ~0 ± atol, e.g. ml4acopf 14_ieee prop3), emitting the within-tol `sat` is fine when we can't prove `unsat`; don't treat it as a false-sat or "stop and fix" it. Policy: a *clear* CE (margin < −atol) → return `sat` immediately; a within-tol CE → write it early (so a timeout can't lose it) but **keep searching** for a clear CE or an `unsat` proof (which overrides it); never let a later `timeout`/`unknown` overwrite a `sat` already found. (`verify_graph._sat_disposition` + `main._emit_result`.)
 - **Never broad-kill processes.** `pkill -f python` / `killall python` takes down the tmux session hosting Claude and any batch orchestrator. Match the verifier narrowly (`vibecheck\.main`) or kill only specific PIDs you started.
 - **Cap memory-uncertain experiments:** `systemd-run --user --scope -p MemoryMax=8G ...`. A runaway tensor alloc otherwise OOM-kills the session. Long/heavy/GPU-scaled work goes to a remote box, not local (local hosts the tmux Claude runs in).
 - **Never silently swallow OOM.** Re-raise `torch.cuda.OutOfMemoryError` / `MemoryError`; catch only when `settings.raise_on_oom=False` (benchmarking loops that record OOM as an outcome).
@@ -60,6 +61,10 @@ box. Per-benchmark records are `docs/benchmarks/<name>.md`. Current 2026 benchma
 status, and known upstream-benchmark bugs are in the **`vnncomp2026`** skill
 (`.claude/skills/vnncomp2026/SKILL.md`).
 
-Two essentials worth keeping in front of you: heavy/long/GPU-scaled work runs on a **remote
-box, never local** (local hosts the tmux Claude runs in — an OOM there kills the session); and
-every AWS `ssh` must `sudo rm -f /tmp/idle_since` or the idle-shutdown fires mid-task.
+Three essentials worth keeping in front of you: heavy/long/GPU-scaled work runs on a **remote
+box, never local** (local hosts the tmux Claude runs in — an OOM there kills the session);
+every AWS `ssh` must `sudo rm -f /tmp/idle_since` or the idle-shutdown fires mid-task; and
+**never keep anything you care about in the remote `/tmp`** — a stop/start (e.g. idle-shutdown,
+which changes the public IP too) **wipes `/tmp`**, so diagnostic scripts, oracles, and results
+must live under `~/persistent_runs/` (survives reboot) or, better, be kept in the local repo
+(e.g. `scratch/`) and `rsync`'d up, so they can be re-pushed after any restart.

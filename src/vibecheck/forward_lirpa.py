@@ -35,6 +35,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .broadcast_util import reconstruct_live_shape, broadcast_rows
+
 
 def _evaluate_box(A_lo, b_lo, A_up, b_up, xl, xh):
     """Compute the BOX bound at this op from linear LB/UB and input box.
@@ -401,6 +403,43 @@ def _bnm_gemm(W, AB):
     return O.permute(1, 0, 2).contiguous()                   # (B, j, m)
 
 
+def _affine_const_bbound(bound_in, bias, out_shape_nd, in_shape_nd, sign,
+                         xl_eval, xh_eval, device, dtype):
+    """y = a + sign·const (const a zero-radius bias) with FULL ONNX broadcast.
+
+    The constant is exact, so the slope rows (A) only get the live tensor's
+    rows broadcast-expanded to the output, and b shifts by ±const. Uses the
+    shared `broadcast_util` so the row expansion matches the zonotope rep
+    exactly. `sign`=+1 for Add, -1 for Sub."""
+    bt_flat = torch.as_tensor(np.asarray(bias).flatten(), dtype=dtype,
+                              device=device)
+    n = bound_in.b_lo.shape[1]
+    if bt_flat.numel() == 1 or bt_flat.numel() == n:
+        # elementwise — no row expansion.
+        A_lo_o, A_up_o = bound_in.A_lo, bound_in.A_up
+        b_lo_o = bound_in.b_lo + sign * bt_flat
+        b_up_o = bound_in.b_up + sign * bt_flat
+    else:
+        const_full = torch.as_tensor(np.asarray(bias), dtype=dtype,
+                                     device=device)
+        const_sh = tuple(const_full.shape) if const_full.dim() > 0 else ()
+        out_sh = tuple(int(d) for d in out_shape_nd)
+        in_sh = (tuple(int(d) for d in in_shape_nd)
+                 if in_shape_nd is not None else (n,))
+        live_sh, const_aligned = reconstruct_live_shape(
+            out_sh, const_sh, in_sh, n)
+        A_lo_o = broadcast_rows(bound_in.A_lo, live_sh, out_sh, 1)
+        A_up_o = broadcast_rows(bound_in.A_up, live_sh, out_sh, 1)
+        const_out = const_full.reshape(const_aligned).expand(out_sh).reshape(-1)
+        b_lo_o = broadcast_rows(bound_in.b_lo, live_sh, out_sh, 1) \
+            + sign * const_out
+        b_up_o = broadcast_rows(bound_in.b_up, live_sh, out_sh, 1) \
+            + sign * const_out
+    lo_box, hi_box = _batched_eval_box(A_lo_o, b_lo_o, A_up_o, b_up_o,
+                                       xl_eval, xh_eval)
+    return _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
+
+
 def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                                     free_states=False,
                                     forced_varying_mask=None,
@@ -703,20 +742,14 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t == 'sub':
             bias = op.get('bias')
-            if bias is not None:
-                bias_t = torch.as_tensor(bias.flatten(), dtype=dtype,
-                                            device=device)
-                A_lo_o = bound_in.A_lo
-                b_lo_o = bound_in.b_lo - bias_t.unsqueeze(0)
-                A_up_o = bound_in.A_up
-                b_up_o = bound_in.b_up - bias_t.unsqueeze(0)
-            else:
+            if bias is None:
                 raise NotImplementedError(
                     "forward-LiRPA: sub op has no 'bias' — treating it as "
                     "identity would silently drop the subtraction")
-            lo_box, hi_box = _batched_eval_box(
-                A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
-            state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
+            state[name] = _affine_const_bbound(
+                bound_in, bias, op.get('out_shape_nd'),
+                op.get('in_shapes_nd', [None])[0], -1.0,
+                xl_eval, xh_eval, device, dtype)
         elif t == 'add':
             if op.get('is_merge'):
                 bound_a = state[ins[0]]; bound_b = state[ins[1]]
@@ -724,29 +757,56 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
                 b_lo_o = bound_a.b_lo + bound_b.b_lo
                 A_up_o = bound_a.A_up + bound_b.A_up
                 b_up_o = bound_a.b_up + bound_b.b_up
+                lo_box, hi_box = _batched_eval_box(
+                    A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
+                state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o,
+                                      lo_box, hi_box)
+            elif op.get('bias') is not None:
+                state[name] = _affine_const_bbound(
+                    bound_in, op['bias'], op.get('out_shape_nd'),
+                    op.get('in_shapes_nd', [None])[0], 1.0,
+                    xl_eval, xh_eval, device, dtype)
             else:
-                bias = op.get('bias')
-                if bias is not None:
-                    bias_t = torch.as_tensor(bias.flatten(), dtype=dtype,
-                                                device=device)
-                    out_shape_nd = op.get('out_shape_nd')
-                    if (out_shape_nd is not None
-                            and bias_t.numel() != bound_in.b_lo.shape[1]):
-                        bias_shape = list(bias.shape) if hasattr(
-                            bias, 'shape') else [bias_t.numel()]
-                        bias_nd = bias_t.reshape(*bias_shape)
-                        ones_out = torch.ones(*out_shape_nd, dtype=dtype,
-                                                device=device)
-                        bias_t = (ones_out * bias_nd).reshape(-1)
-                    A_lo_o = bound_in.A_lo
-                    b_lo_o = bound_in.b_lo + bias_t.unsqueeze(0)
-                    A_up_o = bound_in.A_up
-                    b_up_o = bound_in.b_up + bias_t.unsqueeze(0)
+                state[name] = _BBound(
+                    bound_in.A_lo, bound_in.b_lo, bound_in.A_up,
+                    bound_in.b_up, bound_in.lo_box, bound_in.hi_box)
+        elif t == 'mul':
+            # constant scalar / per-element / per-channel scale: y = s * x.
+            # Linear & exact; mixed-sign s swaps lower/upper PER ELEMENT.
+            scale = op.get('scale')
+            if scale is None:
+                raise NotImplementedError("forward-LiRPA: mul op missing 'scale'")
+            s = torch.as_tensor(np.asarray(scale).flatten(), dtype=dtype,
+                                device=device)
+            n = bound_in.b_lo.shape[1]
+            if s.numel() == 1:
+                s = s.expand(n)
+            elif s.numel() != n:
+                in_shape = op.get('in_shapes_nd', [None])[0]
+                if (in_shape is not None and len(in_shape) == 3
+                        and s.numel() == in_shape[0]):
+                    C, H, W = in_shape
+                    s = s.view(C, 1, 1).expand(C, H, W).reshape(-1)
                 else:
-                    A_lo_o, b_lo_o = bound_in.A_lo, bound_in.b_lo
-                    A_up_o, b_up_o = bound_in.A_up, bound_in.b_up
+                    raise NotImplementedError(
+                        f"forward-LiRPA: mul scale numel {s.numel()} vs n={n}")
+            sp = s.clamp(min=0).unsqueeze(0)            # (1,n)
+            sn = s.clamp(max=0).unsqueeze(0)
+            sp1 = sp.unsqueeze(-1); sn1 = sn.unsqueeze(-1)  # (1,n,1)
+            A_lo_o = sp1 * bound_in.A_lo + sn1 * bound_in.A_up
+            b_lo_o = sp * bound_in.b_lo + sn * bound_in.b_up
+            A_up_o = sp1 * bound_in.A_up + sn1 * bound_in.A_lo
+            b_up_o = sp * bound_in.b_up + sn * bound_in.b_lo
             lo_box, hi_box = _batched_eval_box(
                 A_lo_o, b_lo_o, A_up_o, b_up_o, xl_eval, xh_eval)
+            state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
+        elif t == 'floor':
+            # SOUND linear relaxation: x - 1 < floor(x) <= x. Keeps correlation
+            # (slope 1, offset 0/-1); box is the exact floor of the input box.
+            A_lo_o = bound_in.A_lo; b_lo_o = bound_in.b_lo - 1.0
+            A_up_o = bound_in.A_up; b_up_o = bound_in.b_up
+            lo_box = torch.floor(bound_in.lo_box)
+            hi_box = torch.floor(bound_in.hi_box)
             state[name] = _BBound(A_lo_o, b_lo_o, A_up_o, b_up_o, lo_box, hi_box)
         elif t in ('sigmoid', 'tanh'):
             from .verify_zono_bnb import _sigmoid_tanh_linear_bounds

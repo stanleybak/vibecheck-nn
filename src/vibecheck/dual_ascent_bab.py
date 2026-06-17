@@ -37,6 +37,10 @@ from typing import Optional, Callable
 import numpy as np
 import torch
 
+from .nonlinear_split_planes import op_planes, split_point
+from .nonlinear_split_dual import (backward_sensitivity,
+                                   band_change_correction, split_halfspace)
+
 # ---------------------------------------------------------------------------
 # Defaults — tuned on prop_4260 (TinyImageNet ResNet medium). K=1 wins on
 # wall, K=2 matches Gurobi node count, K=5 gives tightest bounds. Increase
@@ -329,6 +333,96 @@ def _build_substitution_caches(
     return n_gens, e_lb_t, e_hi_t, width_t, d_t, c0, hs_A, hs_b, d_corr, c0_corr
 
 
+def build_nonlinear_split_caches(splittables, d_np, c0, n_gens, device, dtype,
+                                 alpha_l=None, alpha_r=None):
+    """Dual-ascent caches for NONLINEAR splittable neurons (sigmoid/tanh/pow/
+    sin/cos), in the SAME (hs_A, hs_b, d_corr, c0_corr) layout the ReLU
+    substitution path produces — so the batched BaB consumes a mix transparently.
+
+    Each `splittables[i]` dict carries the neuron's parent geometry:
+        relax       a ScalarNonlinearRelax (Sigmoid/Tanh/Sin/Cos/Pow…)
+        op_type     graph op string (drives the zero-vs-midpoint split point)
+        lo, hi      parent pre-activation interval
+        c_in        pre-activation center (z = c_in + a·e)
+        row_indices, row_values   the a row over error symbols (e_new excluded)
+        e_new_col   column of the op's fresh error symbol in d
+        lam, mu, delta            parent band (λ z + μ ± δ); delta = e_new mag
+
+    For each side (0=left z≤p, 1=right z≥p) we re-tighten the band on the
+    sub-interval and fold the change into the objective via
+    `band_change_correction`; one halfspace pins the side's pre-activation.
+    The op stays a band (NOT substituted), so the e_new column survives with a
+    smaller δ'. _ROWS_PER_SPLIT=2 is kept uniform with ReLU by padding row 1
+    with a no-op (0·e ≤ 1, never binds; the dual sets its λ=0).
+
+    `alpha_l`/`alpha_r` (default None) pick the CHILD slope. None → inherit the
+    PARENT slope λ: then g(x)=f(x)−λx has a SUBSET range on the (contained)
+    sub-interval, so the child's offset band [μ'−δ', μ'+δ'] ⊆ the parent's and
+    the split is GUARANTEED to (weakly) tighten — the BaB always makes progress.
+    A slope CHANGE (alpha given) instead rescales the input generators g_k·λ'·a
+    and can loosen at a bad α; supply alphas only when they're being optimised
+    (α-CROWN), initialised at the parent slope so they never regress.
+
+    Returns (hs_A, hs_b, d_corr, c0_corr) shaped like `_compute_query_caches`.
+    Soundness: see nonlinear_split_dual — fixed downstream relaxations over the
+    parent interval remain valid on the (contained) child sub-interval.
+    """
+    n_splits = len(splittables)
+    hs_A = torch.zeros(n_splits, 2, _ROWS_PER_SPLIT, n_gens,
+                       device=device, dtype=dtype)
+    hs_b = torch.zeros(n_splits, 2, _ROWS_PER_SPLIT, device=device, dtype=dtype)
+    d_corr = torch.zeros(n_splits, 2, n_gens, device=device, dtype=dtype)
+    c0_corr = torch.zeros(n_splits, 2, device=device, dtype=dtype)
+    # no-op pad row: 0·e ≤ 1 (always feasible, never binds).
+    hs_b[:, :, 1] = 1.0
+
+    d_np = np.asarray(d_np, dtype=np.float64)
+    for i, sp in enumerate(splittables):
+        relax = sp['relax']
+        lo = float(sp['lo']); hi = float(sp['hi']); c_in = float(sp['c_in'])
+        ridx = np.asarray(sp['row_indices'], dtype=np.int64)
+        rval = np.asarray(sp['row_values'], dtype=np.float64)
+        e_new_col = int(sp['e_new_col'])
+        assert e_new_col not in ridx, (
+            f"nonlinear split {sp.get('op_type')}: e_new_col {e_new_col} "
+            f"overlaps row_indices — d_corr/halfspace would double-count.")
+        lam = float(sp['lam']); mu = float(sp['mu']); delta = float(sp['delta'])
+        p = float(split_point(sp['op_type'], lo, hi))
+        g_k = float(backward_sensitivity(float(d_np[e_new_col]), delta))
+
+        for side, (clo, chi, a_side, name) in enumerate((
+                (lo, p, alpha_l, 'left'), (p, hi, alpha_r, 'right'))):
+            clo_t = torch.tensor(clo, dtype=torch.float64)
+            chi_t = torch.tensor(chi, dtype=torch.float64)
+            if a_side is None:
+                # inherit parent slope -> guaranteed-tightening offset re-fit.
+                lam_n, mu_n, delta_n = (float(t) for t in relax.affine_band(
+                    clo_t, chi_t,
+                    lam=torch.tensor(lam, dtype=torch.float64)))
+            else:
+                # α-chosen slope (optimisable; may loosen at a bad α).
+                sL, tL, sU, tU = op_planes(
+                    relax, clo_t, chi_t,
+                    torch.tensor(a_side, dtype=torch.float64), 'band')
+                lam_n = float(sL); mu_n = 0.5 * float(tL + tU)
+                delta_n = 0.5 * float(tU - tL)
+            dcr, dce, c0c = band_change_correction(
+                g_k, c_in, rval, lam, mu, delta, lam_n, mu_n, delta_n)
+            d_corr[i, side, e_new_col] = float(dce)
+            d_corr[i, side].index_add_(
+                0, torch.as_tensor(ridx, device=device, dtype=torch.long),
+                torch.as_tensor(np.asarray(dcr, dtype=np.float64),
+                                device=device, dtype=dtype))
+            c0_corr[i, side] = float(c0c)
+            hs_row, hs_rhs = split_halfspace(c_in, rval, p, name)
+            hs_A[i, side, 0].index_add_(
+                0, torch.as_tensor(ridx, device=device, dtype=torch.long),
+                torch.as_tensor(np.asarray(hs_row, dtype=np.float64),
+                                device=device, dtype=dtype))
+            hs_b[i, side, 0] = float(hs_rhs)
+    return hs_A, hs_b, d_corr, c0_corr
+
+
 def _batched_dual_ascent(
     d_batch, c0_batch, A_batch, b_batch, lam_batch, alive_mask,
     e_lb, e_hi, width, *, max_iter: int, repair_steps: int,
@@ -438,9 +532,18 @@ def _batched_dual_ascent(
                                torch.zeros_like(eta_star))
 
         step_mask = pending.unsqueeze(-1).to(dtype)
-        lam_batch = lam_batch + (eta_star.unsqueeze(-1) * s_proj) * step_mask
-        lam_batch = lam_batch.clamp_min(0.0)
-        rc = rc + (eta_star.unsqueeze(-1) * da) * step_mask
+        lam_prev = lam_batch
+        lam_batch = (lam_batch
+                     + (eta_star.unsqueeze(-1) * s_proj) * step_mask
+                     ).clamp_min(0.0)
+        # Re-sync rc with the CLAMPED λ. The clamp changes λ by a different
+        # amount than eta·s_proj whenever a multiplier hits the λ≥0 boundary;
+        # the old incremental `rc += eta·da` assumed the unclamped step, so rc
+        # drifted from d+Aᵀλ and g_lam (computed from rc next iter) became an
+        # INVALID — possibly too-high — bound that could falsely certify (seen
+        # for K≥2 with warm-started λ; cold-start K=1 never clamps so it was
+        # masked). Apply the delta for the ACTUAL λ change instead.
+        rc = rc + torch.einsum('bmn,bm->bn', A_batch, lam_batch - lam_prev)
 
     reason = torch.where(
         (reason == -1) & alive_mask,

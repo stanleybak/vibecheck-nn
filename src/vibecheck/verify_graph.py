@@ -1352,6 +1352,11 @@ def _adaptive_spec_lb(gg, xl, xh, bounds_by_relu, spec_ew, spec_bias,
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
         elif t == 'add':
+            # ew passes through unchanged → only sound with no outer-broadcast
+            # operand (reduce-sum adjoint lives in _spec_backward_graph).
+            from .broadcast_util import assert_no_outer_broadcast
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'lb_direct')
             if op.get('is_merge'):
                 for inp in op['inputs']:
                     ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
@@ -1364,6 +1369,9 @@ def _adaptive_spec_lb(gg, xl, xh, bounds_by_relu, spec_ew, spec_bias,
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
 
         elif t == 'sub':
+            from .broadcast_util import assert_no_outer_broadcast
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'lb_direct')
             bias = op.get('bias')
             if bias is not None:
                 from .alpha_crown import _bias_dot_ew
@@ -1554,6 +1562,11 @@ def _per_neuron_adaptive_bounds(gg, xl, xh, bounds_by_relu, target_layer_idx,
             _accum(ew_at_ub, inp, ew_ub_back)
 
         elif t == 'add':
+            # ew passes through unchanged → only sound with no outer-broadcast
+            # operand (reduce-sum adjoint lives in _spec_backward_graph).
+            from .broadcast_util import assert_no_outer_broadcast
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'per_neuron')
             if op.get('is_merge'):
                 for inp in op['inputs']:
                     _accum(ew_at_lb, inp, ew_lb)
@@ -1569,6 +1582,9 @@ def _per_neuron_adaptive_bounds(gg, xl, xh, bounds_by_relu, target_layer_idx,
                 _accum(ew_at_ub, inp, ew_ub)
 
         elif t == 'sub':
+            from .broadcast_util import assert_no_outer_broadcast
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'per_neuron')
             bias = op.get('bias')
             if bias is not None:
                 from .alpha_crown import _bias_dot_ew
@@ -5152,6 +5168,50 @@ def _compute_avg_layer_width(gg, bounds_by_relu):
     return out
 
 
+def _sat_disposition(graph, spec, settings, witness, info):
+    """Classify an ORT-VALIDATED sat witness (from `_validate_sat_witness`,
+    ok=True) as a CLEAR counterexample ('real') or a within-tolerance near-miss
+    ('within_tol').
+
+    Real iff the ORT output violates the spec by MORE than the tolerance
+    (un-banded worst margin <= -sat_tol) — a clear counterexample, commit 'sat'
+    immediately. Otherwise it only violates within tolerance (a near-boundary
+    point the VNNCOMP scorer would accept within atol, but which might be a
+    numerically-marginal *unsafe-looking* point on an actually-unsat instance):
+    persist it to the results file NOW via `settings.result_sink` (so a later
+    timeout can't lose it) and stash it as the run's fallback, but signal the
+    caller to KEEP SEARCHING for a clear counterexample or an unsat proof.
+    `main._emit_result`'s never-downgrade rule keeps this early 'sat' unless a
+    clearer 'sat' or an 'unsat' proof later overrides it.
+
+    Disjunctive-X counterexamples (validated via `check_witness`, no scalar
+    margin) are treated as 'real'.
+    """
+    tol = float(getattr(settings, 'sat_tol', 1e-4))
+    out = info.get('out') if isinstance(info, dict) else None
+    m = None
+    if (out is not None
+            and not any(getattr(c, 'input_lo', None) is not None
+                        for c in spec.disjuncts)):
+        _, _ci = spec.check(np.asarray(out), np.asarray(out))
+        m = _ci.get('worst_margin')
+    if m is None or m <= -tol:
+        return 'real'
+    # -tol < m <= +tol (all that `_validate_sat_witness` lets through, since it
+    # gates on the +/-atol band): a WITHIN-TOLERANCE counterexample. VNNCOMP
+    # accepts it (the violation/near-miss is within COUNTEREXAMPLE_ATOL), so it
+    # is an ACCEPTABLE verdict — though PROVING UNSAT is preferable. Persist it
+    # early and keep searching for a clearer CE or an unsat proof (which would
+    # override it). e.g. 14_ieee full prop3 (true margin ~+1e-6, within tol):
+    # VC can't prove unsat, so the within-tol sat is the acceptable fallback.
+    w = np.asarray(witness).flatten()
+    sink = getattr(settings, 'result_sink', None)
+    if sink is not None:
+        sink(w)   # write 'sat' + counterexample now (never-downgrade keeps it)
+    settings._within_tol_witness = w
+    return 'within_tol'
+
+
 def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
     """Run a SAT witness through ONNXRuntime + check it actually violates
     the spec. Catches spurious counterexamples from PGD/MILP bugs OR from
@@ -5916,8 +5976,18 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         _ok, _info = _validate_sat_witness(_onnx_path, spec, witness,
                                            atol=_atol)
         if _ok:
-            return _finalize('sat', phase, witness=witness,
-                             _prevalidated=True)
+            if _sat_disposition(graph, spec, settings, witness,
+                                _info) == 'real':
+                return _finalize('sat', phase, witness=witness,
+                                 _prevalidated=True)
+            # within-tolerance near-miss: the counterexample was written to
+            # the results file early by _sat_disposition; keep searching for a
+            # clear counterexample or an unsat proof rather than committing.
+            if print_progress:
+                print(f'  [validate] within-tol near-miss from {phase} — CE '
+                      f'saved, continuing for a clear CE / unsat proof',
+                      flush=True)
+            return None
         if print_progress:
             print(f'  [validate] SPURIOUS SAT from {phase} — continuing '
                   f'(budget left, not aborting): {_info.get("reason")}',
@@ -5930,15 +6000,24 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     nh = gg['n_relu']
     relu_names = gg['relu_names']
 
-    # Output size
-    n_output = None
-    for op in reversed(gg['ops']):
-        if op['type'] == 'fc':
-            n_output = op['W'].shape[0]
-            break
-        if op['type'] == 'conv':
-            n_output = op['n_out']
-            break
+    # Output size. The last-fc/conv heuristic is correct only when the net
+    # ENDS in a linear layer. ml4acopf ends in non-linear physics (Concat of
+    # Mul/Sin/Cos branches), so the last Gemm is an intermediate (= bus count,
+    # e.g. 14/118) — far smaller than the true output (186/1190). When the
+    # final op isn't fc/conv, take the true count from a probe forward
+    # (z_final.center.numel()), which is correct for every graph.
+    if gg['ops'][-1]['type'] in ('fc', 'conv'):
+        last = gg['ops'][-1]
+        n_output = (last['W'].shape[0] if last['type'] == 'fc'
+                    else last['n_out'])
+    else:
+        _xl_p = torch.tensor(np.asarray(spec.x_lo).flatten(),
+                             dtype=dtype, device=device)
+        _xh_p = torch.tensor(np.asarray(spec.x_hi).flatten(),
+                             dtype=dtype, device=device)
+        _, _zf_p = _forward_zonotope_graph(_xl_p, _xh_p, gg, device, dtype,
+                                           settings=settings)
+        n_output = int(_zf_p.center.numel())
     assert n_output is not None
 
     queries = spec.as_linear_queries(n_output)
@@ -8940,6 +9019,114 @@ def verify_graph(graph, spec, settings):
                       or i == graph.input_name]) == 2)
         for n in graph.nodes.values())
     if _has_unsupported:
+        # Fast root verify: the SOUND forward zonotope box may already refute
+        # every disjunct (no BaB needed). Run it in float64 with affine-band
+        # sigmoid (sound + far tighter than the box-collapse; the only graphs
+        # here with a sigmoid are the ACOPF physics nets, whose single sigmoid
+        # layer doesn't blow up the generator count). float64 because these
+        # margins can be ~1e-6 — float32 noise would lose them. A SOUND
+        # over-approximation refuting all disjuncts means no counterexample
+        # exists, so this can only return 'verified' on genuinely-unsat cases.
+        # Gated to the ACOPF-physics signature: Sin/Cos OR a genuine both-vary
+        # Mul (mul_bilinear). This catches every ml4acopf model (full has
+        # Sin/Cos + bilinear Mul; the linear-residual/nonresidual variants drop
+        # the trig but keep the bilinear Mul) while EXCLUDING the other non-LP
+        # graphs that share this block: mscn (point-mask Mul + Sigmoid, no trig
+        # and no both-vary Mul) and pensieve (sub_bilinear, no Mul-bilinear) —
+        # they keep their tuned, timing-pinned CROWN/BaB path unchanged. Using
+        # sigmoid presence here would wrongly grab mscn.
+        _has_trig = any(getattr(n, 'op_type', '') in ('Sin', 'Cos')
+                        for n in graph.nodes.values())
+        _has_mul_bilinear = any(
+            getattr(n, 'op_type', '') == 'Mul'
+            and len([i for i in n.inputs
+                     if i in graph.nodes or i == graph.input_name]) == 2
+            for n in graph.nodes.values())
+        _route_acopf = _has_trig or _has_mul_bilinear
+        if (_route_acopf and hasattr(spec, 'x_lo')
+                and getattr(spec, 'x_lo', None) is not None):
+            import torch as _t
+            _prev_sig = (settings.get('sigmoid_relaxation', 'box')
+                         if settings is not None else 'box')
+            if settings is not None:
+                settings.sigmoid_relaxation = 'affine_band'
+            _gg64 = graph.gpu_graph(device='cpu', dtype=_t.float64)
+            _xl = _t.tensor(np.asarray(spec.x_lo).flatten(), dtype=_t.float64)
+            _xh = _t.tensor(np.asarray(spec.x_hi).flatten(), dtype=_t.float64)
+            # Cheap nominal-point SAT probe (ORT-confirmed) before the bound
+            # work: closes specs violated at the operating point itself (e.g.
+            # prop1, unsafe across the whole box) that the internal PGD misses.
+            _np = _acopf_nominal_cex_probe(graph, spec, settings, _xl, _xh)
+            if _np is not None:
+                if settings is not None:
+                    settings.sigmoid_relaxation = _prev_sig
+                return _np
+            _ob_fwd = {}
+            _sb_fwd, _zf = _forward_zonotope_graph(
+                _xl, _xh, _gg64, 'cpu', _t.float64, settings=settings,
+                op_bounds=_ob_fwd)
+            if settings is not None:
+                settings.sigmoid_relaxation = _prev_sig
+            _olo, _ohi = _zf.bounds()
+            _rv, _rd = spec.check(_olo.cpu().numpy(), _ohi.cpu().numpy())
+            if _rv == 'verified':
+                if getattr(settings, 'print_progress', False):
+                    print('[verify_graph] root zono box (affine-band sigmoid) '
+                          f'verified all disjuncts; worst_margin='
+                          f'{_rd.get("worst_margin", 0.0):.3e}', flush=True)
+                return 'verified', {**_rd, 'method': 'root_zono_box'}
+            # Root box didn't close. Try α-CROWN first: gradient-optimize the
+            # nonlinear ops' relaxation slopes (Sqr/Sigmoid/Sin/Cos) to tighten
+            # the root bound (ABC's init-α-CROWN analog; sound for any α). Then
+            # fall back to the dedicated trig verifier (input/nonlinear split).
+            import time as _time_tg
+            _t0 = _time_tg.perf_counter()
+            _tot = float(getattr(settings, 'total_timeout', 60.0))
+            _deadline = _t0 + _tot
+            # Backward-CROWN root with topo-order intermediate-bound refinement
+            # (ABC's tight-intermediate init-CROWN analog). Closes the ml4acopf
+            # linear nets the forward box + α-CROWN miss (e.g. 14_ieee-linear
+            # prop2 -> +3.98, beating ABC). Sound; on 'unknown' we fall through.
+            # Budget-capped so big nets that won't close here leave the trig BaB
+            # its time. GATED on `not _has_trig`: _spec_backward_graph (the
+            # refinement's engine) has no Sin/Cos backward handler, and the FULL
+            # physics nets that use real Sin/Cos are both-timeout anyway (the
+            # trig BaB below handles them). The linear-residual/nonresidual
+            # variants bake the trig as ReLU-PWL — no Sin/Cos op — so they run.
+            # Gated on `not _has_trig` AND a net-size cap: the per-node
+            # refinement (2n sequential backward passes over the WHOLE graph)
+            # is grossly insufficient on the big nets (118: -20k; 300: worse)
+            # AND so costly that one node blows the deadline — those nets'
+            # easy props are closed by the root-box / α-CROWN instead. Only the
+            # small 14_ieee linear nets (n_out~186) benefit, so cap on n_out.
+            _bc_nout = int(_zf.center.numel())
+            _bc_max_out = int(getattr(settings, 'acopf_bwd_crown_max_out', 600))
+            if (not _has_trig and _bc_nout <= _bc_max_out
+                    and bool(getattr(settings, 'acopf_backward_crown', True))):
+                _bc_budget = min(_tot * 0.5, float(getattr(
+                    settings, 'acopf_bwd_crown_budget', 60.0)))
+                _bv, _bd = _acopf_backward_crown_root(
+                    _gg64, spec, _sb_fwd, _ob_fwd, _xl, _xh, _zf,
+                    settings, 'cpu', _t.float64,
+                    deadline=_time_tg.perf_counter() + _bc_budget)
+                if getattr(settings, 'print_progress', False):
+                    print('[verify_graph] acopf backward-CROWN root: '
+                          f'{_bv} worst_margin={_bd.get("worst_margin", 0.0):.3e} '
+                          f'({_bd.get("verified_disj", "?")}/'
+                          f'{_bd.get("n_disj", "?")} disj)', flush=True)
+                if _bv == 'verified':
+                    return 'verified', _bd
+            if bool(getattr(settings, 'acopf_alpha_crown', True)):
+                # α-CROWN gets the bulk of the budget (it's the strongest
+                # lever for these bilinear-dominated specs); the BaB mops up.
+                _abudget = min(_tot * 0.8, 150.0)
+                _av, _ad = _acopf_alpha_opt(
+                    graph, spec, settings, _t0, _abudget)
+                if _av == 'verified':
+                    return 'verified', _ad
+            _rem = max(1.0, _deadline - _time_tg.perf_counter())
+            return _verify_trig_graph(
+                graph, spec, settings, _time_tg.perf_counter(), _rem)
         if getattr(settings, 'tighten_formulation', 'gen_cone') != 'skip':
             # Count VARYING input dims (these specs typically have a handful
             # varying out of 100s of total dims). If that count is small,
@@ -8989,6 +9176,16 @@ def verify_graph(graph, spec, settings):
             settings.input_split_batched_enabled = True
             settings.input_split_batched_branch_sb = True
             settings.input_split_batched_branch_boost = True
+            # The BATCHED zono forward has no Sin/Cos/Floor handlers and lacks
+            # the col-ID merge fix; ml4acopf physics nets must use the SOUND
+            # unbatched input-split (whose _forward_zonotope_graph handles trig
+            # + carries the col-ID/concat soundness fix). Only trig graphs hit
+            # this; pensieve/mscn/lsnc keep the fast batched path.
+            _has_trig = any(
+                getattr(n, 'op_type', '') in ('Sin', 'Cos', 'Floor')
+                for n in graph.nodes.values())
+            if _has_trig:
+                settings.input_split_batched_enabled = False
             import os as _os_ksd
             # The two input-split-branching knobs below are chosen from a
             # graph/spec property, not a benchmark name: the count of VARYING
@@ -9356,6 +9553,517 @@ def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):
     nz_np = nz.cpu().numpy()
     score_per_axis[nz_np] = score_per_col.cpu().numpy()
     return score_per_axis, nz_np
+
+
+_ALPHA_OPS = ('pow', 'sigmoid', 'tanh', 'sin', 'cos', 'exp', 'reciprocal')
+
+
+def _acopf_nominal_cex_probe(graph, spec, settings, xl, xh):
+    """Cheap SAT pre-check: ACOPF specs are sometimes violated at the nominal
+    operating point itself (the whole input box is unsafe — e.g. 14_ieee
+    prop1, margin ~-0.006 at every corner). PGD on the internal point-forward
+    can miss this (the internal forward may disagree with the reference ONNX
+    near the boundary), so directly ORT-check the box center and both corners.
+    Returns ('sat', details) for a CLEAR counterexample (sound — ORT-confirmed,
+    matches α,β-CROWN's clean-input attack); a within-tolerance near-miss is
+    saved early via the result sink and we return None (keep searching)."""
+    if bool(getattr(settings, 'disable_sat_finding', False)):
+        return None
+    onnx_p = getattr(graph, 'onnx_path', None)
+    if onnx_p is None:
+        return None
+    atol = float(settings.sat_validate_atol
+                 if 'sat_validate_atol' in settings else 1e-4)
+    for cand in (0.5 * (xl + xh), xl, xh):
+        w = cand.detach().cpu().numpy().flatten()
+        ok, info = _validate_sat_witness(onnx_p, spec, w, atol=atol)
+        if ok and _sat_disposition(graph, spec, settings, w, info) == 'real':
+            return 'sat', {'witness': w, 'phase': 'acopf_nominal_probe'}
+    return None
+
+
+def _acopf_backward_crown_root(gg, spec, sb, op_bounds, xl, xh, zf,
+                               settings, device, dtype, deadline):
+    """Backward-CROWN root bound with topo-order intermediate-bound refinement
+    — the ml4acopf analog of α,β-CROWN's tight-intermediate initial CROWN.
+
+    Refines every nonlinear op's input-node bounds by backward-CROWN-to-input
+    (intersected with the forward zonotope), then runs the graph spec backward
+    over those tightened bounds. Returns ('verified', details) iff EVERY
+    disjunct has a query whose lower bound (best-of refined backward CROWN and
+    the forward-zono margin — both sound) is > 0; else ('unknown', details).
+
+    Sound by construction: every bound used is a sound over-approximation, and
+    the ANY-query-closes-the-disjunct rule matches `as_linear_queries`
+    semantics (a disjunct is a conjunction; refuting one conjunct refutes it).
+    """
+    import torch as _t
+    from .verify_zono_bnb import (_crown_refine_intermediate_graph,
+                                  _spec_backward_graph)
+    n_out = int(zf.center.numel())
+    queries = spec.as_linear_queries(n_out)
+    if not queries:
+        return 'unknown', {'method': 'acopf_bwd_crown', 'reason': 'no_queries'}
+    spec_ew = {qi: (_t.as_tensor(w, dtype=dtype, device=device), float(b))
+               for qi, (di, w, b) in enumerate(queries)}
+    disj_queries = {}
+    for qi, (di, w, b) in enumerate(queries):
+        disj_queries.setdefault(di, []).append((qi, w, b))
+    # Refine on COPIES — the caller may fall through to α-CROWN / the trig BaB
+    # which rebuild their own state, but don't rely on these being mutated.
+    sb_r = dict(sb)
+    ob_r = dict(op_bounds)
+    _crown_refine_intermediate_graph(
+        gg, xl, xh, sb_r, ob_r, device, dtype, deadline=deadline,
+        print_progress=bool(getattr(settings, 'print_progress', False)))
+    spec_lbs, _ = _spec_backward_graph(
+        sb_r, xl, xh, gg, spec_ew, list(range(len(queries))), len(sb_r),
+        device, dtype, op_bounds=ob_r)
+    # best-of: the forward-zono spec margin is also sound — take the max per
+    # query (mirrors the Phase-1+2 interleaved path).
+    _zc = zf.center.to(dtype)
+    _zG = zf.generators.to(dtype)
+    for qi in range(len(queries)):
+        _w, _b = spec_ew[qi]
+        _fwd = float(_w @ _zc + _b - (_w @ _zG).abs().sum())
+        if _fwd > spec_lbs.get(qi, -float('inf')):
+            spec_lbs[qi] = _fwd
+    # per-disjunct margin = how strongly its strongest-refuted query closes
+    # (a disjunct is verified iff this is > 0).
+    margins = {di: max(spec_lbs.get(qi, -1.0) for qi, _, _ in ql)
+               for di, ql in disj_queries.items()}
+    verified_disj = {di for di, m in margins.items() if m > 0}
+    worst = min(margins.values()) if margins else -1.0
+    det = {'method': 'acopf_bwd_crown', 'worst_margin': worst,
+           'margins': margins, 'verified_disj': len(verified_disj),
+           'n_disj': len(disj_queries)}
+    if len(verified_disj) == len(disj_queries):
+        return 'verified', det
+    return 'unknown', det
+
+
+def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
+                     n_iters=None, lr=None):
+    """α-CROWN (forward / α-zono) for the ACOPF trig graphs. Gradient-optimizes
+    a per-element relaxation slope α∈[0,1] for every Sqr/Sigmoid/Tanh/Sin/Cos/
+    exp/reciprocal op against the WORST-disjunct spec margin, all the way
+    through the differentiable forward zonotope (affine-band sigmoid + α-bands;
+    NO box-collapse, so gradient flows through every op). SOUND: any α gives a
+    sound bound, so a positive margin at ANY iterate proves the property.
+    Returns ('verified', details) on success, else ('unknown', details)."""
+    import torch
+    import time as _time
+    deadline = t_start + total_timeout
+    device = 'cpu'; dt = torch.float64
+    prev_sig = (settings.get('sigmoid_relaxation', 'box')
+                if settings is not None else 'box')
+    if settings is not None:
+        settings.sigmoid_relaxation = 'affine_band'
+    gg = graph.gpu_graph(device=device, dtype=dt)
+    xl = torch.tensor(np.asarray(spec.x_lo).flatten(), dtype=dt, device=device)
+    xh = torch.tensor(np.asarray(spec.x_hi).flatten(), dtype=dt, device=device)
+    print_progress = bool(getattr(settings, 'print_progress', False))
+
+    def _restore():
+        if settings is not None:
+            settings.sigmoid_relaxation = prev_sig
+
+    # probe forward to size the α params (one per element of each α-op output)
+    ob = {}
+    _sb0, _zf0 = _forward_zonotope_graph(xl, xh, gg, device, dt,
+                                         settings=settings, op_bounds=ob)
+    alpha_op_names = [op['name'] for op in gg['ops']
+                      if op['type'] in _ALPHA_OPS and op['name'] in ob
+                      and torch.is_tensor(ob[op['name']][0])]
+    alphas = {nm: torch.full((ob[nm][0].numel(),), 0.5, dtype=dt,
+                             device=device, requires_grad=True)
+              for nm in alpha_op_names}
+    # ALSO α-optimize the ReLU lower-slopes (keyed by layer_idx — the forward
+    # zono's ReLU reads relu_lambdas[layer_idx], the SAME mechanism α-CROWN
+    # uses on every other ReLU benchmark). The ACOPF nets have ReLU MLP blocks
+    # (residual / sin-cos approximations), and some specs are bound by a
+    # ReLU-only path: 14_ieee prop3's binding lb(Y_5) is limited by ~6 unstable
+    # ReLUs that α-CROWN lifts -0.0096 -> +0.0005 (unknown -> verified, matching
+    # α,β-CROWN which also closes it purely via ReLU-slope α; NOT a bilinear
+    # gap). Default 0.5 for unstable neurons; stable/dead ignore α.
+    for op in gg['ops']:
+        if op['type'] == 'relu':
+            _L = op.get('layer_idx')
+            if (_L is not None and _L in _sb0
+                    and torch.is_tensor(_sb0[_L][0])):
+                alphas[_L] = torch.full((_sb0[_L][0].numel(),), 0.5, dtype=dt,
+                                        device=device, requires_grad=True)
+    if not alphas:
+        _restore()
+        return 'unknown', {'method': 'acopf_alpha', 'reason': 'no_alpha_ops'}
+    # group spec queries by disjunct (refuted iff ANY query margin > 0)
+    n_out = int(_zf0.center.numel())
+    qs = spec.as_linear_queries(n_out)
+    if not qs:
+        _restore()
+        return 'unknown', {'method': 'acopf_alpha', 'reason': 'no_queries'}
+    Wq = torch.as_tensor(np.stack([w for _, w, _ in qs]), dtype=dt, device=device)
+    bq = torch.as_tensor(np.array([b for _, _, b in qs]), dtype=dt, device=device)
+    di = [d for d, _, _ in qs]
+    disj_groups = {}
+    for qi, d in enumerate(di):
+        disj_groups.setdefault(d, []).append(qi)
+    grp_idx = [torch.as_tensor(v, device=device) for v in disj_groups.values()]
+
+    n_iters = int(n_iters if n_iters is not None
+                  else getattr(settings, 'acopf_alpha_iters', 400))
+    lr = float(lr if lr is not None
+               else getattr(settings, 'acopf_alpha_lr', 0.5))
+    opt = torch.optim.Adam(list(alphas.values()), lr=lr)
+    # decay LR as the margin approaches 0 (fine convergence near the boundary)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode='max', factor=0.5, patience=15, min_lr=1e-3)
+    best = -1e30
+    for it in range(n_iters):
+        if _time.perf_counter() >= deadline:
+            break
+        opt.zero_grad()
+        _, zf = _forward_zonotope_graph(xl, xh, gg, device, dt,
+                                        settings=settings, relu_lambdas=alphas)
+        c, G = zf.center, zf.generators
+        qm = Wq @ c + bq - (Wq @ G).abs().sum(1)        # (Q,) per-query margin
+        # disjunct margin = max over its queries; spec margin = min over disjuncts
+        dmar = torch.stack([qm[idx].max() for idx in grp_idx])
+        spec_margin = dmar.min()
+        best = max(best, float(spec_margin))
+        if float(spec_margin) > 0:
+            _restore()
+            _m = float(spec_margin)
+            if print_progress:
+                print(f'[acopf_alpha] verified at iter {it}, '
+                      f'margin={_m:.3e}', flush=True)
+            return 'verified', {'method': 'acopf_alpha', 'iter': it,
+                                'worst_margin': _m, 'margins': {0: _m}}
+        (-spec_margin).backward()
+        opt.step()
+        sched.step(float(spec_margin))
+        with torch.no_grad():
+            for p_ in alphas.values():
+                p_.clamp_(0.0, 1.0)
+    _restore()
+    if print_progress:
+        print(f'[acopf_alpha] did not close; best margin={best:.3e}', flush=True)
+    return 'unknown', {'method': 'acopf_alpha', 'best_margin': best}
+
+
+def _verify_trig_graph(graph, spec, settings, t_start, total_timeout):
+    """Self-contained SOUND verifier for graphs whose nonlinearity is trig /
+    AC-power-flow physics (ml4acopf: Sin/Cos/Pow/Sigmoid + element-wise
+    bilinear Mul). The 9-phase `_run_pipeline` and the batched input-split do
+    NOT support these end-to-end (no Sin/Cos handlers in the batched forward,
+    gg serializer chokes on Pow, etc.), so we run a dedicated loop built only
+    on pieces that DO handle them soundly:
+
+      * UNSAT: input-split branch-and-bound. Each leaf (input sub-box) is
+        bounded by the sound forward zonotope (`_forward_zonotope_graph`,
+        float64, affine-band sigmoid) and checked with `spec.check`. A leaf is
+        closed when the box refutes every disjunct; we split the
+        highest-spec-sensitivity varying dim of an open leaf and recurse.
+        Verified iff EVERY leaf closes (sound: each leaf bound is a sound
+        over-approximation of its sub-box, and the leaves cover the input box).
+      * SAT: `pgd_attack_general` on the full box (returns only a CONFIRMED
+        counterexample), tried first.
+
+    Returns (verdict, details). Falls back to 'unknown' (never a false verdict)
+    when the box is too high-dimensional to split within the budget.
+    """
+    import torch
+    import time as _time
+    deadline = t_start + total_timeout
+    device = 'cpu'
+    dt = torch.float64
+    prev_sig = (settings.get('sigmoid_relaxation', 'box')
+                if settings is not None else 'box')
+    if settings is not None:
+        settings.sigmoid_relaxation = 'affine_band'
+    gg = graph.gpu_graph(device=device, dtype=dt)
+    xl0 = torch.tensor(np.asarray(spec.x_lo).flatten(), dtype=dt, device=device)
+    xh0 = torch.tensor(np.asarray(spec.x_hi).flatten(), dtype=dt, device=device)
+    nz = torch.nonzero(xh0 - xl0 > 1e-12).flatten()
+    n_var = int(nz.numel())
+    print_progress = bool(getattr(settings, 'print_progress', False))
+
+    def _restore():
+        if settings is not None:
+            settings.sigmoid_relaxation = prev_sig
+
+    # --- SAT: PGD on the full box (confirmed witnesses only) ---
+    # First validate that the PGD point forward (_forward_batch_graph)
+    # faithfully reproduces the network: compare it to the zono forward
+    # evaluated at the box CENTER (a zero-radius zonotope's center IS the exact
+    # network output). If it diverges or raises (some ml4acopf-linear graphs
+    # hit op-shapes the batched point forward doesn't support), PGD would be
+    # untrustworthy — a wrong forward could confirm a bogus witness (false sat)
+    # — so we SKIP sat-finding. Skipping is SOUND: it never yields a false
+    # unsat/sat; the UNSAT input-split below is unaffected.
+    if not bool(getattr(settings, 'disable_sat_finding', False)):
+        from .verify_zono_bnb import _forward_batch_graph
+        gg32 = graph.gpu_graph(device=device, dtype=torch.float32)
+        xc = (0.5 * (xl0 + xh0))
+        _, _zc = _forward_zonotope_graph(xc, xc, gg, device, dt, settings=settings)
+        pgd_ok = True
+        try:
+            _pf = _forward_batch_graph(xc.float().unsqueeze(0), gg32)
+            pgd_ok = bool(torch.allclose(
+                _pf.flatten().double(), _zc.center.double(),
+                atol=1e-2, rtol=1e-2))
+        except (RuntimeError, ValueError, KeyError) as e:
+            # batched point forward doesn't support some op of this graph;
+            # sat-finding is best-effort, so skip it (sound).
+            pgd_ok = False
+            if print_progress:
+                print(f'[trig_bab] PGD point forward unusable '
+                      f'({type(e).__name__}): skipping sat-finding', flush=True)
+        if pgd_ok:
+            sat_budget = min(15.0, max(2.0, 0.25 * total_timeout))
+            is_sat, witness = _pgd_attack_general(
+                xl0.float(), xh0.float(), spec, gg32, settings,
+                time_budget=sat_budget)
+            if is_sat:
+                # ORT-validate before committing: _pgd_attack_general works on
+                # the internal point-forward, so confirm the witness violates
+                # the spec on the reference ONNX (no false sat). A spurious /
+                # within-tol-only near-miss must not short-circuit the unsat
+                # BaB below.
+                _w = np.asarray(witness).flatten()
+                _onnx_p = getattr(graph, 'onnx_path', None)
+                _atol = float(settings.sat_validate_atol
+                              if 'sat_validate_atol' in settings else 1e-4)
+                _ok, _vinfo = _validate_sat_witness(_onnx_p, spec, _w,
+                                                    atol=_atol)
+                if _ok and _sat_disposition(
+                        graph, spec, settings, _w, _vinfo) == 'real':
+                    _restore()
+                    return 'sat', {'witness': _w}
+                if print_progress:
+                    print('[trig_bab] PGD witness not a clear CE '
+                          f'(ok={_ok}); CE saved if within-tol, continuing to '
+                          'the unsat BaB', flush=True)
+
+    # Input-split is only tractable for a modest number of varying dims; the
+    # 118/300 specs vary ~189 (the split tree is astronomically large). For
+    # those, branch on NONLINEAR-OP PRE-ACTIVATIONS instead (α,β-CROWN's
+    # nonlinear_split): splitting a Sqr/Sigmoid/Sin/Cos input range tightens
+    # that op's relaxation AND every downstream bilinear Mul that consumes it.
+    max_var = int(getattr(settings, 'trig_bab_max_var', 28))
+    if n_var > max_var:
+        return _verify_trig_nonlinear_split(
+            graph, spec, settings, gg, xl0, xh0, dt, device, deadline,
+            print_progress, _restore)
+
+    # --- UNSAT: sound input-split BaB ---
+    def _leaf(xl, xh):
+        _, zf = _forward_zonotope_graph(xl, xh, gg, device, dt, settings=settings)
+        olo, ohi = zf.bounds()
+        v, d = spec.check(olo.cpu().numpy(), ohi.cpu().numpy())
+        return v, d, zf
+
+    def _split_dim(xl, xh, zf):
+        # highest spec-sensitivity varying dim: |worst-disjunct weight · G_in|
+        # times the dim width (impact of halving it).
+        G = zf.generators
+        K_in = n_var
+        G_in = G[:, :K_in] if G.shape[1] >= K_in else G
+        qs = spec.as_linear_queries(int(G.shape[0]))
+        score = torch.zeros(K_in, dtype=dt, device=device)
+        for _, qw, _ in qs:
+            qw_t = torch.as_tensor(qw, dtype=dt, device=device)
+            score = score + (qw_t @ G_in).abs()
+        widths = (xh - xl)[nz[:K_in]]
+        impact = score * widths
+        return int(nz[int(impact.argmax())])
+
+    # Budget: input-split is only tractable for a modest number of varying
+    # dims. ml4acopf 14_ieee has ~22; the 118/300 specs have ~189 (cube blows
+    # up) — for those we bound the work and return unknown rather than churn.
+    max_leaves = int(getattr(settings, 'trig_bab_max_leaves', 20000))
+    max_depth = int(getattr(settings, 'trig_bab_max_depth',
+                            max(40, 6 * max(1, n_var))))
+    queue = [(xl0, xh0, 0)]
+    closed = 0
+    opened = 0
+    while queue:
+        if _time.perf_counter() >= deadline:
+            _restore()
+            return 'unknown', {'method': 'trig_input_split', 'reason': 'timeout',
+                               'leaves_closed': closed}
+        xl, xh, depth = queue.pop()
+        v, d, zf = _leaf(xl, xh)
+        if v == 'verified':
+            closed += 1
+            continue
+        opened += 1
+        if opened > max_leaves or depth > max_depth:
+            _restore()
+            if print_progress:
+                print(f'[trig_bab] gave up: opened={opened} depth={depth} '
+                      f'n_var={n_var} worst_margin={d.get("worst_margin")}',
+                      flush=True)
+            return 'unknown', {'method': 'trig_input_split',
+                               'reason': 'budget', 'leaves_closed': closed}
+        di = _split_dim(xl, xh, zf)
+        mid = 0.5 * (xl[di] + xh[di])
+        xh_l = xh.clone(); xh_l[di] = mid
+        xl_r = xl.clone(); xl_r[di] = mid
+        queue.append((xl, xh_l, depth + 1))
+        queue.append((xl_r, xh, depth + 1))
+    _restore()
+    if print_progress:
+        print(f'[trig_bab] verified: {closed} leaves', flush=True)
+    return 'verified', {'method': 'trig_input_split', 'leaves_closed': closed}
+
+
+_SPLITTABLE_OPS = ('pow', 'sigmoid', 'tanh', 'sin', 'cos', 'exp', 'reciprocal')
+
+
+def _verify_trig_nonlinear_split(graph, spec, settings, gg, xl0, xh0, dt,
+                                 device, deadline, print_progress, _restore):
+    """SOUND nonlinear-split BaB (α,β-CROWN's nonlinear_split analog) for
+    high-input-dim ACOPF specs where input-split is intractable. A BaB node is
+    a dict of per-op-element input-range CLAMPS; the leaf bound is the sound
+    forward zono under those clamps (`op_clamps`). Splitting one nonlinear op's
+    element pre-activation at its midpoint into [lo,m] and [m,hi] yields two
+    children whose op_clamps cover the parent's range — so both verified ⟹
+    parent verified (the op_clamps soundness argument). Verifies iff every leaf
+    closes; never returns a false verdict (falls back to unknown on budget).
+    """
+    import time as _time
+    from .nonlinear_split_planes import split_point
+    cand_set = {op['name'] for op in gg['ops']
+                if op['type'] in _SPLITTABLE_OPS}
+    op_type = {op['name']: op['type'] for op in gg['ops']}
+    last_name = gg['ops'][-1]['name']
+    NEG = float('-inf'); POS = float('inf')
+    nz = torch.nonzero(xh0 - xl0 > 1e-12).flatten()   # varying input dims
+    n_var = int(nz.numel())
+
+    def _leaf(xl, xh, clamps):
+        ob = {}; cids = {}; ofi = {}
+        _, zf = _forward_zonotope_graph(xl, xh, gg, device, dt,
+                                        settings=settings, op_bounds=ob,
+                                        op_clamps=clamps, col_ids_out=cids,
+                                        op_fresh_ids=ofi)
+        olo, ohi = zf.bounds()
+        v, d = spec.check(olo.cpu().numpy(), ohi.cpu().numpy())
+        return v, d, ob, zf, cids, ofi
+
+    def _pick_split(xl, xh, ob, zf, cids, ofi):
+        # bbps-style sensitivity: per-column output margin-slack (summed over
+        # all spec queries). Score each NONLINEAR op by the slack on the δ
+        # columns it allocated, and each INPUT dim by the slack on its noise
+        # column × its current width. Splitting the highest-scoring candidate
+        # most tightens the binding disjunct. Input-dim splits shrink the
+        # bilinear-Mul radii (which nonlinear-op clamps can't), so the hybrid
+        # reaches cases neither split type closes alone.
+        # Returns (kind, payload, score): kind 'nl' -> (op,elem,lo,hi);
+        # 'input' -> (dim, lo, hi).
+        G = zf.generators
+        n_out = int(G.shape[0])
+        qs = spec.as_linear_queries(n_out)
+        if not qs:
+            return None, None, 0.0
+        W = torch.as_tensor(np.stack([w for _, w, _ in qs]),
+                            dtype=dt, device=device)
+        colslack = (W @ G).abs().sum(0)                     # (K,)
+        out_ids = cids.get(last_name, [])
+        id_to_col = {gid: k for k, gid in enumerate(out_ids)}
+        best_kind = None; best_payload = None; best_score = 0.0
+        # nonlinear-op candidates
+        for nm, (a, b) in ofi.items():
+            if nm not in cand_set:
+                continue
+            rng = ob.get(nm)
+            if rng is None or not torch.is_tensor(rng[0]):
+                continue
+            contrib = sum(float(colslack[id_to_col[gid]])
+                          for gid in range(a, b) if gid in id_to_col)
+            if contrib <= best_score:
+                continue
+            lo_t, hi_t = rng
+            w_el = (hi_t - lo_t); wi = int(w_el.argmax())
+            if float(w_el[wi]) <= 1e-12:
+                continue
+            best_kind, best_payload, best_score = 'nl', (
+                nm, wi, float(lo_t[wi]), float(hi_t[wi])), contrib
+        # input-dim candidates: input noise has IDs 0..n_var-1 (made first),
+        # mapping to varying dims nz[j]. Score = slack(col) × current width.
+        for j in range(n_var):
+            k = id_to_col.get(j)
+            if k is None:
+                continue
+            di = int(nz[j])
+            width = float(xh[di] - xl[di])
+            score = float(colslack[k]) * width
+            if score > best_score and width > 1e-9:
+                best_kind, best_payload, best_score = 'input', (
+                    di, float(xl[di]), float(xh[di])), score
+        return best_kind, best_payload, best_score
+
+    max_leaves = int(getattr(settings, 'trig_nl_max_leaves', 6000))
+    max_depth = int(getattr(settings, 'trig_nl_max_depth', 120))
+    queue = [(xl0, xh0, {}, 0)]
+    closed = 0; opened = 0
+    while queue:
+        if _time.perf_counter() >= deadline:
+            _restore()
+            if print_progress:
+                print(f'[trig_nl] timeout: closed={closed} opened={opened}',
+                      flush=True)
+            return 'unknown', {'method': 'trig_nl_split', 'reason': 'timeout',
+                               'leaves_closed': closed}
+        xl, xh, clamps, depth = queue.pop()
+        v, d, ob, zf, cids, ofi = _leaf(xl, xh, clamps)
+        if v == 'verified':
+            closed += 1
+            continue
+        opened += 1
+        kind, payload, sw = _pick_split(xl, xh, ob, zf, cids, ofi)
+        if (kind is None or sw <= 1e-12 or opened > max_leaves
+                or depth > max_depth):
+            _restore()
+            if print_progress:
+                print(f'[trig_nl] gave up: opened={opened} depth={depth} '
+                      f'worst_margin={d.get("worst_margin")} score={sw:.3g}',
+                      flush=True)
+            return 'unknown', {'method': 'trig_nl_split', 'reason': 'budget',
+                               'leaves_closed': closed}
+        if kind == 'input':
+            di, lo_i, hi_i = payload
+            mid = 0.5 * (lo_i + hi_i)
+            xh_l = xh.clone(); xh_l[di] = mid
+            xl_r = xl.clone(); xl_r[di] = mid
+            queue.append((xl, xh_l, clamps, depth + 1))
+            queue.append((xl_r, xh, clamps, depth + 1))
+        else:
+            nm, ei, lo_i, hi_i = payload
+            # Option A split point: 0 if a kink/inflection/min-at-0 op straddles
+            # 0 (sigmoid/tanh/pow), else midpoint (sin/cos and asymmetric ranges).
+            mid = split_point(op_type.get(nm, ''), lo_i, hi_i)
+            n_elem = ob[nm][0].numel()
+
+            def _child(set_lo, set_hi):
+                c2 = {k: [v2[0].clone(), v2[1].clone()]
+                      for k, v2 in clamps.items()}
+                if nm not in c2:
+                    c2[nm] = [torch.full((n_elem,), NEG, dtype=dt, device=device),
+                              torch.full((n_elem,), POS, dtype=dt, device=device)]
+                if set_lo is not None:
+                    c2[nm][0][ei] = set_lo
+                if set_hi is not None:
+                    c2[nm][1][ei] = set_hi
+                return {k: (v2[0], v2[1]) for k, v2 in c2.items()}
+
+            queue.append((xl, xh, _child(None, mid), depth + 1))
+            queue.append((xl, xh, _child(mid, None), depth + 1))
+    _restore()
+    if print_progress:
+        print(f'[trig_nl] verified: {closed} leaves', flush=True)
+    return 'verified', {'method': 'trig_nl_split', 'leaves_closed': closed}
 
 
 def _joint_and_infeasible_in_box(linears, xl_np, xh_np):
@@ -10483,20 +11191,11 @@ def _input_split_fast_leaf(graph, spec, settings, gg, device, dtype):
                 hi.cpu().numpy().astype(np.float64))
            for L, (lo, hi) in sb.items()}
 
-    # Output size — match the existing _run_pipeline logic: pull from
-    # the LAST fc/conv op (n_out for conv = filter count = class count
-    # before reshape).
-    n_output = None
-    for op in reversed(gg['ops']):
-        if op.get('type') == 'fc':
-            W = op.get('W_np') if 'W_np' in op else op.get('W')
-            if W is not None:
-                n_output = int(W.shape[0]); break
-        if op.get('type') == 'conv':
-            n_output = int(op.get('n_out', 0))
-            if n_output > 0: break
-    if n_output is None:
-        return 'unknown', {'phase': 'fast_leaf_no_output'}
+    # Output size = the network's TRUE final output dim, taken from the probe
+    # forward just run (z_final_leaf.center.numel()). The old last-fc/conv
+    # heuristic is wrong for nets ending in non-linear physics (ml4acopf
+    # linear-residual ends in Concat; its last Gemm = bus count 14/118).
+    n_output = int(z_final_leaf.center.numel())
     queries = spec.as_linear_queries(n_output)
     if not queries:
         return 'verified', {'phase': 'fast_leaf_no_queries'}

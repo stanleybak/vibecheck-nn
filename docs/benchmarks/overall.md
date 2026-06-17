@@ -41,23 +41,18 @@ a soundness bug), scan `docs/benchmarks/*.md` to find which benchmarks use the t
 and re-sweep only those (plus their integration pins). Save campaign-wide full sweeps for major
 milestones (e.g. after all regular-track benchmarks, after the extended track is added).
 
-## Remote GPUs
+## Remote GPU (AWS only)
 
-Heavy/long/GPU-scaled work runs on a remote box — **never local**, since local hosts the tmux
-session Claude runs in and an OOM there kills the session (lost context, mid-flight work). Local
-is for quick (~30 s) smoke tests only. Two GPUs, pick by availability:
+ALL pytest runs and any heavy/long/GPU-scaled work run on **AWS — never local**, since local
+hosts the tmux session Claude runs in and an OOM there kills the session (lost context, mid-flight
+work). Do not run test suites locally, not even quick smoke runs. **If AWS is unreachable (box
+down, or `$AWS_GPU_HOST`/`$AWS_GPU_PEM` unset in the shell), ASK the user — never fall back to
+running locally.**
 
-- **server1** — `ssh stan@100.83.144.97` (RTX 3080 / 10 GB, 64 GB RAM, 16-thread i9; Tailscale
-  IP, only reachable inside the owner's tailnet, fine to keep in git; `$SERVER1_HOST` if set).
-  Vibecheck checkout at `~/Desktop/temp/vibecheck-temp` (editable install, `.venv/bin/python`).
-  α,β-CROWN at `~/Desktop/temp/abcrown/...` (conda env `~/miniconda/envs/abcrown/bin/python`).
-  Sometimes overheats / "falls off the bus" under sustained load: `nvidia-smi` returns "No
-  devices were found", verdicts go `verified` → `error_no_result`. Xid 79 → recover with
-  `sudo modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia` (ask
-  the user to run). Xid 154 ("Node Reboot Required") → reboot only.
 - **AWS g5** — `ssh -i "$AWS_GPU_PEM" "$AWS_GPU_HOST"` (A10G / 24 GB). Connection details in env
-  vars (kept out of git); runbook in `AWS_SETUP.txt`. 24 GB fits ABC + vibecheck on cases that
-  OOM on server1. The user starts/stops via the AWS console — Claude only SSHes in.
+  vars (kept out of git); runbook in `AWS_SETUP.txt`. The user starts/stops via the AWS console
+  — Claude only SSHes in. Vibecheck checkout at `~/vibecheck` (`~/vibe/bin/python`); α,β-CROWN
+  per `AWS_SETUP.txt`.
   - **Every ssh must `sudo rm -f /tmp/idle_since`** — batch `ssh host 'cmd'` calls don't register
     in `who`, so they accrue idle seconds even while Claude is actively working; the 5-min
     idle-shutdown (`/usr/local/bin/idle-shutdown.sh`, fires when GPU<5% AND no interactive ssh)
@@ -68,10 +63,10 @@ is for quick (~30 s) smoke tests only. Two GPUs, pick by availability:
     `sudo shutdown -h now` to stop the ~$1/hr billing. Don't shut down if a justifying long
     sweep is producing results.
 
-The 2026 benchmark set lives locally and is rsync'd to the remote before first use (see the
+The 2026 benchmark set lives locally and is rsync'd to AWS before first use (see the
 `vnncomp2026` skill). Sync vibecheck with
-`rsync -az --exclude '.venv' --exclude '__pycache__' <local-repo>/ "$SERVER1_HOST":~/Desktop/temp/vibecheck-temp/`
-(re-run `pip install -e .` on the remote if `pyproject.toml` changed).
+`rsync -az --exclude '.venv' --exclude '__pycache__' <local-repo>/ -e "ssh -i \"$AWS_GPU_PEM\"" "$AWS_GPU_HOST":~/vibecheck/`
+(re-run `pip install -e .` on AWS if `pyproject.toml` changed).
 
 ### Run discipline
 
@@ -80,7 +75,13 @@ The 2026 benchmark set lives locally and is rsync'd to the remote before first u
 - **Detached runs:** `nohup setsid`, results to `~/persistent_runs/` (survives reboot, unlike
   `/tmp`), with a done-flag file. Beware self-matching process greps. Kill only specific PIDs
   you started.
-- **Cache `details` to /tmp.** When running an experiment for the user, pickle the returned
-  `details` dict to `/tmp/vibecheck_runs/{slug}.pkl` (include instance id + config in the slug)
-  so re-views of the same run ("Phase 7 timing?", "unstable count at L3?") don't re-run a 60 s
-  benchmark. Say so when answering from cache; re-run + overwrite for new instance/settings/code.
+- **Never keep anything in the remote `/tmp`.** A stop/start (idle-shutdown, manual stop) **wipes
+  `/tmp` and changes the public IP**. Diagnostic scripts, ABC oracles, and results all vanish.
+  Keep diagnostic scripts in the local repo (e.g. `scratch/`) and `rsync` them up so they can be
+  re-pushed after any restart; write results/oracles to `~/persistent_runs/`. (Learned the hard
+  way 2026-06: an idle-shutdown mid-session wiped the harness + ABC oracle and rotated the IP.)
+- **Cache `details` to `~/persistent_runs/`.** When running an experiment for the user, pickle the
+  returned `details` dict to `~/persistent_runs/vibecheck_runs/{slug}.pkl` (include instance id +
+  config in the slug) so re-views of the same run ("Phase 7 timing?", "unstable count at L3?")
+  don't re-run a 60 s benchmark. Say so when answering from cache; re-run + overwrite for new
+  instance/settings/code.

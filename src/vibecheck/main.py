@@ -96,8 +96,21 @@ def main():
         print(f'Wrote pre-parse cache: {path}')
         sys.exit(0)
 
+    # Shared across _verify and this crash handler: tracks whether a 'sat'
+    # (+counterexample) was already written to the results file, so a later
+    # crash/timeout can't clobber a found counterexample.
+    sat_state = {'emitted': False}
+    # Pre-seed the results file with 'timeout': if the process is HARD-KILLED
+    # for overrunning its budget (no clean exit, no Python exception — e.g. the
+    # harness SIGKILLs it), this leaves the correct verdict behind instead of a
+    # missing file (which a sweep aggregator counts as NO_FILE / not-solved). A
+    # clean finish overwrites it with the real verdict; a crash overwrites it
+    # with 'error'; an early within-tol counterexample overwrites it with 'sat'.
+    if args.results_file:
+        with open(args.results_file, 'w') as f:
+            f.write('timeout\n')
     try:
-        _verify(args)
+        _verify(args, sat_state)
     except SystemExit:
         raise
     except BaseException:
@@ -113,15 +126,19 @@ def main():
         # diagnosability. The traceback above carries the cause.
         import traceback
         traceback.print_exc()
-        if args.results_file:
+        # Don't clobber a counterexample we already wrote (early within-tol /
+        # real-CE write) with 'error' on a late crash.
+        if args.results_file and not sat_state['emitted']:
             with open(args.results_file, 'w') as f:
                 f.write('error\n')
         sys.exit(2)
 
 
-def _verify(args):
+def _verify(args, sat_state=None):
     dtype = _DTYPES[args.dtype]
     t_start = time.time()
+    if sat_state is None:
+        sat_state = {'emitted': False}
 
     # Fast path: load the pre-parsed graph+spec from prepare_instance.sh's
     # cache, skipping the (potentially multi-second) ONNX parse. Gated behind
@@ -216,6 +233,19 @@ def _verify(args):
                 settings.disable_sat_finding = True
         if args.verbose:
             settings.print_progress = True
+        # SAT/counterexample policy: the pipeline may find a *within-tolerance*
+        # counterexample (a near-boundary point that violates only within the
+        # VNNCOMP atol) before it finds a clear one or proves unsat. Hand it a
+        # sink that writes that CE to the results file IMMEDIATELY (so a later
+        # timeout/crash can't lose it) without committing the run — the search
+        # continues for a clear CE or an unsat proof. `_emit_result`'s
+        # never-downgrade rule keeps that early 'sat' unless a later 'sat'
+        # (clearer CE) or 'unsat' (proof — the near-miss was spurious) overrides.
+        settings.sat_tol = float(
+            settings.sat_validate_atol
+            if 'sat_validate_atol' in settings else 1e-4)
+        settings.result_sink = (lambda w: _emit_result(
+            args, spec, 'sat', w, sat_state)) if args.results_file else None
         graph.optimize(settings)
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
@@ -270,8 +300,8 @@ def _verify(args):
 
     if args.results_file:
         # VNNCOMP convention: file contents are the authoritative verdict.
-        # 'unsat' = property holds (no counterexample exists in the unsafe
-        # region); 'sat' = counterexample found; 'unknown' otherwise.
+        # 'unsat' = property holds; 'sat' = counterexample found; else
+        # 'unknown'/'timeout'.
         verdict_map = {
             'verified': 'unsat',
             'sat': 'sat',
@@ -288,27 +318,45 @@ def _verify(args):
         if line == 'unknown' and (
                 timed_out or (args.timeout is not None and t_total >= args.timeout - 2.0)):
             line = 'timeout'
-        with open(args.results_file, 'w') as f:
-            f.write(line + '\n')
-            # VNNCOMP `sat` results must be accompanied by a counterexample in
-            # the results file: the verdict on line 1, then an s-expression
-            #   ((X_0 <v>) (X_1 <v>) ... (Y_0 <v>) ...)
-            # listing every input dim then every output dim. The harness splits
-            # line 1 (verdict) from the remainder (saved as
-            # `<instance>.counterexample.gz`) and re-runs the ONNX on the X's to
-            # confirm the Y's match and the spec is violated. We reuse the same
-            # ORT forward the soundness validator uses so the emitted Y matches.
-            if line == 'sat' and isinstance(details, dict) \
-                    and details.get('witness') is not None:
-                ce = _counterexample_sexpr(args.net, spec, details['witness'])
-                if ce is not None:
-                    f.write(ce + '\n')
-                else:
-                    print('  [warn] sat verdict but could not build a '
-                          'counterexample (no ORT output); results file has '
-                          'the verdict only.')
+        _emit_result(args, spec, line,
+                     details.get('witness') if isinstance(details, dict)
+                     else None,
+                     sat_state)
 
     sys.exit(0 if result == 'verified' else 1)
+
+
+def _emit_result(args, spec, line, witness, sat_state):
+    """Write the VNNCOMP results file: verdict on line 1, then (for 'sat') the
+    counterexample s-expression. Never-downgrade rule: once a 'sat' (with a
+    counterexample) has been written, a later 'timeout'/'unknown'/'error' will
+    NOT overwrite it — a found counterexample is sticky against running out of
+    budget. A later 'sat' (a clearer counterexample) or 'unsat' (a proof — the
+    earlier within-tolerance near-miss was spurious) DOES override.
+
+    Called both for the final verdict and, mid-run, by `settings.result_sink`
+    to persist a within-tolerance counterexample early. Idempotent/repeatable.
+    """
+    if not args.results_file:
+        return
+    if sat_state.get('emitted') and line not in ('sat', 'unsat'):
+        return  # keep the counterexample we already wrote
+    ce = None
+    if line == 'sat' and witness is not None:
+        # VNNCOMP `sat` carries the counterexample: verdict on line 1, then an
+        # s-expression `((X_0 <v>) ... (Y_0 <v>) ...)` over every input then
+        # output dim. The harness re-runs the ONNX on the X's to confirm. We
+        # reuse the same ORT forward the soundness validator uses so Y matches.
+        ce = _counterexample_sexpr(args.net, spec, witness)
+        if ce is None:
+            print('  [warn] sat verdict but could not build a counterexample '
+                  '(no ORT output); results file has the verdict only.')
+    with open(args.results_file, 'w') as f:
+        f.write(line + '\n')
+        if ce is not None:
+            f.write(ce + '\n')
+    if line == 'sat':
+        sat_state['emitted'] = True
 
 
 def _counterexample_sexpr(onnx_path, spec, witness):

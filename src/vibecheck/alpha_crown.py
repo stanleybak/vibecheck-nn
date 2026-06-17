@@ -22,6 +22,7 @@ Phase 2.5 halfspace LP tightening of per-neuron pre-ReLU bounds.
 
 import numpy as np
 import torch
+from .broadcast_util import assert_no_outer_broadcast
 import torch.nn.functional as F
 
 from .verify_zono_bnb import (
@@ -590,6 +591,10 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
         elif t == 'add':
+            # ew passes through unchanged → only sound with no outer-broadcast
+            # operand (reduce-sum adjoint lives in _spec_backward_graph).
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'crown_matrix')
             if op.get('is_merge'):
                 for inp in op['inputs']:
                     ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
@@ -602,6 +607,8 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
         elif t == 'sub':
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'crown_matrix')
             bias = op.get('bias')
             if bias is not None:
                 acc = acc - _bias_dot_ew(
@@ -625,7 +632,9 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
                 raise ValueError("slice backward missing flat_idx/in_shape")
             idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
             ew_back = torch.zeros(ew.shape[0], n_in, dtype=ew.dtype, device=device)
-            ew_back.index_copy_(-1, idx_t, ew)
+            # scatter-ADD adjoint (fan-out gather with duplicate flat_idx must
+            # SUM, not overwrite — index_copy_ is unsound there).
+            ew_back.index_add_(-1, idx_t, ew)
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
@@ -1925,6 +1934,10 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
         elif t == 'add':
+            # ew passes through unchanged → only sound with no outer-broadcast
+            # operand (reduce-sum adjoint lives in _spec_backward_graph).
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'crown_matrix')
             if op.get('is_merge'):
                 for inp in op['inputs']:
                     ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
@@ -1937,6 +1950,8 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
         elif t == 'sub':
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'crown_matrix')
             bias = op.get('bias')
             if bias is not None:
                 acc = acc - _bias_dot_ew(
@@ -1960,7 +1975,9 @@ def capture_ew_per_relu(gg, xl, xh, alpha_spec, bbr, w_q, b_q, device, dtype):
                 raise ValueError("slice backward missing flat_idx/in_shape")
             idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
             ew_back = torch.zeros(n_in, dtype=ew.dtype, device=device)
-            ew_back.index_copy_(-1, idx_t, ew)
+            # scatter-ADD adjoint (fan-out gather with duplicate flat_idx must
+            # SUM, not overwrite — index_copy_ is unsound there).
+            ew_back.index_add_(-1, idx_t, ew)
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 

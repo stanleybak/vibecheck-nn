@@ -53,6 +53,22 @@ class PowRelax(ScalarNonlinearRelax):
     def func(self, x):
         return x ** self.p
 
+    def slope_at(self, x):
+        x = torch.as_tensor(x, dtype=torch.float64)
+        return self.p * x ** (self.p - 1)
+
+    def curvature(self, lo, hi):
+        # per-element code: 0=convex, 1=concave, 2=mixed. x**p is convex
+        # everywhere for EVEN p; for ODD p convex on x>=0, concave on x<=0.
+        lo = torch.as_tensor(lo, dtype=torch.float64)
+        hi = torch.as_tensor(hi, dtype=torch.float64)
+        lo, hi = torch.broadcast_tensors(lo, hi)
+        if self.p % 2 == 0:
+            return torch.zeros_like(lo)
+        return torch.where(lo >= 0.0, torch.zeros_like(lo),
+                           torch.where(hi <= 0.0, torch.ones_like(lo),
+                                       2.0 * torch.ones_like(lo)))
+
     def interval(self, lo, hi):
         """Sound (out_lo, out_hi) for x**p over [lo, hi], element-wise.
 
@@ -80,12 +96,12 @@ class PowRelax(ScalarNonlinearRelax):
         out_hi = torch.maximum(f_lo, f_hi)
         return out_lo, out_hi
 
-    def affine_band(self, lo, hi):
+    def affine_band(self, lo, hi, lam=None):
         """Sound affine band (lam, mu, delta): |x**p - (lam*x + mu)| <= delta
-        for all x in [lo, hi].
+        for all x in [lo, hi]. Sound for ANY lam (α-CROWN slope override).
 
-        lam is the chord slope (hi**p - lo**p)/(hi - lo); on the degenerate
-        hi == lo the band collapses and lam = p*lo**(p-1) (the local derivative).
+        lam defaults to the chord slope (hi**p - lo**p)/(hi - lo); on the
+        degenerate hi == lo the band collapses and lam = p*lo**(p-1).
         g(x) = x**p - lam*x is smooth; its extrema over [lo, hi] are at the
         endpoints or at stationary points x**(p-1) = lam/p. We enumerate those
         roots in-range and bracket gmin/gmax over {lo, hi, roots}.
@@ -99,10 +115,11 @@ class PowRelax(ScalarNonlinearRelax):
         p = self.p
         width = hi - lo
         degenerate = width <= 0.0
-        denom = torch.where(degenerate, torch.ones_like(width), width)
-        lam = torch.where(degenerate,
-                          p * lo ** (p - 1),
-                          (hi ** p - lo ** p) / denom)
+        if lam is None:
+            denom = torch.where(degenerate, torch.ones_like(width), width)
+            lam = torch.where(degenerate,
+                              p * lo ** (p - 1),
+                              (hi ** p - lo ** p) / denom)
 
         def g(x):
             return x ** p - lam * x

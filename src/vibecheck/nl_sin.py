@@ -71,18 +71,22 @@ class SinRelax(ScalarNonlinearRelax):
         out_lo = torch.where(has_trough, -torch.ones_like(endpoint_min), endpoint_min)
         return out_lo, out_hi
 
-    def affine_band(self, lo, hi):
+    def slope_at(self, x):
+        return torch.cos(torch.as_tensor(x, dtype=torch.float64))
+
+    def affine_band(self, lo, hi, lam=None):
         """Sound affine band (lam, mu, delta): |sin(x) - (lam*x + mu)| <= delta
         for all x in [lo, hi].
 
         lam = chord slope (sin(hi) - sin(lo)) / (hi - lo), or cos(lo) when
-        hi == lo. The deviation g(x) = sin(x) - lam*x is smooth, so its max and
-        min over [lo, hi] occur at the endpoints or at interior stationary
-        points where g'(x) = cos(x) - lam = 0, i.e. cos(x) = lam. Those are
+        hi == lo (or a caller-supplied α-CROWN slope). The deviation
+        g(x) = sin(x) - lam*x is smooth, so its max and min over [lo, hi] occur
+        at the endpoints or at interior stationary points where
+        g'(x) = cos(x) - lam = 0, i.e. cos(x) = lam. Those are
         x = +-arccos(lam) + 2*pi*k. We enumerate every such x inside [lo, hi]
         (a bounded count: at most ~ (hi - lo)/(2*pi) + 2 per branch), evaluate g
         at lo, hi and each in-range critical point, then set
-        mu = (gmax + gmin)/2, delta = (gmax - gmin)/2.
+        mu = (gmax + gmin)/2, delta = (gmax - gmin)/2. Sound for ANY lam.
         """
         lo = torch.as_tensor(lo, dtype=torch.float64)
         hi = torch.as_tensor(hi, dtype=torch.float64)
@@ -92,11 +96,12 @@ class SinRelax(ScalarNonlinearRelax):
 
         width = hi - lo
         degenerate = width <= 0.0
-        # chord slope; on hi == lo use the local derivative cos(lo) (band collapses)
-        denom = torch.where(degenerate, torch.ones_like(width), width)
-        lam = torch.where(degenerate,
-                          torch.cos(lo),
-                          (torch.sin(hi) - torch.sin(lo)) / denom)
+        if lam is None:
+            # chord slope; on hi == lo use the local derivative cos(lo).
+            denom = torch.where(degenerate, torch.ones_like(width), width)
+            lam = torch.where(degenerate,
+                              torch.cos(lo),
+                              (torch.sin(hi) - torch.sin(lo)) / denom)
 
         def g(x):
             return torch.sin(x) - lam * x

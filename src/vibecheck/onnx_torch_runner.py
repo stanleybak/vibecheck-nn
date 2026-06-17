@@ -265,12 +265,22 @@ def onnx_forward(model, x, device=None, dtype=None):
 
 
 def pgd_via_onnx(onnx_path, spec, n_restarts=256, n_iter=100, lr=0.1,
-                 device=None, dtype=None, simplify=True, min_restarts=8):
+                 device=None, dtype=None, simplify=True, min_restarts=8,
+                 seeds=None, deadline=None):
     """Run PGD against the raw ONNX model. Returns (sat: bool, witness or None).
 
     Used as a last-resort SAT-finder when gpu_graph can't run forward
     (e.g., transformer attention with shape-sensitive ops). OOM-halves
     n_restarts down to min_restarts before giving up.
+
+    ``seeds`` (optional, [S, n_in] array/tensor): extra starting points
+    prepended to the random restarts — e.g. the dual-ascent BaB's primal
+    witnesses, which are LP-informed and land near the binding region (far more
+    effective than random starts in high-dim ACOPF input boxes).
+
+    ``deadline`` (optional, perf_counter seconds): stop and return the
+    best-so-far (no-sat) once exceeded — bounds wall time on large nets where a
+    full n_restarts*n_iter sweep would otherwise blow a per-instance budget.
     """
     import gzip, time
     import onnx as _onnx
@@ -331,11 +341,18 @@ def pgd_via_onnx(onnx_path, spec, n_restarts=256, n_iter=100, lr=0.1,
             torch.cuda.empty_cache() if device.type == 'cuda' else None
             torch.manual_seed(0)
             x = xl + width * torch.rand(nr, n_in, device=device, dtype=dtype)
+            if seeds is not None and len(seeds):
+                s = torch.as_tensor(seeds, dtype=dtype, device=device).reshape(
+                    -1, n_in).clamp(min=xl, max=xh)
+                x = torch.cat([s, x], dim=0)
             x = x.detach().requires_grad_(True)
+            bsz = x.shape[0]
             for it in range(n_iter):
-                ys = onnx_forward(model, x.reshape(nr, *in_shape),
+                if deadline is not None and time.perf_counter() >= deadline:
+                    return False, None
+                ys = onnx_forward(model, x.reshape(bsz, *in_shape),
                                    device=device, dtype=dtype)
-                ys_flat = ys.reshape(nr, -1)
+                ys_flat = ys.reshape(bsz, -1)
                 # Per-disjunct max margin → min over disjuncts.
                 stacked = torch.stack(
                     [(ys_flat @ W.T + b).max(dim=1).values for W, b in zip(Ws, bs)],

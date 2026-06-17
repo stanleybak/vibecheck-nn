@@ -56,18 +56,56 @@ class ScalarNonlinearRelax:
         bounding f over [lo, hi]. Must be sound by construction."""
         raise NotImplementedError
 
-    def affine_band(self, lo, hi):
+    def affine_band(self, lo, hi, lam=None):
         """Sound affine over-approximation. Returns (lam, mu, delta) with
         |f(x) - (lam*x + mu)| <= delta  for all x in [lo, hi], delta >= 0.
-        Must be sound by construction (no sampling)."""
+        Must be sound by construction (no sampling).
+
+        ``lam`` (optional): use THIS slope instead of the default chord slope.
+        ANY real lam is sound — mu/delta are recomputed as the exact midpoint /
+        half-range of g(x)=f(x)-lam*x over [lo,hi] (endpoints + critical points
+        where f'(x)=lam). This is the α-CROWN hook: a differentiable lam lets
+        gradient pick the slope that maximises the downstream margin."""
         raise NotImplementedError
 
+    def slope_at(self, x):
+        """f'(x) — used by ``affine_band_alpha`` to span a sound slope range."""
+        raise NotImplementedError
 
-def zono_affine_transform(relax, center, generators, rel_pad=1e-6):
+    def curvature(self, lo, hi):
+        """Per-element curvature code over [lo,hi]: 0=convex, 1=concave,
+        2=mixed. Used by the split-relaxation two-plane form to pick
+        tangent-vs-secant. Default = mixed (always falls back to the parallel
+        band, which is sound for any curvature)."""
+        lo = torch.as_tensor(lo, dtype=torch.float64)
+        hi = torch.as_tensor(hi, dtype=torch.float64)
+        lo, hi = torch.broadcast_tensors(lo, hi)
+        return 2.0 * torch.ones_like(lo)
+
+    def affine_band_alpha(self, lo, hi, alpha):
+        """α-parametrised band: lam = (1-α)·f'(lo) + α·f'(hi), α in [0,1].
+        Differentiable in α; sound for every α (``affine_band`` recomputes a
+        sound mu/delta for whatever lam it is given). Mirrors the convex-op
+        α-zono path (exp/reciprocal) used by ``_zono_alpha_close``."""
+        a = alpha.clamp(0.0, 1.0) if torch.is_tensor(alpha) else alpha
+        d_lo = self.slope_at(lo)
+        d_hi = self.slope_at(hi)
+        lam = d_lo + a * (d_hi - d_lo)
+        return self.affine_band(lo, hi, lam=lam)
+
+
+def zono_affine_transform(relax, center, generators, rel_pad=1e-6,
+                          tight_lo=None, tight_hi=None, alpha=None,
+                          return_band=False):
     """Sound DeepZ elementwise transformer for f, using relax.affine_band.
 
     Zonotope layout: center (n,), generators (n, k) [row i = element i's gens].
-    Returns (new_center (n,), new_gens (n, k+n)).
+    Returns (new_center (n,), new_gens (n, k+n)); with ``return_band=True`` also
+    returns the per-element band ``(lam, mu, delta+pad)`` actually used — the
+    EXACT parent geometry the dual-ascent nonlinear-split state needs (delta is
+    returned WITH the float-rounding pad, so it equals the fresh e_new column
+    magnitude in new_gens; the dual sensitivity g_k = d[e_new]/that value is then
+    exact). All three are cast to ``center.dtype``.
 
     For z_i = center_i + generators_i . e (e in [-1,1]^k), with affine band
     |f(x) - (lam_i x + mu_i)| <= delta_i over [lo_i, hi_i] = z_i's range:
@@ -75,6 +113,16 @@ def zono_affine_transform(relax, center, generators, rel_pad=1e-6):
     i.e. scale the existing gens by lam (preserves input correlation, unlike a
     box collapse) and add ONE fresh error generator of magnitude delta per
     element. Sound for any noise assignment.
+
+    ``tight_lo``/``tight_hi`` (per-element, optional): intersect the band's input
+    range with [tight_lo, tight_hi] — the nonlinear-split clamp. The band is then
+    computed over the TIGHTER range (smaller delta, often different lam) but still
+    applied to the FULL zonotope. This is sound for the sub-domain where the op's
+    input lies in the clamp: on that sub-domain every (x, f(x)) is inside the
+    clamped band, so the resulting zonotope's bound over-approximates f there; the
+    two children of a split (clamp [lo,m] and [m,hi]) cover the parent's range, so
+    "both children verified ⟹ parent verified" (same argument as ReLU
+    ``tight_bounds`` / the exp/reciprocal op_clamps path).
 
     The band is computed in float64 then cast (avoids float32 rounding making
     delta too small); `rel_pad` adds a small value-relative slack covering the
@@ -84,7 +132,21 @@ def zono_affine_transform(relax, center, generators, rel_pad=1e-6):
     rad = generators.abs().sum(dim=1)
     lo = (center - rad).double()
     hi = (center + rad).double()
-    lam, mu, delta = relax.affine_band(lo, hi)
+    if tight_lo is not None:
+        lo = torch.maximum(lo, torch.as_tensor(
+            tight_lo, dtype=torch.float64, device=center.device))
+    if tight_hi is not None:
+        hi = torch.minimum(hi, torch.as_tensor(
+            tight_hi, dtype=torch.float64, device=center.device))
+        # empty intersection (infeasible sub-domain) -> collapse to a point;
+        # any bound is sound there since no real input reaches it.
+        hi = torch.maximum(hi, lo)
+    if alpha is not None:
+        # α-CROWN: differentiable slope; gradient flows lam<-alpha<-spec margin.
+        a = alpha.double() if torch.is_tensor(alpha) else alpha
+        lam, mu, delta = relax.affine_band_alpha(lo, hi, a)
+    else:
+        lam, mu, delta = relax.affine_band(lo, hi)
     lam = torch.as_tensor(lam, dtype=dt, device=center.device)
     mu = torch.as_tensor(mu, dtype=dt, device=center.device)
     delta = torch.as_tensor(delta, dtype=dt, device=center.device).clamp(min=0)
@@ -92,7 +154,10 @@ def zono_affine_transform(relax, center, generators, rel_pad=1e-6):
     new_gens = lam.unsqueeze(-1) * generators
     pad = rel_pad * (new_center.abs() + new_gens.abs().sum(dim=1) + 1.0)
     err = torch.diag(delta + pad)
-    return new_center, torch.cat([new_gens, err], dim=1)
+    out = (new_center, torch.cat([new_gens, err], dim=1))
+    if return_band:
+        return (*out, (lam, mu, delta + pad))
+    return out
 
 
 def _as64(*ts):
@@ -135,3 +200,4 @@ def assert_interval_sound(relax, lo, hi, n_samples=50000, atol=1e-6):
 # Without this, consumers (forward zono sin/cos/floor, pow) saw an empty
 # REGISTRY → KeyError on the first ml4acopf Floor/Sin/Cos/Pow op.
 from . import nl_sin, nl_cos, nl_floor, nl_pow  # noqa: E402,F401
+from . import nl_sigmoid_tanh  # noqa: E402,F401

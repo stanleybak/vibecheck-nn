@@ -7,6 +7,30 @@ import torch.nn.functional as F
 
 from .settings import default_settings, resolve_torch
 from .zonotope import TorchZonotope
+from .broadcast_util import (reconstruct_live_shape, broadcast_rows_backward,
+                             assert_no_outer_broadcast)
+
+
+def _bcast_ew_back(ew, op):
+    """CROWN backward adjoint of an ONNX outer-broadcast on input[0]. If the op
+    forward-expanded its live input (in numel != out numel, e.g. Sub (N,)-(M,)
+    -> (N,M)), the effective weight at the broadcast outputs must be SUMMED back
+    onto the live rows; otherwise ew passes through unchanged. Matches the
+    forward broadcast layout via the shared `broadcast_util`."""
+    in_shapes = op.get('in_shapes_nd')
+    out_sh = op.get('out_shape_nd')
+    if not in_shapes or in_shapes[0] is None or out_sh is None:
+        return ew
+    in_sh = tuple(int(d) for d in in_shapes[0])
+    out_sh = tuple(int(d) for d in out_sh)
+    n_in = int(np.prod(in_sh)); n_out = int(np.prod(out_sh))
+    if n_in == n_out:
+        return ew
+    bias = op.get('bias')
+    bt = np.asarray(bias) if bias is not None else np.zeros(())
+    const_sh = tuple(bt.shape) if bt.ndim > 0 else ()
+    live_sh, _ = reconstruct_live_shape(out_sh, const_sh, in_sh, n_in)
+    return broadcast_rows_backward(ew, live_sh, out_sh, ew.dim() - 1)
 
 
 def _sigmoid_tanh_chord_parallelogram(lo, hi, act_kind):
@@ -317,7 +341,12 @@ def _pow_two_line_coeffs(lo, hi, p, tangent_pos=None):
     tan_pos_clipped = torch.maximum(torch.minimum(tangent_pos, hi), lo)
     tan_slope = p * tan_pos_clipped.pow(p - 1)
     tan_const = tan_pos_clipped.pow(p) - tan_slope * tan_pos_clipped
-    convex_regime = (lo >= 0) | ((hi <= 0) & (p % 2 == 0))
+    # Even powers are convex on ALL of R (f'' = p(p-1)x^(p-2) >= 0 since
+    # p-2 is even), so the tangent-LB / chord-UB two-line is valid even on a
+    # sign-crossing interval — NOT just lo>=0 or hi<=0. Boxing sign-mixed
+    # even powers (the old behaviour) is needlessly loose and, for self-
+    # product squares over a wide [-a, a], catastrophic.
+    convex_regime = (lo >= 0) | (p % 2 == 0)
     concave_regime = (hi <= 0) & (p % 2 == 1)
     use_two_line = convex_regime | concave_regime
     # Sound assignment per regime: convex → LB=tangent, UB=chord;
@@ -492,6 +521,35 @@ def _make_slopes(lo, hi):
     return lo_s, up_s, up_t, active, dead, unstable
 
 
+def _point_bcast_bias(a, bias, op, sign):
+    """Batched point  y = a + sign*bias  with full ONNX broadcast, matching the
+    zono forward handlers EXACTLY (the PGD forward must reproduce the network or
+    sat-finding is unsound). `a` is (B, n_in). Three cases:
+      - elementwise (bias scalar or n_in)            -> a + sign*bias
+      - aligned/last-dim (prod(out_shape) == n_in)   -> reshape a to out_shape,
+        right-align bias and broadcast (the Add (3,C)+(C,) pattern)
+      - genuine OUTER broadcast (a expands into out)  -> mirror
+        `_zono_broadcast_const`'s live-shape reconstruction (Sub (N,)-(M,)->(N,M)).
+    """
+    bt = torch.as_tensor(np.asarray(bias), dtype=a.dtype, device=a.device)
+    n_in = a.shape[1]
+    B = a.shape[0]
+    if bt.numel() == 1 or bt.numel() == n_in:
+        return a + sign * bt.flatten()
+    out_sh = tuple(int(d) for d in op.get('out_shape_nd'))
+    if int(np.prod(out_sh)) == n_in:
+        # aligned broadcast: a already has the output numel; bias right-aligns.
+        a_nd = a.reshape(B, *out_sh)
+        return (a_nd + sign * bt).reshape(B, -1)
+    const_sh = tuple(int(d) for d in bt.shape) if bt.dim() > 0 else ()
+    in_sh = tuple(int(d) for d in op.get('in_shapes_nd', [None])[0])
+    live_sh, const_aligned = reconstruct_live_shape(
+        out_sh, const_sh, in_sh, n_in)
+    a_nd = a.reshape(B, *live_sh)
+    const_nd = bt.reshape(const_aligned)
+    return (a_nd + sign * const_nd).expand(B, *out_sh).reshape(B, -1)
+
+
 def _forward_batch_graph(x, gg):
     """Batched forward pass for PGD on graph networks (supports skip connections)."""
     batch = x.shape[0]
@@ -524,16 +582,14 @@ def _forward_batch_graph(x, gg):
                 a = act[op['inputs'][0]]
                 bias = op.get('bias')
                 if bias is not None:
-                    a = a + torch.tensor(bias.flatten(), dtype=a.dtype,
-                                         device=a.device)
+                    a = _point_bcast_bias(a, bias, op, 1.0)
                 act[name] = a
 
         elif t == 'sub':
             a = act[op['inputs'][0]]
             bias = op.get('bias')
             if bias is not None:
-                a = a - torch.tensor(bias.flatten(), dtype=a.dtype,
-                                     device=a.device)
+                a = _point_bcast_bias(a, bias, op, -1.0)
             act[name] = a
 
         elif t == 'sub_bilinear':
@@ -614,6 +670,15 @@ def _forward_batch_graph(x, gg):
 
         elif t == 'tanh':
             act[name] = torch.tanh(act[op['inputs'][0]])
+
+        elif t == 'sin':
+            act[name] = torch.sin(act[op['inputs'][0]])
+
+        elif t == 'cos':
+            act[name] = torch.cos(act[op['inputs'][0]])
+
+        elif t == 'floor':
+            act[name] = torch.floor(act[op['inputs'][0]])
 
         elif t in ('avg_pool', 'max_pool'):
             a = act[op['inputs'][0]]
@@ -1064,30 +1129,14 @@ def _zono_broadcast_const(z, const_t, op_sign, in_shape_nd, out_shape_nd,
     n_in = z.center.numel()
     out_sh = (tuple(int(d) for d in out_shape_nd)
               if out_shape_nd is not None else (n_in,))
-    rank = len(out_sh)
     const_sh = tuple(int(d) for d in const_t.shape) if const_t.dim() > 0 \
         else ()
-    const_aligned = (1,) * (rank - len(const_sh)) + const_sh
-    # Reconstruct the live broadcast shape: where the constant has a 1 at
-    # an out dim, that dim belongs to the live tensor (=out dim); where
-    # the constant fully drives the dim (==out dim != 1), the live tensor
-    # is 1 there. (If both const and live genuinely vary on the same dim,
-    # they must equal the out dim — handled by taking out dim when const
-    # is 1.)
-    live_sh = tuple(out_sh[d] if const_aligned[d] == 1 else 1
-                    for d in range(rank))
-    if int(np.prod(live_sh)) != n_in:
-        # Fall back to right-aligning the recorded in-shape; if THAT also
-        # mismatches, the broadcast layout is ambiguous → fail loudly
-        # rather than emit an unsound (wrong-layout) result.
-        in_sh = (tuple(int(d) for d in in_shape_nd)
-                 if in_shape_nd is not None else (n_in,))
-        live_sh = (1,) * (rank - len(in_sh)) + in_sh
-        if int(np.prod(live_sh)) != n_in:
-            raise NotImplementedError(
-                f'broadcast {("Add" if op_sign > 0 else "Sub")}: cannot '
-                f'place live numel {n_in} into out shape {out_sh} given '
-                f'const shape {const_sh} (in_shape={in_shape_nd})')
+    in_sh = (tuple(int(d) for d in in_shape_nd)
+             if in_shape_nd is not None else (n_in,))
+    # Shared broadcast-shape reconstruction (single source of truth across the
+    # zono + LiRPA reps; see broadcast_util).
+    live_sh, const_aligned = reconstruct_live_shape(
+        out_sh, const_sh, in_sh, n_in)
     c_nd = z.center.reshape(live_sh)
     const_nd = const_t.reshape(const_aligned) if const_t.dim() >= 0 \
         else const_t
@@ -1104,7 +1153,8 @@ def _zono_broadcast_const(z, const_t, op_sign, in_shape_nd, out_shape_nd,
 def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
                              relu_lambdas=None, op_bounds=None,
-                             op_clamps=None):
+                             op_clamps=None, col_ids_out=None,
+                             op_fresh_ids=None, op_geom_out=None):
     if relu_lambdas is None:
         # plain (non-differentiable) use: keep the historical no-grad
         # fast path; the alpha-zono caller passes relu_lambdas and needs
@@ -1113,18 +1163,29 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
             return _forward_zonotope_graph_impl(
                 xl, xh, gg, device, dtype, settings=settings,
                 rec_zono=rec_zono, tight_bounds=tight_bounds,
-                op_bounds=op_bounds, op_clamps=op_clamps)
+                op_bounds=op_bounds, op_clamps=op_clamps,
+                col_ids_out=col_ids_out, op_fresh_ids=op_fresh_ids,
+                op_geom_out=op_geom_out)
     return _forward_zonotope_graph_impl(
         xl, xh, gg, device, dtype, settings=settings, rec_zono=rec_zono,
         tight_bounds=tight_bounds, relu_lambdas=relu_lambdas,
-        op_bounds=op_bounds, op_clamps=op_clamps)
+        op_bounds=op_bounds, op_clamps=op_clamps,
+        col_ids_out=col_ids_out, op_fresh_ids=op_fresh_ids,
+        op_geom_out=op_geom_out)
 
 
 def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
                              relu_lambdas=None, op_bounds=None,
-                             op_clamps=None):
+                             op_clamps=None, col_ids_out=None,
+                             op_fresh_ids=None, op_geom_out=None):
     """Graph-aware zonotope forward pass (supports skip connections).
+
+    ``op_geom_out`` (optional dict): for each elementwise splittable nonlinear
+    op (sigmoid/tanh/sin/cos/pow), record at op-time the PRE-ACTIVATION
+    zonotope geometry the dual-ascent nonlinear-split state needs —
+    ``op_geom_out[name] = (z.center, z.generators, input_global_col_ids)`` —
+    captured before downstream pops drop the input's col-id entry.
 
     Args:
         xl, xh: input bounds (flat torch tensors)
@@ -1183,6 +1244,20 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
     forks = gg['fork_points']
     sb = {}
 
+    # Explicit per-column global noise IDs. Merges compute their sound shared
+    # count as the common-prefix length of the two branches' ID arrays, which
+    # stays correct across prefix-breaking ops (sigmoid/tanh, both-vary
+    # mul/sub/div) — unlike the positional gen_count assumption. Merges/bilinear
+    # set col_ids_state[name] in their handler; all other ops derive it
+    # generically after the dispatch (preserve input[0]'s IDs, append fresh).
+    col_ids_state = {gg['input_name']: list(range(z_init.n_gens))}
+    _id_counter = [z_init.n_gens]
+
+    def _alloc_ids(k):
+        start = _id_counter[0]
+        _id_counter[0] = start + max(0, int(k))
+        return list(range(start, start + max(0, int(k))))
+
     if rec_zono is not None:
         rec_zono.setdefault('gen_rows_by_layer', {})
         rec_zono.setdefault('col_origin', {})
@@ -1222,6 +1297,7 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
     for op_idx, op in enumerate(gg['ops']):
         name = op['name']
         t = op['type']
+        _pre_fresh_id = _id_counter[0]  # for op_fresh_ids attribution
 
         if t == 'conv':
             z = _get(op['inputs'][0])
@@ -1307,9 +1383,14 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                                      hi_p.detach().clone())
                 zono_state[name] = z2
                 gen_count[name] = z2.n_gens
+                # prefix-preserving (old gens scaled + fresh appended)
+                _base = col_ids_state[op['inputs'][0]]
+                col_ids_state[name] = (
+                    list(_base) + _alloc_ids(z2.n_gens - len(_base)))
                 for inp in op['inputs']:
                     if last_use.get(inp) == op_idx and inp in zono_state:
                         del zono_state[inp]
+                        col_ids_state.pop(inp, None)
                 continue
             # Build the (lo, hi) the relaxation will use: intersect z's
             # own bounds with any externally-supplied tight bounds. We
@@ -1345,10 +1426,13 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             if op.get('is_merge'):
                 z_a = _get(op['inputs'][0])
                 z_b = _get(op['inputs'][1])
-                # Find shared generators: use the deepest common fork point
-                shared = _find_shared_gens_count(
-                    op['inputs'][0], op['inputs'][1], gg, gen_count)
+                # Shared = common-prefix length of the two branches' column IDs.
+                ida = col_ids_state[op['inputs'][0]]
+                idb = col_ids_state[op['inputs'][1]]
+                shared = _common_prefix_len(ida, idb)
                 zono_state[name] = z_a.add(z_b, shared)
+                # add layout: [a[:s]+b[:s] | a[s:] | b[s:]]  ->  ida + idb[s:]
+                col_ids_state[name] = list(ida) + list(idb[shared:])
             else:
                 z = _get(op['inputs'][0])
                 bias = op.get('bias')
@@ -1408,8 +1492,9 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             z_b = _get(op['inputs'][1])
             ka = z_a.generators.shape[1]
             kb = z_b.generators.shape[1]
-            shared = _find_shared_gens_count(
-                op['inputs'][0], op['inputs'][1], gg, gen_count)
+            ida = col_ids_state[op['inputs'][0]]
+            idb = col_ids_state[op['inputs'][1]]
+            shared = _common_prefix_len(ida, idb)
             # Layout: G_out = [G_a_shared - G_b_shared | G_a_extra | -G_b_extra]
             g_a_shared = z_a.generators[:, :shared]
             g_b_shared = z_b.generators[:, :shared]
@@ -1422,6 +1507,8 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             ], dim=1)
             zono_state[name] = TorchZonotope(
                 z_a.center - z_b.center, g_out)
+            # Same layout as add-merge: ida + idb[shared:].
+            col_ids_state[name] = list(ida) + list(idb[shared:])
 
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
@@ -1455,36 +1542,103 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                 g_flat.index_select(0, idx_t))
 
         elif t == 'concat':
+            # Stack rows. Inputs share only their common column-ID prefix;
+            # each input's columns BEYOND that prefix are DISTINCT noise and
+            # must get their OWN output columns (block-diagonal), with zeros
+            # for other inputs' rows. The old pad-and-stack aliased different
+            # inputs' noise into the same column index — sound for per-row
+            # bounds but an UNDER-approximation of the joint range, which
+            # corrupts downstream merges/bilinears (ml4acopf wide-box).
             zs = [_get(inp) for inp in op['inputs']]
-            n_gens = max(z.generators.shape[1] for z in zs)
-            cs, gs = [], []
-            for z in zs:
-                c_flat = z.center.reshape(-1)
-                g_flat = z.generators.reshape(c_flat.numel(), -1)
-                if g_flat.shape[1] < n_gens:
-                    pad = torch.zeros(c_flat.numel(),
-                                       n_gens - g_flat.shape[1],
-                                       dtype=g_flat.dtype, device=device)
-                    g_flat = torch.cat([g_flat, pad], dim=1)
-                cs.append(c_flat); gs.append(g_flat)
-            zono_state[name] = TorchZonotope(
-                torch.cat(cs, dim=0), torch.cat(gs, dim=0))
+            inp_ids = [col_ids_state[inp] for inp in op['inputs']]
+            cp = list(inp_ids[0])
+            for ids in inp_ids[1:]:
+                cp = cp[:_common_prefix_len(cp, ids)]
+            s = len(cp)
+            cflats = [z.center.reshape(-1) for z in zs]
+            gflats = [z.generators.reshape(c.numel(), -1)
+                      for z, c in zip(zs, cflats)]
+            extra = [g.shape[1] - s for g in gflats]
+            total_rows = sum(c.numel() for c in cflats)
+            total_cols = s + sum(extra)
+            G = torch.zeros(total_rows, total_cols, dtype=dtype, device=device)
+            out_ids = list(cp)
+            r0, c0 = 0, s
+            for ids, c, gf, ec in zip(inp_ids, cflats, gflats, extra):
+                nr = c.numel()
+                if s > 0:
+                    G[r0:r0 + nr, :s] = gf[:, :s]
+                if ec > 0:
+                    G[r0:r0 + nr, c0:c0 + ec] = gf[:, s:]
+                    out_ids.extend(ids[s:])
+                    c0 += ec
+                r0 += nr
+            zono_state[name] = TorchZonotope(torch.cat(cflats, dim=0), G)
+            col_ids_state[name] = out_ids
 
         elif t in ('sigmoid', 'tanh'):
-            # Nonlinear activation: collapse to box. Center = midpoint of
-            # the activation's range over [lo, hi]; one new gen per cell
-            # with magnitude (hi - lo)/2. Record pre-act bounds for CROWN.
+            # Two relaxations, chosen by settings.sigmoid_relaxation:
+            #  - 'box' (default): center = midpoint of the activation range,
+            #    one new gen per cell of magnitude (hi-lo)/2. Discards ALL
+            #    input correlation but keeps the generator count bounded (reset
+            #    each activation) — safe for sigmoid-heavy nets (dist_shift).
+            #  - 'affine_band': the sound DeepZ affine-band transform (like
+            #    sin/cos) — y = lam*x + mu, lam-scaled gens preserved + one
+            #    fresh delta gen per element. Far tighter (keeps correlation),
+            #    but GROWS the generator count, so opt in where the net has few
+            #    sigmoid cells (ml4acopf: one 24-wide layer).
             z = _get(op['inputs'][0])
             lo_pre, hi_pre = z.bounds()
-            act = torch.sigmoid if t == 'sigmoid' else torch.tanh
-            s_lo = act(lo_pre); s_hi = act(hi_pre)
-            c_out = (s_lo + s_hi) / 2
-            mu = (s_hi - s_lo) / 2
-            n = c_out.numel()
-            # New zonotope: zero old gens (no preserved correlation), add
-            # diag(mu) for the n new noise variables.
-            new_g = torch.diag(mu)
-            zono_state[name] = TorchZonotope(c_out, new_g)
+            if op_geom_out is not None:
+                op_geom_out[name] = {
+                    'c_in': z.center.detach().clone(),
+                    'gens': z.generators.detach().clone(),
+                    'in_ids': list(col_ids_state[op['inputs'][0]])}
+            mode = (settings.get('sigmoid_relaxation', 'box')
+                    if settings is not None else 'box')
+            # nonlinear-split clamp (sound; children cover the parent).
+            _tl = _th = None
+            if op_clamps is not None and name in op_clamps:
+                _tl, _th = op_clamps[name]
+            if mode == 'affine_band':
+                from .nonlinear_relax import REGISTRY, zono_affine_transform
+                relax = REGISTRY['Sigmoid' if t == 'sigmoid' else 'Tanh']()
+                _alpha = (relu_lambdas[name] if relu_lambdas is not None
+                          and name in relu_lambdas else None)
+                if op_geom_out is not None and name in op_geom_out:
+                    new_c, new_g, _band = zono_affine_transform(
+                        relax, z.center, z.generators, tight_lo=_tl,
+                        tight_hi=_th, alpha=_alpha, return_band=True)
+                    op_geom_out[name]['band'] = tuple(
+                        b.detach().clone() for b in _band)
+                else:
+                    new_c, new_g = zono_affine_transform(
+                        relax, z.center, z.generators, tight_lo=_tl,
+                        tight_hi=_th, alpha=_alpha)
+                zono_state[name] = TorchZonotope(new_c, new_g)
+                # preserve-append: keep input[0]'s col IDs + fresh per element
+                _base = col_ids_state[op['inputs'][0]]
+                col_ids_state[name] = (
+                    list(_base) + _alloc_ids(new_g.shape[1] - len(_base)))
+            else:
+                act = torch.sigmoid if t == 'sigmoid' else torch.tanh
+                _lo_c = (torch.maximum(lo_pre, _tl.to(lo_pre.dtype))
+                         if _tl is not None else lo_pre)
+                _hi_c = (torch.minimum(hi_pre, _th.to(hi_pre.dtype))
+                         if _th is not None else hi_pre)
+                _hi_c = torch.maximum(_hi_c, _lo_c)
+                s_lo = act(_lo_c); s_hi = act(_hi_c)
+                c_out = (s_lo + s_hi) / 2
+                mu = (s_hi - s_lo) / 2
+                # zero old gens (no preserved correlation), diag(mu) fresh.
+                zono_state[name] = TorchZonotope(c_out, torch.diag(mu))
+                col_ids_state[name] = _alloc_ids(c_out.numel())
+            if op_bounds is not None:
+                _ol = (torch.maximum(lo_pre, _tl.to(lo_pre.dtype))
+                       if _tl is not None else lo_pre)
+                _oh = (torch.minimum(hi_pre, _th.to(hi_pre.dtype))
+                       if _th is not None else hi_pre)
+                op_bounds[name] = (_ol.detach().clone(), _oh.detach().clone())
             layer_idx = op.get('layer_idx')
             if layer_idx is not None:
                 sb[layer_idx] = (lo_pre.clone(), hi_pre.clone())
@@ -1498,11 +1652,40 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             from .nonlinear_relax import REGISTRY, zono_affine_transform
             z = _get(op['inputs'][0])
             lo_pre, hi_pre = z.bounds()
+            _cap = op_geom_out is not None and t in ('sin', 'cos')
+            if _cap:
+                op_geom_out[name] = {
+                    'c_in': z.center.detach().clone(),
+                    'gens': z.generators.detach().clone(),
+                    'in_ids': list(col_ids_state[op['inputs'][0]])}
+            # nonlinear-split clamp: tighten the band's input range to the
+            # split sub-interval (sound — children cover the parent).
+            _tl = _th = None
+            if op_clamps is not None and name in op_clamps:
+                _tl, _th = op_clamps[name]
             relax = REGISTRY[{'sin': 'Sin', 'cos': 'Cos', 'floor': 'Floor'}[t]]()
-            new_c, new_g = zono_affine_transform(relax, z.center, z.generators)
+            # α-CROWN: caller-optimized per-element slope (sound for any α,
+            # differentiable). floor has no tunable slope, so only sin/cos.
+            _alpha = (relu_lambdas[name] if t in ('sin', 'cos')
+                      and relu_lambdas is not None and name in relu_lambdas
+                      else None)
+            if _cap:
+                new_c, new_g, _band = zono_affine_transform(
+                    relax, z.center, z.generators, tight_lo=_tl, tight_hi=_th,
+                    alpha=_alpha, return_band=True)
+                op_geom_out[name]['band'] = tuple(
+                    b.detach().clone() for b in _band)
+            else:
+                new_c, new_g = zono_affine_transform(
+                    relax, z.center, z.generators, tight_lo=_tl, tight_hi=_th,
+                    alpha=_alpha)
             zono_state[name] = TorchZonotope(new_c, new_g)
             if op_bounds is not None:
-                op_bounds[name] = (lo_pre.detach().clone(), hi_pre.detach().clone())
+                _ol = (torch.maximum(lo_pre, _tl.to(lo_pre.dtype))
+                       if _tl is not None else lo_pre)
+                _oh = (torch.minimum(hi_pre, _th.to(hi_pre.dtype))
+                       if _th is not None else hi_pre)
+                op_bounds[name] = (_ol.detach().clone(), _oh.detach().clone())
             layer_idx = op.get('layer_idx')
             if layer_idx is not None:
                 sb[layer_idx] = (lo_pre.clone(), hi_pre.clone())
@@ -1569,11 +1752,36 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                     for i in (0, 1) for j in (0, 1)])
                 iv_state[name] = (_corners.min(dim=0).values.detach(),
                                   _corners.max(dim=0).values.detach())
+            # Only the shared generator prefix (the branches' common column-ID
+            # prefix) is the SAME noise in both operands; columns beyond it are
+            # branch-specific and must stay independent or the bilinear product
+            # under-approximates (unsound — ml4acopf wide-box).
+            ida = col_ids_state[op['inputs'][0]]
+            idb = col_ids_state[op['inputs'][1]]
+            shared = _common_prefix_len(ida, idb)
             new_c, new_g = _torch_zono_mul_bilinear(
                 z_a.center, z_a.generators, z_b.center, z_b.generators,
                 shape_a=in_shapes[0], shape_b=in_shapes[1],
-                shape_out=out_shape)
+                shape_out=out_shape, shared_gens=shared)
             zono_state[name] = TorchZonotope(new_c, new_g)
+            nout = zono_state[name].n_gens
+            a_pt = (z_a.generators.numel() == 0
+                    or bool(z_a.generators.abs().max() < 1e-12))
+            b_pt = (z_b.generators.numel() == 0
+                    or bool(z_b.generators.abs().max() < 1e-12))
+            if not (a_pt or b_pt):
+                # both-vary layout: [shared | a_extra | b_extra | box].
+                # shared+a_extra = ida (a's full IDs); b_extra = b's own IDs
+                # beyond the shared prefix; box = fresh second-order columns.
+                col_ids_state[name] = (
+                    list(ida) + list(idb[shared:])
+                    + _alloc_ids(nout - len(ida) - (len(idb) - shared)))
+            else:
+                # point-mask: preserves the VARYING side's columns positionally
+                base = idb if a_pt else ida
+                col_ids_state[name] = (
+                    list(base[:nout]) if nout <= len(base)
+                    else list(base) + _alloc_ids(nout - len(base)))
 
         elif t == 'div_bilinear':
             # Element-wise Div. Point denominator → exact. Non-point
@@ -1640,6 +1848,11 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             # used per-element when the [lo, hi] crosses curvature change.
             from .zonotope import _torch_zono_pow_int
             z = _get(op['inputs'][0])
+            if op_geom_out is not None:
+                op_geom_out[name] = {
+                    'c_in': z.center.detach().clone(),
+                    'gens': z.generators.detach().clone(),
+                    'in_ids': list(col_ids_state[op['inputs'][0]])}
             exp = op.get('exponent', 2.0)
             assert float(int(exp)) == float(exp), (
                 f'pow: only integer exponents supported, got {exp}')
@@ -1648,12 +1861,50 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             in_rad = (z.generators.abs().sum(dim=1)
                        if z.generators.numel() > 0
                        else torch.zeros_like(z.center))
-            op['_pow_in_lo'] = (z.center - in_rad).detach()
-            op['_pow_in_hi'] = (z.center + in_rad).detach()
+            _ptl = _pth = None
+            if op_clamps is not None and name in op_clamps:
+                _ptl, _pth = op_clamps[name]
+            _pl = (torch.maximum(z.center - in_rad, _ptl.to(z.center.dtype))
+                   if _ptl is not None else z.center - in_rad)
+            _ph = (torch.minimum(z.center + in_rad, _pth.to(z.center.dtype))
+                   if _pth is not None else z.center + in_rad)
+            op['_pow_in_lo'] = _pl.detach()
+            op['_pow_in_hi'] = torch.maximum(_ph, _pl).detach()
+            if op_bounds is not None:
+                op_bounds[name] = (_pl.detach().clone(),
+                                   torch.maximum(_ph, _pl).detach().clone())
             _relax = (settings.get('pow_relaxation', 'chord')
                        if settings is not None else 'chord')
-            new_c, new_g = _torch_zono_pow_int(
-                z.center, z.generators, int(exp), relaxation=_relax)
+            _alpha = (relu_lambdas[name] if relu_lambdas is not None
+                      and name in relu_lambdas else None)
+            if _alpha is not None and int(exp) == 2:
+                # α-CROWN Sqr: convex band y=λx+μ±δ over the (clamped) range
+                # with a DIFFERENTIABLE slope λ(α)=2lo+α(2hi-2lo). Sound for any
+                # α (μ,δ are the exact midpoint/half-range of g=x²-λx, whose
+                # only interior extremum is the tangent x*=λ/2); gradient flows
+                # λ<-α. Preserves x-correlation (λ·gens) — no box.
+                _a = _alpha.clamp(0.0, 1.0)
+                lam = 2.0 * _pl + _a * (2.0 * _ph - 2.0 * _pl)
+                xstar = (0.5 * lam).clamp(min=_pl, max=torch.maximum(_ph, _pl))
+                g_lo = _pl * _pl - lam * _pl
+                g_hi = _ph * _ph - lam * _ph
+                g_st = xstar * xstar - lam * xstar
+                gmax = torch.maximum(g_lo, g_hi)
+                gmin = torch.minimum(torch.minimum(g_lo, g_hi), g_st)
+                mu = 0.5 * (gmax + gmin)
+                delta = (0.5 * (gmax - gmin)).clamp(min=0)
+                new_c = lam * z.center + mu
+                new_g = lam.unsqueeze(-1) * z.generators
+                _pad = 1e-6 * (new_c.abs() + new_g.abs().sum(1) + 1.0)
+                new_g = torch.cat([new_g, torch.diag(delta + _pad)], dim=1)
+                if op_geom_out is not None and name in op_geom_out:
+                    op_geom_out[name]['band'] = (
+                        lam.detach().clone(), mu.detach().clone(),
+                        (delta + _pad).detach().clone())
+            else:
+                new_c, new_g = _torch_zono_pow_int(
+                    z.center, z.generators, int(exp), relaxation=_relax,
+                    tight_lo=_ptl, tight_hi=_pth)
             op['_pow_relaxation'] = _relax
             zono_state[name] = TorchZonotope(new_c, new_g)
 
@@ -1807,10 +2058,39 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
 
         gen_count[name] = zono_state[name].n_gens
 
-        # Free zonotopes that are no longer needed
+        # Generic per-column IDs for ops that didn't set them in-handler.
+        # Default: prefix-preserving — keep input[0]'s IDs (linear / relu /
+        # sin / cos / pow / exp / slice / reshape / fc / reduce_sum / div /
+        # matmul preserve their first input's columns as a leading block) and
+        # append fresh IDs for any extra columns. (Merges, concat, and
+        # sigmoid/tanh set their own IDs in-handler.) No input -> all fresh.
+        if name not in col_ids_state:
+            nout = zono_state[name].n_gens
+            in0 = op['inputs'][0] if op['inputs'] else None
+            base = col_ids_state.get(in0) if in0 is not None else None
+            if base is None:
+                col_ids_state[name] = _alloc_ids(nout)
+            elif nout <= len(base):
+                col_ids_state[name] = list(base[:nout])
+            else:
+                col_ids_state[name] = list(base) + _alloc_ids(nout - len(base))
+
+        # Record the fresh global-noise IDs this op allocated (the nonlinear
+        # ops' per-element δ columns), so the nonlinear-split BaB can attribute
+        # output margin-slack back to each op (bbps-style scoring).
+        if op_fresh_ids is not None and _id_counter[0] > _pre_fresh_id:
+            op_fresh_ids[name] = (_pre_fresh_id, _id_counter[0])
+
+        # Free zonotopes (and their col IDs) that are no longer needed
         for inp in op['inputs']:
             if last_use.get(inp) == op_idx and inp in zono_state:
                 del zono_state[inp]
+                col_ids_state.pop(inp, None)
+
+    # Debug hook: expose the final per-column ID map (used by soundness probes
+    # to inspect merge alignment). Off unless a dict is supplied.
+    if col_ids_out is not None:
+        col_ids_out.update(col_ids_state)
 
     # Find last op's zonotope
     last_name = gg['ops'][-1]['name']
@@ -1821,7 +2101,14 @@ def _find_shared_gens_count(name_a, name_b, gg, gen_count):
     """Find shared generator count at fork point for two merging branches.
 
     Walks backward through gpu_graph ops to find the deepest common ancestor
-    that is a fork point.
+    that is a fork point. NOTE: this assumes a positional noise-identity
+    invariant (column k of every descendant of fork F is F's k-th noise) that
+    holds only for prefix-preserving ops (linear / relu / sin / cos / pow /
+    exp / merges). The unbatched forward instead tracks explicit per-column
+    global IDs (``col_ids_state``) and uses ``_common_prefix_len`` at merges,
+    which stays correct across prefix-breaking ops (sigmoid/tanh, both-vary
+    mul/sub/div). This function remains for the batched/alpha paths whose
+    graphs are prefix-preserving.
     """
     forks = gg['fork_points']
     input_name = gg['input_name']
@@ -1854,15 +2141,39 @@ def _find_shared_gens_count(name_a, name_b, gg, gen_count):
     return gen_count.get(input_name, 0)
 
 
+def _common_prefix_len(ids_a, ids_b):
+    """Length of the longest common leading run of two column-ID sequences.
+
+    Two branches forking from a common ancestor carry that ancestor's noise as
+    a shared prefix of their column-ID arrays; they diverge at the first column
+    whose global ID differs. That divergence index is exactly the number of
+    generator columns the two branches genuinely share (same noise, same
+    position) — the sound ``shared`` count for a zonotope merge. Robust to
+    prefix-breaking ops, which alter the ID arrays so the common prefix
+    shrinks accordingly.
+    """
+    n = min(len(ids_a), len(ids_b))
+    i = 0
+    while i < n and ids_a[i] == ids_b[i]:
+        i += 1
+    return i
+
+
 @torch.no_grad()
 def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                           remaining_specs, nh, device, dtype,
                           return_ew=False, return_input_linear=False,
-                          op_bounds=None):
+                          op_bounds=None, seed_node=None):
     """Graph-aware spec backward pass for networks with skip connections.
 
     spec_ew maps query_id -> (w, bias) where w is in OUTPUT space.
     Propagates backward through ALL ops including the final linear layer.
+
+    seed_node: if given, the backward starts at this op's output (w is in
+        that node's space, not OUTPUT space) instead of the final op — used
+        by the topo-order intermediate-bound refinement to bound an
+        arbitrary interior node by CROWN-to-input. Ops topologically after
+        seed_node carry no ew and are skipped.
 
     Returns (spec_lbs, still_open). Optional flags add tuple tails:
       - return_ew=True: appends ew_at_relu (qid -> {layer_idx -> ew_numpy})
@@ -1885,8 +2196,9 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
         acc = b_spec
         qid_ew_at_relu = {} if return_ew else None
 
-        # Seed ew at the output of the last op
-        last_name = ops[-1]['name']
+        # Seed ew at the output of the last op (or an interior node when
+        # refining that node's bound by CROWN-to-input).
+        last_name = seed_node if seed_node is not None else ops[-1]['name']
         ew_at[last_name] = ew_init.clone()
 
         # Walk backward through ALL ops
@@ -1896,6 +2208,11 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 continue
             ew = ew_at[name]
             t = op['type']
+            _tr = __import__('os').environ.get('VC_BWD_TRACE')
+            if _tr and (_tr == 'all' or str(qid) == _tr):
+                _ewmag = float(sum(v.abs().sum() for v in ew_at.values()))
+                print(f'[bwd q{qid}] {name} ({t}) ew={tuple(ew.shape)} '
+                      f'acc={float(acc):+.5g} |ew|1={_ewmag:.5g}', flush=True)
 
             if t == 'conv':
                 acc += float(
@@ -1911,18 +2228,20 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
             elif t == 'fc':
                 W = op['W']; bias = op['bias']
                 in_shape_nd = op.get('in_shapes_nd', [None])[0]
-                out_shape_nd = op.get('out_shape_nd')
+                # Batched/ND matmul: in (prefix..., k), W (m, k) -> y (prefix...,
+                # m), where the trailing m may be SQUEEZED in out_shape (m==1 ->
+                # out (prefix,)). Detect by the contraction dim + numel rather
+                # than out_shape_nd[-1] (which can have lost the trailing 1).
                 if (in_shape_nd is not None and len(in_shape_nd) >= 2
-                        and out_shape_nd is not None
-                        and out_shape_nd[-1] == W.shape[0]
-                        and W.shape[1] == in_shape_nd[-1]):
-                    prefix = out_shape_nd[:-1]
+                        and W.shape[1] == in_shape_nd[-1]
+                        and ew.numel() == int(np.prod(in_shape_nd[:-1]))
+                        * W.shape[0]):
+                    prefix = tuple(int(d) for d in in_shape_nd[:-1])
                     ew_nd = ew.reshape(*prefix, W.shape[0])
                     acc += float((ew_nd * bias).sum())
-                    ew_back_nd = ew_nd @ W
-                    ew_back = ew_back_nd.reshape(-1)
+                    ew_back = (ew_nd @ W).reshape(-1)
                 else:
-                    acc += float(ew @ bias)
+                    acc += float((ew * bias).sum())   # bias may be scalar/bcast
                     ew_back = ew @ W
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
@@ -1956,10 +2275,12 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                             ew, bias, ew.dtype, ew.device,
                             out_shape=op.get('out_shape_nd')))
                     inp = op['inputs'][0]
-                    ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+                    ew_b = _bcast_ew_back(ew, op)
+                    ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_b)) + ew_b
 
             elif t == 'sub':
-                # Sub backward: ew passes through, bias contributes to acc
+                # Sub backward: ew passes through (reduce-summed if the forward
+                # outer-broadcast the input), bias contributes to acc.
                 bias = op.get('bias')
                 if bias is not None:
                     from .alpha_crown import _bias_dot_ew
@@ -1967,7 +2288,8 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                         ew, bias, ew.dtype, ew.device,
                         out_shape=op.get('out_shape_nd')))
                 inp = op['inputs'][0]
-                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew)) + ew
+                ew_b = _bcast_ew_back(ew, op)
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_b)) + ew_b
 
             elif t == 'sub_bilinear':
                 # Sub(a, b) backward: y = a - b → ew_a = ew, ew_b = -ew.
@@ -1989,7 +2311,14 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 idx_t = torch.as_tensor(flat_idx, dtype=torch.long,
                                           device=ew.device)
                 ew_back = torch.zeros(n_in, dtype=ew.dtype, device=ew.device)
-                ew_back.index_copy_(-1, idx_t, ew)
+                # Adjoint of a gather (out[k]=in[idx[k]]) is scatter-ADD:
+                # in_grad[idx[k]] += out_grad[k]. When flat_idx has DUPLICATE
+                # indices (a fan-out gather — one input feeds many outputs,
+                # as power-flow nets do gathering a bus voltage into many line
+                # equations), index_copy_ keeps only the LAST write and DROPS
+                # the rest, producing an unsound backward coefficient. Use
+                # index_add_ (== index_copy_ when indices are unique).
+                ew_back.index_add_(-1, idx_t, ew)
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
@@ -2096,6 +2425,49 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 ew_x = ew_x.reshape(-1); ew_y = ew_y.reshape(-1)
                 ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_x)) + ew_x
                 ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_y)) + ew_y
+
+            elif (t == 'mul_bilinear' and op['inputs'][0] == op['inputs'][1]
+                  and op_bounds is not None and name in op_bounds):
+                # Self-product x*x = x^2 (ml4acopf /Pow_* squares). The
+                # general McCormick branch below treats the two operands as
+                # INDEPENDENT (corner plane y_l*x + x_l*y - x_l*y_l), which
+                # over a wide sign-mixed [-a, a] gives a lower bound ~ -a^2
+                # at x=0 — catastrophic (this was the -444 spec bound). x^2
+                # is convex everywhere, so use the exact square two-line
+                # CROWN (tangent LB + chord UB) — the same helper the `pow`
+                # backward uses, and a single coefficient to the shared input.
+                (xl_b, xh_b), _ = op_bounds[name]
+                lo_sq = xl_b.to(device=ew.device, dtype=ew.dtype).flatten()
+                hi_sq = xh_b.to(device=ew.device, dtype=ew.dtype).flatten()
+                assert lo_sq.numel() == ew.numel(), (
+                    f'self-product square backward: operand/output numel '
+                    f'mismatch at {name!r} ({lo_sq.numel()} vs {ew.numel()})')
+                (lb_slope, lb_const, ub_slope, ub_const,
+                 use_two_line, box_lo_v, box_hi_v) = _pow_two_line_coeffs(
+                    lo_sq, hi_sq, 2)
+                ep = ew.clamp(min=0); en = ew.clamp(max=0)
+                slope_back = ep * lb_slope + en * ub_slope
+                const_back = ep * lb_const + en * ub_const
+                # Box fallback is unreachable for p=2 now (convex everywhere)
+                # but kept for parity/safety with the pow backward.
+                slope_back = torch.where(use_two_line, slope_back,
+                                          torch.zeros_like(slope_back))
+                const_back = torch.where(use_two_line, const_back,
+                                          torch.where(ep > 0, box_lo_v,
+                                              torch.zeros_like(box_lo_v))
+                                          + torch.where(en < 0, box_hi_v,
+                                              torch.zeros_like(box_hi_v)))
+                acc += float(const_back.sum())
+                if __import__('os').environ.get('VC_SQR_DUMP') == name:
+                    _nz = (ew.abs() > 1e-12).nonzero().flatten().tolist()
+                    print(f'[sqr {name}] ew nonzero elems: '
+                          f'{[(i, round(float(ew[i]),4), round(float(lo_sq[i]),3), round(float(hi_sq[i]),3), round(float(const_back[i]),3)) for i in _nz]}',
+                          flush=True)
+                    print(f'  (i, ew, lo, hi, const_contrib); sum const={float(const_back.sum()):+.4g}',
+                          flush=True)
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(
+                    inp, torch.zeros_like(slope_back)) + slope_back
 
             elif (t == 'mul_bilinear' and op_bounds is not None
                   and name in op_bounds):
@@ -2290,6 +2662,37 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                                               torch.zeros_like(box_hi_v)))
                 acc += float(const_back.sum())
                 ew_back = slope_back
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif t == 'floor':
+                # Floor backward via the SAME sound affine band the forward
+                # DeepZ uses (nl_floor.FloorRelax): within one integer cell
+                # floor is the exact constant (lam=0, mu=floor(lo), delta=0 —
+                # matches ABC's exact floor node); spanning a boundary uses
+                # floor(x) in (x-1, x] => lam=1, mu=-0.5, delta=0.5. The lower
+                # / upper linear bounds are lam*x + (mu -/+ delta); CROWN picks
+                # per sign of ew (both slopes == lam, so ew_back = ew*lam).
+                from .nl_floor import FloorRelax
+                L = op.get('layer_idx')
+                if L is not None and L in tight:
+                    lo_pre, hi_pre = tight[L]
+                elif op_bounds is not None and name in op_bounds:
+                    # Forward stores floor's (clamp-tightened) input pre-bounds
+                    # under op_bounds[name]; floor often carries no layer_idx.
+                    lo_pre, hi_pre = op_bounds[name]
+                else:
+                    raise KeyError(
+                        f'floor backward: no input bounds for {name!r} '
+                        f'(layer_idx={L}); forward must populate tight[L] or '
+                        f'op_bounds[name] before the backward pass.')
+                lam, mu, delta = FloorRelax().affine_band(
+                    lo_pre.to(device=ew.device, dtype=ew.dtype),
+                    hi_pre.to(device=ew.device, dtype=ew.dtype))
+                ep = ew.clamp(min=0); en = ew.clamp(max=0)
+                acc += float((ep * (mu - delta)).sum()
+                             + (en * (mu + delta)).sum())
+                ew_back = ew * lam
+                inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
             else:
@@ -3388,6 +3791,126 @@ def _crown_intermediate_batched(gg, xl, xh, device, dtype):
     return tight
 
 
+@torch.no_grad()
+def _crown_refine_intermediate_graph(gg, xl, xh, sb, op_bounds, device, dtype,
+                                     deadline=None, print_progress=False,
+                                     max_node=1024):
+    """Topo-order backward-CROWN intermediate-bound refinement for graphs with
+    bilinear / scalar-nonlinear ops (ml4acopf). This is the per-node analog of
+    `_crown_intermediate_batched` (which only refines ReLU pre-activations and
+    needs the batched forward that ml4acopf's outer-broadcast ops break): for
+    EACH nonlinear op's input node it bounds that node by backward-CROWN to the
+    network input (seeding `_spec_backward_graph` at the node via `seed_node`,
+    +e_i for the lower and -e_i for the upper of every element) and INTERSECTS
+    with the forward-zono bound already in `sb` / `op_bounds`.
+
+    Soundness: both the CROWN-to-input bound and the forward-zono bound are
+    sound over-approximations, so their intersection (max of los, min of his)
+    stays sound; refining FEWER nodes (deadline hit) is also sound — the
+    un-refined nodes keep their forward-zono bounds. ABC reaches its tight
+    init-CROWN bound the same way (tight intermediates feeding the relaxations);
+    on the ml4acopf linear nets this flips the spec bound from hugely negative
+    to ABC-or-better (e.g. 14_ieee-linear-residual prop2: -452 -> +3.98).
+
+    Mutates `sb` (int layer_idx keys: relu/sigmoid/tanh/sin/cos/floor
+    pre-activations) and `op_bounds` (bilinear input tuples; scalar-nonlin
+    input boxes) IN PLACE, and returns them. Pass COPIES if the caller needs
+    the un-refined bounds afterwards.
+
+    deadline: optional perf_counter() time after which no further nodes are
+    refined (the spec backward the caller runs next still uses every
+    refinement done so far).
+    """
+    ops = gg['ops']
+    NL = ('relu', 'sigmoid', 'tanh', 'sin', 'cos', 'floor',
+          'mul_bilinear', 'sub_bilinear', 'div_bilinear')
+    refined = {}
+    n_done = 0
+    # Per-node refinement cost = 2n sequential backward passes; on the big
+    # nets (300_ieee: n up to ~3.8k) ONE node can run for minutes and blow the
+    # `deadline` (which is only checked between nodes). Track the worst node
+    # time and stop proactively before a node that would overrun; skip nodes
+    # with n > max_node outright (too costly, and the refinement is grossly
+    # insufficient on the big nets anyway — keep their forward-zono bound).
+    max_node_dt = 0.0
+
+    def _crown_node(node, flo, fhi):
+        n = flo.numel()
+        eye = torch.eye(n, dtype=dtype, device=device)
+        se = {}
+        for i in range(n):
+            se[2 * i] = (eye[i], 0.0)        # lower bound of node[i]
+            se[2 * i + 1] = (-eye[i], 0.0)   # lower bound of -node[i] -> -upper
+        lbs, _ = _spec_backward_graph(
+            sb, xl, xh, gg, se, list(range(2 * n)), len(sb), device, dtype,
+            op_bounds=op_bounds, seed_node=node)
+        clo = torch.tensor([lbs[2 * i] for i in range(n)],
+                           dtype=dtype, device=device)
+        chi = torch.tensor([-lbs[2 * i + 1] for i in range(n)],
+                           dtype=dtype, device=device)
+        rlo = torch.maximum(flo, clo)
+        # keep hi >= lo even if the intersect would invert (numerical guard).
+        rhi = torch.minimum(fhi, torch.maximum(chi, rlo))
+        return rlo, rhi
+
+    def _is_bilin(op):
+        nm = op['name']
+        return (op['type'] in ('mul_bilinear', 'sub_bilinear', 'div_bilinear')
+                and nm in op_bounds
+                and isinstance(op_bounds[nm], tuple)
+                and isinstance(op_bounds[nm][0], tuple))
+
+    for op in ops:
+        if deadline is not None and time.perf_counter() > deadline:
+            if print_progress:
+                print(f'[acopf-bwd-crown] refinement deadline hit after '
+                      f'{n_done} nodes', flush=True)
+            break
+        t = op['type']
+        if t not in NL:
+            continue
+        nm = op['name']
+        ins = op['inputs']
+        if _is_bilin(op):
+            (al, ah), (bl, bh) = op_bounds[nm]
+            fb = {ins[0]: (al, ah), ins[1]: (bl, bh)}
+        elif nm in op_bounds:
+            fb = {ins[0]: op_bounds[nm]}
+        elif 'layer_idx' in op and op['layer_idx'] in sb:
+            fb = {ins[0]: sb[op['layer_idx']]}
+        else:
+            continue
+        nfb = {}
+        for nd, (flo, fhi) in fb.items():
+            if nd in refined:
+                nfb[nd] = refined[nd]
+                continue
+            flo = flo.to(device=device, dtype=dtype)
+            fhi = fhi.to(device=device, dtype=dtype)
+            now = time.perf_counter()
+            # Skip oversized nodes, and stop before a node likely to overrun
+            # the deadline (estimated from the worst node seen so far). Either
+            # way keep the forward-zono bound for this node (sound).
+            if (flo.numel() > max_node
+                    or (deadline is not None
+                        and now + 1.3 * max_node_dt > deadline)):
+                refined[nd] = (flo, fhi)
+                nfb[nd] = (flo, fhi)
+                continue
+            r = _crown_node(nd, flo, fhi)
+            max_node_dt = max(max_node_dt, time.perf_counter() - now)
+            refined[nd] = r
+            nfb[nd] = r
+            n_done += 1
+        if _is_bilin(op):
+            op_bounds[nm] = (nfb[ins[0]], nfb[ins[1]])
+        elif nm in op_bounds:
+            op_bounds[nm] = nfb[ins[0]]
+        if 'layer_idx' in op and op['layer_idx'] in sb:
+            sb[op['layer_idx']] = nfb[ins[0]]
+    return sb, op_bounds
+
+
 def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                                    return_input_linear=False,
                                    alpha_at_layer=None,
@@ -3574,6 +4097,12 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
             ew_at[inp] = ew_back if existing is None else existing + ew_back
 
         elif t == 'add':
+            # This batched pass propagates ew through unchanged — only sound if
+            # no operand is outer-broadcast (the reduce-sum adjoint lives in the
+            # scalar _spec_backward_graph). Fail loud rather than silently
+            # unsound if a future outer-broadcast Add reaches here.
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'batched')
             if op.get('is_merge'):
                 # Skip connection: y = z_a + z_b. ew flows to both
                 # inputs unchanged; no constant contribution to acc.
@@ -3622,6 +4151,8 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                 ew_at[inp] = ew.clone() if existing is None else existing + ew
 
         elif t == 'sub':
+            assert_no_outer_broadcast(op.get('in_shapes_nd'),
+                                      op.get('out_shape_nd'), t, 'batched')
             bias = op.get('bias')
             if bias is not None:
                 bt = op.get('_bias_t_cached')
@@ -3659,7 +4190,10 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                 idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
                 op['_flat_idx_t_cached'] = idx_t
             ew_back = torch.zeros(B, ew.shape[1], n_in_layer, dtype=dtype, device=device)
-            ew_back.index_copy_(-1, idx_t, ew)
+            # scatter-ADD adjoint: a fan-out gather (duplicate flat_idx) must
+            # SUM the per-output contributions, not overwrite (index_copy_
+            # drops all but the last → unsound). See _spec_backward_graph.
+            ew_back.index_add_(-1, idx_t, ew)
             inp = op['inputs'][0]
             existing = ew_at.get(inp)
             ew_at[inp] = ew_back if existing is None else existing + ew_back
