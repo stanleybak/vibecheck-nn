@@ -113,7 +113,7 @@ git.
 - **`run_benchmarks.py <category|all|regular> [--bench-version 1.0]`** - replays
   prepare+run over a benchmark's instances.csv into a results.csv. Handles the
   2026 versioned layout (`benchmarks/<cat>/<version>/`); `--bench-version`
-  selects 1.0 (v1 specs; default) or 2.0 (v2; not yet parseable). `--log-dir DIR`
+  selects 1.0 (v1 specs; default) or 2.0 (v2; supported). `--log-dir DIR`
   saves each instance's stdout for inspection.
 - **`parse_log.py LOG|DIR`** (or pipe a log on stdin) - summarizes captured run
   logs: verdict, timing, net/spec shape, and (for a killed/timed-out run) the

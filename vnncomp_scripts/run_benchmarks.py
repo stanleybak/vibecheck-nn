@@ -15,7 +15,7 @@ verdict line) is gzipped to the sidecar the scoring harness expects:
 VNNCOMP 2026 layout: benchmarks are versioned, `benchmarks/<cat>/<version>/`
 (e.g. `1.0`, `2.0`), each version dir holding its own instances.csv + onnx/ +
 vnnlib/. `--bench-version` selects which (default `1.0`, i.e. the v1 specs;
-v2 spec parsing is not wired up yet). The flat 2025 layout
+v2 specs are supported too). The flat 2025 layout
 (`benchmarks/<cat>/instances.csv`) is still accepted as a fallback. The
 results-repo path style and the `<year>_<cat>` output tag are derived from the
 benchmarks-dir name, so pointing `--benchmarks-dir` at a 2025 or 2026 clone
@@ -269,7 +269,7 @@ def main():
                                            os.path.expanduser('~/repositories/vnncomp2026_results')))
     ap.add_argument('--bench-version', default='1.0',
                     help='spec-version dir to run (2026 layout): 1.0 (v1) or 2.0 '
-                         '(v2; not yet parseable). Default 1.0.')
+                         '(v2; supported). Default 1.0.')
     ap.add_argument('--version', default='v1',
                     help='version string passed to the install/prepare/run '
                          'scripts (the VNNCOMP script ABI, unrelated to '

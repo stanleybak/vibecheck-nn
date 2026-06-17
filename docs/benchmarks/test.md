@@ -51,15 +51,12 @@ while IFS=, read -r onnx vnnlib to; do
 done < "$B/instances.csv"
 ```
 
-## Known unresolved — v2 (2.0) specs not yet parsed
+## VNNLIB v2 (2.0) specs (supported)
 
-The `benchmarks/test/2.0` specs use the new VNNLIB **v2** syntax
+The `benchmarks/test/2.0` specs use the VNNLIB **v2** syntax
 (`(vnnlib-version <2.0>)`, `declare-network`, `declare-input`, `X[0]`/`Y[0]`
-indexing). `vnnlib_loader.py` is regex-based on the v1 `X_<n>`/`Y_<n>` form and
-does not recognize v2 — a v2 spec raises `ValueError: No input bounds found in
-VNNLIB` (`vnnlib_loader.py:65`) and `run_instance.sh` reports `error`. Use the 1.0
-instances until the loader learns v2 (the first real VNNCOMP-2026 compatibility
-task — wire vibecheck to the common parser at
-`vnncomp2026_benchmarks/scripts/vnnlib_parser.py`, or extend the loader; the two
-versions were cross-checked to agree, and v2 is the version to prefer when both
-exist).
+indexing). The VNNLIB v2 loader parses these: all five `test/2.0` instances load
+and return the same verdicts as 1.0 (nano/tiny/small/unsat give unsat, sat gives
+sat). Run them with `--bench-version 2.0`. (v2 is the version to prefer when both
+exist; per-benchmark v2 coverage across the full 2026 set may still vary, since
+some upstream v2 files are known-buggy.)

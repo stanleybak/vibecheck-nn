@@ -8,9 +8,8 @@
 # carries no tuning — it exists so run_instance.sh selects an explicit, stable
 # profile for the `test` category and pins the one behavior the set depends on.
 #
-# v2 (2.0) specs use the new `declare-network` / `X[0]` syntax that
-# vnnlib_loader.py does not yet parse — use the 1.0 instances for now. See
-# docs/benchmarks/test.md.
+# v2 (2.0) specs (the `declare-network` / `X[0]` syntax) now parse too; all five
+# test/2.0 instances give the same verdicts. See docs/benchmarks/test.md.
 
 # Phase-0 PGD must stay on: it's what finds the test_sat (ACAS Xu 1-7) witness.
 # Everything else is default_settings().
