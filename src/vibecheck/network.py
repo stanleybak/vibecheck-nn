@@ -1403,11 +1403,18 @@ class ComputeGraph:
         from .onnx_optimizer import (drop_identity_pads,
                                      fold_conv,
                                      fold_gemm,
-                                     fuse_gemm_reshape_conv)
+                                     fuse_gemm_reshape_conv,
+                                     maxpool_to_relu)
         # Ungated: removing all-zero Pad nodes is an exact identity (TinyYOLO
         # carries Pad(pads=[0]*8) no-ops that otherwise hit gpu_graph's loud
         # NotImplementedError). Non-zero pads are kept and still raise.
         drop_identity_pads(self)
+        # Exact MaxPool -> ReLU decomposition: no backend has a real MaxPool
+        # handler (only a point-only dense path + a loose box-approx forward),
+        # so conv nets with pooling (vggnet16) need this to verify. Exact, so
+        # safe to keep on by default; no-op when there is no MaxPool.
+        if getattr(settings, 'maxpool_to_relu', True):
+            maxpool_to_relu(self)
         if settings.optimize_relu_relation:
             fold_conv(self)
             fold_gemm(self)

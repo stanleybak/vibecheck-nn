@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from .settings import default_settings, resolve_torch
 from .zonotope import TorchZonotope
+from .patches_zonotope import PatchesZonotope
 from .broadcast_util import (reconstruct_live_shape, broadcast_rows_backward,
                              assert_no_outer_broadcast)
 
@@ -1007,6 +1008,19 @@ def _ibp_forward_graph(xl, xh, gg, device, dtype):
                                     padding=op['padding']).flatten()
             hi[name] = F.max_pool2d(hi4, (kH, kW), stride=op['stride'],
                                     padding=op['padding']).flatten()
+        elif t in ('slice', 'gather'):
+            # bounds follow the gather/slice index map (maxpool_to_relu phase
+            # extraction): out[k] = in[flat_idx[k]] for both lo and hi.
+            idx = torch.as_tensor(op['flat_idx'], dtype=torch.long,
+                                  device=device)
+            lo[name], hi[name] = l[idx], h[idx]
+        elif t == 'sub_bilinear':
+            # y = a - b: [lo_a - hi_b, hi_a - lo_b]  (maxpool_to_relu b-a)
+            l2, h2 = lo[op['inputs'][1]], hi[op['inputs'][1]]
+            lo[name], hi[name] = l - h2, h - l2
+        elif t == 'concat':
+            lo[name] = torch.cat([lo[i] for i in op['inputs']])
+            hi[name] = torch.cat([hi[i] for i in op['inputs']])
         else:
             raise NotImplementedError(
                 f'_ibp_forward_graph: unsupported op {t!r} at {name!r} — '
@@ -1301,9 +1315,39 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
 
         if t == 'conv':
             z = _get(op['inputs'][0])
-            z.propagate_conv(op['kernel'], op['bias'], op['in_shape'],
-                             op['stride'], op['padding'])
+            _did_reduce = False
+            _conv_args = (op['kernel'], op['bias'], op['in_shape'],
+                          op['stride'], op['padding'])
+            try:
+                z.propagate_conv(*_conv_args)
+            except torch.cuda.OutOfMemoryError:
+                # Box-reduce-on-OOM safety valve (gated): reduce the conv INPUT
+                # to a per-neuron box (caps patch growth) and retry — only when
+                # forced, so correlation is kept everywhere it fits.
+                if not (isinstance(z, PatchesZonotope) and z._mode == 'patches'
+                        and settings is not None
+                        and getattr(settings, 'box_reduce_on_oom', False)):
+                    raise
+                torch.cuda.empty_cache()
+                z.box_reduce()
+                z.propagate_conv(*_conv_args)
+                _did_reduce = True
             zono_state[name] = z
+            # Gated box order-reduction by patch-byte budget (proactive): when
+            # a conv's patch tensor exceeds `box_reduce_patch_budget` bytes,
+            # collapse to a per-neuron box. Default off → no effect elsewhere.
+            _brb = (getattr(settings, 'box_reduce_patch_budget', None)
+                    if settings is not None else None)
+            if (isinstance(_brb, (int, float)) and _brb > 0
+                    and isinstance(z, PatchesZonotope)
+                    and z._mode == 'patches' and z._patches is not None
+                    and z._patches.numel() * z._patches.element_size() > _brb):
+                z.box_reduce()
+                _did_reduce = True
+            # Box gens are fresh noise → reset this op's col-ids to fresh
+            # (skips the generic prefix-preserving default below).
+            if _did_reduce:
+                col_ids_state[name] = _alloc_ids(z.n_gens)
 
         elif t == 'fc':
             z = _get(op['inputs'][0])
@@ -1396,7 +1440,14 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             # own bounds with any externally-supplied tight bounds. We
             # record this same (lo, hi) into rec_zono so the LP triangle
             # constraints in state_from_phase1 match the parametrization.
-            need_pre_bounds = (
+            # Gated CROWN-retighten: use the (tight) zono's own bounds to pick
+            # the FEW unstable neurons, backward-CROWN only those (cheap), and
+            # feed the tightened bounds into the relu relaxation — keeps the
+            # zono tight without bounding IBP's grossly-inflated set. Default
+            # off (no effect on any other path).
+            _crt = (settings is not None and layer_idx is not None
+                    and getattr(settings, 'crown_retighten_forward', False))
+            need_pre_bounds = _crt or (
                 rec_zono is not None and layer_idx is not None
             ) or (tight_bounds is not None and layer_idx in (tight_bounds or {}))
             if need_pre_bounds:
@@ -1408,7 +1459,62 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                     pre_lo = torch.maximum(pre_lo_z, tlo)
                     pre_hi = torch.minimum(pre_hi_z, thi)
                 else:
-                    pre_lo, pre_hi = pre_lo_z, pre_hi_z
+                    pre_lo, pre_hi = pre_lo_z.clone(), pre_hi_z.clone()
+                if _crt:
+                    uns = ((pre_lo < 0) & (pre_hi > 0)).nonzero().flatten()
+                    # Cap: backward-CROWN only the WIDEST-N unstable neurons
+                    # (largest hi-lo). The rest keep their sound (looser) zono
+                    # bounds. Sound (we only tighten a subset); the widest
+                    # neurons drive downstream looseness, so a modest cap keeps
+                    # most of the tightening at a fraction of the cost (a deep
+                    # full backward over thousands of unstable is the VGG16
+                    # bottleneck). Default None = tighten all (unchanged).
+                    _cap = getattr(settings,
+                                   'crown_retighten_max_neurons', None)
+                    if _cap is not None and uns.numel() > int(_cap):
+                        w = (pre_hi[uns] - pre_lo[uns])
+                        top = torch.topk(w, int(_cap)).indices
+                        uns = uns[top]
+                    _pre_3d = len(op.get('in_shapes_nd', [()])[0]) == 3
+                    if uns.numel() > 0 and _pre_3d and getattr(
+                            settings, 'crown_retighten_patches', False):
+                        # Patches-mode backward CROWN: the relation stays a
+                        # localized per-neuron patch (receptive-field sized)
+                        # instead of a dense full-feature-map matrix — the
+                        # backward dual of PatchesZonotope. ~5x faster at deep
+                        # conv layers; the neuron batch self-splits on OOM.
+                        # Retightens ALL unstable (the cap is a dense-only
+                        # crutch). Validated bit-equivalent to the dense path.
+                        from .patches_crown import patches_bounds
+                        pre_op = op['inputs'][0]
+                        out_shape = tuple(op['in_shapes_nd'][0])
+                        if getattr(settings, 'crown_retighten_debug', False):
+                            print(f'  [retighten L={layer_idx} '
+                                  f'pre_unstable={uns.numel()} '
+                                  f'shape={out_shape}]', flush=True)
+                        lb, ub = patches_bounds(
+                            gg, xl, xh, sb, pre_op, out_shape, uns,
+                            device, dtype)
+                        pre_lo[uns] = torch.maximum(pre_lo[uns], lb)
+                        pre_hi[uns] = torch.minimum(pre_hi[uns], ub)
+                    elif uns.numel() > 0:
+                        from .alpha_crown import _crown_backward_matrix
+                        pre_op = op['inputs'][0]
+                        n_at = pre_lo.numel()
+                        _ch = int(getattr(settings,
+                                          'crown_retighten_chunk', 512))
+                        for _s in range(0, uns.numel(), _ch):
+                            idx = uns[_s:_s + _ch]
+                            ew = torch.zeros(idx.numel(), n_at,
+                                             dtype=dtype, device=device)
+                            ew[torch.arange(idx.numel(), device=device),
+                               idx] = 1.0
+                            lb, _ = _crown_backward_matrix(
+                                gg, xl, xh, {}, sb, pre_op, ew, device, dtype)
+                            nlb, _ = _crown_backward_matrix(
+                                gg, xl, xh, {}, sb, pre_op, -ew, device, dtype)
+                            pre_lo[idx] = torch.maximum(pre_lo[idx], lb)
+                            pre_hi[idx] = torch.minimum(pre_hi[idx], -nlb)
                 if rec_zono is not None and layer_idx is not None:
                     from .verify_graph import _record_zono_pre_relu_rows
                     _record_zono_pre_relu_rows(
@@ -1490,23 +1596,34 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             # pensieve_*_parallel where output = MatMul1 - MatMul2.
             z_a = _get(op['inputs'][0])
             z_b = _get(op['inputs'][1])
-            ka = z_a.generators.shape[1]
-            kb = z_b.generators.shape[1]
             ida = col_ids_state[op['inputs'][0]]
             idb = col_ids_state[op['inputs'][1]]
             shared = _common_prefix_len(ida, idb)
-            # Layout: G_out = [G_a_shared - G_b_shared | G_a_extra | -G_b_extra]
-            g_a_shared = z_a.generators[:, :shared]
-            g_b_shared = z_b.generators[:, :shared]
-            g_a_extra = z_a.generators[:, shared:]
-            g_b_extra = z_b.generators[:, shared:]
-            g_out = torch.cat([
-                g_a_shared - g_b_shared,
-                g_a_extra,
-                -g_b_extra,
-            ], dim=1)
-            zono_state[name] = TorchZonotope(
-                z_a.center - z_b.center, g_out)
+            if isinstance(z_a, PatchesZonotope):
+                # Patches-native subtraction (maxpool->relu's b - a, two
+                # channel-slices of the same conv): stays in patches form,
+                # column order [shared | a_extra | b_extra] matches the dense
+                # path below so the col-id layout is unchanged.
+                zono_state[name] = z_a.sub(z_b, shared)
+            elif isinstance(z_b, PatchesZonotope):
+                raise NotImplementedError(
+                    'sub_bilinear with a dense lhs and a patches rhs is not '
+                    'supported (would need to materialise the patches rhs '
+                    'dense); the maxpool decomposition never produces it')
+            else:
+                # Dense layout: G_out = [G_a_shared - G_b_shared |
+                #                        G_a_extra | -G_b_extra]
+                g_a_shared = z_a.generators[:, :shared]
+                g_b_shared = z_b.generators[:, :shared]
+                g_a_extra = z_a.generators[:, shared:]
+                g_b_extra = z_b.generators[:, shared:]
+                g_out = torch.cat([
+                    g_a_shared - g_b_shared,
+                    g_a_extra,
+                    -g_b_extra,
+                ], dim=1)
+                zono_state[name] = TorchZonotope(
+                    z_a.center - z_b.center, g_out)
             # Same layout as add-merge: ida + idb[shared:].
             col_ids_state[name] = list(ida) + list(idb[shared:])
 
@@ -1519,11 +1636,18 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             if flat_idx is None:
                 raise ValueError("slice op missing 'flat_idx'")
             idx_t = torch.as_tensor(flat_idx, dtype=torch.long, device=device)
-            c_flat = z.center.reshape(-1)
-            g_flat = z.generators.reshape(c_flat.numel(), -1)
-            zono_state[name] = TorchZonotope(
-                c_flat.index_select(0, idx_t),
-                g_flat.index_select(0, idx_t))
+            if isinstance(z, PatchesZonotope):
+                # Patches-native: a contiguous channel-block slice (the only
+                # pattern maxpool->relu emits) stays in patches form with no
+                # dense G materialisation — critical for full-image inputs
+                # where dense G would be terabytes.
+                zono_state[name] = z.slice(idx_t)
+            else:
+                c_flat = z.center.reshape(-1)
+                g_flat = z.generators.reshape(c_flat.numel(), -1)
+                zono_state[name] = TorchZonotope(
+                    c_flat.index_select(0, idx_t),
+                    g_flat.index_select(0, idx_t))
 
         elif t == 'permute':
             # Exact reordering of the element (row) dimension: a pure

@@ -505,7 +505,14 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
     for i in range(start_idx, -1, -1):
         op = ops[i]; name = op['name']
         if name not in ew_at: continue
-        ew = ew_at[name]; t = op['type']
+        # Pop (not read) so each op's adjoint frees once consumed: a backward
+        # op's inputs are at strictly lower indices (visited later) and its own
+        # adjoint is fully accumulated by all higher-index consumers before we
+        # reach it, so nothing reads ew_at[name] again. Keeps the live ew set
+        # at ~fork-width instead of every op at once — the difference between
+        # fitting and OOMing on VGG16's 3.2M-neuron layers. (input_name is
+        # never an op here, so its adjoint survives for the concretization.)
+        ew = ew_at.pop(name); t = op['type']
         if t == 'conv':
             out_shape = op['out_shape']
             kernel = op['kernel'].to(dtype=dtype, device=device)
