@@ -194,11 +194,23 @@ def main():
         else:
             only_b.append((k, bv))
 
+    # per-category coverage: how many official rows have a captured verbose log
+    cats = sorted({r['category'] for r in official} | {d['category'] for d in instances})
+    coverage = []
+    for c in cats:
+        v = sum(1 for d in instances if d['category'] == c)
+        o = sum(1 for r in official if r['category'] == c)
+        coverage.append((c, v, o))
+
     cmp_path = os.path.join(outdir, 'compare.txt')
     with open(cmp_path, 'w') as f:
         f.write('Sanity check: reconstructed (verbose) vs official (results.csv)\n')
         f.write(f'  instances with verbose logs : {len(instances)}\n')
         f.write(f'  official results.csv rows   : {len(official)}\n')
+        f.write('  per-category coverage (verbose captured / official rows):\n')
+        for c, v, o in coverage:
+            flag = '' if v == o else '   <-- verbose truncated' if v < o else ''
+            f.write(f'    {c:<22} {v:>4} / {o:<4}{flag}\n')
         f.write(f'  agree (verdict matches)     : {len(agree)}\n')
         f.write(f'  DISAGREE (real verdict conflict): {len(disagree)}\n')
         f.write(f'  killed/truncated verbose (official has verdict): {len(killed)}\n')
@@ -230,6 +242,9 @@ def main():
           f'[{sum(1 for d in instances if d["status"]=="completed")} ok, '
           f'{sum(1 for d in instances if d["status"]=="KILLED")} killed]')
     print(f'  official rows      : {len(official)}')
+    for c, v, o in coverage:
+        print(f'    {c:<22} verbose {v:>4} / {o:<4} official'
+              + ('  <-- verbose truncated' if v < o else ''))
     print(f'  -> {recon_csv}')
     print(f'  -> {outdir}/results_official.csv')
     print(f'  -> {len(instances)} per-instance log dirs under {outdir}/')
