@@ -38,3 +38,7 @@ run_*.py
 # ...but the committed VNNCOMP batch runner is not a scratch script
 !vnncomp_scripts/run_benchmarks.py
 scratch/
+
+# Local log parsing (vnncomp_scripts/parse_log.py inputs/outputs)
+vnncomp_scripts/log.txt
+vnncomp_scripts/parsed_log/

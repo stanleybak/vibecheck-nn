@@ -1,240 +1,243 @@
 #!/usr/bin/env python3
-"""Summarize vibecheck VNNCOMP run logs - the stdout the competition captures
-per instance (and what `run_benchmarks.py --log-dir` saves locally).
+"""Parse a full VNNCOMP run log into a per-instance breakdown under parsed_log/.
 
-The install/prepare/run scripts emit stable banner anchors:
+Input: a single log file (default: `log.txt` next to this script) -- e.g. the
+website's select-all dump of a toolkit run. It contains the verbose per-instance
+output (with [vibecheck:prepare_instance] / [vibecheck:run_instance] banners) AND
+the per-category results.csv blocks the competition harness wrote.
 
-    [vibecheck:run_instance] BEGIN category=<cat> timeout=<t>s
-        onnx=...   vnnlib=...   config=...
-    [vibecheck:run_instance] END verdict=<v> elapsed=<s>s rc=<rc> category=<cat>
+The log is `set -x` xtrace, so every shell `echo` appears twice (a `+ echo '...'`
+trace line and the real output line). We parse only the real OUTPUT lines
+(anchored to the line start), ignoring the `+ ...` traces.
 
-plus vibecheck's own `Result:`, `Time:`, the `N ops, N ReLU layers` net line,
-`N constraint(s), N disjunct(s)`, and `[heartbeat] phase=...` lines. This reads
-one log, a directory tree (the --log-dir layout), or stdin, and prints status:
-verdict, timing, the net/spec shape, and - crucially for a run that timed out -
-whether it CLOSED (saw its END banner) or was KILLED, and the last heartbeat
-phase it was stuck in.
+Output (all under parsed_log/, which is gitignored):
+  results.csv           -- RECONSTRUCTED from the verbose run banners (indexed).
+  results_official.csv  -- the results.csv rows embedded in the log (what the
+                           harness recorded).
+  compare.txt           -- sanity check: do the two agree per instance? Lists
+                           agreements, disagreements, and instances present in
+                           one but not the other (e.g. verbose truncated).
+  <NNNN>_<cat>__<net>__<prop>/log.txt -- each instance's raw log slice, by index,
+                           so any results.csv row is easy to open.
 
-Usage:
-    parse_log.py LOG [--full]       # one captured stdout log
-    parse_log.py DIR [--full]       # a run_benchmarks.py --log-dir tree
-    cat run.log | parse_log.py      # from stdin
+Usage:  parse_log.py [logfile]
 """
-import argparse
-import glob
+import csv
 import os
 import re
 import sys
-from collections import Counter
 
-BEGIN_RE = re.compile(r'\[vibecheck:(\w+)\]\s+BEGIN\s+(.*)')
-END_RE = re.compile(r'\[vibecheck:(\w+)\]\s+END\s+(.*)')
-KV_RE = re.compile(r'(\w+)=(\S+)')
-FIELD_RE = re.compile(r'^\s+(onnx|vnnlib|config|tool_dir)=(.+)$')
-RESULT_RE = re.compile(r'^\s*Result:\s+(\w+)')
-TIME_RE = re.compile(r'^\s*Time:\s+([\d.]+)s')
-NET_RE = re.compile(r'^\s*(\d+)\s+ops,\s+(\d+)\s+ReLU layers.*input shape:\s*(.+)')
-SPEC_RE = re.compile(r'^\s*(\d+)\s+constraint\(s\),\s+(\d+)\s+disjunct')
-HB_RE = re.compile(r'\[heartbeat\]\s+phase=(\S+)\s+in-phase=(\S+)\s+total=(\S+)\s+gpu=(\S+)')
-ERR_RE = re.compile(r'Traceback \(most recent call last\)|^[\w.]*(?:Error|Exception):')
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-
-def parse_blocks(text):
-    """Split a log into [vibecheck:<script>] BEGIN..END blocks. A BEGIN with no
-    matching END (next BEGIN or EOF first) is left `closed=False` → the run was
-    killed mid-flight (timeout SIGKILL / crash), which is itself the diagnosis."""
-    blocks, cur = [], None
-    for ln in text.splitlines():
-        mb = BEGIN_RE.search(ln)
-        if mb:
-            if cur:
-                blocks.append(cur)
-            cur = {'script': mb.group(1), 'kv': dict(KV_RE.findall(mb.group(2))),
-                   'closed': False, 'verdict': None, 'elapsed': None, 'rc': None,
-                   'status': None, 'solve': None, 'net': None, 'spec': None,
-                   'last_phase': None, 'last_inphase': None, 'errors': []}
-            continue
-        if cur is None:
-            continue
-        me = END_RE.search(ln)
-        if me and me.group(1) == cur['script']:
-            kv = dict(KV_RE.findall(me.group(2)))
-            # END verdict is from the authoritative results file
-            # (unsat/sat/unknown/timeout) and WINS over the stdout `Result:`
-            # line, which uses verified/unknown wording.
-            cur.update(closed=True, verdict=kv.get('verdict') or cur['verdict'],
-                       elapsed=(kv.get('elapsed') or '').rstrip('s') or None,
-                       rc=kv.get('rc'), status=kv.get('status'))
-            blocks.append(cur)
-            cur = None
-            continue
-        mf = FIELD_RE.match(ln)
-        if mf:
-            cur['kv'][mf.group(1)] = mf.group(2).strip()
-        if (m := RESULT_RE.match(ln)) and not cur['verdict']:
-            cur['verdict'] = m.group(1)
-        if m := TIME_RE.match(ln):
-            cur['solve'] = m.group(1)
-        if m := NET_RE.match(ln):
-            cur['net'] = (m.group(1), m.group(2), m.group(3).strip())
-        if m := SPEC_RE.match(ln):
-            cur['spec'] = (m.group(1), m.group(2))
-        if m := HB_RE.search(ln):
-            cur['last_phase'], cur['last_inphase'] = m.group(1), m.group(2)
-        if ERR_RE.match(ln.strip()):
-            cur['errors'].append(ln.strip()[:200])
-    if cur:
-        blocks.append(cur)
-    return blocks
+# OUTPUT banner anchors (line start; the `+ echo '...'` xtrace dupes start with
+# '+' and are skipped).
+PREP_BEGIN = re.compile(r'^\[vibecheck:prepare_instance\] BEGIN')
+PREP_END = re.compile(r'^\[vibecheck:prepare_instance\] END\s+(.*)')
+RUN_BEGIN = re.compile(r'^\[vibecheck:run_instance\] BEGIN\s+(.*)')
+RUN_END = re.compile(r'^\[vibecheck:run_instance\] END\s+(.*)')
+FIELD = re.compile(r'^\s+(onnx|vnnlib|config)=(.+?)\s*$')
+KV = re.compile(r'(\w+)=(\S+)')
+TIME = re.compile(r'^\s*Time:\s+([\d.]+)s')
+NET = re.compile(r'^\s*(\d+)\s+ops,\s+(\d+)\s+ReLU layers.*input shape:\s*(.+)')
+HB = re.compile(r'^\[heartbeat\]\s+phase=(\S+)\s+in-phase=(\S+)')
+# Embedded official results.csv row: cat,onnx,vnnlib,prepare_s,verdict,runtime_s
+# (onnx path may be `./benchmarks/...` or `<repo>/benchmarks/...`).
+CSV_ROW = re.compile(
+    r'^([A-Za-z0-9_]+),'
+    r'((?:\./|[\w.-]+/)*benchmarks/\S+?\.onnx(?:\.gz)?),'
+    r'(\S+?\.vnnlib(?:\.gz)?),'
+    r'([\d.]+),(unsat|sat|unknown|timeout|error),([\d.]+)\s*$')
 
 
-def _stem(block, key):
-    p = block['kv'].get(key)
-    if not p:
-        return None
-    b = os.path.basename(p)
+def _stem(p):
+    b = os.path.basename(p or '')
     for ext in ('.gz', '.onnx', '.vnnlib'):
         if b.endswith(ext):
             b = b[:-len(ext)]
     return b
 
 
-def status_of(run):
-    """One-word status from a run_instance block."""
-    if not run['closed']:
-        return 'KILLED'           # no END banner → SIGKILL/crash mid-run
-    v = (run['verdict'] or 'unknown').lower()
-    if v == 'error':
-        return 'ERROR'
-    if v in ('sat', 'unsat', 'unknown', 'timeout'):
-        return v
-    return v or 'unknown'
+def _version(p):
+    """Benchmark spec version dir (e.g. '1.0'/'2.0') from a path, or ''."""
+    m = re.search(r'/(\d+\.\d+)/', p or '')
+    return m.group(1) if m else ''
 
 
-def fmt_instance(run, prep=None, full=False):
-    net = _stem(run, 'onnx') or '?'
-    prop = _stem(run, 'vnnlib') or '?'
-    cat = run['kv'].get('category', '?')
-    st = status_of(run)
-    line = f'{st:<8} {cat}/{net} :: {prop}'
-    bits = []
-    if run['elapsed']:
-        bits.append(f"elapsed={run['elapsed']}s")
-    if run['solve']:
-        bits.append(f"solve={run['solve']}s")
-    if prep and prep.get('elapsed'):
-        bits.append(f"prep={prep['elapsed']}s")
-    if run['kv'].get('rc') is not None and run['rc']:
-        bits.append(f"rc={run['rc']}")
-    if bits:
-        line += '   (' + ', '.join(bits) + ')'
-    out = [line]
-    if st == 'KILLED' and run['last_phase']:
-        out.append(f'         ^ hung in phase={run["last_phase"]} '
-                   f'in-phase={run["last_inphase"]} (last heartbeat before kill)')
-    elif st == 'KILLED':
-        out.append('         ^ no END banner and no heartbeat - died before/at load '
-                   '(enable VIBECHECK_HEARTBEAT=N to localize a hang)')
-    if run['errors']:
-        out.append(f'         ! {run["errors"][-1]}')
-    if full:
-        if run['net']:
-            out.append(f'         net: {run["net"][0]} ops, {run["net"][1]} ReLU, '
-                       f'input {run["net"][2]}')
-        if run['spec']:
-            out.append(f'         spec: {run["spec"][0]} constraints, '
-                       f'{run["spec"][1]} disjunct(s)')
-        if run['kv'].get('config'):
-            out.append(f'         config: {run["kv"]["config"]}')
-    return '\n'.join(out)
+def parse_instance(slice_lines):
+    """Pull verdict/timing/identity out of one instance's log slice."""
+    d = {'category': '?', 'onnx': '', 'vnnlib': '', 'verdict': None,
+         'run_elapsed': None, 'prep_elapsed': None, 'solve': None,
+         'net': None, 'hung_phase': None, 'status': 'completed'}
+    saw_run_begin = False
+    for ln in slice_lines:
+        m = FIELD.match(ln)
+        if m:
+            d[m.group(1)] = m.group(2)
+            continue
+        m = PREP_END.match(ln)
+        if m:
+            d['prep_elapsed'] = (dict(KV.findall(m.group(1))).get('elapsed')
+                                 or '').rstrip('s') or None
+            continue
+        m = RUN_BEGIN.match(ln)
+        if m:
+            saw_run_begin = True
+            d['category'] = dict(KV.findall(m.group(1))).get('category', d['category'])
+            continue
+        m = RUN_END.match(ln)
+        if m:
+            kv = dict(KV.findall(m.group(1)))
+            d['verdict'] = kv.get('verdict')
+            d['run_elapsed'] = (kv.get('elapsed') or '').rstrip('s') or None
+            continue
+        m = TIME.match(ln)
+        if m:
+            d['solve'] = m.group(1)
+            continue
+        m = NET.match(ln)
+        if m:
+            d['net'] = f'{m.group(1)} ops, {m.group(2)} ReLU, input {m.group(3).strip()}'
+            continue
+        m = HB.match(ln)
+        if m:
+            d['hung_phase'] = f'{m.group(1)} (in-phase {m.group(2)})'
+    if saw_run_begin and d['verdict'] is None:
+        d['status'] = 'KILLED'    # run started but never emitted an END banner
+    elif not saw_run_begin:
+        d['status'] = 'NO_RUN'    # prepare only (run never started)
+    return d
 
 
-def collect_dir(path):
-    """Group a --log-dir tree into (run_block, prepare_block) per instance."""
-    runs, preps = {}, {}
-    for fp in sorted(glob.glob(os.path.join(path, '**', '*.log'), recursive=True)):
-        base = os.path.basename(fp)
-        with open(fp, errors='replace') as f:
-            blocks = parse_blocks(f.read())
-        if base.endswith('.prepare.log'):
-            key = (os.path.dirname(fp), base[:-len('.prepare.log')])
-            for b in blocks:
-                if b['script'] == 'prepare_instance':
-                    preps[key] = b
-        elif base.endswith('.run.log'):
-            key = (os.path.dirname(fp), base[:-len('.run.log')])
-            for b in blocks:
-                if b['script'] == 'run_instance':
-                    runs[key] = b
-        else:  # generic combined log: take any run_instance blocks
-            for i, b in enumerate(blocks):
-                if b['script'] == 'run_instance':
-                    runs[(fp, i)] = b
-    return runs, preps
-
-
-def summarize(runs, preps, full=False):
-    keys = sorted(runs, key=lambda k: (status_of(runs[k]) != 'KILLED',
-                                       runs[k]['kv'].get('category', ''),
-                                       _stem(runs[k], 'onnx') or ''))
-    counts = Counter(status_of(runs[k]) for k in keys)
-    issues, slow = [], []
-    for k in keys:
-        r = runs[k]
-        print(fmt_instance(r, preps.get(k), full=full))
-        st = status_of(r)
-        if st in ('KILLED', 'ERROR', 'unknown', 'timeout'):
-            issues.append(k)
-        try:
-            slow.append((float(r['elapsed']), k))
-        except (TypeError, ValueError):
-            pass
-    print('\n=== summary ===')
-    print(f'instances: {len(keys)}')
-    for st, n in counts.most_common():
-        print(f'  {st:<8} {n}')
-    if slow:
-        slow.sort(reverse=True)
-        print('slowest:')
-        for s, k in slow[:5]:
-            print(f'  {s:6.2f}s  {runs[k]["kv"].get("category","?")}/'
-                  f'{_stem(runs[k], "onnx")}')
-    if issues:
-        print(f'needs-attention: {len(issues)} '
-              f'(KILLED / ERROR / unknown / timeout - listed first above)')
-    else:
-        print('needs-attention: none')
+def _safe(name):
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', name)
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('path', nargs='?', help='log file, --log-dir tree, or omit for stdin')
-    ap.add_argument('--full', action='store_true',
-                    help='also print net/spec shape + config per instance')
-    args = ap.parse_args()
+    logpath = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SCRIPT_DIR, 'log.txt')
+    if not os.path.isfile(logpath):
+        sys.exit(f'log file not found: {logpath} (drop the run log there, or pass a path)')
+    lines = open(logpath, errors='replace').read().splitlines()
+    outdir = os.path.join(SCRIPT_DIR, 'parsed_log')
+    os.makedirs(outdir, exist_ok=True)
 
-    if args.path and os.path.isdir(args.path):
-        runs, preps = collect_dir(args.path)
-        if not runs:
-            sys.exit(f'no [vibecheck:run_instance] blocks found under {args.path}')
-        summarize(runs, preps, full=args.full)
-        return
+    # --- slice into instances: each starts at an OUTPUT prepare-BEGIN banner ---
+    starts = [i for i, l in enumerate(lines) if PREP_BEGIN.match(l)]
+    bounds = starts + [len(lines)]
+    instances = []
+    for idx, s in enumerate(starts):
+        sl = lines[s:bounds[idx + 1]]
+        d = parse_instance(sl)
+        d['index'] = idx
+        d['slice'] = sl
+        instances.append(d)
 
-    text = open(args.path, errors='replace').read() if args.path else sys.stdin.read()
-    blocks = parse_blocks(text)
-    runs = [b for b in blocks if b['script'] == 'run_instance']
-    preps = [b for b in blocks if b['script'] == 'prepare_instance']
-    if not runs and not blocks:
-        sys.exit('no [vibecheck:*] banner blocks found - was the log captured '
-                 'with the run/prepare scripts (verbose, banners on)?')
-    if not runs:  # only prepare/install blocks present
-        for b in blocks:
-            print(f"{b['script']}: status={b.get('status') or ('closed' if b['closed'] else 'KILLED')}"
-                  f" elapsed={b.get('elapsed')}")
-        return
-    for i, r in enumerate(runs):
-        print(fmt_instance(r, preps[i] if i < len(preps) else None, full=args.full or len(runs) == 1))
+    # --- embedded official results.csv rows ---
+    official = []
+    for l in lines:
+        m = CSV_ROW.match(l)
+        if m:
+            official.append(dict(category=m.group(1), onnx=m.group(2), vnnlib=m.group(3),
+                                 prep_s=m.group(4), verdict=m.group(5), runtime_s=m.group(6)))
+
+    # --- per-instance log slices (set d['_dir'] as we go) ---
+    for d in instances:
+        d['_dir'] = f"{d['index']:04d}_{_safe(d['category'])}__{_safe(_stem(d['onnx']))}__{_safe(_stem(d['vnnlib']))}"
+        idir = os.path.join(outdir, d['_dir'])
+        os.makedirs(idir, exist_ok=True)
+        with open(os.path.join(idir, 'log.txt'), 'w') as f:
+            f.write('\n'.join(d['slice']) + '\n')
+
+    # --- write reconstructed results.csv (uses _dir) ---
+    recon_csv = os.path.join(outdir, 'results.csv')
+    with open(recon_csv, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['index', 'category', 'version', 'net', 'prop', 'verdict',
+                    'status', 'run_s', 'prep_s', 'solve_s', 'log_dir'])
+        for d in instances:
+            w.writerow([d['index'], d['category'], _version(d['onnx']),
+                        _stem(d['onnx']), _stem(d['vnnlib']), d['verdict'] or '',
+                        d['status'], d['run_elapsed'] or '', d['prep_elapsed'] or '',
+                        d['solve'] or '', d['_dir']])
+
+    # --- write official results.csv ---
+    with open(os.path.join(outdir, 'results_official.csv'), 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['category', 'onnx', 'vnnlib', 'prep_s', 'verdict', 'runtime_s'])
+        for r in official:
+            w.writerow([r['category'], r['onnx'], r['vnnlib'], r['prep_s'],
+                        r['verdict'], r['runtime_s']])
+
+    # --- sanity check: reconstructed (B) vs official (A) by (cat,version,net,prop) ---
+    def key(cat, onnx, vnnlib):
+        return (cat, _version(onnx), _stem(onnx), _stem(vnnlib))
+
+    b_map, a_map = {}, {}
+    for d in instances:
+        b_map.setdefault(key(d['category'], d['onnx'], d['vnnlib']), []).append(d['verdict'])
+    for r in official:
+        a_map.setdefault(key(r['category'], r['onnx'], r['vnnlib']), []).append(r['verdict'])
+
+    agree, disagree, killed, only_a, only_b = [], [], [], [], []
+    for k in sorted(set(a_map) | set(b_map)):
+        av = a_map.get(k)
+        bv = b_map.get(k)
+        if av and bv:
+            bv_real = [v for v in bv if v]   # drop None (killed/truncated verbose)
+            if not bv_real:
+                killed.append((k, av))       # official has a verdict, verbose was cut off
+            elif set(av) == set(bv_real):
+                agree.append((k, av, bv_real))
+            else:
+                disagree.append((k, av, bv_real))
+        elif av:
+            only_a.append((k, av))
+        else:
+            only_b.append((k, bv))
+
+    cmp_path = os.path.join(outdir, 'compare.txt')
+    with open(cmp_path, 'w') as f:
+        f.write('Sanity check: reconstructed (verbose) vs official (results.csv)\n')
+        f.write(f'  instances with verbose logs : {len(instances)}\n')
+        f.write(f'  official results.csv rows   : {len(official)}\n')
+        f.write(f'  agree (verdict matches)     : {len(agree)}\n')
+        f.write(f'  DISAGREE (real verdict conflict): {len(disagree)}\n')
+        f.write(f'  killed/truncated verbose (official has verdict): {len(killed)}\n')
+        f.write(f'  only in official (no verbose captured): {len(only_a)}\n')
+        f.write(f'  only in verbose (no results row)     : {len(only_b)}\n\n')
+        if killed:
+            f.write('=== verbose killed/truncated (official verdict shown) ===\n')
+            for k, av in killed:
+                f.write(f'  {k} : official={av}\n')
+            f.write('\n')
+        if disagree:
+            f.write('=== DISAGREEMENTS (cat, ver, net, prop : official vs verbose) ===\n')
+            for k, av, bv in disagree:
+                f.write(f'  {k} : official={av} verbose={bv}\n')
+            f.write('\n')
+        if only_a:
+            f.write('=== in official only (verbose truncated/missing) ===\n')
+            for k, av in only_a:
+                f.write(f'  {k} : {av}\n')
+            f.write('\n')
+        if only_b:
+            f.write('=== in verbose only (no official results row) ===\n')
+            for k, bv in only_b:
+                f.write(f'  {k} : {bv}\n')
+
+    # --- console summary ---
+    print(f'Parsed {logpath}')
+    print(f'  instances (verbose): {len(instances)}  '
+          f'[{sum(1 for d in instances if d["status"]=="completed")} ok, '
+          f'{sum(1 for d in instances if d["status"]=="KILLED")} killed]')
+    print(f'  official rows      : {len(official)}')
+    print(f'  -> {recon_csv}')
+    print(f'  -> {outdir}/results_official.csv')
+    print(f'  -> {len(instances)} per-instance log dirs under {outdir}/')
+    print(f'  sanity: agree={len(agree)} disagree={len(disagree)} '
+          f'killed/truncated={len(killed)} only-official={len(only_a)} '
+          f'only-verbose={len(only_b)}  (-> compare.txt)')
+    if disagree:
+        print('  WARNING: real verdict DISAGREEMENTS found -- see compare.txt')
 
 
 if __name__ == '__main__':
