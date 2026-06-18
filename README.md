@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/stanleybak/vibecheck-nn/master/vibecheck.png" alt="vibecheck logo" width="640">
+  <img src="https://raw.githubusercontent.com/stanleybak/vibecheck-nn/master/vibecheck.svg" alt="vibecheck logo" width="640">
 </p>
 
 **Vibecheck** is a high-performance vibe-coded neural network verification tool. Given an ONNX neural network and a VNNLIB specification, Vibecheck tries to prove the property or find a counterexample. It solves the same problem as established verifiers like  [α,β-CROWN](https://github.com/Verified-Intelligence/alpha-beta-CROWN) and [Marabou](https://github.com/NeuralNetworkVerification/Marabou), hopefully faster and on larger networks.
