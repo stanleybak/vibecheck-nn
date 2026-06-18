@@ -1,0 +1,7 @@
+# vggnet16_2022 — ImageNet VGG16 (3x224x224): 13 Conv + 5 MaxPool + 3 FC.
+# Robustness specs perturb only a FEW pixels (spec0: 1 pixel, eps~1e-5), so the
+# input box has ~1 varying dim — input-split + forward-zono is the right regime.
+# Keep verify_graph on its OWN zono+CROWN+input-split path (which has a sound
+# box-approximation max_pool); do NOT auto-route conv graphs to milp_verify/
+# gpu_layers, which has no MaxPool handler.
+auto_route_milp_for_conv: false

@@ -410,6 +410,11 @@ def default_settings(**overrides):
         print_progress=True,
         fuse_gemm_conv=True,
         optimize_relu_relation=True,
+        # Exact MaxPool -> ReLU decomposition (max(a,b)=a+ReLU(b-a)) at load
+        # time, so conv nets with pooling (vggnet16) verify via the ReLU
+        # machinery (no backend has a real MaxPool handler). No-op without
+        # MaxPool; exact, so on by default.
+        maxpool_to_relu=True,
         bnb_max_depth=128,
         total_timeout=120.0,
         milp_sample_timeout=5.0,

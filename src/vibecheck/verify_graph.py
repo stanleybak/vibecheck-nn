@@ -126,9 +126,12 @@ def _serialize_gg_ops(gg):
         elif t in ('slice', 'gather'):
             d['flat_idx'] = op['flat_idx']
         elif t in ('matmul_bilinear', 'softmax', 'concat', 'squeeze',
-                   'exp', 'reciprocal', 'reduce_sum', 'mul_bilinear'):
+                   'exp', 'reciprocal', 'reduce_sum', 'mul_bilinear',
+                   'sub_bilinear'):
             # carried with full geometry; consumers that cannot handle
-            # these types still raise in their own dispatch
+            # these types still raise in their own dispatch.
+            # sub_bilinear (a-b, linear) appears in the maxpool_to_relu
+            # decomposition's binary-max tree (max(a,b)=a+ReLU(b-a)).
             d['axis'] = op.get('axis')
             d['axes'] = op.get('axes')
             d['keepdims'] = op.get('keepdims')

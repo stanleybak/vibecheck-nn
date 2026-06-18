@@ -397,6 +397,125 @@ def fold_gemm(graph):
     return folded_any
 
 
+def maxpool_to_relu(graph):
+    """Replace each MaxPool with an EXACT ReLU decomposition.
+
+    `max(a, b) = a + ReLU(b - a)` is exact. For a kH×kW window we:
+      1. extract the P = kH*kW window positions with a single 1-hot
+         phase-extraction Conv (C → P*C, stride = pool stride, PHASE-MAJOR
+         channel layout out_ch = p*C + c, so phase p lands in a contiguous
+         channel block);
+      2. contiguous-channel-Slice that into P phase tensors of the pooled
+         shape;
+      3. reduce them with a binary-max TREE of `Sub`/`Relu`/`Add` nodes.
+
+    The result is EXACT (not a relaxation) and uses only Conv + contiguous
+    Slice + Sub + Relu + Add — all of which the gpu_graph / CROWN-backward /
+    input-split backends support. MaxPool itself has NO handler in those
+    backends (only a point-only dense path and a loose box-approx forward),
+    so this rewrite is what lets conv nets with pooling (vggnet16) verify.
+    The forks it introduces also stop `verify_graph` from auto-routing the
+    (now non-sequential) graph to the no-MaxPool milp/gpu_layers path.
+
+    Padding is NOT supported: MaxPool pads with -inf, which a Conv/ReLU
+    decomposition cannot represent — a padded MaxPool raises (loud, never a
+    silent wrong bound). vggnet16 uses pad=0.
+    """
+    from .network import OP_REGISTRY
+
+    maxpools = [n for n in list(graph.topo_order)
+                if graph.nodes.get(n) is not None
+                and graph.nodes[n].op_type == 'MaxPool']
+    if not maxpools:
+        return False
+
+    for mp_name in maxpools:
+        mp = graph.nodes[mp_name]
+        inp = mp.inputs[0]
+        kH, kW = mp.params['kernel_shape']
+        sH, sW = mp.params['stride']
+        pH, pW = mp.params['padding']
+        if pH != 0 or pW != 0:
+            raise NotImplementedError(
+                f'maxpool_to_relu: padded MaxPool at {mp_name!r} (pad='
+                f'{(pH, pW)}) unsupported — maxpool pads with -inf, which the '
+                'ReLU decomposition cannot represent.')
+        ish = (graph.nodes[inp].output_shape if inp in graph.nodes
+               else graph.input_shape)
+        if ish is None or len(ish) not in (3, 4):
+            raise NotImplementedError(
+                f'maxpool_to_relu: need a 3/4-D input shape at {mp_name!r}, '
+                f'got {ish!r}')
+        cax = 1 if len(ish) == 4 else 0          # channel axis (N,C,H,W or C,H,W)
+        C = int(ish[cax])
+        P = kH * kW
+
+        # (P*C, C, kH, kW) 1-hot phase-extraction kernel, phase-major:
+        # out_ch p*C+c reads input channel c at window position (p//kW, p%kW).
+        ker = np.zeros((P * C, C, kH, kW), dtype=np.float32)
+        for p in range(P):
+            ph, pw = p // kW, p % kW
+            for c in range(C):
+                ker[p * C + c, c, ph, pw] = 1.0
+        conv_name = mp_name + '__mp2relu_conv'
+        graph.nodes[conv_name] = OP_REGISTRY['Conv'](
+            name=conv_name, op_type='Conv', inputs=[inp],
+            params={'kernel': ker, 'bias': np.zeros(P * C, np.float32),
+                    'stride': (sH, sW), 'padding': (0, 0), 'group': 1})
+
+        # contiguous channel slices -> P phase tensors of the pooled shape
+        phases = []
+        for p in range(P):
+            pn = f'{mp_name}__mp2relu_phase{p}'
+            graph.nodes[pn] = OP_REGISTRY['Slice'](
+                name=pn, op_type='Slice', inputs=[conv_name],
+                params={'axes': [cax], 'starts': [p * C],
+                        'ends': [(p + 1) * C]})
+            phases.append(pn)
+
+        # binary-max tree: max(a, b) = a + ReLU(b - a)
+        _ctr = [0]
+
+        def _binmax(a, b):
+            i = _ctr[0]; _ctr[0] += 1
+            sub = f'{mp_name}__mp2relu_sub{i}'
+            rel = f'{mp_name}__mp2relu_relu{i}'
+            mx = f'{mp_name}__mp2relu_max{i}'
+            graph.nodes[sub] = OP_REGISTRY['Sub'](
+                name=sub, op_type='Sub', inputs=[b, a], params={})
+            graph.nodes[rel] = OP_REGISTRY['Relu'](
+                name=rel, op_type='Relu', inputs=[sub], params={})
+            graph.nodes[mx] = OP_REGISTRY['Add'](
+                name=mx, op_type='Add', inputs=[a, rel], params={})
+            return mx
+
+        level = phases
+        while len(level) > 1:
+            nxt = [_binmax(level[k], level[k + 1])
+                   for k in range(0, len(level) - 1, 2)]
+            if len(level) % 2 == 1:
+                nxt.append(level[-1])      # carry the odd one to the next level
+            level = nxt
+        out_name = level[0]
+
+        # rewire consumers of the MaxPool to the decomposition output; drop it
+        for other in graph.nodes.values():
+            other.inputs = [out_name if x == mp_name else x
+                            for x in other.inputs]
+        if getattr(graph, 'output_name', None) == mp_name:
+            graph.output_name = out_name
+        if getattr(graph, 'output_names', None):
+            graph.output_names = [out_name if x == mp_name else x
+                                  for x in graph.output_names]
+        del graph.nodes[mp_name]
+
+    graph.topological_sort()
+    from .onnx_loader import _infer_shapes, _precache_conv_tensors
+    _infer_shapes(graph)
+    _precache_conv_tensors(graph)
+    return True
+
+
 def drop_identity_pads(graph):
     """Remove Pad nodes whose pads are all zero (exact identity).
 

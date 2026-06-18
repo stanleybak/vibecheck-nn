@@ -315,13 +315,33 @@ def _verify(args, sat_state=None):
         # fall back to comparing elapsed wall against the budget for any path
         # that doesn't set the flag.
         timed_out = (isinstance(details, dict) and details.get('timed_out'))
+        _w_final = (details.get('witness') if isinstance(details, dict)
+                    else None)
+        # UNIVERSAL SAT-validation chokepoint (matches the VNNCOMP scoring
+        # step): before emitting `sat`, replay the witness through CPU
+        # onnxruntime and confirm it violates the spec within
+        # `sat_validate_atol`. verify_graph already validates internally at
+        # `_finalize` (this re-check is idempotent), but the milp/bnb/hybrid
+        # and conv→milp auto-route paths do NOT — this is their gate. Only a
+        # witnessed `sat` that ORT rejects is downgraded (no false SAT, no
+        # bogus CE file); witness-less results are left untouched. Skipped
+        # only when sat-validation is explicitly disabled (soundness probes).
+        if (line == 'sat' and _w_final is not None
+                and not bool(getattr(settings, 'skip_sat_validation', False))):
+            from .verify_graph import _validate_sat_witness
+            _atol_f = float(settings.sat_validate_atol
+                            if 'sat_validate_atol' in settings else 1e-4)
+            _ok_f, _vinfo_f = _validate_sat_witness(
+                getattr(graph, 'onnx_path', None), spec, _w_final, atol=_atol_f)
+            if not _ok_f:
+                print('  [validate] final SAT witness rejected by ORT '
+                      f'({_vinfo_f.get("reason")}) — downgrading, not emitting SAT')
+                line = 'timeout' if timed_out else 'unknown'
+                _w_final = None
         if line == 'unknown' and (
                 timed_out or (args.timeout is not None and t_total >= args.timeout - 2.0)):
             line = 'timeout'
-        _emit_result(args, spec, line,
-                     details.get('witness') if isinstance(details, dict)
-                     else None,
-                     sat_state)
+        _emit_result(args, spec, line, _w_final, sat_state)
 
     sys.exit(0 if result == 'verified' else 1)
 

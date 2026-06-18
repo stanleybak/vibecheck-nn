@@ -54,6 +54,12 @@ class PatchesZonotope:
     # would OOM the next stride-2 conv.
     _materialize_factor = 4
 
+    # CPU-offload threshold (bytes). When set (not None) and a conv's output
+    # patch tensor would exceed it, that tensor is placed in host (CPU) RAM
+    # and the conv/bounds/relu stream K-chunks to the GPU — caps GPU memory at
+    # the cost of PCIe transfer. None = off (no offload). Set from settings.
+    _offload_threshold_bytes = None
+
     def __init__(self, center, patches, offsets, out_shape,
                  _mode='patches', _dense=None):
         """
@@ -142,19 +148,22 @@ class PatchesZonotope:
         G = self._materialize_G()
         return TorchZonotope(self.center.clone(), G)
 
-    def _materialize_G(self, chunk=512):
+    def _materialize_G(self, chunk=512, target_device=None):
         """Build dense ``(n_flat, K)`` tensor by placing each patch at its
         offset.
 
         Chunked over K to avoid the 2× peak that would arise from materialising
         a full ``(K, C*H*W)`` intermediate plus its contiguous transpose. Each
         chunk writes directly into the final G via an in-place scatter on the
-        column-slice view.
+        column-slice view. ``target_device`` (default = patches device) lets
+        an offloaded (CPU) patch tensor materialise its dense G on the GPU,
+        streaming the patch chunks there.
         """
         C, H, W = self.out_shape
         K, C_p, kH, kW = self._patches.shape
         assert C_p == C
-        device = self._patches.device
+        device = (target_device if target_device is not None
+                  else self._patches.device)
         dtype = self._patches.dtype
         n_flat = C * H * W
         if K == 0:
@@ -163,7 +172,8 @@ class PatchesZonotope:
         target_y, target_x, valid = self._target_grid()
         ty = target_y.clamp(0, H - 1)
         tx = target_x.clamp(0, W - 1)
-        flat_idx = ty * W + tx  # (K, kH, kW)
+        flat_idx = (ty * W + tx).to(device)  # (K, kH, kW)
+        valid = valid.to(device)
         c_off = (torch.arange(C, device=device) * (H * W)).view(1, C, 1, 1)
 
         G = torch.zeros(n_flat, K, dtype=dtype, device=device)
@@ -171,7 +181,7 @@ class PatchesZonotope:
         for start in range(0, K, chunk):
             end = min(start + chunk, K)
             kc = end - start
-            patches_c = self._patches[start:end]
+            patches_c = self._patches[start:end].to(device)
             valid_c = valid[start:end]
             flat_c = flat_idx[start:end]
             masked_c = patches_c * valid_c[:, None, :, :].to(dtype)
@@ -184,11 +194,15 @@ class PatchesZonotope:
         return G
 
     def _materialize_to_dense(self):
-        """Convert in-place from patches to dense mode."""
+        """Convert in-place from patches to dense mode. When offloaded, build
+        the dense G on the center's (GPU) device so downstream dense ops (FC)
+        run there with the GPU-resident weights."""
         if self._mode == 'dense':
             return
-        G = self._materialize_G()
-        self._dense = TorchZonotope(self.center, G)
+        tdev = (self._center.device if self._is_offloaded()
+                else self._patches.device)
+        G = self._materialize_G(target_device=tdev)
+        self._dense = TorchZonotope(self._center.to(tdev), G)
         self._patches = None
         self._offsets = None
         self._mode = 'dense'
@@ -205,13 +219,12 @@ class PatchesZonotope:
         """
         K, C, kH, kW = self._patches.shape
         _C, H, W = self.out_shape
-        device = self._patches.device
+        device = self._patches.device  # compute on patches' device (CPU if offloaded)
+        off = self._offsets.to(device)
         dys = torch.arange(kH, device=device)
         dxs = torch.arange(kW, device=device)
-        ty = (self._offsets[:, 0:1, None] + dys[None, :, None]).expand(
-            K, kH, kW)
-        tx = (self._offsets[:, 1:2, None] + dxs[None, None, :]).expand(
-            K, kH, kW)
+        ty = (off[:, 0:1, None] + dys[None, :, None]).expand(K, kH, kW)
+        tx = (off[:, 1:2, None] + dxs[None, None, :]).expand(K, kH, kW)
         valid = (ty >= 0) & (ty < H) & (tx >= 0) & (tx < W)
         return ty, tx, valid
 
@@ -235,10 +248,24 @@ class PatchesZonotope:
     # Bounds
     # ------------------------------------------------------------------
 
+    def _is_offloaded(self):
+        """True when patches live on a different (CPU) device than the center
+        — i.e. CPU-offloaded, so heavy ops must stream K-chunks to the center's
+        (GPU) device instead of touching the whole patch tensor at once."""
+        return (self._mode == 'patches' and self._patches is not None
+                and self._patches.device != self._center.device)
+
+    def _stream_chunk(self, K, per_gen_bytes):
+        """K-chunk size that caps the per-chunk GPU tensor at _conv_chunk_bytes."""
+        return max(1, min(K, self._conv_chunk_bytes // max(1, per_gen_bytes)))
+
     def bounds(self):
         """Compute element-wise (lo, hi) bounds."""
         if self._mode == 'dense':
             return self._dense.bounds()
+
+        if self._is_offloaded():
+            return self._bounds_streamed()
 
         C, H, W = self.out_shape
         K, C_p, kH, kW = self._patches.shape
@@ -256,12 +283,148 @@ class PatchesZonotope:
         # Per-channel scatter: avoids the (K, C, kH, kW) intermediate that
         # would dominate memory at K~8000, C~64, kH~13.
         out_flat = torch.zeros(C, H * W, dtype=dtype, device=device)
-        abs_p = torch.abs(self._patches)
+        # Per-channel abs (NOT a full torch.abs(self._patches) copy) — the full
+        # copy would double the patch tensor's memory and OOM box_reduce/bounds
+        # right when the patches are largest (just before a rebox).
         for c in range(C):
-            src = abs_p[:, c, :, :].flatten() * valid_flat
+            src = self._patches[:, c, :, :].abs().flatten() * valid_flat
             out_flat[c].scatter_add_(0, flat_idx, src)
         abs_sum = out_flat.flatten()
         return self.center - abs_sum, self.center + abs_sum
+
+    def _bounds_streamed(self):
+        """Offloaded bounds: stream K-chunks of the CPU patch tensor to the
+        center's device, scatter |patch| into a (C*H*W) accumulator. Caps the
+        live GPU tensor at one chunk regardless of K."""
+        C, H, W = self.out_shape
+        K, C_p, kH, kW = self._patches.shape
+        cdev = self._center.device
+        dtype = self._center.dtype
+        if K == 0:
+            return self._center.clone(), self._center.clone()
+        HW = H * W
+        abs_sum = torch.zeros(C * HW, dtype=dtype, device=cdev)
+        off = self._offsets.to(cdev)
+        dys = torch.arange(kH, device=cdev)
+        dxs = torch.arange(kW, device=cdev)
+        c_off = (torch.arange(C, device=cdev) * HW).view(1, C, 1, 1)
+        chunk = self._stream_chunk(K, self._patches.element_size()
+                                   * C_p * kH * kW)
+        for start in range(0, K, chunk):
+            end = min(start + chunk, K)
+            kc = end - start
+            p = self._patches[start:end].to(cdev, non_blocking=True)
+            oy = off[start:end, 0]; ox = off[start:end, 1]
+            ty = (oy[:, None, None] + dys[None, :, None]).expand(kc, kH, kW)
+            tx = (ox[:, None, None] + dxs[None, None, :]).expand(kc, kH, kW)
+            valid = (ty >= 0) & (ty < H) & (tx >= 0) & (tx < W)
+            flat = (ty.clamp(0, H - 1) * W + tx.clamp(0, W - 1))  # (kc,kH,kW)
+            absp = p.abs() * valid[:, None, :, :].to(dtype)
+            idx = (c_off + flat.unsqueeze(1)).reshape(-1)  # (kc*C*kH*kW,)
+            abs_sum.scatter_add_(0, idx, absp.reshape(-1))
+            del p, absp, idx
+        return self._center - abs_sum, self._center + abs_sum
+
+    def box_reduce(self):
+        """In-place box (interval) order-reduction (Girard-style).
+
+        Replace ALL generators with one axis-aligned generator per neuron,
+        scaled by that neuron's L1 radius ``r_i = Σ_k |g_k[i]|`` — i.e. the
+        "scaled identity" reset: each surviving neuron becomes a fresh 1×1
+        patch of magnitude ``r_i`` at its own position. Sound (the per-neuron
+        box strictly contains the zonotope), and it RESETS the patch shape to
+        1×1 and the generator count to ``#neurons with r_i > 0`` — undoing
+        receptive-field patch growth. Cost: discards cross-neuron correlation
+        (looser downstream — a localized IBP-style reset). Returns self.
+        """
+        lo, hi = self.bounds()
+        center = (lo + hi) / 2
+        radii = (hi - lo) / 2
+        C, H, W = self.out_shape
+        device = center.device
+        dtype = center.dtype
+        nz = torch.nonzero(radii).squeeze(1)
+        K = nz.numel()
+        patches = torch.zeros(K, C, 1, 1, dtype=dtype, device=device)
+        offsets = torch.zeros(K, 2, dtype=torch.long, device=device)
+        if K > 0:
+            c_idx, y_idx, x_idx = _flat_to_chw(nz, (C, H, W))
+            patches[torch.arange(K, device=device), c_idx, 0, 0] = radii[nz]
+            offsets[:, 0] = y_idx
+            offsets[:, 1] = x_idx
+        self._center = center
+        self._patches = patches
+        self._offsets = offsets
+        self._mode = 'patches'
+        self._dense = None
+        return self
+
+    # ------------------------------------------------------------------
+    # Row (neuron) selection
+    # ------------------------------------------------------------------
+
+    def _as_channel_block(self, flat_idx):
+        """If ``flat_idx`` selects a full contiguous channel block — all
+        spatial positions of channels ``[c0, c1)`` of the current
+        ``(C, H, W)`` feature map, i.e. ``flat_idx == arange(c0*HW, c1*HW)``
+        — return ``(c0, c1, H, W)``; else ``None``.
+
+        This is the only index pattern the maxpool->relu decomposition emits
+        (per-phase channel slices of the phase-extraction conv), and it keeps
+        every generator's patch intact (only the channel sub-block is taken),
+        so it stays patches-native with no dense materialisation.
+        """
+        if self.out_shape is None or len(self.out_shape) != 3:
+            return None
+        C, H, W = self.out_shape
+        HW = H * W
+        n = flat_idx.numel()
+        if n == 0 or HW == 0 or n % HW != 0:
+            return None
+        first = int(flat_idx[0].item())
+        if first % HW != 0:
+            return None
+        c0 = first // HW
+        c1 = c0 + n // HW
+        if c1 > C:
+            return None
+        expected = torch.arange(
+            first, first + n, device=flat_idx.device, dtype=flat_idx.dtype)
+        if not torch.equal(flat_idx, expected):
+            return None
+        return c0, c1, H, W
+
+    def slice(self, flat_idx):
+        """Select a subset of output neurons (rows) by flat index.
+
+        FAST PATH (patches-native): a contiguous channel block stays in
+        patches form — slice each generator's patch channels, keep offsets.
+        Any other pattern falls back to dense (materialise + index_select),
+        which is sound but loses the memory advantage.
+        """
+        if not isinstance(flat_idx, torch.Tensor):
+            dev = (self._dense.center.device if self._mode == 'dense'
+                   else self._patches.device)
+            flat_idx = torch.as_tensor(flat_idx, dtype=torch.long, device=dev)
+
+        cb = self._as_channel_block(flat_idx)
+        if cb is not None and self._mode == 'patches':
+            c0, c1, H, W = cb
+            new_center = self._center[c0 * H * W:c1 * H * W].clone()
+            new_patches = self._patches[:, c0:c1, :, :].contiguous()
+            return PatchesZonotope(
+                new_center, new_patches, self._offsets.clone(),
+                (c1 - c0, H, W))
+
+        # Dense fallback (already dense, or a non-channel-block index).
+        c_flat = self.center.reshape(-1)
+        g_flat = self.generators.reshape(c_flat.numel(), -1)
+        sub = TorchZonotope(
+            c_flat.index_select(0, flat_idx),
+            g_flat.index_select(0, flat_idx))
+        new_out = (cb[1] - cb[0], cb[2], cb[3]) if cb is not None else None
+        return PatchesZonotope(
+            sub.center, None, None, new_out, _mode='dense', _dense=sub)
 
     # ------------------------------------------------------------------
     # Conv / FC propagation
@@ -329,34 +492,49 @@ class PatchesZonotope:
         s1_off_y = self._offsets[:, 0] + (pH - kH_new + 1)
         s1_off_x = self._offsets[:, 1] + (pW - kW_new + 1)
 
-        device = self._patches.device
+        # Compute always happens on the center's device (GPU); the input
+        # patch chunk is moved there if it's CPU-offloaded. The OUTPUT patch
+        # tensor goes to CPU when it would exceed `_offload_threshold_bytes`
+        # (host RAM, ≤ the configured budget), else stays on GPU.
+        cdev = self._center.device
+        if kernel.device != cdev:
+            kernel = kernel.to(cdev)
         dtype_pre = self._patches.dtype
-
-        # Chunk size: cap the per-chunk pre tensor at the budget below.
-        # cuDNN workspace adds a small constant on top. Tests monkeypatch
-        # ``_conv_chunk_bytes`` to force chunking with small K.
         elem_bytes = self._patches.element_size()
         bytes_per_gen = elem_bytes * C_out * kH_pre * kW_pre
         chunk = max(
             1, min(K, self._conv_chunk_bytes // max(1, bytes_per_gen)))
+        _off_th = type(self)._offload_threshold_bytes
+
+        def _out_dev(per_gen):
+            return (torch.device('cpu')
+                    if (_off_th is not None and K * per_gen > _off_th)
+                    else cdev)
 
         if sH == 1 and sW == 1:
-            # Stride-1: output patch == pre patch. Pre-allocate final and
-            # write conv result chunk-by-chunk.
+            out_dev = _out_dev(elem_bytes * C_out * kH_pre * kW_pre)
             new_patches = torch.empty(
-                K, C_out, kH_pre, kW_pre,
-                dtype=dtype_pre, device=device)
+                K, C_out, kH_pre, kW_pre, dtype=dtype_pre, device=out_dev)
             for start in range(0, K, chunk):
                 end = min(start + chunk, K)
-                new_patches[start:end] = F.conv2d(
-                    self._patches[start:end], kernel, stride=(1, 1),
-                    padding=(kH_new - 1, kW_new - 1))
+                inp = self._patches[start:end]
+                if inp.device != cdev:
+                    inp = inp.to(cdev, non_blocking=True)
+                res = F.conv2d(inp, kernel, stride=(1, 1),
+                               padding=(kH_new - 1, kW_new - 1))
+                new_patches[start:end] = (
+                    res if res.device == out_dev else res.to(out_dev))
+                del inp, res
             new_offsets = torch.stack([s1_off_y, s1_off_x], dim=1)
         else:
+            device = cdev  # stride>1 index arrays live on the compute device
             # Stride > 1: per-gen subsample to keep only stride-s aligned
             # output positions. Different gens have different alignment
             # (depending on s1_off mod s); we gather a uniform shape with
-            # zero-padding for misaligned positions.
+            # zero-padding for misaligned positions. Index math runs on the
+            # compute device (s1_off may be CPU-offloaded).
+            s1_off_y = s1_off_y.to(device)
+            s1_off_x = s1_off_x.to(device)
             dy_min = (-s1_off_y) % sH  # (K,)
             dx_min = (-s1_off_x) % sW
             max_num_y = (kH_pre + sH - 1) // sH
@@ -369,38 +547,46 @@ class PatchesZonotope:
             x_valid = x_idx < kW_pre
             y_safe = y_idx.clamp(0, kH_pre - 1)
             x_safe = x_idx.clamp(0, kW_pre - 1)
+            out_dev = _out_dev(elem_bytes * C_out * max_num_y * max_num_x)
             new_patches = torch.empty(
                 K, C_out, max_num_y, max_num_x,
-                dtype=dtype_pre, device=device)
+                dtype=dtype_pre, device=out_dev)
             c_ar = torch.arange(C_out, device=device).view(1, C_out, 1, 1)
             for start in range(0, K, chunk):
                 end = min(start + chunk, K)
                 kc = end - start
+                inp = self._patches[start:end]
+                if inp.device != cdev:
+                    inp = inp.to(cdev, non_blocking=True)
                 # Conv only this chunk so the (chunk, C_out, kH_pre, kW_pre)
                 # intermediate is bounded.
                 pre_chunk = F.conv2d(
-                    self._patches[start:end], kernel, stride=(1, 1),
+                    inp, kernel, stride=(1, 1),
                     padding=(kH_new - 1, kW_new - 1))
                 k_ar_c = torch.arange(
                     kc, device=device).view(kc, 1, 1, 1)
                 y_idx_c = y_safe[start:end, None, :, None]
                 x_idx_c = x_safe[start:end, None, None, :]
-                new_patches[start:end] = pre_chunk[
+                res = pre_chunk[
                     k_ar_c.expand(kc, C_out, max_num_y, max_num_x),
                     c_ar.expand(kc, C_out, max_num_y, max_num_x),
                     y_idx_c.expand(kc, C_out, max_num_y, max_num_x),
                     x_idx_c.expand(kc, C_out, max_num_y, max_num_x),
                 ]
-                del pre_chunk
+                new_patches[start:end] = (
+                    res if res.device == out_dev else res.to(out_dev))
+                del pre_chunk, inp, res
             mask = (y_valid[:, None, :, None] & x_valid[:, None, None, :])
-            new_patches.mul_(mask.to(dtype_pre))
+            new_patches.mul_(mask.to(dtype_pre).to(new_patches.device))
             # New offsets in the stride-s output frame.
             new_off_y = (s1_off_y + dy_min) // sH
             new_off_x = (s1_off_x + dx_min) // sW
             new_offsets = torch.stack([new_off_y, new_off_x], dim=1)
 
         self._patches = new_patches
-        self._offsets = new_offsets
+        # Keep offsets on the same device as patches (CPU when offloaded) so
+        # every downstream op (add/sub/slice/relu) stays device-consistent.
+        self._offsets = new_offsets.to(new_patches.device)
         self.out_shape = new_out_shape
 
         # Zero phantom positions so a raw conv→conv chain is correct (the
@@ -415,8 +601,12 @@ class PatchesZonotope:
         # area so we tolerate a 4× memory hit before flipping; tinyimagenet
         # ResNet (TinyImageNet_resnet_medium) needs this delay to traverse
         # the 14×14 stage without dense-conv OOM at K ≈ 10K.
+        # Skip the dense flip when CPU-offloaded: materialising the dense
+        # (n_flat × K) generator matrix is exactly what offload avoids, and
+        # would instantly OOM. Offloaded patches stay in patch form on CPU.
         kH_p, kW_p = self._patches.shape[2], self._patches.shape[3]
-        if kH_p * kW_p >= self._materialize_factor * H_out * W_out:
+        if (not self._is_offloaded()
+                and kH_p * kW_p >= self._materialize_factor * H_out * W_out):
             self._materialize_to_dense()
 
     def propagate_fc(self, W, bias):
@@ -457,21 +647,21 @@ class PatchesZonotope:
         dtype = self._patches.dtype
 
         if K > 0:
-            target_y, target_x, valid = self._target_grid()
-            ty = target_y.clamp(0, H - 1)
-            tx = target_x.clamp(0, W - 1)
-            flat_idx = ty * W + tx  # (K, kH, kW)
-
-            # Gather lam at each (k, c, dy, dx) target position.
-            # lam_flat[c, flat_idx[k, dy, dx]] -> (K, C, kH, kW) lam-at-target.
-            lam_flat = lam_3d.reshape(C, H * W)  # (C, H*W)
-            idx_expand = flat_idx.unsqueeze(1).expand(
-                K, C, kH, kW).reshape(K, C, kH * kW)
-            lam_at = lam_flat.unsqueeze(0).expand(K, C, H * W).gather(
-                2, idx_expand).reshape(K, C, kH, kW)
-            # Mask invalid positions (we're about to multiply patches by these).
-            lam_at = lam_at * valid[:, None, :, :].to(dtype)
-            self._patches.mul_(lam_at)
+            if self._is_offloaded():
+                self._scale_patches_at_target(lam_3d)
+            else:
+                target_y, target_x, valid = self._target_grid()
+                ty = target_y.clamp(0, H - 1)
+                tx = target_x.clamp(0, W - 1)
+                flat_idx = ty * W + tx  # (K, kH, kW)
+                # lam_flat[c, flat_idx[k,dy,dx]] -> (K,C,kH,kW) lam-at-target.
+                lam_flat = lam_3d.reshape(C, H * W)
+                idx_expand = flat_idx.unsqueeze(1).expand(
+                    K, C, kH, kW).reshape(K, C, kH * kW)
+                lam_at = lam_flat.unsqueeze(0).expand(K, C, H * W).gather(
+                    2, idx_expand).reshape(K, C, kH, kW)
+                lam_at = lam_at * valid[:, None, :, :].to(dtype)
+                self._patches.mul_(lam_at)
 
         # Append new gens (one per unstable neuron) for the μ noise symbols.
         ui = torch.where(ust)[0]
@@ -481,16 +671,54 @@ class PatchesZonotope:
             kW_now = self._patches.shape[3]
             new_patches = torch.zeros(
                 nu, C, kH_now, kW_now, dtype=dtype, device=device)
-            c_un, y_un, x_un = _flat_to_chw(ui, (C, H, W))
-            new_patches[torch.arange(nu, device=device), c_un, 0, 0] = mu[ui]
+            c_un, y_un, x_un = _flat_to_chw(ui.to(device), (C, H, W))
+            new_patches[torch.arange(nu, device=device), c_un, 0, 0] = \
+                mu[ui].to(device)
             new_offsets = torch.zeros(
                 nu, 2, dtype=torch.long, device=device)
             new_offsets[:, 0] = y_un
             new_offsets[:, 1] = x_un
             self._patches = torch.cat([self._patches, new_patches], dim=0)
-            self._offsets = torch.cat([self._offsets, new_offsets], dim=0)
+            self._offsets = torch.cat(
+                [self._offsets, new_offsets.to(self._offsets.device)], dim=0)
 
         return lo, hi
+
+    def _scale_patches_at_target(self, lam_3d):
+        """In-place: multiply each generator's patch by ``lam`` evaluated at
+        the patch's target feature-map positions (masking out-of-bounds).
+        Streams K-chunks to the center's device so a CPU-offloaded patch
+        tensor is never materialised whole on the GPU."""
+        C, H, W = self.out_shape
+        K, C_p, kH, kW = self._patches.shape
+        if K == 0:
+            return
+        cdev = self._center.device
+        pdev = self._patches.device
+        dtype = self._patches.dtype
+        lam_flat = lam_3d.reshape(C, H * W).to(cdev)
+        off = self._offsets.to(cdev)
+        dys = torch.arange(kH, device=cdev)
+        dxs = torch.arange(kW, device=cdev)
+        chunk = self._stream_chunk(K, self._patches.element_size()
+                                   * C_p * kH * kW)
+        for start in range(0, K, chunk):
+            end = min(start + chunk, K); kc = end - start
+            oy = off[start:end, 0]; ox = off[start:end, 1]
+            ty = (oy[:, None, None] + dys[None, :, None]).expand(kc, kH, kW)
+            tx = (ox[:, None, None] + dxs[None, None, :]).expand(kc, kH, kW)
+            valid = (ty >= 0) & (ty < H) & (tx >= 0) & (tx < W)
+            flat = (ty.clamp(0, H - 1) * W + tx.clamp(0, W - 1))
+            idx = flat.unsqueeze(1).expand(kc, C, kH, kW).reshape(kc, C, kH * kW)
+            lam_at = lam_flat.unsqueeze(0).expand(kc, C, H * W).gather(
+                2, idx).reshape(kc, C, kH, kW)
+            lam_at = lam_at * valid[:, None, :, :].to(dtype)
+            p = self._patches[start:end]
+            if p.device != cdev:
+                p = p.to(cdev, non_blocking=True)
+            p.mul_(lam_at)
+            self._patches[start:end] = p if pdev == cdev else p.to(pdev)
+            del p, lam_at
 
     def nonzero_rows(self, unstable_idx, chunk=256):
         """Sparse ``(row_ids, col_ids, values)`` of ``G[unstable_idx, :]``.
@@ -791,3 +1019,37 @@ class PatchesZonotope:
         return PatchesZonotope(
             self.center + other.center, new_patches, new_offsets,
             self.out_shape)
+
+    def _negated(self):
+        """Return ``-self`` (center and generators negated), same offsets
+        and shape. Used by ``sub`` via the identity ``a - b == a + (-b)``."""
+        if self._mode == 'dense':
+            d = self._dense
+            neg = TorchZonotope(-d.center, -d.generators)
+            return PatchesZonotope(
+                -d.center, None, None, self.out_shape,
+                _mode='dense', _dense=neg)
+        return PatchesZonotope(
+            -self._center, -self._patches, self._offsets.clone(),
+            self.out_shape)
+
+    def sub(self, other, shared_gens):
+        """Element-wise ``self - other`` with ``shared_gens`` leading shared
+        noise columns.
+
+        Reuses ``add``'s offset-alignment + zero-padding logic via the
+        negation identity ``a - b == a + (-b)``: shared columns subtract
+        (``a[:s] - b[:s]``), ``self``'s extra columns stay, ``other``'s extra
+        columns are negated. Column ORDER matches ``add``
+        (``[shared | a_extra | b_extra]``), so the caller's
+        ``col_ids = ida + idb[shared:]`` stays valid.
+
+        Loadbearing for the maxpool->relu decomposition's ``max(a, b) =
+        a + ReLU(b - a)``, where ``b - a`` subtracts two channel-slices of
+        the same phase-extraction conv (same offsets, same K) — staying
+        patches-native with no dense materialisation.
+        """
+        if not isinstance(other, PatchesZonotope):
+            neg = TorchZonotope(-other.center, -other.generators)
+            return self.to_dense().add(neg, shared_gens)
+        return self.add(other._negated(), shared_gens)
