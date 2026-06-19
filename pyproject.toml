@@ -22,6 +22,14 @@ dependencies = [
     # Required to load SAGAN-style self-attention generators (cgan
     # small_transformer); see onnx_loader.load_onnx's auto-simplify trigger.
     "onnxsim",
+    # Runtime: the universal SAT-witness validation (verify_graph._validate_sat_witness,
+    # main._verify chokepoint) replays witnesses on CPU onnxruntime — the VNNCOMP scoring
+    # engine — and the surrogate-attack mode uses it for counterexample validation.
+    "onnxruntime",
+    # surrogate-attack mode (surrogate_pgd.py): converts the folded float surrogate of an
+    # INT8-quantized model to torch for gradient-PGD. onnx2torch handles transformer ops
+    # (Softmax/Erf/LayerNorm) that vibecheck's own forward graph does not.
+    "onnx2torch",
 ]
 
 [project.optional-dependencies]

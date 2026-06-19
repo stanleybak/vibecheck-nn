@@ -90,6 +90,12 @@ echo "Building pre-parse cache..."
 "$PY" -m vibecheck.main --net "$ONNX_FILE" --spec "$VNNLIB_FILE" --write-pkl $PREP_DEBUG \
 	|| echo "WARNING: pre-parse cache failed; timed run will parse normally"
 
+# Quantized models (e.g. smart_turn): fold the continuous float surrogate now (untimed),
+# so the timed surrogate-attack run only pays the cheap onnx2torch convert, not the fold.
+# No-op for non-quantized ONNX (the pre-parse cache above is what those use).
+"$PY" -m vibecheck.main --net "$ONNX_FILE" --build-surrogate \
+	|| echo "Note: surrogate build skipped (non-quantized or unavailable)."
+
 # 4. Warmup: a short real run (5s) to trigger torch.compile / CUDA kernel
 #    compilation for this graph so the timed run doesn't pay first-call JIT.
 #    Result is discarded.

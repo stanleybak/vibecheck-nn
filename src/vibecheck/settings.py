@@ -132,6 +132,17 @@ def default_settings(**overrides):
         # soundness bug — the LP relaxation incorrectly claims UNSAT.
         # Default False (production behavior).
         disable_sat_finding=False,
+        # Surrogate-attack mode (INCOMPLETE / attack-only — never returns unsat). For
+        # ONNX vibecheck can't build a sound graph for (INT8-quantized: DequantizeLinear/
+        # QuantizeLinear), fold a continuous float SURROGATE, run PGD for the whole
+        # timeout using the surrogate ONLY for the gradient direction, and validate every
+        # candidate counterexample on the ORIGINAL (quantized) model via CPU onnxruntime
+        # (the scoring engine — so a mismatched surrogate can never yield a false sat).
+        # Only triggers when surrogate_attack=True AND the ONNX has quantized ops.
+        # See surrogate_pgd.py. (Built for smart_turn_multimodal_2026.)
+        surrogate_attack=False,
+        surrogate_attack_restarts=3,
+        surrogate_attack_steps=50,
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded

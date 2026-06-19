@@ -76,6 +76,12 @@ def main():
                              'and exit WITHOUT verifying. Used by '
                              'prepare_instance.sh; the timed run then loads it '
                              'via --allow-unsafe-pkl-loading.')
+    parser.add_argument('--build-surrogate', action='store_true',
+                        help='If --net is INT8-quantized (DequantizeLinear/'
+                             'QuantizeLinear), fold a continuous float surrogate ONNX to '
+                             'the deterministic surrogate path and exit (no verification). '
+                             'Used by prepare_instance.sh so the timed surrogate-attack '
+                             'run skips the fold. No-op for non-quantized models.')
     args = parser.parse_args()
 
     if args.verbose:
@@ -106,6 +112,18 @@ def main():
         from .preparse import write_cache
         path = write_cache(args.net, args.spec, _DTYPES[args.dtype])
         print(f'Wrote pre-parse cache: {path}')
+        sys.exit(0)
+
+    if args.build_surrogate:
+        # Prepare step for quantized models: fold the float surrogate (untimed) so the
+        # timed surrogate-attack run only pays the cheap onnx2torch convert.
+        from . import surrogate_pgd as sp
+        if sp.has_quantized_ops(args.net):
+            p = _surrogate_path(args.net)
+            sp.build_float_surrogate(args.net, p)
+            print(f'Built float surrogate: {p}')
+        else:
+            print('No quantized ops detected; surrogate not needed.')
         sys.exit(0)
 
     # Shared across _verify and this crash handler: tracks whether a 'sat'
@@ -151,6 +169,14 @@ def _verify(args, sat_state=None):
     t_start = time.time()
     if sat_state is None:
         sat_state = {'emitted': False}
+
+    # Surrogate-attack mode (incomplete; INT8-quantized / unsupported ONNX). Must run
+    # BEFORE the graph load below, which would fail on DequantizeLinear/QuantizeLinear.
+    # Gated on an explicit config with surrogate_attack=True AND the ONNX having
+    # quantized ops; emits the verdict and exits. See surrogate_pgd.py.
+    _surr = _maybe_surrogate_attack(args, sat_state)
+    if _surr is not None:
+        sys.exit(_surr)
 
     # Fast path: load the pre-parsed graph+spec from prepare_instance.sh's
     # cache, skipping the (potentially multi-second) ONNX parse. Gated behind
@@ -356,6 +382,67 @@ def _verify(args, sat_state=None):
         _emit_result(args, spec, line, _w_final, sat_state)
 
     sys.exit(0 if result == 'verified' else 1)
+
+
+def _maybe_surrogate_attack(args, sat_state):
+    """If surrogate-attack mode is enabled (config flag) AND the ONNX is quantized,
+    run gradient-PGD via a continuous float surrogate, emit the verdict, and return a
+    process exit code. Otherwise return None to fall through to normal verification.
+
+    Incomplete/attack-only: returns only sat/timeout/unknown (never verified), with the
+    counterexample validated on the ORIGINAL model via CPU onnxruntime."""
+    if args.config is None:
+        return None
+    from .config_loader import load_config
+    overrides = load_config(args.config)
+    if not overrides.get('surrogate_attack', False):
+        return None
+    from . import surrogate_pgd as sp
+    if not sp.has_quantized_ops(args.net):
+        return None  # surrogate mode only engages for quantized models
+    from .settings import default_settings
+    overrides.setdefault('total_timeout', args.timeout)
+    settings = default_settings(**overrides)
+    timeout = float(args.timeout if args.timeout else 100.0)
+    print(f'Surrogate-attack mode: quantized ONNX -> PGD via float surrogate '
+          f'(restarts={settings.surrogate_attack_restarts}, '
+          f'steps={settings.surrogate_attack_steps}, timeout={timeout}s)')
+    verdict, witness = sp.surrogate_attack(
+        args.net, args.spec, settings, timeout,
+        surrogate_path=_surrogate_path(args.net),
+        log=(print if args.verbose else (lambda _m: None)))
+    if args.results_file:
+        _emit_surrogate_result(args, verdict, witness, sat_state)
+    print(f'\nResult (surrogate-attack): {verdict}')
+    return 1  # never 'verified' in this incomplete mode
+
+
+def _surrogate_path(onnx_path):
+    """Deterministic path for the folded float surrogate (shared by prepare/run)."""
+    import hashlib
+    import tempfile
+    h = hashlib.md5(os.path.abspath(onnx_path).encode()).hexdigest()[:12]
+    return os.path.join(tempfile.gettempdir(), f'vibecheck_surrogate_{h}.onnx')
+
+
+def _emit_surrogate_result(args, verdict, witness, sat_state):
+    """Write the surrogate verdict; for sat, a multi-input counterexample
+    `((X_0 v)... (Y_0 v)...)` over the concatenated inputs (ORIGINAL-model order) + the
+    ORT-CPU output. Honors the never-downgrade rule."""
+    import numpy as np
+    from . import surrogate_pgd as sp
+    if verdict == 'sat' and witness is not None:
+        x = np.concatenate([np.asarray(w).ravel() for w in witness]).astype(np.float64)
+        y = np.asarray(sp._ort_eval(args.net, witness)).ravel().astype(np.float64)
+        # %.9g is float32-exact (the witness is float32) and ~halves the cex size vs %.17g.
+        atoms = [f'(X_{i} {v:.9g})' for i, v in enumerate(x)]
+        atoms += [f'(Y_{j} {v:.9g})' for j, v in enumerate(y)]
+        with open(args.results_file, 'w') as f:
+            f.write('sat\n(' + '\n'.join(atoms) + ')\n')
+        sat_state['emitted'] = True
+    elif not sat_state.get('emitted'):
+        with open(args.results_file, 'w') as f:
+            f.write(verdict + '\n')
 
 
 def _emit_result(args, spec, line, witness, sat_state):

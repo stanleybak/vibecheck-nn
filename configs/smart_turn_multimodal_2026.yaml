@@ -1,0 +1,9 @@
+# smart_turn_multimodal_2026: a 41.6M-param INT8-quantized multimodal (audio+video)
+# transformer. vibecheck (and ABC) cannot build a sound graph for the quantized ops
+# (DequantizeLinear/QuantizeLinear), so we run the INCOMPLETE surrogate-attack mode:
+# fold a continuous float surrogate, PGD for the whole timeout (gradient from the
+# surrogate), and validate every counterexample on the ORIGINAL model via CPU
+# onnxruntime. Never returns unsat. See src/vibecheck/surrogate_pgd.py.
+surrogate_attack: true
+surrogate_attack_restarts: 3
+surrogate_attack_steps: 60
