@@ -10,7 +10,13 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "scipy",
-    "onnx",
+    # onnx/onnxruntime are PINNED to the VNNCOMP 2026 witness-replay environment
+    # (onnx 1.21.0 / onnxruntime 1.26.0 / Python 3.12). The official scorer replays
+    # every `sat` witness on exactly these versions; vibecheck validates its own
+    # counterexamples on the same engine (see onnxruntime below), so the pin keeps a
+    # CE vibecheck accepts from being rejected by a newer ORT's slightly different
+    # floats. Bump both together only when the official scorer's pins move.
+    "onnx==1.21.0",
     "torch",
     "dotmap",
     # Gurobi is used by the default `graph` mode's LP/MILP tightening. The pip
@@ -24,8 +30,11 @@ dependencies = [
     "onnxsim",
     # Runtime: the universal SAT-witness validation (verify_graph._validate_sat_witness,
     # main._verify chokepoint) replays witnesses on CPU onnxruntime — the VNNCOMP scoring
-    # engine — and the surrogate-attack mode uses it for counterexample validation.
-    "onnxruntime",
+    # engine — and the surrogate-attack mode uses it for counterexample validation. PINNED
+    # to 1.26.0 (the 2026 scorer's exact version): CE-replay numerics are ORT's, so an
+    # unpinned install pulling a newer ORT could compute a different witness Y and disagree
+    # with the official scorer. CPUExecutionProvider is forced at every call site.
+    "onnxruntime==1.26.0",
     # surrogate-attack mode (surrogate_pgd.py): converts the folded float surrogate of an
     # INT8-quantized model to torch for gradient-PGD. onnx2torch handles transformer ops
     # (Softmax/Erf/LayerNorm) that vibecheck's own forward graph does not.
@@ -33,7 +42,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-cov", "pyyaml", "onnxruntime"]
+dev = ["pytest", "pytest-cov", "pyyaml", "onnxruntime==1.26.0"]
 
 [project.scripts]
 vibecheck = "vibecheck.main:main"
