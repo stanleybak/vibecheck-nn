@@ -1284,6 +1284,11 @@ def default_settings(**overrides):
         # `skip_sat_validation=True` opts out (e.g. for ORT-free envs).
         sat_validate_atol=1e-4,
         skip_sat_validation=False,
+        # Per-value precision for the counterexample s-expression written to the
+        # results file (used by BOTH the graph and surrogate-attack emit paths).
+        # '.17g' round-trips float64 losslessly, so the scorer replays the exact
+        # witness vibecheck found (maximizes strict-CORRECT vs within-tolerance).
+        counterexample_precision='.17g',
         # When a PGD/MILP stage proposes a SAT witness that fails the
         # validation above (spurious / near-boundary), DON'T abort to
         # 'unknown' — fall through to the next, often stronger, attack or

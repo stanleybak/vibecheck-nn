@@ -21,6 +21,17 @@ def test_runner_sin_cos_pow_floor():
     assert torch.allclose(_torch_op('Floor', [x], {}), torch.floor(x))
 
 
+def test_runner_min_max():
+    a = torch.tensor([1.0, 5.0, -2.0])
+    b = torch.tensor([3.0, 2.0, -1.0])
+    assert _torch_op('Min', [a, b], {}).tolist() == [1.0, 2.0, -2.0]
+    assert _torch_op('Max', [a, b], {}).tolist() == [3.0, 5.0, -1.0]
+    # variadic + broadcast against a scalar (the clamp form)
+    c = torch.tensor(0.0)
+    assert _torch_op('Max', [a, c], {}).tolist() == [1.0, 5.0, 0.0]
+    assert _torch_op('Min', [a, b, c], {}).tolist() == [0.0, 0.0, -2.0]
+
+
 def test_runner_equal_where():
     a = torch.tensor([1.0, 2.0, 3.0])
     b = torch.tensor([1.0, 9.0, 3.0])

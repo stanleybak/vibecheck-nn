@@ -516,6 +516,96 @@ def maxpool_to_relu(graph):
     return True
 
 
+def min_max_to_relu(graph):
+    """Replace each Min/Max with an EXACT ReLU+affine decomposition.
+
+    Min/Max have no sound general handler (the `MiscNode` fallback only passes a
+    POINT through input 0), so any net that actually bounds a Min/Max — e.g. the
+    clamp `clamp(v,LO,HI)=Min(Max(v,LO),HI)` the network-pair (monotonic_acasxu)
+    converter emits — needs this. Like `maxpool_to_relu`, the result is exact (not
+    a relaxation) and uses only Sub/Relu/Add, which every backend supports.
+
+    Constant operand (the common case — `Min(x, c)` / `Max(x, c)`, the const folded
+    into `params['const_*']`), with single-input affine ops (work with noise):
+        max(x,c) = c + ReLU(x - c)     Sub(sub_val=c) -> Relu -> Add(bias=c)
+        min(x,c) = c - ReLU(c - x)     Sub(negate,bias=c) -> Relu -> Sub(negate,bias=c)
+    Two variable inputs `op(a,b)` (mirrors maxpool's binary-max):
+        max(a,b) = a + ReLU(b - a)     Sub([b,a]) -> Relu -> Add([a,relu])
+        min(a,b) = a - ReLU(a - b)     Sub([a,b]) -> Relu -> Sub([a,relu])
+    """
+    from .network import OP_REGISTRY
+
+    mm = [n for n in list(graph.topo_order)
+          if graph.nodes.get(n) is not None
+          and graph.nodes[n].op_type in ('Min', 'Max')]
+    if not mm:
+        return False
+
+    for nm in mm:
+        node = graph.nodes[nm]
+        is_max = node.op_type == 'Max'
+        ckey = next((k for k in node.params if k.startswith('const_')), None)
+        sub = f'{nm}__mm2relu_sub'
+        rel = f'{nm}__mm2relu_relu'
+        out = f'{nm}__mm2relu_out'
+
+        if ckey is not None:
+            # constant operand: variable is inputs[0], constant is params[ckey]
+            c = np.asarray(node.params[ckey])
+            x = node.inputs[0]
+            if is_max:                                   # c + ReLU(x - c)
+                graph.nodes[sub] = OP_REGISTRY['Sub'](
+                    name=sub, op_type='Sub', inputs=[x], params={'sub_val': c})
+                graph.nodes[rel] = OP_REGISTRY['Relu'](
+                    name=rel, op_type='Relu', inputs=[sub], params={})
+                graph.nodes[out] = OP_REGISTRY['Add'](
+                    name=out, op_type='Add', inputs=[rel], params={'bias': c})
+            else:                                        # c - ReLU(c - x)
+                graph.nodes[sub] = OP_REGISTRY['Sub'](
+                    name=sub, op_type='Sub', inputs=[x],
+                    params={'negate': True, 'bias': c})
+                graph.nodes[rel] = OP_REGISTRY['Relu'](
+                    name=rel, op_type='Relu', inputs=[sub], params={})
+                graph.nodes[out] = OP_REGISTRY['Sub'](
+                    name=out, op_type='Sub', inputs=[rel],
+                    params={'negate': True, 'bias': c})
+        else:
+            # two variable inputs a,b
+            assert len(node.inputs) == 2, \
+                f'min_max_to_relu: {node.op_type} {nm!r} has no const and {len(node.inputs)} inputs'
+            a, b = node.inputs
+            if is_max:                                   # a + ReLU(b - a)
+                graph.nodes[sub] = OP_REGISTRY['Sub'](
+                    name=sub, op_type='Sub', inputs=[b, a], params={})
+                graph.nodes[rel] = OP_REGISTRY['Relu'](
+                    name=rel, op_type='Relu', inputs=[sub], params={})
+                graph.nodes[out] = OP_REGISTRY['Add'](
+                    name=out, op_type='Add', inputs=[a, rel], params={})
+            else:                                        # a - ReLU(a - b)
+                graph.nodes[sub] = OP_REGISTRY['Sub'](
+                    name=sub, op_type='Sub', inputs=[a, b], params={})
+                graph.nodes[rel] = OP_REGISTRY['Relu'](
+                    name=rel, op_type='Relu', inputs=[sub], params={})
+                graph.nodes[out] = OP_REGISTRY['Sub'](
+                    name=out, op_type='Sub', inputs=[a, rel], params={})
+
+        # rewire consumers of the Min/Max to the decomposition output; drop it
+        for other in graph.nodes.values():
+            other.inputs = [out if x == nm else x for x in other.inputs]
+        if getattr(graph, 'output_name', None) == nm:
+            graph.output_name = out
+        if getattr(graph, 'output_names', None):
+            graph.output_names = [out if x == nm else x
+                                  for x in graph.output_names]
+        del graph.nodes[nm]
+
+    graph.topological_sort()
+    from .onnx_loader import _infer_shapes, _precache_conv_tensors
+    _infer_shapes(graph)
+    _precache_conv_tensors(graph)
+    return True
+
+
 def drop_identity_pads(graph):
     """Remove Pad nodes whose pads are all zero (exact identity).
 

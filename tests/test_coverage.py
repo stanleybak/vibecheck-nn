@@ -549,10 +549,12 @@ def test_shape_op_no_input_shape():
 # --- MiscNode (line 1146) ---
 
 def test_misc_propagation():
+    # MiscNode has no sound zonotope handler — propagation must raise (a silent
+    # passthrough of input[0] is unsound for Min/Max/Where/Equal/etc.).
     node = MiscNode(name='m', op_type='Cast', inputs=['input'])
     g = _make_graph([node], input_shape=(1, 3))
-    out = _run_point(g, np.array([1, 2, 3], dtype=float))
-    np.testing.assert_array_equal(out, [1, 2, 3])
+    with pytest.raises(NotImplementedError):
+        _run_point(g, np.array([1, 2, 3], dtype=float))
 
 
 # --- ComputeGraph __str__ with various params (lines 1296, 1311, 1359-1362) ---

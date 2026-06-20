@@ -170,6 +170,12 @@ def _verify(args, sat_state=None):
     if sat_state is None:
         sat_state = {'emitted': False}
 
+    # Network-pair benchmarks (isomorphic_acasxu / monotonic_acasxu): `--net` is a
+    # pair list `[('f',a),('g',b)]` and `--spec` relates the two nets. Convert to a
+    # single MERGED onnx + v1 spec up front, then verify normally. Must run BEFORE the
+    # graph load. See network_pair.py (the merge is exact + onnxruntime-oracle-gated).
+    _maybe_network_pair(args)
+
     # Surrogate-attack mode (incomplete; INT8-quantized / unsupported ONNX). Must run
     # BEFORE the graph load below, which would fail on DequantizeLinear/QuantizeLinear.
     # Gated on an explicit config with surrogate_attack=True AND the ONNX having
@@ -283,7 +289,8 @@ def _verify(args, sat_state=None):
             settings.sat_validate_atol
             if 'sat_validate_atol' in settings else 1e-4)
         settings.result_sink = (lambda w: _emit_result(
-            args, spec, 'sat', w, sat_state)) if args.results_file else None
+            args, spec, 'sat', w, sat_state,
+            settings.counterexample_precision)) if args.results_file else None
         graph.optimize(settings)
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
@@ -379,9 +386,24 @@ def _verify(args, sat_state=None):
         if line == 'unknown' and (
                 timed_out or (args.timeout is not None and t_total >= args.timeout - 2.0)):
             line = 'timeout'
-        _emit_result(args, spec, line, _w_final, sat_state)
+        _emit_result(args, spec, line, _w_final, sat_state,
+                     settings.counterexample_precision)
 
     sys.exit(0 if result == 'verified' else 1)
+
+
+def _maybe_network_pair(args):
+    """If `--net` is a network-pair list-string (isomorphic/monotonic_acasxu),
+    convert the pair to a single merged ONNX + v1 spec and rewrite args.net/args.spec
+    in place so the normal pipeline verifies it. No-op otherwise."""
+    from . import network_pair as npair
+    if not npair.is_network_pair_net_field(args.net):
+        return
+    merged_onnx, merged_spec = npair.build_merged_instance(args.net, args.spec)
+    print(f'Network-pair instance: merged {npair.detect_kind(npair._read_vnnlib_text(args.spec))} '
+          f'pair -> {merged_onnx}')
+    args.net = merged_onnx
+    args.spec = merged_spec
 
 
 def _maybe_surrogate_attack(args, sat_state):
@@ -412,7 +434,8 @@ def _maybe_surrogate_attack(args, sat_state):
         surrogate_path=_surrogate_path(args.net),
         log=(print if args.verbose else (lambda _m: None)))
     if args.results_file:
-        _emit_surrogate_result(args, verdict, witness, sat_state)
+        _emit_surrogate_result(args, verdict, witness, sat_state,
+                               settings.counterexample_precision)
     print(f'\nResult (surrogate-attack): {verdict}')
     return 1  # never 'verified' in this incomplete mode
 
@@ -425,7 +448,18 @@ def _surrogate_path(onnx_path):
     return os.path.join(tempfile.gettempdir(), f'vibecheck_surrogate_{h}.onnx')
 
 
-def _emit_surrogate_result(args, verdict, witness, sat_state):
+def _cex_sexpr(x_flat, y_flat, fmt='.17g'):
+    """Build the VNNCOMP counterexample s-expression `((X_0 v) ... (Y_0 v) ...)`
+    from flattened input/output arrays — the single place the on-disk cex format
+    lives. `fmt` is the per-value precision, supplied by both emit paths from the
+    `counterexample_precision` setting (default '.17g', which round-trips float64
+    losslessly)."""
+    atoms = [f'(X_{i} {v:{fmt}})' for i, v in enumerate(x_flat)]
+    atoms += [f'(Y_{j} {v:{fmt}})' for j, v in enumerate(y_flat)]
+    return '(' + '\n'.join(atoms) + ')'
+
+
+def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
     """Write the surrogate verdict; for sat, a multi-input counterexample
     `((X_0 v)... (Y_0 v)...)` over the concatenated inputs (ORIGINAL-model order) + the
     ORT-CPU output. Honors the never-downgrade rule."""
@@ -434,18 +468,15 @@ def _emit_surrogate_result(args, verdict, witness, sat_state):
     if verdict == 'sat' and witness is not None:
         x = np.concatenate([np.asarray(w).ravel() for w in witness]).astype(np.float64)
         y = np.asarray(sp._ort_eval(args.net, witness)).ravel().astype(np.float64)
-        # %.9g is float32-exact (the witness is float32) and ~halves the cex size vs %.17g.
-        atoms = [f'(X_{i} {v:.9g})' for i, v in enumerate(x)]
-        atoms += [f'(Y_{j} {v:.9g})' for j, v in enumerate(y)]
         with open(args.results_file, 'w') as f:
-            f.write('sat\n(' + '\n'.join(atoms) + ')\n')
+            f.write('sat\n' + _cex_sexpr(x, y, cex_fmt) + '\n')
         sat_state['emitted'] = True
     elif not sat_state.get('emitted'):
         with open(args.results_file, 'w') as f:
             f.write(verdict + '\n')
 
 
-def _emit_result(args, spec, line, witness, sat_state):
+def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
     """Write the VNNCOMP results file: verdict on line 1, then (for 'sat') the
     counterexample s-expression. Never-downgrade rule: once a 'sat' (with a
     counterexample) has been written, a later 'timeout'/'unknown'/'error' will
@@ -466,7 +497,7 @@ def _emit_result(args, spec, line, witness, sat_state):
         # s-expression `((X_0 <v>) ... (Y_0 <v>) ...)` over every input then
         # output dim. The harness re-runs the ONNX on the X's to confirm. We
         # reuse the same ORT forward the soundness validator uses so Y matches.
-        ce = _counterexample_sexpr(args.net, spec, witness)
+        ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt)
         if ce is None:
             print('  [warn] sat verdict but could not build a counterexample '
                   '(no ORT output); results file has the verdict only.')
@@ -478,7 +509,7 @@ def _emit_result(args, spec, line, witness, sat_state):
         sat_state['emitted'] = True
 
 
-def _counterexample_sexpr(onnx_path, spec, witness):
+def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g'):
     """Build the VNNCOMP counterexample s-expression for a SAT witness.
 
     Returns `((X_0 <v>) ... (Y_0 <v>) ...)` (one atom per line) or None if the
@@ -495,9 +526,7 @@ def _counterexample_sexpr(onnx_path, spec, witness):
     if y is None:
         return None
     y = np.asarray(y).flatten().astype(np.float64)
-    atoms = [f'(X_{i} {v:.17g})' for i, v in enumerate(x)]
-    atoms += [f'(Y_{j} {v:.17g})' for j, v in enumerate(y)]
-    return '(' + '\n'.join(atoms) + ')'
+    return _cex_sexpr(x, y, cex_fmt)
 
 
 if __name__ == '__main__':

@@ -1297,12 +1297,19 @@ class ShapeOpNode(GraphNode):
 
 
 class MiscNode(GraphNode):
-    """Fallback for Cast, Equal, Where, Expand, ScatterND, ArgMax, Min, Max."""
+    """Registry placeholder for ops with no sound zonotope handler (Cast, Equal,
+    Where, Expand, ScatterND, ArgMax, Min, Max). Graph build + shape inference work
+    (so constant-folding can still eliminate them), but PROPAGATION raises: passing
+    input[0] through ignores the operation entirely (e.g. Min/Max/Where), which is
+    unsound. A loud NotImplementedError is more informative than a wrong bound — if
+    one of these is actually needed, give it a real handler (Min/Max already have one
+    via onnx_optimizer.min_max_to_relu)."""
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
-        z = get_input(self.inputs[0])
-        _require_point(self, z)
-        zono_state[self.name] = z
+        raise NotImplementedError(
+            f"no sound zonotope handler for op '{self.op_type}' "
+            f"(node '{self.name}'); it reached propagation un-folded. "
+            f"Implement a handler or fold/rewrite it (cf. min_max_to_relu).")
 
 
 # ---------------------------------------------------------------------------
@@ -1404,7 +1411,8 @@ class ComputeGraph:
                                      fold_conv,
                                      fold_gemm,
                                      fuse_gemm_reshape_conv,
-                                     maxpool_to_relu)
+                                     maxpool_to_relu,
+                                     min_max_to_relu)
         # Ungated: removing all-zero Pad nodes is an exact identity (TinyYOLO
         # carries Pad(pads=[0]*8) no-ops that otherwise hit gpu_graph's loud
         # NotImplementedError). Non-zero pads are kept and still raise.
@@ -1415,6 +1423,11 @@ class ComputeGraph:
         # safe to keep on by default; no-op when there is no MaxPool.
         if getattr(settings, 'maxpool_to_relu', True):
             maxpool_to_relu(self)
+        # Exact Min/Max -> ReLU+affine: no backend bounds Min/Max soundly (MiscNode
+        # only passes a point through), so nets that bound a Min/Max (e.g. the
+        # monotonic_acasxu clamp) need this. Exact, on by default, no-op without Min/Max.
+        if getattr(settings, 'min_max_to_relu', True):
+            min_max_to_relu(self)
         if settings.optimize_relu_relation:
             fold_conv(self)
             fold_gemm(self)

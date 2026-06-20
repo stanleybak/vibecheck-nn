@@ -461,12 +461,13 @@ def test_shape_op():
     np.testing.assert_array_equal(out, center)
 
 
-def test_misc_passthrough():
+def test_misc_raises():
+    # MiscNode has no sound zonotope handler — propagation raises rather than
+    # silently passing input[0] through (unsound for Min/Max/Where/etc.).
     node = MiscNode(name='m', op_type='Cast', inputs=['input'])
     g = _make_graph([node], input_shape=(1, 3))
-    center = np.array([1, 2, 3], dtype=float)
-    out = _run_point(g, center)
-    np.testing.assert_array_equal(out, center)
+    with pytest.raises(NotImplementedError):
+        _run_point(g, np.array([1, 2, 3], dtype=float))
 
 
 # --- MatMulBilinear ---

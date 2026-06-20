@@ -7,3 +7,6 @@
 surrogate_attack: true
 surrogate_attack_restarts: 3
 surrogate_attack_steps: 60
+# This model has a large multimodal input; the witness is float32, so %.9g is
+# float32-exact and ~halves the counterexample file size vs the .17g default.
+counterexample_precision: '.9g'

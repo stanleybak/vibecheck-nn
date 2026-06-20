@@ -30,6 +30,13 @@ def _torch_op(op_type, inputs, attrs):
         return inputs[0] / inputs[1]
     if op_type == 'Neg':
         return -inputs[0]
+    if op_type in ('Min', 'Max'):
+        # ONNX Min/Max are variadic + broadcasting; exact elementwise reduce.
+        fn = torch.minimum if op_type == 'Min' else torch.maximum
+        acc = inputs[0]
+        for t in inputs[1:]:
+            acc = fn(acc, t)
+        return acc
     if op_type == 'MatMul':
         return inputs[0] @ inputs[1]
     if op_type == 'Gemm':
