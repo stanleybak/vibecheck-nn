@@ -6003,22 +6003,26 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
     nh = gg['n_relu']
     relu_names = gg['relu_names']
 
-    # Output size. The last-fc/conv heuristic is correct only when the net
-    # ENDS in a linear layer. ml4acopf ends in non-linear physics (Concat of
+    # Output size. The last-fc/conv heuristic is correct only when the net ENDS
+    # in a linear layer. ml4acopf ends in non-linear physics (Concat of
     # Mul/Sin/Cos branches), so the last Gemm is an intermediate (= bus count,
-    # e.g. 14/118) — far smaller than the true output (186/1190). When the
-    # final op isn't fc/conv, take the true count from a probe forward
-    # (z_final.center.numel()), which is correct for every graph.
+    # e.g. 14/118) — far smaller than the true output (186/1190). When the final
+    # op isn't fc/conv, propagate to get the true count — but over a DEGENERATE
+    # (point) input box, not the real box. The count (center.numel()) is the same
+    # either way, but a point makes every ReLU stable, so NO error generators are
+    # created: the real box OOMs the dense generator matrix on wide residual nets
+    # (soundnessbench model_residual: 128->12288 Gemm + 15 convs -> ~16 GB) BEFORE
+    # PGD runs, whereas the point probe stays at 0 generators. (The net's inferred
+    # output shape can't be used here: it under-counts ml4acopf's Concat. The
+    # point probe is exact for every graph and far cheaper than the box probe.)
     if gg['ops'][-1]['type'] in ('fc', 'conv'):
         last = gg['ops'][-1]
         n_output = (last['W'].shape[0] if last['type'] == 'fc'
                     else last['n_out'])
     else:
-        _xl_p = torch.tensor(np.asarray(spec.x_lo).flatten(),
-                             dtype=dtype, device=device)
-        _xh_p = torch.tensor(np.asarray(spec.x_hi).flatten(),
-                             dtype=dtype, device=device)
-        _, _zf_p = _forward_zonotope_graph(_xl_p, _xh_p, gg, device, dtype,
+        _xm = torch.tensor(((np.asarray(spec.x_lo) + np.asarray(spec.x_hi))
+                            / 2.0).flatten(), dtype=dtype, device=device)
+        _, _zf_p = _forward_zonotope_graph(_xm, _xm, gg, device, dtype,
                                            settings=settings)
         n_output = int(_zf_p.center.numel())
     assert n_output is not None
