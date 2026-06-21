@@ -1,0 +1,17 @@
+# ml4acopf_2024 (regular track, 69 instances, 600s timeout).
+#
+# AC optimal-power-flow surrogate nets ending in non-linear physics (Concat of
+# Sigmoid / Mul / Sin / Cos power-flow branches), 14/118/300-bus. No config
+# OVERRIDES are needed: the verifier auto-detects the non-linear graph and routes
+# to the forward-LiRPA + α-CROWN + nonlinear-split dual-ascent BaB path
+# (acopf_dual_ascent) at verify time — independent of the profile (confirmed: the
+# graph-aware auto-profile differs from plain defaults only on metadata). This
+# file exists solely so the sweep (which matches benchmarks by config name) picks
+# the benchmark up; verdicts/behavior equal the documented default-settings runs.
+#
+# Status (docs/benchmarks/ml4acopf_2024.md): near-parity with α,β-CROWN on the
+# init-CROWN cases; the dtype-aware band-pad fix closes full-net prop3 to unsat.
+# The hardest 118/300 cases time out for BOTH tools (nested degree-3 power-flow
+# bilinears). Integration: tests/integration/test_ml4acopf_2024.py (4 cases).
+
+raise_on_oom: true     # default, explicit: OOM raises (no slow/misleading CPU fallback)
