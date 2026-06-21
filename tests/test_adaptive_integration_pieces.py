@@ -101,10 +101,22 @@ def test_maybe_nonlinear_augment_hook(tmp_path):
     vmain._maybe_nonlinear_augment(args1)
     assert args1.net == net and not hasattr(args1, 'orig_net_for_cex')
 
-    # no-op on a missing spec file (OSError caught)
+    # a missing spec is skipped HERE (best-effort pre-detection, OSError caught) — the
+    # loudness for a genuinely-missing spec comes from the verification load / surrogate
+    # parse, not this cosmetic pre-step (which must tolerate dummy/monkeypatched paths).
     args2 = types.SimpleNamespace(net=net, spec=str(tmp_path / 'nope.vnnlib'))
     vmain._maybe_nonlinear_augment(args2)
     assert args2.net == net
+
+    # a .gz spec path read as text raises UnicodeDecodeError (a ValueError) in the pre-read;
+    # caught and skipped (the real loader handles .gz). Must not crash the pre-detection.
+    import gzip
+    gzp = str(tmp_path / 'v1.vnnlib.gz')
+    with gzip.open(gzp, 'wt') as f:
+        f.write(open(sp1).read())
+    args3 = types.SimpleNamespace(net=net, spec=gzp)
+    vmain._maybe_nonlinear_augment(args3)
+    assert args3.net == net
 
 
 def test_counterexample_sexpr_orig(tmp_path):

@@ -5176,21 +5176,27 @@ def _sat_disposition(graph, spec, settings, witness, info):
     ok=True) as a CLEAR counterexample ('real') or a within-tolerance near-miss
     ('within_tol').
 
-    Real iff the ORT output violates the spec by MORE than the tolerance
-    (un-banded worst margin <= -sat_tol) — a clear counterexample, commit 'sat'
-    immediately. Otherwise it only violates within tolerance (a near-boundary
-    point the VNNCOMP scorer would accept within atol, but which might be a
-    numerically-marginal *unsafe-looking* point on an actually-unsat instance):
-    persist it to the results file NOW via `settings.result_sink` (so a later
-    timeout can't lose it) and stash it as the run's fallback, but signal the
-    caller to KEEP SEARCHING for a clear counterexample or an unsat proof.
-    `main._emit_result`'s never-downgrade rule keeps this early 'sat' unless a
-    clearer 'sat' or an 'unsat' proof later overrides it.
+    Real iff the ORT output GENUINELY violates the spec (un-banded worst margin
+    `m < 0`) — the float32 ORT margin IS the ground truth (same engine the scorer
+    uses), and a strictly-negative margin is a clear violation that the scorer
+    scores CORRECT (it holds without needing the tolerance), so commit 'sat' and
+    stop. NO extra buffer: we do NOT require `m <= -atol` (that wrongly demoted a
+    genuine CE like `m=-5e-5` to "keep searching", grinding to the timeout).
+
+    Otherwise `0 <= m <= +atol` (all that `_validate_sat_witness` lets through,
+    since it gates on the +/-atol band): a point that does NOT actually violate
+    (m >= 0) but which the VNNCOMP scorer accepts ONLY via the tolerance
+    (CORRECT_UP_TO_TOLERANCE) — a true near-boundary case that might really be
+    unsat. Persist it to the results file NOW via `settings.result_sink` (so a
+    later timeout can't lose the acceptable fallback) but signal the caller to
+    KEEP SEARCHING for a genuine CE (m<0) or an unsat proof. `main._emit_result`'s
+    never-downgrade rule keeps this early 'sat' unless a clearer 'sat' or an
+    'unsat' proof later overrides it. e.g. 14_ieee full prop3 (true margin ~+1e-6,
+    within tol): VC can't prove unsat, so the within-tol sat is the fallback.
 
     Disjunctive-X counterexamples (validated via `check_witness`, no scalar
     margin) are treated as 'real'.
     """
-    tol = float(getattr(settings, 'sat_tol', 1e-4))
     out = info.get('out') if isinstance(info, dict) else None
     m = None
     if (out is not None
@@ -5198,15 +5204,15 @@ def _sat_disposition(graph, spec, settings, witness, info):
                         for c in spec.disjuncts)):
         _, _ci = spec.check(np.asarray(out), np.asarray(out))
         m = _ci.get('worst_margin')
-    if m is None or m <= -tol:
+    if m is None or m < 0.0:
         return 'real'
-    # -tol < m <= +tol (all that `_validate_sat_witness` lets through, since it
-    # gates on the +/-atol band): a WITHIN-TOLERANCE counterexample. VNNCOMP
-    # accepts it (the violation/near-miss is within COUNTEREXAMPLE_ATOL), so it
-    # is an ACCEPTABLE verdict — though PROVING UNSAT is preferable. Persist it
-    # early and keep searching for a clearer CE or an unsat proof (which would
-    # override it). e.g. 14_ieee full prop3 (true margin ~+1e-6, within tol):
-    # VC can't prove unsat, so the within-tol sat is the acceptable fallback.
+    # m >= 0: the witness does NOT actually violate, but it's within +atol of
+    # violating (all `_validate_sat_witness` lets through) — the scorer accepts it
+    # CORRECT_UP_TO_TOLERANCE. By default keep searching for a genuine CE / unsat
+    # and hold this as the fallback; `keep_searching_within_tol=False` commits it
+    # now instead.
+    if not bool(getattr(settings, 'keep_searching_within_tol', True)):
+        return 'real'
     w = np.asarray(witness).flatten()
     sink = getattr(settings, 'result_sink', None)
     if sink is not None:

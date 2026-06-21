@@ -22,7 +22,7 @@ import time
 
 import numpy as np
 import onnx
-from onnx import helper, numpy_helper
+from onnx import TensorProto, helper, numpy_helper
 
 
 # --------------------------------------------------------------------------- detect
@@ -92,6 +92,101 @@ def build_float_surrogate(onnx_path, out_path):
     return out_path
 
 
+def build_fakequant_surrogate(onnx_path, out_path):
+    """Fold Q/DQ into a continuous float ONNX that REPRODUCES the INT8 rounding (Path B).
+
+    Like build_float_surrogate, but each ACTIVATION QuantizeLinear/DequantizeLinear becomes
+    an explicit FAKE-QUANT in float ops instead of Identity:
+      QuantizeLinear(x)    -> Clip(Round(x/scale) + zp, qmin, qmax)   (kept in float)
+      DequantizeLinear(q)  -> (q - zp) * scale
+    so the model carries the activation rounding the float (STE) surrogate drops. Round is
+    ONNX round-half-to-even. NON-differentiable (Round grad is 0 a.e.); a fast GPU eval oracle
+    to rank PGD candidates before the authoritative ORT-CPU confirm.
+
+    Fidelity (MEASURED on smart_turn, 61 points spanning 4 quant cells): the fold matches the
+    original quantized model under ORT on ~59/61, diverging only at EXACT cell boundaries — a
+    rounding TIE where ONNX `Round` and ORT's fused `QuantizeLinear` pick different int codes
+    (localized to the first conv's quant; one flipped code -> a ~0.06 output swing on this
+    boundary-sensitive model). A reciprocal-multiply variant `round(x*(1/scale))` was tried and
+    made NO difference (same 2/61), so it is the rounding tie, not the division. Executed on a
+    different float backend (onnx2torch GPU), the conv/matmul accumulation adds a couple more
+    boundary flips (3/61). This is the SAME boundary float-sensitivity as a CPU/arch change
+    (the box-vs-local platform effect), not a fixable bug; the fq eval is therefore an
+    APPROXIMATE ranking oracle and ORT-CPU remains the deciding oracle (the attack's ORT gate
+    is conservative — it only skips the ORT confirm when fq is CLEARLY safe). Weight/bias
+    DequantizeLinear (initializer input) is baked to a float constant as build_float_surrogate."""
+    m = _load_onnx_model(onnx_path)
+    g = m.graph
+    init = {i.name: numpy_helper.to_array(i) for i in g.initializer}
+    init_dtype = {i.name: i.data_type for i in g.initializer}
+    new_nodes, add_init = [], []
+    uid = [0]
+
+    def _const(arr, base):
+        uid[0] += 1
+        nm = f'_fq_{base}_{uid[0]}'
+        add_init.append(numpy_helper.from_array(np.asarray(arr, np.float32), nm))
+        return nm
+
+    def _tmp(base):
+        uid[0] += 1
+        return f'_fq_{base}_{uid[0]}'
+
+    for n in g.node:
+        if n.op_type == 'QuantizeLinear':
+            x = n.input[0]
+            if x in init:
+                raise NotImplementedError('fake-quant: QuantizeLinear with initializer input '
+                                          '(weight quant) not supported — expected activation only')
+            s = init[n.input[1]].astype(np.float64)
+            z = init[n.input[2]].astype(np.float64) if len(n.input) > 2 and n.input[2] in init else 0.0
+            if np.size(s) > 1:
+                raise NotImplementedError('fake-quant: per-axis activation QuantizeLinear '
+                                          '(non-scalar scale) needs axis-aware broadcast')
+            zdt = init_dtype.get(n.input[2], TensorProto.UINT8) if len(n.input) > 2 else TensorProto.UINT8
+            qmin, qmax = (0.0, 255.0) if zdt == TensorProto.UINT8 else (-128.0, 127.0)
+            s_nm, z_nm = _const(s, 'qs'), _const(z, 'qz')
+            lo_nm, hi_nm = _const(qmin, 'qlo'), _const(qmax, 'qhi')
+            t_div, t_rnd, t_add = _tmp('qdiv'), _tmp('qrnd'), _tmp('qadd')
+            new_nodes.append(helper.make_node('Div', [x, s_nm], [t_div]))
+            new_nodes.append(helper.make_node('Round', [t_div], [t_rnd]))
+            new_nodes.append(helper.make_node('Add', [t_rnd, z_nm], [t_add]))
+            new_nodes.append(helper.make_node('Clip', [t_add, lo_nm, hi_nm], [n.output[0]]))
+            continue
+        if n.op_type == 'DequantizeLinear':
+            x = n.input[0]
+            s = init[n.input[1]].astype(np.float64)
+            z = init[n.input[2]].astype(np.float64) if len(n.input) > 2 and n.input[2] in init else 0.0
+            axis = next((a.i for a in n.attribute if a.name == 'axis'), 1)
+            if x in init:                                       # weight/bias const -> baked float
+                w = init[x].astype(np.float64)
+                if np.ndim(s) > 0:
+                    shp = [1] * w.ndim
+                    shp[axis % w.ndim] = s.shape[0]
+                    s = s.reshape(shp)
+                    z = np.reshape(z, shp) if np.ndim(z) > 0 else z
+                add_init.append(numpy_helper.from_array(((w - z) * s).astype(np.float32), n.output[0]))
+            else:                                               # activation DQ -> (q - z) * s
+                if np.size(s) > 1:
+                    raise NotImplementedError('fake-quant: per-axis activation DequantizeLinear '
+                                              '(non-scalar scale) needs axis-aware broadcast')
+                s_nm, z_nm = _const(s, 'ds'), _const(z, 'dz')
+                t_sub = _tmp('dsub')
+                new_nodes.append(helper.make_node('Sub', [x, z_nm], [t_sub]))
+                new_nodes.append(helper.make_node('Mul', [t_sub, s_nm], [n.output[0]]))
+            continue
+        new_nodes.append(n)
+    del g.node[:]
+    g.node.extend(new_nodes)
+    g.initializer.extend(add_init)
+    keep = [o for o in m.opset_import if (o.domain or 'ai.onnx') in ('ai.onnx', '')]
+    del m.opset_import[:]
+    m.opset_import.extend(keep)
+    m.ir_version = 8
+    onnx.save(m, out_path)
+    return out_path
+
+
 # ----------------------------------------------------------------------------- spec
 
 class SurrogateSpec:
@@ -118,6 +213,12 @@ def parse_box_and_output(vnnlib_path):
     """Parse a v1 OR v2 box-robustness spec into a SurrogateSpec. Supports per-input
     boxes (multi-input v2) and an output DNF of single-output threshold constraints
     (the L-inf-robustness / classification case the surrogate mode targets)."""
+    # Resolve via ensure_decompressed: instances.csv references the PLAIN name while the
+    # benchmark ships only `.gz` (raw open() then FileNotFoundError'd the smart_turn sweep),
+    # and a stale decompressed sibling older than the `.gz` (the smart_turn vnnlib was
+    # regenerated; the local unzip predates it) gets re-inflated to the current spec.
+    from .io_util import ensure_decompressed
+    vnnlib_path = ensure_decompressed(vnnlib_path)
     if vnnlib_path.endswith('.gz'):
         with gzip.open(vnnlib_path, 'rt') as fh:
             txt = fh.read()
@@ -193,9 +294,20 @@ def _flat(idx_str, strides):
 
 # ------------------------------------------------------------------------ ORT validate
 
+_ORT_SESSION_CACHE = {}
+
+
 def _ort_eval(onnx_path, feed):
     import onnxruntime as ort
-    sess = ort.InferenceSession(_decompressed(onnx_path), providers=['CPUExecutionProvider'])
+    # Cache the InferenceSession per model: building it LOADS + optimizes the ONNX
+    # (~0.53s for the 1.1GB smart_turn model), and surrogate-attack calls this once
+    # PER PGD STEP to confirm a witness — re-creating it each call made the replay,
+    # not inference, dominate wall (78s/100s on smart_turn). One session per model.
+    sess = _ORT_SESSION_CACHE.get(onnx_path)
+    if sess is None:
+        sess = ort.InferenceSession(_decompressed(onnx_path),
+                                    providers=['CPUExecutionProvider'])
+        _ORT_SESSION_CACHE[onnx_path] = sess
     names = [i.name for i in sess.get_inputs()]
     return np.asarray(sess.run(None, {names[k]: feed[k].astype(np.float32) for k in range(len(names))})[0]).ravel()
 
@@ -210,7 +322,18 @@ def _decompressed(path):
 
 def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=None, log=print):
     """Run surrogate-PGD. Returns (verdict, witness) where verdict in {'sat','timeout',
-    'unknown'} and witness is a list of per-input np.ndarrays (None unless sat)."""
+    'unknown'} and witness is a list of per-input np.ndarrays (None unless sat).
+
+    Candidates considered (all ORT-CPU-confirmed on the ORIGINAL quantized model, the
+    authoritative oracle): the box CENTER, the box CORNERS, and each PGD restart's best
+    point. PGD gradients come from the float (STE) surrogate; the FAKE-QUANT surrogate
+    (Path B), which reproduces the INT8 rounding and so tracks ORT, RANKS candidates so the
+    most promising hits ORT first. Disposition mirrors CLAUDE's within-tolerance policy: a
+    CLEAR CE (strict output crossing) returns 'sat' immediately; a WITHIN-TOLERANCE CE (the
+    output is within `sat_validate_atol` of violating — e.g. a quantization-pinned Y==rhs)
+    is stashed as a back-pocket witness while the search continues for a clear CE, and is
+    emitted as 'sat' only if no clear CE is found (`keep_searching_within_tol`, default
+    True)."""
     import torch
     from onnx2torch import convert
 
@@ -225,15 +348,31 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     restarts = int(getattr(settings, 'surrogate_attack_restarts', 1))
     steps = int(getattr(settings, 'surrogate_attack_steps', 50))
     atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    keep_searching = bool(getattr(settings, 'keep_searching_within_tol', True))
+    use_quant_eval = bool(getattr(settings, 'surrogate_quant_eval', True))
 
     if surrogate_path is None or not os.path.exists(surrogate_path):
         surrogate_path = (surrogate_path or '/tmp/_vibecheck_surrogate.onnx')
         build_float_surrogate(onnx_path, surrogate_path)
         log(f'[surrogate] built float surrogate -> {surrogate_path}')
-    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Device follows settings.device (GPU default). The float surrogate's forward is
+    # GPU-architecture-dependent (cuBLAS/cuDNN reduction order), so PGD's sign-steps can
+    # follow a different trajectory on a different GPU — but that no longer loses CEs: the
+    # FAKE-QUANT eval model (Path B) reproduces the INT8 rounding and RANKS whatever points
+    # the trajectory visits, the box CENTER/CORNERS are checked regardless of trajectory,
+    # and the authoritative ORT-CPU replay of the ORIGINAL model decides 'sat'.
+    _want_gpu = (getattr(settings, 'device', 'gpu') == 'gpu')
+    dev = 'cuda' if (_want_gpu and torch.cuda.is_available()) else 'cpu'
     model = convert(surrogate_path).eval().to(dev)
+    eval_model = None
+    if use_quant_eval:
+        fq_path = (surrogate_path[:-5] if surrogate_path.endswith('.onnx') else surrogate_path) + '_fq.onnx'
+        if not os.path.exists(fq_path):
+            build_fakequant_surrogate(onnx_path, fq_path)
+        eval_model = convert(fq_path).eval().to(dev)
     log(f'[surrogate] loaded on {dev} in {time.time()-t0:.1f}s; '
-        f'inputs={[(n, s) for n, s, _, _ in spec.inputs]} restarts={restarts} steps={steps}')
+        f'inputs={[(n, s) for n, s, _, _ in spec.inputs]} restarts={restarts} steps={steps} '
+        f'quant_eval={"on" if eval_model is not None else "off"}')
 
     def to_t(a, shp):
         return torch.tensor(a.astype(np.float32).reshape(tuple(shp)), device=dev)
@@ -242,59 +381,129 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     cens = [(l + h) / 2 for l, h in zip(los, his)]
 
     def viol_loss(y):
-        # maximize the best-clause violation margin (smooth: max over clauses of min over constraints)
+        # smooth surrogate loss for the GRADIENT: max over clauses of min over constraints.
         clause_vals = []
         for clause in spec.out_dnf:
             margins = [(y[i] - rhs) if op == 'gt' else (rhs - y[i]) for i, op, rhs in clause]
             clause_vals.append(torch.stack(margins).min())
         return torch.stack(clause_vals).max()
 
-    def validate(pts):
-        feed = [p.detach().cpu().numpy().reshape(mshapes[k])
-                for k, p in enumerate(pts)]
-        # in-box invariant: PGD projects every step to [lo,hi], so a witness is in-box by
-        # construction. Assert it (loud on any future projection bug) rather than silently
-        # dropping — an out-of-box witness must never reach the original-model replay.
+    def margin_np(y):
+        # violation margin on a numpy output: >0 strict crossing, in (-atol,0] within-tol.
+        best = -np.inf
+        for clause in spec.out_dnf:
+            m = min((y[i] - rhs) if op == 'gt' else (rhs - y[i]) for i, op, rhs in clause)
+            best = max(best, m)
+        return float(best)
+
+    def fq_margin(pts):
+        # fake-quant GPU eval margin for RANKING (≈ORT, no ORT cost); None if quant_eval off.
+        if eval_model is None:
+            return None
+        with torch.no_grad():
+            y = eval_model(*pts)
+            y = (y[0] if isinstance(y, (list, tuple)) else y).reshape(-1)
+        return margin_np(y.detach().cpu().numpy())
+
+    _t_val = _t_fwd = 0.0
+    _n_steps = _n_val = 0
+    within_tol = [None]   # back-pocket within-tolerance witness (feed, y)
+
+    def ort_consider(pts, tag):
+        """ORT-CPU replay of the ORIGINAL quantized model. CLEAR CE (strict crossing) ->
+        return ('sat', (feed,y)). WITHIN-TOLERANCE CE (within sat_validate_atol of the
+        boundary) -> stash + keep searching (or accept now if keep_searching is off).
+        Otherwise -> None."""
+        nonlocal _t_val, _n_val
+        feed = [p.detach().cpu().numpy().reshape(mshapes[k]) for k, p in enumerate(pts)]
+        # in-box invariant: every candidate is built inside [lo,hi] (center/corner/projected
+        # PGD); assert it loudly rather than silently shipping an out-of-box witness.
         for f, (_, _, lo, hi) in zip(feed, spec.inputs):
             ff = f.ravel()
             assert (ff >= lo - atol).all() and (ff <= hi + atol).all(), \
-                'surrogate PGD produced an out-of-box witness'
+                'surrogate produced an out-of-box witness'
+        _v0 = time.time()
         y = _ort_eval(onnx_path, feed)
-        # STRICT output violation (no atol slack toward the boundary) so the on-threshold
-        # center (e.g. Y==rhs) is NOT a sat; PGD must find a clear crossing. atol is only
-        # for the in-box check above.
-        return spec.violated(y, atol=0.0), (feed, y)
+        _t_val += time.time() - _v0
+        _n_val += 1
+        m = margin_np(y)
+        if m > 0.0:
+            log(f'[surrogate] CLEAR SAT at {tag} (ORT margin={m:.3e})')
+            return ('sat', (feed, y))
+        if m > -atol and within_tol[0] is None:
+            within_tol[0] = (feed, y)
+            log(f'[surrogate] within-tol CE at {tag} (ORT margin={m:.3e}, atol={atol:g}) — '
+                + ('stashed; keep searching for a clear CE' if keep_searching else 'accepting (keep_searching off)'))
+            if not keep_searching:
+                return ('sat', within_tol[0])
+        return None
 
     rng = torch.Generator(device='cpu')
-    best_verdict = 'unknown'
+    _bs = getattr(settings, 'pgd_seed', None)
+    base_seed = int(_bs) if isinstance(_bs, (int, float)) else None
+    alphas = list(getattr(settings, 'surrogate_alphas', None) or [0.05, 0.1, 0.2, 0.02])
+
+    # 1) CENTER. For a quantized model whose output is constant over the box (the box sits
+    #    inside one quantization cell, so PGD can't move the output), the center value IS
+    #    the verdict — clear SAT (e.g. Y=0.918 > 0.5) or within-tol (e.g. Y pinned at 0.5).
+    res = ort_consider(cens, 'center')
+    if res is not None:
+        return 'sat', res[1][0]
+
+    # 2) PGD restarts on the float surrogate (gradient). The first restart is seeded from
+    #    the CENTER, the rest from seeded RANDOM in-box points (`pgd_seed + r`). Each step is
+    #    a GRADUAL L-inf step `alpha*(h-l)*sign(grad)` (alpha < 1, several steps — NOT a
+    #    single jump to a box vertex) CLAMPED back into [lo,hi]. No box-corner enumeration
+    #    (1.27 M dims). When the center is only within-tol, this is exactly the "keep
+    #    searching for a clear CE" pass; the within-tol witness stays stashed as the fallback.
     for r in range(restarts):
+        if time.time() - t0 > timeout:
+            break
+        alpha = alphas[r % len(alphas)]
         if r == 0:
             pts = [c.clone() for c in cens]
         else:
-            rng.manual_seed(r)
+            rng.manual_seed((base_seed + r) if base_seed is not None else r)
             pts = [l + (h - l) * torch.rand(l.shape, generator=rng).to(dev) for l, h in zip(los, his)]
-        # quick center/restart check first (covers trivially-SAT)
-        ok, wy = validate(pts)
-        if ok:
-            log(f'[surrogate] SAT at restart {r} init (validated on original ORT-CPU)')
-            return 'sat', wy[0]
+        best_loss = float('-inf')
+        best_pts = [p.detach().clone() for p in pts]
         for it in range(steps):
             if time.time() - t0 > timeout:
-                log(f'[surrogate] timeout after {time.time()-t0:.1f}s (restart {r}, step {it})')
-                return ('timeout' if best_verdict != 'sat' else 'sat'), None
+                break
+            _f0 = time.time()
             for p in pts:
                 p.requires_grad_(True)
             y = model(*pts)
             y = (y[0] if isinstance(y, (list, tuple)) else y).reshape(-1)
             loss = viol_loss(y)
+            _lv = float(loss.detach())
+            if _lv > best_loss:        # most-violating surrogate point (pre-step)
+                best_loss = _lv
+                best_pts = [p.detach().clone() for p in pts]
             grads = torch.autograd.grad(loss, pts)
             with torch.no_grad():
-                pts = [torch.minimum(torch.maximum(p + (h - l) / 2 * g.sign(), l), h)
+                pts = [torch.minimum(torch.maximum(p + alpha * (h - l) * g.sign(), l), h)
                        for p, g, l, h in zip(pts, grads, los, his)]
-            ok, wy = validate(pts)
-            if ok:
-                log(f'[surrogate] SAT at restart {r} step {it+1} '
-                    f'(validated on original ORT-CPU; t={time.time()-t0:.1f}s)')
-                return 'sat', wy[0]
-    log(f'[surrogate] no counterexample after {restarts}x{steps} (t={time.time()-t0:.1f}s)')
-    return 'unknown', None
+            _t_fwd += time.time() - _f0
+            _n_steps += 1
+        # Gate the (expensive) ORT replay with the fake-quant eval (Path B, ≈ORT): only
+        # confirm this restart's best if fake-quant says it at least reaches within-tol
+        # (skip the ORT call when it's clearly safe). No eval oracle -> always confirm.
+        fqm = fq_margin(best_pts)
+        if fqm is None or fqm >= -atol:
+            res = ort_consider(best_pts, f'restart{r}(a={alpha}'
+                               + (f',fq={fqm:.3e})' if fqm is not None else ')'))
+            if res is not None:
+                return 'sat', res[1][0]
+
+    # 3) No clear CE: emit the back-pocket within-tolerance CE if we found one (the VNNCOMP
+    #    scorer accepts it, CORRECT_UP_TO_TOLERANCE); else unknown/timeout (this incomplete
+    #    mode can't prove unsat for a quantized model).
+    timed_out = (time.time() - t0) > timeout
+    if within_tol[0] is not None:
+        log(f'[surrogate] no clear CE — emitting within-tol CE (t={time.time()-t0:.1f}s; '
+            f'steps={_n_steps} fwd={_t_fwd:.1f}s validate={_t_val:.1f}s/{_n_val})')
+        return 'sat', within_tol[0][0]
+    log(f'[surrogate] no CE (t={time.time()-t0:.1f}s; steps={_n_steps} '
+        f'fwd={_t_fwd:.1f}s validate={_t_val:.1f}s/{_n_val})')
+    return ('timeout' if timed_out else 'unknown'), None

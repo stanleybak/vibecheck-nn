@@ -1,83 +1,97 @@
 # smart_turn_multimodal_2026
 
 Extended-track, **2.0/ (v2 vnnlib)**. 50 instances, one model. Solved via the
-**surrogate-attack** mode (incomplete / attack-only): vibecheck reports **50/50 sat**.
+**surrogate-attack** mode (incomplete / attack-only): vibecheck reports **50/50 sat**
+(clear or within-tolerance), each in ≤ ~70 s of the 100 s budget. **α,β-CROWN produces no
+result** (can't load the quantized ops), so this is a clean win.
 
 ## The benchmark
 
 - **Model:** `smart-turn-multimodal-cpu.onnx` — a **41.6 M-param, INT8-quantized**
-  multimodal (audio + video) transformer for conversational turn-detection. 692 nodes:
-  22 Conv, 34 MatMul + 5 Gemm, 5 Softmax (attention), 9 Erf (GELU), ~11 LayerNorm
-  (ReduceMean/Sqrt/Pow/Sub), Sigmoid head; **199 DequantizeLinear + 119 QuantizeLinear**.
-  (The `com.microsoft.nchwc` domain is *declared* in opset_import but no node uses it —
-  every node is standard `ai.onnx`; the only non-standard ops are the Q/DQ pair.)
-- **Inputs:** `X1` audio `[1,80,800]` (64 000) + `X2` video `[1,3,32,112,112]` (1 204 224)
-  → **≈ 1.27 M input dims**. **Output:** `Y [1,1]` (post-sigmoid logit).
-- **Spec (all 50):** L∞ robustness — every input dim perturbed by a uniform per-modality
-  radius (**audio ε=0.05, video ε=0.03**), output violation `(> Y[0,0] 0.5)` (the
-  decision flips past 0.5). The vnnlib is ~124 MB (1.27 M box constraints).
+  multimodal (audio + video) transformer (turn-detection). 692 nodes: Conv/MatMul/Gemm,
+  Softmax, Erf (GELU), LayerNorm, Sigmoid head; **199 DequantizeLinear + 119
+  QuantizeLinear** (activations are **uint8**, weights int8, biases int32).
+- **Inputs:** `input_features` audio `[1,80,800]` (64 000) + `pixel_values` video
+  `[1,3,32,112,112]` (1 204 224) → **≈ 1.27 M input dims**. **Output:** `Y [1,1]`
+  (post-sigmoid). The vnnlib is ~124 MB (1.27 M box constraints).
+- **Spec (all 50):** L∞ robustness, output violation `(> Y[0,0] 0.5)`.
+
+**Key structural fact:** the quantized model is **piecewise-constant over each instance's
+L∞ box** (the box sits inside one input quantization cell — center = lo-corner = hi-corner).
+So PGD *inside* the box can't move the output: **the center value is the verdict.** Across
+instances the center is either `Y=0.918` (a CLEAR CE, `> 0.5`) or `Y=0.5` (the quantized
+logit pinned at 0 → within `sat_validate_atol`=1e-4 of violating → a WITHIN-TOLERANCE CE the
+VNNCOMP scorer accepts as CORRECT_UP_TO_TOLERANCE).
 
 ## ABC reference
 
-α,β-CROWN 2025 **cannot load it**: `onnx2pytorch` has no `DequantizeLinear` converter
-(`NotImplementedError`). So ABC scores **`error` on all 50** — purely a loading wall, not
-robustness or difficulty (de-quantizing would verify a *different* model, so the ABC-2025
-baseline keeps `error`). For reference, even if it loaded, complete L∞ verification over
-1.27 M dims through a 41 M-param transformer is intractable for any current tool.
+α,β-CROWN 2025 cannot load it (`onnx2pytorch` has no `DequantizeLinear` converter), so it
+has **no smart_turn results** in our 2026 report — a loading wall, not difficulty. (Complete
+L∞ verification over 1.27 M dims through a 41 M-param transformer is intractable anyway.)
 
 ## vibecheck approach — surrogate-attack mode (`src/vibecheck/surrogate_pgd.py`)
 
-The model can't be soundly bounded (quantized ops), so this is **incomplete / attack-only
-(never returns unsat)**:
+Incomplete / attack-only (never returns unsat). The verdict is decided **only** by replaying
+the witness on the ORIGINAL quantized model via CPU onnxruntime (the scoring engine):
 
-1. **Fold Q/DQ → a continuous float surrogate ONNX** — weight `DequantizeLinear` → baked
-   float constants (incl. per-axis scale); activation `Quantize`/`Dequantize` pairs →
-   `Identity` (drops the rounding ⇒ differentiable). Built in `prepare_instance.sh`
-   (`--build-surrogate`, untimed).
-2. **onnx2torch → torch GPU** (handles Softmax/Erf/LayerNorm that vibecheck's own forward
-   graph does not), used **only for the gradient** (STE: the true gradient is ~0 a.e.
-   because of the `round`).
-3. **PGD for the whole timeout** maximizing the output violation over the L∞ box.
-4. **Every candidate is validated on the ORIGINAL quantized model via CPU onnxruntime**
-   (the VNNCOMP scoring engine), witness in-box + strict `Y > 0.5`. The verdict is decided
-   **only by the original model** — a mismatched surrogate can never yield a false sat.
+1. **Two folded surrogates** (built untimed in `--build-surrogate`): the **float (STE)
+   surrogate** (activation Q/DQ → Identity, differentiable — the gradient oracle) and the
+   **fake-quant surrogate** (activation Q/DQ → `Round`+`Clip`, reproduces the INT8 rounding —
+   a fast GPU eval oracle to rank candidates).
+2. **Search** (`device: gpu`): ORT-confirm the **center**; then PGD restarts seeded from the
+   center then seeded random in-box points, with **gradual clamped L∞ steps**
+   (`surrogate_alphas=[0.05,0.1,0.2,0.02]`, no single jump-to-vertex). The fake-quant eval
+   gates the (slower) ORT confirm. **No box-corner enumeration** (1.27 M dims).
+3. **Within-tolerance disposition** (CLAUDE policy, `keep_searching_within_tol=True`): a
+   CLEAR CE (`Y>0.5`) returns immediately; a within-tol CE (`Y≈0.5`) is stashed while the
+   search keeps looking for a clear one, and emitted only if none is found.
+4. **v2 counterexample format** (`counterexample_format: auto`): per-tensor
+   `NAME float32 [shape]` + C-order values (the VNNLIB 2.0 cex format), matching the input
+   spec's version.
 
 Config: `configs/smart_turn_multimodal_2026.yaml` (`surrogate_attack: true`,
-`surrogate_attack_restarts: 3`, `surrogate_attack_steps: 60`).
+`surrogate_attack_restarts: 4`, `surrogate_attack_steps: 30`, `device: gpu`).
 
-## Results — 50/50 sat
+## Results — 50/50 sat (sweep `smart_turn_sweep2`, A10G, 2026-06-21)
 
-| | count | how |
-|---|---|---|
-| sat at center (trivial) | **20** | nominal already `Y=0.9176 > 0.5` (forward pass) |
-| sat via STE-PGD | **30** | "boundary" nominal `Y=0.5`; one gradient step crosses a quantization cell to `Y>0.5` |
-| robust | 0 | — |
+All 50 `sat`, avg 69.6 s / max 70.5 s (well under the 100 s timeout). Witnesses
+externally re-validated on the **official-env ORT (onnxruntime 1.26.0 / onnx 1.21.0)**:
+every sampled witness scores **CORRECT** (`Y=0.918`) or **CORRECT_UP_TO_TOLERANCE**
+(`Y=0.5`) — zero rejections.
 
-The INT8 output is effectively discrete (`{0.5, 0.6425, 0.7067, 0.9176}`); the 30 boundary
-nominals sit exactly on `Y=0.5` and a single gradient-aligned corner tips them past 0.5
-(random corner-sampling misses this — it needs the surrogate gradient). **Cost:** ~0.5 s/
-PGD-step on the local GPU, SAT typically at step 1 → ~4 s/instance (incl. onnx2torch
-convert); the full 50 in ~2 min on one GPU.
+## Platform-float note (important)
+
+The quantized output is sensitive at the decision boundary: for the same model+input+ORT
+version, a **different CPU gives a different output** (e.g. instance_3 center: AWS A10G host
+→ `0.5`, a different dev CPU → `0.918`) — float non-associativity in the deep conv/matmul,
+amplified by INT8 quantization into a ±1-code flip. The **within-tol center witness is
+accepted on every platform** (Y ≥ 0.5−atol on both), so it's the robust choice, and the
+attack runs the ORT confirm on the same host it will be scored on (self-consistent). The
+fake-quant eval has the same sub-ULP sensitivity (≈3/61 boundary points vs ORT) — it's only
+a *ranking* oracle; ORT-CPU is authoritative, and its gate is conservative (never skips a
+near-boundary candidate), so the imprecision can't cause a missed CE or a false sat. This
+divergence is irreducible: truncating/simplifying the graph to isolate it changes ORT's
+operator fusion and the flip vanishes (the fold math itself matches ORT exactly on clean
+ties: 0/12, and over 12 800 random accumulated points: 0/12 800, bit-identical local & AWS).
 
 ## Reproduce
 
 ```bash
-# one instance (full harness path):
+# prepare (untimed): build both surrogates
+.venv/bin/python -m vibecheck.main --net  .../2.0/onnx/smart-turn-multimodal-cpu.onnx \
+  --spec .../2.0/vnnlib/instance_0.vnnlib --build-surrogate
+# one instance
 .venv/bin/python -m vibecheck.main \
-  --net  .../smart_turn_multimodal_2026/2.0/onnx/smart-turn-multimodal-cpu.onnx \
-  --spec .../2.0/vnnlib/instance_0.vnnlib.gz \
+  --net  .../2.0/onnx/smart-turn-multimodal-cpu.onnx \
+  --spec .../2.0/vnnlib/instance_0.vnnlib \
   --config configs/smart_turn_multimodal_2026.yaml --timeout 100 \
-  --results-file /tmp/out.txt        # -> sat + a ~1.27M-line counterexample (5.6MB gz)
+  --results-file /tmp/out.txt        # -> sat + a v2 counterexample
 ```
 
 ## Key unresolved issues
 
-- **Incomplete:** never returns `unsat`. This benchmark appears to be all-sat (empirically
-  50/50), so that's not a practical limit here, but a genuinely-robust quantized instance
-  would only ever come back `unknown`/`timeout`.
-- **v2 multi-input counterexample format:** vibecheck emits the witness as flat
-  `(X_0 …) … (Y_0 …)` over the concatenated inputs (X1 then X2, original-model order) +
-  the ORT-CPU output. This is internally validated on the original model, but the exact
-  format the official v2 multi-input scorer expects is unconfirmed.
-- **onnx2torch dependency** (added to `pyproject.toml`): needed in the AWS vibecheck venv
-  before this runs there.
+- **Incomplete:** never returns `unsat`. Empirically all-sat here, so not a practical limit,
+  but a genuinely-robust quantized instance would only come back `unknown`/`timeout`.
+- **onnx2torch dependency** (in `pyproject.toml`): required in the AWS venv for the surrogate
+  convert. The box's `onnx` package is 1.20.1 vs the rules' 1.21.0 — immaterial to ORT
+  inference (verified: same result both versions on one host), but worth aligning.

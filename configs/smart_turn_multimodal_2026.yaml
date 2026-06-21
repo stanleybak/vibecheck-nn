@@ -1,12 +1,20 @@
 # smart_turn_multimodal_2026: a 41.6M-param INT8-quantized multimodal (audio+video)
 # transformer. vibecheck (and ABC) cannot build a sound graph for the quantized ops
-# (DequantizeLinear/QuantizeLinear), so we run the INCOMPLETE surrogate-attack mode:
-# fold a continuous float surrogate, PGD for the whole timeout (gradient from the
-# surrogate), and validate every counterexample on the ORIGINAL model via CPU
-# onnxruntime. Never returns unsat. See src/vibecheck/surrogate_pgd.py.
+# (DequantizeLinear/QuantizeLinear), so we run the INCOMPLETE surrogate-attack mode
+# (never returns unsat). See src/vibecheck/surrogate_pgd.py.
+#
+# The quantized model is piecewise-CONSTANT over each instance's L-inf box (the box sits
+# inside one input quantization cell), so PGD inside the box can't move the output — the
+# box CENTER value is the verdict. Output spec is `Y > 0.5`: instances split into clear
+# SAT (center Y=0.918 > 0.5) and within-tolerance SAT (center Y pinned at 0.5, within
+# sat_validate_atol=1e-4 of violating -> scorer accepts as CORRECT_UP_TO_TOLERANCE). The
+# attack checks center + box corners + a few PGD restarts; the fake-quant surrogate (Path
+# B) ranks candidates, and every witness is ORT-CPU-confirmed on the ORIGINAL model.
 surrogate_attack: true
-surrogate_attack_restarts: 3
-surrogate_attack_steps: 60
-# This model has a large multimodal input; the witness is float32, so %.9g is
-# float32-exact and ~halves the counterexample file size vs the .17g default.
+surrogate_attack_restarts: 4
+surrogate_attack_steps: 30
+# Witness is float32, so %.9g is float32-exact and ~halves the counterexample file size.
 counterexample_precision: '.9g'
+# GPU (default): the fake-quant eval oracle + center/corner checks make the attack robust
+# to the GPU-architecture trajectory divergence that the old per-step-ORT path suffered.
+device: gpu

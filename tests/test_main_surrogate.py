@@ -42,6 +42,16 @@ def test_maybe_surrogate_non_quantized(tmp_path):
         _args(config=_cfg(tmp_path), net=q, spec=v), {'emitted': False}) is None
 
 
+def test_maybe_surrogate_missing_spec_raises(tmp_path):
+    # A missing spec file must raise LOUDLY (the surrogate path does not exist to silently
+    # swallow it as timeout/unknown) -> main's crash handler records 'error', exit 2.
+    q = _quant_onnx(str(tmp_path / 'q.onnx'))
+    with pytest.raises(FileNotFoundError):
+        vbmain._maybe_surrogate_attack(
+            _args(config=_cfg(tmp_path), net=q, spec=str(tmp_path / 'nope.vnnlib'), timeout=10),
+            {'emitted': False})
+
+
 def test_surrogate_path_deterministic():
     a = vbmain._surrogate_path('/x/y.onnx')
     assert a == vbmain._surrogate_path('/x/y.onnx')
@@ -57,6 +67,47 @@ def test_emit_surrogate_unknown_and_never_downgrade(tmp_path):
     vbmain._emit_surrogate_result(_args(net='x', results_file=rf), 'timeout', None,
                                   {'emitted': True})
     assert open(rf).read().strip() == 'unknown'
+
+
+def test_resolve_cex_version(tmp_path):
+    assert vbmain._resolve_cex_version('1', 'x') == '1.0'
+    assert vbmain._resolve_cex_version('v2', 'x') == '2.0'
+    v1 = _v1_spec(str(tmp_path / 'v1.vnnlib'))
+    v2 = str(tmp_path / 'v2.vnnlib')
+    open(v2, 'w').write('(vnnlib-version <2.0>)\n(declare-network f '
+                        '(declare-input X real [1,2]) (declare-output Y real [1,1]))\n'
+                        '(assert (> Y[0,0] 0.5))\n')
+    assert vbmain._resolve_cex_version('auto', v1) == '1.0'   # detect v1
+    assert vbmain._resolve_cex_version('auto', v2) == '2.0'   # detect v2
+    # only a .gz on disk, referenced by the plain instances.csv name -> still detected
+    import gzip
+    with gzip.open(v2 + '.gz', 'wt') as f:
+        f.write(open(v2).read())
+    os.remove(v2)
+    assert vbmain._resolve_cex_version('auto', v2) == '2.0'
+
+
+def test_format_cex_v1_v2(tmp_path):
+    import numpy as np
+    q = _quant_onnx(str(tmp_path / 'q.onnx'))                 # input 'X' [1,2], output 'Y' [1,1]
+    x, y = np.array([0.7, 0.3]), np.array([0.6])
+    v1 = vbmain._format_cex('1.0', q, x, y, '.6g')
+    assert v1.startswith('((X_0 ') and '(Y_0 ' in v1
+    v2 = vbmain._format_cex('2.0', q, x, y, '.6g').splitlines()
+    assert v2[0] == 'X float32 [1,2]' and v2[1:3] == ['0.7', '0.3']
+    assert v2[3] == 'Y float32 [1,1]' and v2[4] == '0.6'
+
+
+def test_emit_surrogate_result_v2(tmp_path):
+    import numpy as np
+    q = _quant_onnx(str(tmp_path / 'q.onnx'))
+    rf = str(tmp_path / 'r.txt')
+    wit = [np.array([[0.5, 0.5]], np.float32)]               # in-box witness
+    vbmain._emit_surrogate_result(_args(net=q, results_file=rf, cex_version='2.0'),
+                                  'sat', wit, {'emitted': False}, cex_fmt='.6g')
+    txt = open(rf).read()
+    assert txt.startswith('sat\n')
+    assert 'X float32 [1,2]' in txt and 'Y float32 [1,1]' in txt
 
 
 def test_verify_surrogate_hook_sat(tmp_path):
@@ -77,7 +128,9 @@ def test_build_surrogate_cli(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as e:
         vbmain.main()
     assert e.value.code == 0
-    assert os.path.exists(vbmain._surrogate_path(q))
+    p = vbmain._surrogate_path(q)
+    assert os.path.exists(p)                       # float (STE) surrogate
+    assert os.path.exists(p[:-5] + '_fq.onnx')     # fake-quant eval surrogate (Path B)
 
 
 def test_build_surrogate_cli_nonquant(tmp_path, monkeypatch):

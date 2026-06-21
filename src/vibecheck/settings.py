@@ -143,6 +143,17 @@ def default_settings(**overrides):
         surrogate_attack=False,
         surrogate_attack_restarts=3,
         surrogate_attack_steps=50,
+        # surrogate-attack: build a second, FAKE-QUANT surrogate (activation Q/DQ ->
+        # round+clamp, reproducing the INT8 rounding the float/STE surrogate drops) and
+        # use it as a fast GPU EVAL oracle to rank candidates before the authoritative
+        # ORT-CPU confirm. Validated to track ORT exactly on cell interiors (off only by
+        # one cell at exact rounding-tie boundaries). False -> rank by surrogate loss.
+        surrogate_quant_eval=True,
+        # PGD L-inf step sizes (fractions of the input-box width) cycled across restarts.
+        # All < 1 so each restart takes SEVERAL gradual clamped steps rather than a single
+        # FGSM jump straight to a box vertex; the spread (0.02..0.2) covers fine-to-coarse
+        # trajectories. r-th restart uses surrogate_alphas[r % len].
+        surrogate_alphas=[0.05, 0.1, 0.2, 0.02],
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded
@@ -1295,11 +1306,25 @@ def default_settings(**overrides):
         # `skip_sat_validation=True` opts out (e.g. for ORT-free envs).
         sat_validate_atol=1e-4,
         skip_sat_validation=False,
-        # Per-value precision for the counterexample s-expression written to the
-        # results file (used by BOTH the graph and surrogate-attack emit paths).
-        # '.17g' round-trips float64 losslessly, so the scorer replays the exact
-        # witness vibecheck found (maximizes strict-CORRECT vs within-tolerance).
+        # On a WITHIN-TOLERANCE counterexample (the witness does NOT actually
+        # violate — un-banded ORT margin >= 0 — but is within `sat_validate_atol`
+        # of violating, so the scorer accepts it as CORRECT_UP_TO_TOLERANCE):
+        # when True (default), persist it as the fallback 'sat' but KEEP SEARCHING
+        # for a genuine CE (margin < 0) or an unsat proof — the within-tol sat is
+        # only the back-pocket result a later clear sat / unsat can override. When
+        # False, commit the within-tol sat immediately and stop. (A GENUINE
+        # violation, margin < 0, always commits 'sat' immediately regardless.)
+        keep_searching_within_tol=True,
+        # Per-value precision for the counterexample written to the results file
+        # (used by BOTH the graph and surrogate-attack emit paths). '.17g'
+        # round-trips float64 losslessly, so the scorer replays the exact witness
+        # vibecheck found (maximizes strict-CORRECT vs within-tolerance).
         counterexample_precision='.17g',
+        # Counterexample on-disk FORMAT, matching the VNNCOMP rules per spec version:
+        #   '1' / '1.0' -> flat s-expression `((X_0 v)... (Y_0 v)...)`
+        #   '2' / '2.0' -> per-tensor `NAME float32 [shape]\n<C-order values>` blocks
+        #   'auto' (default) -> match the INPUT vnnlib's version (v2 spec -> v2 cex).
+        counterexample_format='auto',
         # When a PGD/MILP stage proposes a SAT witness that fails the
         # validation above (spurious / near-boundary), DON'T abort to
         # 'unknown' — fall through to the next, often stronger, attack or

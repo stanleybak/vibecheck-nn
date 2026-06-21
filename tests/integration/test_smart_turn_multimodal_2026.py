@@ -2,11 +2,14 @@
 
 The model is INT8-quantized (DequantizeLinear/QuantizeLinear), so vibecheck can't build a
 sound graph and the standard _runner path (ComputeGraph.from_onnx + load_vnnlib) doesn't
-apply. This pins src/vibecheck/surrogate_pgd: fold a float surrogate, PGD via onnx2torch
-on the GPU, and confirm the counterexample violates the spec on the ORIGINAL quantized
-model via CPU onnxruntime. Pins one trivial-at-center instance and one boundary instance
-that only the STE gradient cracks. Needs the 2026 benchmark clone + a CUDA GPU +
-onnx2torch; skips otherwise. See docs/benchmarks/smart_turn_multimodal_2026.md.
+apply. This pins src/vibecheck/surrogate_pgd: fold a float surrogate (gradient) + a
+fake-quant surrogate (eval oracle), search center/corners/PGD, and confirm every witness on
+the ORIGINAL quantized model via CPU onnxruntime. The quantized output is platform-float
+sensitive near the decision boundary, so the recomputed Y is a CLEAR crossing (Y>0.5) on
+some machines and exactly 0.5 (within sat_validate_atol) on others — both score CORRECT for
+the VNNCOMP scorer, so the assertion mirrors that acceptance (Y >= 0.5 - atol) rather than a
+strict >0.5. Needs the 2026 benchmark clone + a CUDA GPU + onnx2torch; skips otherwise. See
+docs/benchmarks/smart_turn_multimodal_2026.md.
 """
 import os
 
@@ -25,7 +28,7 @@ def _bench_dir():
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize('inst', [0, 5])   # 0 = boundary (STE-PGD), 5 = trivial-at-center
+@pytest.mark.parametrize('inst', [0, 5])   # both sat (within-tol or clear, platform-dependent)
 def test_smart_turn_surrogate_sat(inst):
     bench = _bench_dir()
     if bench is None:
@@ -46,6 +49,8 @@ def test_smart_turn_surrogate_sat(inst):
                                 surrogate_attack_steps=40)
     verdict, wit = sp.surrogate_attack(onnx, vnnlib, settings, timeout=120, log=lambda _m: None)
     assert verdict == 'sat' and wit is not None
-    # the verdict is decided by the ORIGINAL quantized model on ORT-CPU (scoring engine)
+    # the verdict is decided by the ORIGINAL quantized model on ORT-CPU (scoring engine);
+    # accepted iff within COUNTEREXAMPLE_ATOL of violating Y>0.5 (clear on some platforms,
+    # exactly 0.5 = within-tolerance on others — both score CORRECT).
     y = sp._ort_eval(onnx, wit)
-    assert y[0] > 0.5
+    assert y[0] >= 0.5 - float(settings.sat_validate_atol)

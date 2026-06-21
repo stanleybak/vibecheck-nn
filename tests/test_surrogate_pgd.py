@@ -16,10 +16,16 @@ from vibecheck import surrogate_pgd as sp
 
 # ----------------------------------------------------------------- synthetic models
 
-def _quant_onnx(path, w=(3, 4), per_axis=False):
-    """X[1,2] --Q/DQ--> @ DQ(int8 W[2,1]) + b --Sigmoid--> Y[1,1]."""
+def _quant_onnx(path, w=(3, 4), per_axis=False, act_uint8=False):
+    """X[1,2] --Q/DQ--> @ DQ(int8 W[2,1]) + b --Sigmoid--> Y[1,1].
+
+    w=(0,0) gives a constant model (Y==sigmoid(0)==0.5 for all X). act_uint8 quantizes the
+    activation as uint8 (zp 128, qmin/qmax 0/255) instead of int8 (zp 0, -128/127)."""
     W = np.array([[w[0]], [w[1]]], dtype=np.int8)
-    xscale = np.array(0.02, np.float32); xzp = np.array(0, np.int8)
+    if act_uint8:
+        xscale = np.array(0.02, np.float32); xzp = np.array(128, np.uint8)
+    else:
+        xscale = np.array(0.02, np.float32); xzp = np.array(0, np.int8)
     if per_axis:
         wscale = np.array([0.1], np.float32); wzp = np.array([0], np.int8)
         dq_w = helper.make_node('DequantizeLinear', ['W', 'wscale', 'wzp'], ['Wf'], axis=1)
@@ -142,6 +148,48 @@ def test_parse_gz_spec(tmp_path):
     assert sp.parse_box_and_output(gz).out_dnf == [[(0, 'gt', 0.5)]]
 
 
+def test_parse_gz_readonly_dir(tmp_path):
+    # When only the .gz exists in a NON-writable dir, ensure_decompressed can't materialize
+    # a sibling and returns the .gz path -> parse_box_and_output reads it in-memory (gzip).
+    import stat
+    d = tmp_path / 'ro'
+    d.mkdir()
+    plain = _v1_spec(str(d / 'v1.vnnlib'))
+    gz = str(d / 'v1.vnnlib.gz')
+    with gzip.open(gz, 'wt') as f:
+        f.write(open(plain).read())
+    os.remove(plain)                                   # only the .gz remains
+    os.chmod(d, stat.S_IRUSR | stat.S_IXUSR)           # read-only dir
+    try:
+        assert sp.parse_box_and_output(gz).out_dnf == [[(0, 'gt', 0.5)]]
+    finally:
+        os.chmod(d, stat.S_IRWXU)                       # restore for tmp cleanup
+
+
+def test_surrogate_attack_midstep_timeout(tmp_path, monkeypatch):
+    # Timeout that elapses AFTER the per-restart check passes but DURING the step loop ->
+    # the per-step break fires. Deterministic via a counted fake clock: the surrogate_attack
+    # calls time.time() as t0, the load-log, the center validate (x2), the restart check,
+    # then the step check (6th call) — trip on that 6th call.
+    q = _quant_onnx(str(tmp_path / 'q.onnx'))
+    v = _v1_spec(str(tmp_path / 'v.vnnlib'), thr=0.99)            # no CE -> reaches the steps
+    spath = str(tmp_path / 's.onnx')
+    sp.build_float_surrogate(q, spath)                            # build untimed
+
+    class _Clk:
+        def __init__(self):
+            self.n = -1
+
+        def __call__(self):
+            self.n += 1
+            return 0.0 if self.n < 5 else 100.0                  # 6th call (n==5) trips
+
+    monkeypatch.setattr(sp.time, 'time', _Clk())
+    verdict, _ = sp.surrogate_attack(q, v, _S(), timeout=1.0,
+                                     surrogate_path=spath, log=lambda _m: None)
+    assert verdict == 'timeout'
+
+
 def test_parse_unsupported_raises(tmp_path):
     open(tmp_path / 'bad1.vnnlib', 'w').write('(declare-const X_0 Real)\n')   # no output
     with pytest.raises(NotImplementedError):
@@ -171,6 +219,7 @@ class _S:
     surrogate_attack_restarts = 2
     surrogate_attack_steps = 25
     sat_validate_atol = 1e-4
+    device = 'cpu'   # unit tests stay on CPU (deterministic, no GPU contention)
 
 
 def test_surrogate_attack_sat(tmp_path):
@@ -240,3 +289,122 @@ def test_surrogate_attack_builds_surrogate_if_missing(tmp_path):
     assert not os.path.exists(spath)
     sp.surrogate_attack(q, v, _S(), timeout=30, surrogate_path=spath, log=lambda _m: None)
     assert os.path.exists(spath)
+
+
+# --------------------------------------------------- fake-quant eval oracle (Path B)
+
+@pytest.mark.parametrize('per_axis', [False, True])
+def test_build_fakequant_matches_original(tmp_path, per_axis):
+    """The fake-quant surrogate reproduces the ORIGINAL quantized output EXACTLY (it IS the
+    INT8 rounding), unlike the float/STE surrogate which drops it."""
+    import onnxruntime as ort
+    q = _quant_onnx(str(tmp_path / 'q.onnx'), per_axis=per_axis)
+    fq = sp.build_fakequant_surrogate(q, str(tmp_path / 'fq.onnx'))
+    m = onnx.load(fq)
+    assert not any(n.op_type in ('DequantizeLinear', 'QuantizeLinear') for n in m.graph.node)
+    types = {n.op_type for n in m.graph.node}
+    assert {'Round', 'Clip', 'Sub', 'Mul'} <= types          # activation fake-quant emitted
+    assert all((o.domain or 'ai.onnx') in ('ai.onnx', '') for o in m.opset_import)
+    qs = ort.InferenceSession(q, providers=['CPUExecutionProvider'])
+    fs = ort.InferenceSession(fq, providers=['CPUExecutionProvider'])
+    for x in ([[0.7, 0.3]], [[0.1, 0.9]], [[0.5, 0.5]]):
+        xa = np.array(x, np.float32)
+        assert abs(qs.run(None, {'X': xa})[0].ravel()[0]
+                   - fs.run(None, {'X': xa})[0].ravel()[0]) < 1e-5
+
+
+def test_build_fakequant_uint8_activation(tmp_path):
+    import onnxruntime as ort
+    q = _quant_onnx(str(tmp_path / 'qu.onnx'), act_uint8=True)
+    fq = sp.build_fakequant_surrogate(q, str(tmp_path / 'fqu.onnx'))
+    qs = ort.InferenceSession(q, providers=['CPUExecutionProvider'])
+    fs = ort.InferenceSession(fq, providers=['CPUExecutionProvider'])
+    for x in ([[0.7, 0.3]], [[0.2, 0.8]]):
+        xa = np.array(x, np.float32)
+        assert abs(qs.run(None, {'X': xa})[0].ravel()[0]
+                   - fs.run(None, {'X': xa})[0].ravel()[0]) < 1e-5
+
+
+def _save_graph(path, nodes, inits, in_shape=(1, 2), out_shape=(1, 2)):
+    g = helper.make_graph(nodes, 'g',
+                          [helper.make_tensor_value_info('X', TensorProto.FLOAT, list(in_shape))],
+                          [helper.make_tensor_value_info('Y', TensorProto.FLOAT, list(out_shape))], inits)
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 13)]); m.ir_version = 8
+    onnx.save(m, path)
+    return path
+
+
+def test_build_fakequant_raises_quant_init_input(tmp_path):
+    # QuantizeLinear on an initializer (weight quant) is unsupported by the fake-quant fold.
+    p = _save_graph(str(tmp_path / 'qi.onnx'), [
+        helper.make_node('QuantizeLinear', ['C', 'sc', 'zp'], ['cq']),
+        helper.make_node('DequantizeLinear', ['cq', 'sc', 'zp'], ['cf']),
+        helper.make_node('Add', ['X', 'cf'], ['Y']),
+    ], [numpy_helper.from_array(np.array([[0.5, 0.5]], np.float32), 'C'),
+        numpy_helper.from_array(np.array(0.02, np.float32), 'sc'),
+        numpy_helper.from_array(np.array(0, np.int8), 'zp')])
+    with pytest.raises(NotImplementedError):
+        sp.build_fakequant_surrogate(p, str(tmp_path / 'o.onnx'))
+
+
+def test_build_fakequant_raises_per_axis_activation_q(tmp_path):
+    # per-axis (non-scalar scale) activation QuantizeLinear needs axis-aware broadcast.
+    p = _save_graph(str(tmp_path / 'paq.onnx'), [
+        helper.make_node('QuantizeLinear', ['X', 'svec', 'zvec'], ['q'], axis=1),
+        helper.make_node('DequantizeLinear', ['q', 'svec', 'zvec'], ['Y'], axis=1),
+    ], [numpy_helper.from_array(np.array([0.02, 0.03], np.float32), 'svec'),
+        numpy_helper.from_array(np.array([0, 0], np.int8), 'zvec')])
+    with pytest.raises(NotImplementedError):
+        sp.build_fakequant_surrogate(p, str(tmp_path / 'o.onnx'))
+
+
+def test_build_fakequant_raises_per_axis_activation_dq(tmp_path):
+    # scalar activation Q (builds), then per-axis activation DQ (non-scalar scale) -> raise.
+    p = _save_graph(str(tmp_path / 'padq.onnx'), [
+        helper.make_node('QuantizeLinear', ['X', 'sc', 'zp'], ['q']),
+        helper.make_node('DequantizeLinear', ['q', 'svec', 'zvec'], ['Y'], axis=1),
+    ], [numpy_helper.from_array(np.array(0.02, np.float32), 'sc'),
+        numpy_helper.from_array(np.array(0, np.int8), 'zp'),
+        numpy_helper.from_array(np.array([0.02, 0.03], np.float32), 'svec'),
+        numpy_helper.from_array(np.array([0, 0], np.int8), 'zvec')])
+    with pytest.raises(NotImplementedError):
+        sp.build_fakequant_surrogate(p, str(tmp_path / 'o.onnx'))
+
+
+# ------------------------------------------------- within-tolerance SAT disposition
+
+def test_surrogate_attack_within_tol_emit(tmp_path):
+    # Constant model: Y==0.5 for all X; spec `Y > 0.5` is never strictly crossed, but the
+    # center is within sat_validate_atol of violating -> within-tolerance SAT, emitted after
+    # the search finds no clear CE (keep_searching_within_tol default True).
+    q = _quant_onnx(str(tmp_path / 'q0.onnx'), w=(0, 0))
+    v = _v1_spec(str(tmp_path / 'v.vnnlib'), thr=0.5)
+    verdict, wit = sp.surrogate_attack(q, v, _S(), timeout=30,
+                                       surrogate_path=str(tmp_path / 's.onnx'), log=lambda _m: None)
+    assert verdict == 'sat' and wit is not None
+    y = sp._ort_eval(q, wit)
+    assert abs(y[0] - 0.5) <= 1e-4 and not (y[0] > 0.5)      # within-tol, not a strict crossing
+
+
+def test_surrogate_attack_within_tol_immediate(tmp_path):
+    # keep_searching_within_tol=False -> accept the within-tol CE at the center immediately.
+    class _Simm(_S):
+        keep_searching_within_tol = False
+    q = _quant_onnx(str(tmp_path / 'q0.onnx'), w=(0, 0))
+    v = _v1_spec(str(tmp_path / 'v.vnnlib'), thr=0.5)
+    verdict, wit = sp.surrogate_attack(q, v, _Simm(), timeout=30,
+                                       surrogate_path=str(tmp_path / 's.onnx'), log=lambda _m: None)
+    assert verdict == 'sat' and wit is not None
+
+
+def test_surrogate_attack_quant_eval_off(tmp_path):
+    # surrogate_quant_eval=False -> no fake-quant eval oracle (eval_model None, fq_margin
+    # returns None); candidates fall through to the ORT-confirm loop ranked by surrogate
+    # loss. thr=0.6: center<0.6 so it reaches that loop, corner clears.
+    class _Soff(_S):
+        surrogate_quant_eval = False
+    q = _quant_onnx(str(tmp_path / 'q.onnx'))
+    v = _v1_spec(str(tmp_path / 'v.vnnlib'), thr=0.6)
+    verdict, wit = sp.surrogate_attack(q, v, _Soff(), timeout=30,
+                                       surrogate_path=str(tmp_path / 's.onnx'), log=lambda _m: None)
+    assert verdict == 'sat' and sp._ort_eval(q, wit)[0] > 0.6

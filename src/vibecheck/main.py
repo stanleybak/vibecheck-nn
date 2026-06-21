@@ -115,16 +115,36 @@ def main():
         sys.exit(0)
 
     if args.build_surrogate:
-        # Prepare step for quantized models: fold the float surrogate (untimed) so the
-        # timed surrogate-attack run only pays the cheap onnx2torch convert.
+        # Prepare step for quantized models: fold BOTH surrogates (untimed) so the timed
+        # surrogate-attack run only pays the cheap onnx2torch convert — the float (STE)
+        # surrogate for gradients and the fake-quant surrogate for the GPU eval oracle.
         from . import surrogate_pgd as sp
         if sp.has_quantized_ops(args.net):
             p = _surrogate_path(args.net)
             sp.build_float_surrogate(args.net, p)
-            print(f'Built float surrogate: {p}')
+            fq = (p[:-5] if p.endswith('.onnx') else p) + '_fq.onnx'
+            sp.build_fakequant_surrogate(args.net, fq)
+            print(f'Built float surrogate: {p}\nBuilt fake-quant surrogate: {fq}')
         else:
             print('No quantized ops detected; surrogate not needed.')
         sys.exit(0)
+
+    # Resolve the counterexample on-disk FORMAT version once, from the original spec
+    # (BEFORE _verify rewrites args.spec for pair/augment) + the config's
+    # `counterexample_format` ('auto' -> match the input vnnlib version). Both the graph
+    # and surrogate emit paths read args.cex_version.
+    _cf = 'auto'
+    if args.config:
+        from .config_loader import load_config
+        _cf = load_config(args.config).get('counterexample_format', 'auto')
+    try:
+        args.cex_version = _resolve_cex_version(_cf, args.spec)
+    except OSError:
+        # 'auto' reads the spec head to detect its version; if it isn't readable yet (a dummy
+        # path with a monkeypatched loader, or a not-yet-materialized file), fall back to v1
+        # FORMAT. This is cosmetic only — a genuinely-missing spec still fails LOUDLY at the
+        # verification load (graph/spec loaders), which the crash handler records as 'error'.
+        args.cex_version = '1.0'
 
     # Shared across _verify and this crash handler: tracks whether a 'sat'
     # (+counterexample) was already written to the results file, so a later
@@ -290,9 +310,9 @@ def _verify(args, sat_state=None):
         # continues for a clear CE or an unsat proof. `_emit_result`'s
         # never-downgrade rule keeps that early 'sat' unless a later 'sat'
         # (clearer CE) or 'unsat' (proof — the near-miss was spurious) overrides.
-        settings.sat_tol = float(
-            settings.sat_validate_atol
-            if 'sat_validate_atol' in settings else 1e-4)
+        # (_sat_disposition decides real-vs-within-tol from the un-banded ORT margin
+        # `m<0` + the sat_validate_atol band in _validate_sat_witness; no separate
+        # sat_tol buffer — a strictly-negative margin is a genuine CE.)
         settings.result_sink = (lambda w: _emit_result(
             args, spec, 'sat', w, sat_state,
             settings.counterexample_precision)) if args.results_file else None
@@ -424,6 +444,12 @@ def _maybe_nonlinear_augment(args):
     polynomials, a different dimension; the VNNCOMP scorer ignores the solver's Y
     but the cex must still have the original output shape)."""
     from . import nonlinear_augment as nla
+    # This is a best-effort PRE-DETECTION of a nonlinear spec. Catch OSError (missing /
+    # monkeypatched-dummy path) AND ValueError (e.g. `_read_vnnlib_text` opening a `.gz`
+    # spec as text -> UnicodeDecodeError, a ValueError subclass) and SKIP: a genuinely-bad
+    # spec is NOT swallowed — it still raises LOUDLY at the verification load (graph/spec
+    # loaders, which DO handle .gz, or the surrogate `parse_box_and_output`), recorded as
+    # 'error'. This only avoids a noisy pre-read; it never hides a verification error.
     try:
         text = nla._read_vnnlib_text(args.spec)
     except (OSError, ValueError):
@@ -480,27 +506,97 @@ def _surrogate_path(onnx_path):
 
 
 def _cex_sexpr(x_flat, y_flat, fmt='.17g'):
-    """Build the VNNCOMP counterexample s-expression `((X_0 v) ... (Y_0 v) ...)`
-    from flattened input/output arrays — the single place the on-disk cex format
-    lives. `fmt` is the per-value precision, supplied by both emit paths from the
-    `counterexample_precision` setting (default '.17g', which round-trips float64
-    losslessly)."""
+    """Build the VNNLIB 1.0 counterexample s-expression `((X_0 v) ... (Y_0 v) ...)`
+    from flattened input/output arrays. `fmt` is the per-value precision from the
+    `counterexample_precision` setting (default '.17g', round-trips float64 losslessly)."""
     atoms = [f'(X_{i} {v:{fmt}})' for i, v in enumerate(x_flat)]
     atoms += [f'(Y_{j} {v:{fmt}})' for j, v in enumerate(y_flat)]
     return '(' + '\n'.join(atoms) + ')'
 
 
+# TensorProto elem_type -> the dtype string a v2 counterexample writes (FLOAT/DOUBLE/FLOAT16).
+_ONNX_DT = {1: 'float32', 11: 'float64', 10: 'float16'}
+
+
+def _onnx_io_meta(onnx_path):
+    """(inputs, outputs) — each a list of (name, dtype_str, shape, size) for the ONNX's free
+    inputs and outputs in graph order: the per-tensor structure a v2 counterexample needs."""
+    import numpy as np
+    from . import surrogate_pgd as sp
+    m = sp._load_onnx_model(onnx_path)
+    init = {i.name for i in m.graph.initializer}
+
+    def meta(vi):
+        shape = [d.dim_value if d.dim_value > 0 else 1 for d in vi.type.tensor_type.shape.dim]
+        return (vi.name, _ONNX_DT.get(vi.type.tensor_type.elem_type, 'float32'),
+                shape, int(np.prod(shape)) if shape else 1)
+
+    init_names = init
+    ins = [meta(i) for i in m.graph.input if i.name not in init_names]
+    outs = [meta(o) for o in m.graph.output]
+    return ins, outs
+
+
+def _cex_v2(ins_meta, outs_meta, x_flat, y_flat, fmt):
+    """Build the VNNLIB 2.0 counterexample: per-tensor `NAME dtype [d0,d1,...]` header then
+    the tensor's C-order values (one per line) — every input (the flat X split by input size)
+    then every output (the flat Y split by output size). Mirrors the VNN-COMP 2026 v2 format."""
+    lines = []
+    for meta, flat in ((ins_meta, x_flat), (outs_meta, y_flat)):
+        off = 0
+        for name, dt, shape, size in meta:
+            lines.append(f"{name} {dt} [{','.join(str(d) for d in shape)}]")
+            lines.extend(f'{v:{fmt}}' for v in flat[off:off + size])
+            off += size
+    return '\n'.join(lines)
+
+
+def _format_cex(version, onnx_path, x_flat, y_flat, fmt):
+    """Dispatch the counterexample to the v1 (flat X_i/Y_i s-expr) or v2 (per-tensor) format
+    per the resolved spec version."""
+    if version == '2.0':
+        ins, outs = _onnx_io_meta(onnx_path)
+        return _cex_v2(ins, outs, x_flat, y_flat, fmt)
+    return _cex_sexpr(x_flat, y_flat, fmt)
+
+
+def _vnnlib_version(spec_path):
+    """Detect a VNNLIB spec's version ('2.0' vs '1.0') from its head (handles .gz, and the
+    instances.csv-style plain name when only the .gz is on disk)."""
+    import gzip
+    if not os.path.exists(spec_path) and os.path.exists(spec_path + '.gz'):
+        spec_path = spec_path + '.gz'
+    opener = gzip.open if spec_path.endswith('.gz') else open
+    with opener(spec_path, 'rt') as fh:
+        txt = fh.read(4096)
+    return '2.0' if ('vnnlib-version' in txt or 'declare-network' in txt
+                     or 'declare-input' in txt) else '1.0'
+
+
+def _resolve_cex_version(cf, spec_path):
+    """Resolve the on-disk counterexample format version from the `counterexample_format`
+    setting value: explicit '1'/'2', else 'auto' -> match the input spec's vnnlib version."""
+    cf = str(cf).lower()
+    if cf in ('1', '1.0', 'v1'):
+        return '1.0'
+    if cf in ('2', '2.0', 'v2'):
+        return '2.0'
+    return _vnnlib_version(spec_path)
+
+
 def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
-    """Write the surrogate verdict; for sat, a multi-input counterexample
-    `((X_0 v)... (Y_0 v)...)` over the concatenated inputs (ORIGINAL-model order) + the
-    ORT-CPU output. Honors the never-downgrade rule."""
+    """Write the surrogate verdict; for sat, a counterexample over the multi-input witness
+    (ORIGINAL-model order) + the ORT-CPU output, in the format matching the input spec's
+    vnnlib version (`args.cex_version`; smart_turn is v2 -> per-tensor blocks). Honors the
+    never-downgrade rule."""
     import numpy as np
     from . import surrogate_pgd as sp
     if verdict == 'sat' and witness is not None:
         x = np.concatenate([np.asarray(w).ravel() for w in witness]).astype(np.float64)
         y = np.asarray(sp._ort_eval(args.net, witness)).ravel().astype(np.float64)
+        ce = _format_cex(getattr(args, 'cex_version', '1.0'), args.net, x, y, cex_fmt)
         with open(args.results_file, 'w') as f:
-            f.write('sat\n' + _cex_sexpr(x, y, cex_fmt) + '\n')
+            f.write('sat\n' + ce + '\n')
         sat_state['emitted'] = True
     elif not sat_state.get('emitted'):
         with open(args.results_file, 'w') as f:
@@ -528,14 +624,15 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
         # s-expression `((X_0 <v>) ... (Y_0 <v>) ...)` over every input then
         # output dim. The harness re-runs the ONNX on the X's to confirm. We
         # reuse the same ORT forward the soundness validator uses so Y matches.
+        _ver = getattr(args, 'cex_version', '1.0')
         _orig = getattr(args, 'orig_net_for_cex', None)
         if _orig is not None:
             # Nonlinear-augmented instance: the loaded net's outputs are the
             # constraint polynomials, not the original net's output. Emit Y from
             # the ORIGINAL net so the cex has the benchmark's true output shape.
-            ce = _counterexample_sexpr_orig(_orig, witness, cex_fmt)
+            ce = _counterexample_sexpr_orig(_orig, witness, cex_fmt, _ver)
         else:
-            ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt)
+            ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt, _ver)
         if ce is None:
             print('  [warn] sat verdict but could not build a counterexample '
                   '(no ORT output); results file has the verdict only.')
@@ -547,13 +644,11 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
         sat_state['emitted'] = True
 
 
-def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g'):
-    """Build the VNNCOMP counterexample s-expression for a SAT witness.
-
-    Returns `((X_0 <v>) ... (Y_0 <v>) ...)` (one atom per line) or None if the
-    ONNX output can't be computed (e.g. onnxruntime missing). Y is obtained from
-    the same ORT forward the soundness validator runs, so it matches the
-    scoring harness's recomputed output within tolerance.
+def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0'):
+    """Build the counterexample for a SAT witness in the v1 (flat) or v2 (per-tensor)
+    format. Returns the cex string or None if the ONNX output can't be computed (e.g.
+    onnxruntime missing). Y is obtained from the same ORT forward the soundness validator
+    runs, so it matches the scoring harness's recomputed output within tolerance.
     """
     import numpy as np
     from .verify_graph import _validate_sat_witness
@@ -564,13 +659,13 @@ def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g'):
     if y is None:
         return None
     y = np.asarray(y).flatten().astype(np.float64)
-    return _cex_sexpr(x, y, cex_fmt)
+    return _format_cex(version, onnx_path, x, y, cex_fmt)
 
 
-def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g'):
-    """Counterexample s-expression for a nonlinear-AUGMENTED instance: X is the
-    witness, Y is the ORIGINAL net's output recomputed in float32 CPU ORT (the
-    same arithmetic the VNNCOMP scorer uses). Returns None if ORT can't run."""
+def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0'):
+    """Counterexample for a nonlinear-AUGMENTED instance: X is the witness, Y is the
+    ORIGINAL net's output recomputed in float32 CPU ORT (the same arithmetic the VNNCOMP
+    scorer uses), formatted per the spec version. Returns None if ORT can't run."""
     import numpy as np
     try:
         import onnxruntime as ort
@@ -592,7 +687,8 @@ def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g'):
         y = sess.run(None, {in_meta.name: x.reshape(in_shape).astype(np.float32)})[0]
     except (RuntimeError, OSError, ValueError):
         return None
-    return _cex_sexpr(x, np.asarray(y).flatten().astype(np.float64), cex_fmt)
+    return _format_cex(version, orig_onnx, x,
+                       np.asarray(y).flatten().astype(np.float64), cex_fmt)
 
 
 if __name__ == '__main__':
