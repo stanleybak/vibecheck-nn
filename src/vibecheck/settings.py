@@ -176,6 +176,17 @@ def default_settings(**overrides):
         # pendulum ~0.005). Equivalent compute, much broader coverage.
         pgd_alpha_multi=False,
         pgd_alpha_multi_fractions=(0.25, 0.05, 0.01, 0.002),
+        # Budget-filling SAT attack (acopf/trig path only): `pgd_attack_general`
+        # runs ONE restart batch and returns; on a tiny net that takes ~1s and
+        # leaves most of the sat-budget unused. When >0, the trig SAT phase
+        # re-runs fresh-random batches until at least this many seconds elapse
+        # (capped by the sat-budget) or a CE is found — needle CEs at a curved
+        # nonlinear-input-constraint boundary (adaptive_cruise) need many more
+        # restarts than one batch. 0 = current behavior (single batch).
+        # The acopf/trig SAT loop seeds each batch `pgd_seed + loop_index` (see
+        # `pgd_seed` above) so more iterations explore NEW randomness yet stay
+        # reproducible for seed-0..9 tuning.
+        pgd_sat_min_time=0.0,
         # Per-leaf PGD inside input_split BaB: when an `unknown` leaf is
         # encountered, run a short PGD attack on that localized sub-box
         # before splitting. Helps when root-PGD missed a narrow SAT

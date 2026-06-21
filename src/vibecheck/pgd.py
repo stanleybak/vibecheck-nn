@@ -208,7 +208,7 @@ def _gpu_witness_candidates(margins_per_disj):
 
 def pgd_attack_general(xl, xh, spec, gg, settings,
                         restrict_disj=None, time_budget=None,
-                        per_restart_disj=None):
+                        per_restart_disj=None, seed=None):
     """PGD counterexample search for any VNNSpec (DNF).
 
     Args:
@@ -239,6 +239,14 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
 
     dev = xl.device
     dt = xl.dtype
+    # Deterministic seeding (reproducible attacks for seed-0..9 tuning). Only the
+    # EXPLICIT `seed` arg seeds here — the trig SAT loop passes `pgd_seed+i` per
+    # batch. Callers that don't pass a seed are left untouched (the main verify
+    # path seeds globally before PGD via settings.pgd_seed, so re-seeding here
+    # would change its RNG state). Seeding the default generator covers every
+    # torch.rand below (restart init + OSI).
+    if isinstance(seed, (int, float)):
+        torch.manual_seed(int(seed))
     n_restarts = int(getattr(settings, 'pgd_restarts', 10))
     n_iter = int(getattr(settings, 'pgd_iter', 100))
     lr_decay = float(getattr(settings, 'pgd_lr_decay', 0.99))
@@ -378,9 +386,16 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
     plateau_iters = int(getattr(settings, 'pgd_plateau_iters', 100))
     best_min_margin = float('inf')
     iters_without_improvement = 0
+    # Diagnostics: the smallest (closest-to-unsafe) margin seen across ALL iters
+    # and the number of iters actually run (for the verbose gap/restart report).
+    global_best_margin = float('inf')
+    _iters_run = 0
+    _print = bool(getattr(settings, 'print_progress', False))
 
     for t in range(1, n_iter + 1):
+        _iters_run = t
         if time_budget is not None and (time.perf_counter() - t_start) > time_budget:
+            _iters_run = t - 1
             break
 
         out = traced_forward(x_adv)
@@ -400,6 +415,14 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
             if margins_pd:
                 all_m = torch.cat(margins_pd, dim=1)
                 curr_min = float(all_m.min().item())
+                # True sat-gap: a CE needs ALL constraints of SOME disjunct on
+                # the unsafe side, i.e. min_d (max_c margin_dc) <= 0. Track that
+                # (not the permissive min over every constraint) as the gap.
+                _conj = torch.stack(
+                    [m.max(dim=1).values for m in margins_pd], dim=1)
+                _gap = float(_conj.min().item())
+                if _gap < global_best_margin:
+                    global_best_margin = _gap
                 # Only count "no improvement" when ALL restarts are
                 # above the hinge (no candidate to refine).
                 if curr_min > hinge_thr:
@@ -452,11 +475,24 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
     with torch.no_grad():
         out = traced_forward(x_adv)
         margins_pd = _compute_margins_per_disj_batched(out, spec_mats)
+        if margins_pd:
+            _conj = torch.stack(
+                [m.max(dim=1).values for m in margins_pd], dim=1)
+            _fm = float(_conj.min().item())
+            if _fm < global_best_margin:
+                global_best_margin = _fm
         cand = _gpu_witness_candidates(margins_pd)
         if cand is not None and cand.any():
             witness = _confirm_witness(x_adv, out, cand)
             if witness is not None:
                 return True, witness
+    if _print:
+        # Gap = how far the best attacked point is from crossing into the
+        # unsafe region (margin <= 0). Positive => no CE found; the smaller,
+        # the closer PGD got. Reports the actual restart pool and iters run.
+        print(f'[pgd] no CE: restarts={n_restarts} iters={_iters_run}/{n_iter} '
+              f'gap(best_margin)={global_best_margin:+.3e} '
+              f'elapsed={time.perf_counter() - t_start:.2f}s', flush=True)
     return False, None
 
 

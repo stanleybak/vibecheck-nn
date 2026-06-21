@@ -176,6 +176,11 @@ def _verify(args, sat_state=None):
     # graph load. See network_pair.py (the merge is exact + onnxruntime-oracle-gated).
     _maybe_network_pair(args)
 
+    # Nonlinear v2 specs (adaptive_cruise_control): transpile to an augmented
+    # ONNX + linear v1 spec up front, then verify normally. Must run BEFORE the
+    # graph load. See nonlinear_augment.py (transpile is ORT-oracle-gated).
+    _maybe_nonlinear_augment(args)
+
     # Surrogate-attack mode (incomplete; INT8-quantized / unsupported ONNX). Must run
     # BEFORE the graph load below, which would fail on DequantizeLinear/QuantizeLinear.
     # Gated on an explicit config with surrogate_attack=True AND the ONNX having
@@ -406,6 +411,32 @@ def _maybe_network_pair(args):
     args.spec = merged_spec
 
 
+def _maybe_nonlinear_augment(args):
+    """If `--spec` is a NONLINEAR v2 spec (degree>=2 polynomial atoms / X*Y
+    coupling, e.g. adaptive_cruise_control), transpile to an augmented ONNX (runs
+    the original net f, then computes each constraint polynomial p_c(X,Y) as an
+    extra output) + a LINEAR v1 DNF spec, and rewrite args.net/args.spec in place
+    so the normal pipeline verifies it. ORT-oracle-gated (augmented output ==
+    polynomial). No-op for linear specs. Must run BEFORE the graph load.
+
+    Stashes the ORIGINAL net path on args so the emitted counterexample carries
+    the original net's output Y (the augmented net's outputs are the constraint
+    polynomials, a different dimension; the VNNCOMP scorer ignores the solver's Y
+    but the cex must still have the original output shape)."""
+    from . import nonlinear_augment as nla
+    try:
+        text = nla._read_vnnlib_text(args.spec)
+    except (OSError, ValueError):
+        return
+    if not nla.is_nonlinear_v2_spec(text):
+        return
+    aug_onnx, aug_spec = nla.build_augmented_instance(args.net, args.spec)
+    print(f'Nonlinear v2 spec: augmented {args.net} -> {aug_onnx}')
+    args.orig_net_for_cex = args.net
+    args.net = aug_onnx
+    args.spec = aug_spec
+
+
 def _maybe_surrogate_attack(args, sat_state):
     """If surrogate-attack mode is enabled (config flag) AND the ONNX is quantized,
     run gradient-PGD via a continuous float surrogate, emit the verdict, and return a
@@ -497,7 +528,14 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
         # s-expression `((X_0 <v>) ... (Y_0 <v>) ...)` over every input then
         # output dim. The harness re-runs the ONNX on the X's to confirm. We
         # reuse the same ORT forward the soundness validator uses so Y matches.
-        ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt)
+        _orig = getattr(args, 'orig_net_for_cex', None)
+        if _orig is not None:
+            # Nonlinear-augmented instance: the loaded net's outputs are the
+            # constraint polynomials, not the original net's output. Emit Y from
+            # the ORIGINAL net so the cex has the benchmark's true output shape.
+            ce = _counterexample_sexpr_orig(_orig, witness, cex_fmt)
+        else:
+            ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt)
         if ce is None:
             print('  [warn] sat verdict but could not build a counterexample '
                   '(no ORT output); results file has the verdict only.')
@@ -527,6 +565,34 @@ def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g'):
         return None
     y = np.asarray(y).flatten().astype(np.float64)
     return _cex_sexpr(x, y, cex_fmt)
+
+
+def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g'):
+    """Counterexample s-expression for a nonlinear-AUGMENTED instance: X is the
+    witness, Y is the ORIGINAL net's output recomputed in float32 CPU ORT (the
+    same arithmetic the VNNCOMP scorer uses). Returns None if ORT can't run."""
+    import numpy as np
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return None
+    x = np.asarray(witness).flatten().astype(np.float64)
+    try:
+        if orig_onnx.endswith('.gz'):
+            import gzip
+            with gzip.open(orig_onnx, 'rb') as _f:
+                sess = ort.InferenceSession(
+                    _f.read(), providers=['CPUExecutionProvider'])
+        else:
+            sess = ort.InferenceSession(
+                orig_onnx, providers=['CPUExecutionProvider'])
+        in_meta = sess.get_inputs()[0]
+        in_shape = [d if isinstance(d, int) and d > 0 else 1
+                    for d in in_meta.shape]
+        y = sess.run(None, {in_meta.name: x.reshape(in_shape).astype(np.float32)})[0]
+    except (RuntimeError, OSError, ValueError):
+        return None
+    return _cex_sexpr(x, np.asarray(y).flatten().astype(np.float64), cex_fmt)
 
 
 if __name__ == '__main__':

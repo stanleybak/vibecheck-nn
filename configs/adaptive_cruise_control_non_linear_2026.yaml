@@ -1,0 +1,27 @@
+# adaptive_cruise_control_non_linear_2026 (extended track, 50 instances, v2 spec).
+#
+# 2-input ACC nets with NONLINEAR v2 specs: the DNF atoms are polynomials in X and
+# the output Y (degree 2: X*Y, Y^2, plus a nonlinear INPUT constraint 200*X0 >= X1^2).
+# vibecheck verifies a LINEAR spec, so `nonlinear_augment` transpiles each instance to
+# an augmented ONNX (runs f, computes each constraint polynomial p_c(X,Y) as an extra
+# output) + a linear DNF v1 spec (clause = AND of (p_c <= 0)). The augmented net's
+# bilinear Mul routes it to the acopf/trig path, which runs on GPU here (default
+# device) — faster PGD, so more restarts within the sat budget.
+#
+# These instances are tolerance-BOUNDARY: the true f64 min of p_c is exactly 0, so a
+# sound `unsat` is unavailable; the scorer runs the net in float32 where rounding gives
+# a clear CE (p_c ~ -2.4e-4). So the verdict is `sat`, found by PGD.
+#
+# The CE is a needle where the curved input-constraint boundary meets the output-spec
+# boundary, across a 62-disjunct DNF. The default PGD (single step-size + one joint
+# loss over all 62 disjuncts) misses it even with 20x more restarts (measured). Two
+# diversifiers fix it: per-restart disjunct targeting (each restart descends ONE
+# disjunct's AND-group, mirroring a,b-CROWN's per-OR attack pools) + multi-alpha (cover
+# the narrow basin's step size). pgd_sat_min_time refills the otherwise-unused sat
+# budget with fresh deterministic-seeded batches until a CE is found. Tuned so seeds
+# 0..9 all crack the hardest instances (see docs/benchmarks/adaptive_cruise_control_2026.md).
+pgd_per_restart_disjunct: true
+pgd_alpha_multi: true
+pgd_restarts: 512
+pgd_iter: 200
+pgd_sat_min_time: 14.0

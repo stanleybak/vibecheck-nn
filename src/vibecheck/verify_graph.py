@@ -9057,9 +9057,12 @@ def verify_graph(graph, spec, settings):
                          if settings is not None else 'box')
             if settings is not None:
                 settings.sigmoid_relaxation = 'affine_band'
-            _gg64 = graph.gpu_graph(device='cpu', dtype=_t.float64)
-            _xl = _t.tensor(np.asarray(spec.x_lo).flatten(), dtype=_t.float64)
-            _xh = _t.tensor(np.asarray(spec.x_hi).flatten(), dtype=_t.float64)
+            _bcdev = _resolve_device(settings)
+            _gg64 = graph.gpu_graph(device=_bcdev, dtype=_t.float64)
+            _xl = _t.tensor(np.asarray(spec.x_lo).flatten(), dtype=_t.float64,
+                            device=_bcdev)
+            _xh = _t.tensor(np.asarray(spec.x_hi).flatten(), dtype=_t.float64,
+                            device=_bcdev)
             # Cheap nominal-point SAT probe (ORT-confirmed) before the bound
             # work: closes specs violated at the operating point itself (e.g.
             # prop1, unsafe across the whole box) that the internal PGD misses.
@@ -9070,7 +9073,7 @@ def verify_graph(graph, spec, settings):
                 return _np
             _ob_fwd = {}
             _sb_fwd, _zf = _forward_zonotope_graph(
-                _xl, _xh, _gg64, 'cpu', _t.float64, settings=settings,
+                _xl, _xh, _gg64, _bcdev, _t.float64, settings=settings,
                 op_bounds=_ob_fwd)
             if settings is not None:
                 settings.sigmoid_relaxation = _prev_sig
@@ -9114,7 +9117,7 @@ def verify_graph(graph, spec, settings):
                     settings, 'acopf_bwd_crown_budget', 60.0)))
                 _bv, _bd = _acopf_backward_crown_root(
                     _gg64, spec, _sb_fwd, _ob_fwd, _xl, _xh, _zf,
-                    settings, 'cpu', _t.float64,
+                    settings, _bcdev, _t.float64,
                     deadline=_time_tg.perf_counter() + _bc_budget)
                 if getattr(settings, 'print_progress', False):
                     print('[verify_graph] acopf backward-CROWN root: '
@@ -9661,7 +9664,7 @@ def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
     import torch
     import time as _time
     deadline = t_start + total_timeout
-    device = 'cpu'; dt = torch.float64
+    device = _resolve_device(settings); dt = torch.float64
     prev_sig = (settings.get('sigmoid_relaxation', 'box')
                 if settings is not None else 'box')
     if settings is not None:
@@ -9758,6 +9761,18 @@ def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
     return 'unknown', {'method': 'acopf_alpha', 'best_margin': best}
 
 
+def _resolve_device(settings):
+    """Device string ('cuda'/'cpu') from `settings.device` via the generic
+    `resolve_torch` helper — follows the configured device (default 'gpu'),
+    falling back to CPU without CUDA. Any benchmark can pin CPU via its config
+    (`device: cpu`, e.g. ml4acopf's float64 physics + Gurobi LP); GPU otherwise."""
+    import torch
+    if settings is None:
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+    from .settings import resolve_torch
+    return str(resolve_torch(settings)[0])
+
+
 def _verify_trig_graph(graph, spec, settings, t_start, total_timeout):
     """Self-contained SOUND verifier for graphs whose nonlinearity is trig /
     AC-power-flow physics (ml4acopf: Sin/Cos/Pow/Sigmoid + element-wise
@@ -9782,7 +9797,7 @@ def _verify_trig_graph(graph, spec, settings, t_start, total_timeout):
     import torch
     import time as _time
     deadline = t_start + total_timeout
-    device = 'cpu'
+    device = _resolve_device(settings)
     dt = torch.float64
     prev_sig = (settings.get('sigmoid_relaxation', 'box')
                 if settings is not None else 'box')
@@ -9827,30 +9842,62 @@ def _verify_trig_graph(graph, spec, settings, t_start, total_timeout):
                 print(f'[trig_bab] PGD point forward unusable '
                       f'({type(e).__name__}): skipping sat-finding', flush=True)
         if pgd_ok:
-            sat_budget = min(15.0, max(2.0, 0.25 * total_timeout))
-            is_sat, witness = _pgd_attack_general(
-                xl0.float(), xh0.float(), spec, gg32, settings,
-                time_budget=sat_budget)
-            if is_sat:
-                # ORT-validate before committing: _pgd_attack_general works on
-                # the internal point-forward, so confirm the witness violates
-                # the spec on the reference ONNX (no false sat). A spurious /
-                # within-tol-only near-miss must not short-circuit the unsat
-                # BaB below.
-                _w = np.asarray(witness).flatten()
-                _onnx_p = getattr(graph, 'onnx_path', None)
-                _atol = float(settings.sat_validate_atol
-                              if 'sat_validate_atol' in settings else 1e-4)
+            _onnx_p = getattr(graph, 'onnx_path', None)
+            _atol = float(settings.sat_validate_atol
+                          if 'sat_validate_atol' in settings else 1e-4)
+
+            def _try_witness(_w):
+                """ORT-validate + dispose a candidate witness. Returns the
+                ('sat', details) tuple for a CLEAR CE (commit now); None for a
+                within-tol CE (persisted by `_sat_disposition`, keep searching)
+                or a witness ORT rejects."""
+                _w = np.asarray(_w).flatten()
                 _ok, _vinfo = _validate_sat_witness(_onnx_p, spec, _w,
                                                     atol=_atol)
                 if _ok and _sat_disposition(
                         graph, spec, settings, _w, _vinfo) == 'real':
-                    _restore()
                     return 'sat', {'witness': _w}
                 if print_progress:
-                    print('[trig_bab] PGD witness not a clear CE '
-                          f'(ok={_ok}); CE saved if within-tol, continuing to '
-                          'the unsat BaB', flush=True)
+                    print('[trig_bab] witness not a clear CE '
+                          f'(ok={_ok}); saved if within-tol, continuing',
+                          flush=True)
+                return None
+
+            sat_budget = min(15.0, max(2.0, 0.25 * total_timeout))
+            # `pgd_attack_general` runs ONE restart batch per call. When
+            # `pgd_sat_min_time` is set, re-run fresh batches until that many
+            # seconds elapse (capped by sat_budget) or a CE is found — the extra
+            # restarts (with per-disjunct targeting + multi-α from the config)
+            # catch needle CEs at a curved nonlinear-input boundary. Each batch
+            # gets a distinct deterministic seed (base + loop index) so more
+            # iterations explore NEW randomness yet stay reproducible for
+            # seed-0..9 tuning. min_time=0 → exactly one batch (default).
+            _sat_min_t = float(getattr(settings, 'pgd_sat_min_time', 0.0) or 0.0)
+            _base_seed = getattr(settings, 'pgd_seed', None)
+            _base_seed = int(_base_seed) if isinstance(_base_seed, (int, float)) else None
+            _sat_t0 = _time.time()
+            _loop_i = 0
+            while True:
+                _rem = sat_budget - (_time.time() - _sat_t0)
+                if _rem <= 0:
+                    break
+                _bseed = None if _base_seed is None else _base_seed + _loop_i
+                is_sat, witness = _pgd_attack_general(
+                    xl0.float(), xh0.float(), spec, gg32, settings,
+                    time_budget=_rem, seed=_bseed)
+                _loop_i += 1
+                if is_sat:
+                    # ORT-validate each hit. A CLEAR CE commits 'sat' now; a
+                    # within-tol CE is persisted by `_try_witness` but does NOT
+                    # short-circuit — keep attacking for a clear CE (a fresh
+                    # batch often deepens a near-boundary hit past the tolerance,
+                    # matching the seed-tuned 10/10 clear rate) until the budget.
+                    _r = _try_witness(witness)
+                    if _r is not None:
+                        _restore()
+                        return _r
+                if (_time.time() - _sat_t0) >= min(_sat_min_t, sat_budget):
+                    break
 
     # Input-split is only tractable for a modest number of varying dims; the
     # 118/300 specs vary ~189 (the split tree is astronomically large). For
