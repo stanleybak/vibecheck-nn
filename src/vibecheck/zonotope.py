@@ -813,8 +813,6 @@ def _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b,
         return c_a * c_b, g_b * c_a.unsqueeze(-1)
 
     # Broadcasting path: reshape to nd, multiply.
-    K = max(g_a.shape[1] if g_a.numel() > 0 else 0,
-             g_b.shape[1] if g_b.numel() > 0 else 0)
     a_nd = c_a.reshape(*shape_a)
     b_nd = c_b.reshape(*shape_b)
     c_out_nd = a_nd * b_nd
@@ -822,18 +820,25 @@ def _torch_zono_mul_bilinear(c_a, g_a, c_b, g_b,
     c_out = c_out_nd.reshape(-1)
     if a_is_point and b_is_point:
         return c_out, c_out.new_zeros(c_out.numel(), 0)
+    # For a point operand only the OTHER side's generators propagate (= the
+    # constant scales each generator column), so the output column count is that
+    # side's OWN count — NOT max(K_a, K_b). A point operand may carry more (zero)
+    # columns than the varying one (mismatched K from different fork ancestries);
+    # using max() then reshaped the varying gens to the wrong width and crashed.
     if b_is_point:
         if g_a.numel() == 0:
             return c_out, c_out.new_zeros(c_out.numel(), 0)
-        g_a_nd = g_a.reshape(*shape_a, K)
-        g_out_nd = (g_a_nd * b_nd.unsqueeze(-1)).expand(*out_shape, K)
-        return c_out, g_out_nd.contiguous().reshape(-1, K)
+        Ka = g_a.shape[1]
+        g_a_nd = g_a.reshape(*shape_a, Ka)
+        g_out_nd = (g_a_nd * b_nd.unsqueeze(-1)).expand(*out_shape, Ka)
+        return c_out, g_out_nd.contiguous().reshape(-1, Ka)
     # a is point
     if g_b.numel() == 0:
         return c_out, c_out.new_zeros(c_out.numel(), 0)
-    g_b_nd = g_b.reshape(*shape_b, K)
-    g_out_nd = (g_b_nd * a_nd.unsqueeze(-1)).expand(*out_shape, K)
-    return c_out, g_out_nd.contiguous().reshape(-1, K)
+    Kb = g_b.shape[1]
+    g_b_nd = g_b.reshape(*shape_b, Kb)
+    g_out_nd = (g_b_nd * a_nd.unsqueeze(-1)).expand(*out_shape, Kb)
+    return c_out, g_out_nd.contiguous().reshape(-1, Kb)
 
 
 def _torch_zono_div_scalar_b(c_a, g_a, c_b, g_b):
