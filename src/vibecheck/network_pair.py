@@ -42,7 +42,6 @@ import onnx.compose as compose
 import onnxruntime as ort
 
 TARGET_OPSET = 13
-STRICT_MARGIN = 1e-4   # a strict `< 0` is encoded `<= -margin` (excludes the boundary)
 ORACLE_TOL = 1e-3      # max |merged - reference| allowed before we refuse the merge
 
 
@@ -168,12 +167,18 @@ def _parse_output_atoms(text):
     atoms = []
 
     def add(lhs, raw_op, raw_rhs):
-        # strict `<`/`>` on a zero rhs -> margin (exclude the boundary/trivial point)
-        if raw_op in ('<', '<='):
-            op = '<='; rhs = raw_rhs - (STRICT_MARGIN if raw_op == '<' and raw_rhs == 0.0 else 0.0)
-        else:
-            op = '>='; rhs = raw_rhs + (STRICT_MARGIN if raw_op == '>' and raw_rhs == 0.0 else 0.0)
-        atoms.append({'lhs': lhs, 'op': op, 'rhs': rhs})
+        # NON-STRICT bound (sound): a strict `< 0` is encoded as its closure
+        # `<= 0` (a SUPERSET of the true unsafe set), NOT `<= -margin` (a strict
+        # SUBSET that would false-unsat a shallow real CE — e.g. monotonic_acasxu
+        # diff = -5e-5). The strict `<` semantics are enforced DOWNSTREAM in the
+        # SAT-detection: PGD + ORT confirmation only commit 'sat' on a CLEAR CE
+        # (margin <= -atol); the measure-zero boundary (diff = 0, e.g. an iso
+        # pair's trivial point or a monotone net's x1==x2 diagonal) validates only
+        # within tolerance, so it is persisted as a within-tol sat while the
+        # search keeps looking for a clear CE or an unsat proof. See
+        # `verify_graph._sat_disposition`.
+        op = '<=' if raw_op in ('<', '<=') else '>='
+        atoms.append({'lhs': lhs, 'op': op, 'rhs': raw_rhs})
 
     # form 1: (OP Y_a[i] (SIGN Y_b[j] eps))  ->  Y_a[i] - Y_b[j] (OP) (±eps)
     seen = set()

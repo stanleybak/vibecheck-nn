@@ -104,7 +104,9 @@ def test_parse_mono_ir(tmp_path):
     assert ir['n'] == 5 and ir['dnf'] == 'and' and len(ir['atoms']) == 1
     assert ir['rel']['k'] == 0 and ir['rel']['dmax'] == 2.0
     at = ir['atoms'][0]
-    assert at['op'] == '<=' and at['rhs'] == -npair.STRICT_MARGIN     # strict < 0 -> <= -margin
+    # strict `< 0` -> NON-STRICT closure `<= 0` (sound bound); strictness is
+    # enforced downstream in SAT-detection (clear CE vs within-tol boundary).
+    assert at['op'] == '<=' and at['rhs'] == 0.0
     assert at['lhs'][('f', 3)] == 1.0 and at['lhs'][('g', 3)] == -1.0
 
 
