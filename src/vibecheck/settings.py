@@ -164,6 +164,12 @@ def default_settings(**overrides):
         sign_attack_steps=200,
         sign_preact_penalty=1.0,    # gentle "push Sign pre-acts off zero" plateau-escape term
         sign_per_disjunct=False,    # general (max-competitor) loss; True targets each disjunct
+        # Per-layer adaptive clipped-STE: each Sign's clip eps = frac * median(|pre-act|), so
+        # only the (~frac-)nearest-zero pre-acts (the flippable ones) carry gradient, scaled to
+        # THAT layer's magnitude. Binarized-conv pre-acts span orders of magnitude across layers
+        # (e.g. ~643 after conv1 vs ~8 after conv2); a fixed eps zeros a whole layer's gradient
+        # and the PGD stalls. Restart r uses sign_attack_clip_fracs[r % len]. Small fracs work.
+        sign_attack_clip_fracs=[0.05, 0.2, 0.1, 0.02],
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded

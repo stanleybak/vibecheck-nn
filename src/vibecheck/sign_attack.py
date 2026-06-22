@@ -82,6 +82,7 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     restarts = int(getattr(settings, 'sign_attack_restarts', 50))
     steps = int(getattr(settings, 'sign_attack_steps', 200))
     pen_coef = float(getattr(settings, 'sign_preact_penalty', 1.0))
+    fracs = [float(f) for f in getattr(settings, 'sign_attack_clip_fracs', [0.05, 0.2, 0.1, 0.02])]
     per_disjunct = bool(getattr(settings, 'sign_per_disjunct', False))
     keep_searching = bool(getattr(settings, 'keep_searching_within_tol', True))
     _bs = getattr(settings, 'pgd_seed', None)
@@ -91,7 +92,11 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
 
     class _SignSTE(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, x, eps):
+        def forward(ctx, x, frac):
+            # Per-layer ADAPTIVE clip: eps tracks THIS layer's pre-activation scale, so the
+            # gradient survives whatever the magnitude is. Binarized-conv pre-acts span orders
+            # of magnitude between layers; a fixed eps zeros a whole layer's gradient -> stall.
+            eps = frac * float(x.detach().abs().median()) + 1e-12
             ctx.save_for_backward(x)
             ctx.eps = eps
             return torch.sign(x)
@@ -110,7 +115,7 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
         def backward(ctx, g):
             return g
 
-    eps_box = [5.0]                              # mutable; loose/tight alternated per restart
+    frac_box = [fracs[0]]                         # mutable; cycled over clip_fracs per restart
     model = convert(onnx_path).eval().to(dev)
 
     def _leaf(name):                             # last path component of an onnx2torch module name
@@ -121,7 +126,7 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
         if type(mod).__name__ != 'OnnxFunction':
             continue
         if _leaf(name) == 'Sign':                # FIRST sign of a merge -> clipped STE on x
-            mod.function = (lambda x, _e=eps_box: _SignSTE.apply(x, _e[0]))
+            mod.function = (lambda x, _f=frac_box: _SignSTE.apply(x, _f[0]))
             n_first += 1
         elif _leaf(name) == 'Sign_1':            # SECOND sign -> identity-grad pass-through
             mod.function = (lambda x: _SignPass.apply(x))
@@ -140,7 +145,6 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     hi = torch.tensor(np.asarray(spec.x_hi, np.float32).reshape(in_shape), device=dev)
     cen = (lo + hi) / 2
     half = (hi - lo) / 2
-    tight_first = n_first > 2                     # deeper BNNs: start with the tight surrogate
     within_tol = [None]
     n_val = [0]
 
@@ -176,13 +180,15 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     for r in range(restarts):
         if time.time() - t0 > timeout:
             break
-        eps_box[0] = 0.1 if ((r % 2 == 0) == tight_first) else 5.0
+        frac_box[0] = fracs[r % len(fracs)]
         alpha = float(half.max()) / 4.0
         if r == 0:
-            delta = torch.zeros_like(cen)
+            delta = torch.zeros_like(cen)            # restart 0: the original (box center)
         else:
             rng.manual_seed(base_seed + r)
-            delta = (2 * torch.rand(cen.shape, generator=rng).to(dev) - 1) * half
+            # random box VERTEX: L-inf adversaries land on the boundary, and the CEs on this
+            # benchmark are vertex-like (most pixels pinned to lo/hi); start there.
+            delta = half * torch.sign(2 * torch.rand(cen.shape, generator=rng).to(dev) - 1)
         delta = delta.detach().requires_grad_(True)
         opt = torch.optim.Adam([delta], lr=alpha)
         sched = torch.optim.lr_scheduler.ExponentialLR(opt, 0.99)
@@ -201,7 +207,7 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
             opt.step()
             sched.step()
             if it % 10 == 0 or it == steps - 1:
-                res = ort_consider(x, f'restart{r}(eps={eps_box[0]}) step{it}')
+                res = ort_consider(x, f'restart{r}(frac={frac_box[0]}) step{it}')
                 if res is not None:
                     return 'sat', res[1]
     timed_out = (time.time() - t0) > timeout
