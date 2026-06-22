@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/stanleybak/vibecheck-nn/main/vibecheck.svg" alt="vibecheck logo" width="640">
 </p>
 
-The **vibecheck** formal verification tool is a high-performance, vibe-coded semi-decision procedure for neural networks. Given an ONNX neural network and a VNNLIB specification, vibecheck tries to prove the property or find a counterexample. It solves the same open-loop neural network verification problem as established verifiers like [α,β-CROWN](https://github.com/Verified-Intelligence/alpha-beta-CROWN), [Marabou](https://github.com/NeuralNetworkVerification/Marabou), and [NNV](https://github.com/verivital/nnv), hopefully faster and on larger networks. Does your neural network pass the vibecheck?
+The **vibecheck** formal verification tool is a high-performance, vibe-coded decision procedure for neural networks. Given an ONNX neural network and a VNNLIB specification, vibecheck tries to prove the property or find a counterexample. It solves the same open-loop neural network verification problem as established verifiers like [α,β-CROWN](https://github.com/Verified-Intelligence/alpha-beta-CROWN), [Marabou](https://github.com/NeuralNetworkVerification/Marabou), and [NNV](https://github.com/verivital/nnv), hopefully faster and on larger networks. Does your neural network pass the vibecheck?
 
 ## Setup
 
