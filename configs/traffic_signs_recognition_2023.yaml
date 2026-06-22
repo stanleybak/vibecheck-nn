@@ -1,0 +1,14 @@
+# traffic_signs_recognition_2023 (regular track, 45 instances, 480s timeout): GTSRB Binary
+# Neural Networks — the "QConv" layers use `Sign` activations (binarized weights/acts).
+# Neither vibecheck nor ABC can bound `Sign` soundly through onnx2pytorch, so we run the
+# INCOMPLETE sign-attack mode (never returns unsat): PGD on a clipped-STE surrogate of `Sign`
+# (forward = true Sign; backward = clipped STE, single per Sign->Add->Sign merge) finds the
+# adversarial counterexample, then validates the witness on the ORIGINAL (true-Sign) model
+# via CPU onnxruntime. See src/vibecheck/sign_attack.py. ABC solves 43/45 sat (2 timeout) the
+# same way (its own STE-PGD); the general max-competitor loss + ~400 steps cracks all sizes.
+sign_attack: true
+sign_attack_restarts: 50
+sign_attack_steps: 400
+# Witness is a float32 image; %.9g is float32-exact and compact.
+counterexample_precision: '.9g'
+device: gpu

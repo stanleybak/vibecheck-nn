@@ -154,6 +154,16 @@ def default_settings(**overrides):
         # FGSM jump straight to a box vertex; the spread (0.02..0.2) covers fine-to-coarse
         # trajectories. r-th restart uses surrogate_alphas[r % len].
         surrogate_alphas=[0.05, 0.1, 0.2, 0.02],
+        # Sign-BNN attack mode (sign_attack.py): for binarized nets with `Sign` activations
+        # (e.g. traffic_signs_recognition_2023) neither vibecheck nor ABC can bound soundly, so
+        # PGD on a clipped-STE surrogate of Sign finds the adversarial CE; the witness is
+        # validated on the ORIGINAL model via ORT-CPU. Engages only when sign_attack=True AND
+        # the ONNX has `Sign` ops.
+        sign_attack=False,
+        sign_attack_restarts=50,
+        sign_attack_steps=200,
+        sign_preact_penalty=1.0,    # gentle "push Sign pre-acts off zero" plateau-escape term
+        sign_per_disjunct=False,    # general (max-competitor) loss; True targets each disjunct
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded

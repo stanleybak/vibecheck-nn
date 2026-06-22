@@ -209,6 +209,13 @@ def _verify(args, sat_state=None):
     if _surr is not None:
         sys.exit(_surr)
 
+    # Sign-BNN attack mode (incomplete; binarized nets with `Sign` activations vibecheck can't
+    # bound). Gated on config sign_attack=True AND the ONNX having `Sign` ops; emits the verdict
+    # via the surrogate-attack emit path (same witness shape). See sign_attack.py.
+    _sgn = _maybe_sign_attack(args, sat_state)
+    if _sgn is not None:
+        sys.exit(_sgn)
+
     # Fast path: load the pre-parsed graph+spec from prepare_instance.sh's
     # cache, skipping the (potentially multi-second) ONNX parse. Gated behind
     # the explicit unsafe-pkl flag; falls back to a normal parse on any miss.
@@ -494,6 +501,38 @@ def _maybe_surrogate_attack(args, sat_state):
         _emit_surrogate_result(args, verdict, witness, sat_state,
                                settings.counterexample_precision)
     print(f'\nResult (surrogate-attack): {verdict}')
+    return 1  # never 'verified' in this incomplete mode
+
+
+def _maybe_sign_attack(args, sat_state):
+    """If sign-attack mode is enabled (config flag) AND the ONNX has `Sign` ops (a BNN),
+    run STE-PGD to find an adversarial counterexample, emit the verdict (reusing the
+    surrogate emit path — same witness shape, ORT-validated on args.net), and return a
+    process exit code. Otherwise return None to fall through to normal verification.
+    Incomplete/attack-only: returns only sat/timeout/unknown (never verified)."""
+    if args.config is None:
+        return None
+    from .config_loader import load_config
+    overrides = load_config(args.config)
+    if not overrides.get('sign_attack', False):
+        return None
+    from . import sign_attack as sa
+    if not sa.has_sign_ops(args.net):
+        return None  # sign mode only engages for binarized (Sign) nets
+    from .settings import default_settings
+    overrides.setdefault('total_timeout', args.timeout)
+    settings = default_settings(**overrides)
+    timeout = float(args.timeout if args.timeout else 100.0)
+    print(f'Sign-BNN attack mode: STE-PGD on Sign surrogate '
+          f'(restarts={settings.sign_attack_restarts}, steps={settings.sign_attack_steps}, '
+          f'timeout={timeout}s)')
+    verdict, witness = sa.sign_attack(
+        args.net, args.spec, settings, timeout,
+        log=(print if args.verbose else (lambda _m: None)))
+    if args.results_file:
+        _emit_surrogate_result(args, verdict, witness, sat_state,
+                               settings.counterexample_precision)
+    print(f'\nResult (sign-attack): {verdict}')
     return 1  # never 'verified' in this incomplete mode
 
 
