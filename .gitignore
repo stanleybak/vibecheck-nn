@@ -38,3 +38,7 @@ run_*.py
 # ...but the committed VNNCOMP batch runner is not a scratch script
 !vnncomp_scripts/run_benchmarks.py
 scratch/
+
+# Claude Code local config (agents, skills, periodic-campaign loop) — local-only,
+# not part of the published tool.
+.claude/
