@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # import sibling
 from vibecheck import main as vbmain
 from test_sign_attack import _bnn_onnx, _plain_onnx, _vnnlib
 from test_torch_attack import _net
+from test_cctsdb_yolo import _net as _cct_net, _vnnlib as _cct_vnnlib
 
 
 def _args(**kw):
@@ -71,4 +72,35 @@ def test_torch_hook_sat(tmp_path):
                          'device: cpu\n')
     code = vbmain._maybe_torch_attack(_args(config=cfg, net=q, spec=v, results_file=rf),
                                       {'emitted': False})
+    assert code == 1 and open(rf).read().startswith('sat')
+
+
+# ---- _maybe_cctsdb_yolo ----
+
+def test_cctsdb_hook_no_config():
+    assert vbmain._maybe_cctsdb_yolo(_args(config=None), {'emitted': False}) is None
+
+
+def test_cctsdb_hook_flag_off(tmp_path):
+    assert vbmain._maybe_cctsdb_yolo(
+        _args(config=_cfg(tmp_path, 'cctsdb_yolo: false\n'), net='x'), {'emitted': False}) is None
+
+
+def test_cctsdb_hook_unsat(tmp_path):
+    q = _cct_net(str(tmp_path / 'n.onnx'))
+    v = _cct_vnnlib(str(tmp_path / 'v.vnnlib'), thr=-0.01)
+    rf = str(tmp_path / 'r.txt')
+    code = vbmain._maybe_cctsdb_yolo(
+        _args(config=_cfg(tmp_path, 'cctsdb_yolo: true\n'), net=q, spec=v, results_file=rf),
+        {'emitted': False})
+    assert code == 0 and open(rf).read().strip() == 'unsat'
+
+
+def test_cctsdb_hook_sat(tmp_path):
+    q = _cct_net(str(tmp_path / 'n.onnx'))
+    v = _cct_vnnlib(str(tmp_path / 'v.vnnlib'), thr=0.5)
+    rf = str(tmp_path / 'r.txt')
+    code = vbmain._maybe_cctsdb_yolo(
+        _args(config=_cfg(tmp_path, 'cctsdb_yolo: true\n'), net=q, spec=v, results_file=rf),
+        {'emitted': False})
     assert code == 1 and open(rf).read().startswith('sat')

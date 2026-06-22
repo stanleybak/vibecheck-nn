@@ -177,6 +177,12 @@ def default_settings(**overrides):
         torch_attack=False,
         torch_attack_restarts=20,
         torch_attack_steps=200,
+        # cctsdb_yolo custom handler (cctsdb_yolo.py): COMPLETE verification of the CCTSDB YOLO
+        # patch benchmarks by enumerating the finite integer patch-position grid through the
+        # ORIGINAL net on ORT-CPU. Engages only when cctsdb_yolo=True. cctsdb_max_positions caps
+        # the enumeration (a larger free grid => not a discrete-patch instance => raise).
+        cctsdb_yolo=False,
+        cctsdb_max_positions=1_000_000,
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded

@@ -1,0 +1,12 @@
+# cctsdb_yolo_2023 (extended track, 39 instances, 350s timeout): CCTSDB YOLO traffic-sign
+# patch robustness. The ONNX bakes patch-placement (ScatterND/Range/Where) + a YOLO detector +
+# post-processing (ArgMax/dynamic-Min/Max) that neither vibecheck's graph loader nor onnx2torch
+# can ingest. But the property is DISCRETE: the vnnlib fixes the image + ground-truth box/label
+# and varies only two INTEGER patch-position coordinates over a small range, so the unsafe set
+# is a finite grid of placements. The cctsdb_yolo handler (cctsdb_yolo.py) verifies COMPLETELY
+# by enumerating every integer patch position through the ORIGINAL net on onnxruntime-CPU (which
+# runs all the control-flow ops) and thresholding the detection score — ~1.6s/instance, no
+# bounds. This mirrors how alpha,beta-CROWN solves it (a custom model loader + enumeration).
+cctsdb_yolo: true
+# Witness is the full input vector (image + position + gt); %.9g is float32-exact and compact.
+counterexample_precision: '.9g'
