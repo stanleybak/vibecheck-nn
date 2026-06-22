@@ -216,6 +216,13 @@ def _verify(args, sat_state=None):
     if _sgn is not None:
         sys.exit(_sgn)
 
+    # Generic onnx2torch PGD attack mode (incomplete; differentiable nets vibecheck can't bound
+    # soundly/cheaply, e.g. collins_aerospace YOLOv5-nano). Gated on config torch_attack=True;
+    # emits via the surrogate-attack emit path (same witness shape). See torch_attack.py.
+    _tch = _maybe_torch_attack(args, sat_state)
+    if _tch is not None:
+        sys.exit(_tch)
+
     # Fast path: load the pre-parsed graph+spec from prepare_instance.sh's
     # cache, skipping the (potentially multi-second) ONNX parse. Gated behind
     # the explicit unsafe-pkl flag; falls back to a normal parse on any miss.
@@ -533,6 +540,35 @@ def _maybe_sign_attack(args, sat_state):
         _emit_surrogate_result(args, verdict, witness, sat_state,
                                settings.counterexample_precision)
     print(f'\nResult (sign-attack): {verdict}')
+    return 1  # never 'verified' in this incomplete mode
+
+
+def _maybe_torch_attack(args, sat_state):
+    """If generic torch-attack mode is enabled (config flag), run onnx2torch PGD to find an
+    adversarial counterexample, emit the verdict (reusing the surrogate emit path — same witness
+    shape, ORT-validated on args.net), and return a process exit code. Otherwise return None to
+    fall through to normal verification. Incomplete/attack-only (never verified)."""
+    if args.config is None:
+        return None
+    from .config_loader import load_config
+    overrides = load_config(args.config)
+    if not overrides.get('torch_attack', False):
+        return None
+    from . import torch_attack as ta
+    from .settings import default_settings
+    overrides.setdefault('total_timeout', args.timeout)
+    settings = default_settings(**overrides)
+    timeout = float(args.timeout if args.timeout else 100.0)
+    print(f'Torch-attack mode: onnx2torch PGD '
+          f'(restarts={settings.torch_attack_restarts}, steps={settings.torch_attack_steps}, '
+          f'timeout={timeout}s)')
+    verdict, witness = ta.torch_attack(
+        args.net, args.spec, settings, timeout,
+        log=(print if args.verbose else (lambda _m: None)))
+    if args.results_file:
+        _emit_surrogate_result(args, verdict, witness, sat_state,
+                               settings.counterexample_precision)
+    print(f'\nResult (torch-attack): {verdict}')
     return 1  # never 'verified' in this incomplete mode
 
 

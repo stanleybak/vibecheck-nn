@@ -170,6 +170,13 @@ def default_settings(**overrides):
         # (e.g. ~643 after conv1 vs ~8 after conv2); a fixed eps zeros a whole layer's gradient
         # and the PGD stalls. Restart r uses sign_attack_clip_fracs[r % len]. Small fracs work.
         sign_attack_clip_fracs=[0.05, 0.2, 0.1, 0.02],
+        # Generic onnx2torch PGD attack mode (torch_attack.py): for differentiable nets
+        # vibecheck can't bound soundly/cheaply (e.g. collins_aerospace YOLOv5-nano). Engages
+        # only when torch_attack=True; PGDs the perturbed input dims and validates the witness
+        # on the ORIGINAL model via ORT-CPU. Incomplete / attack-only (never proves unsat).
+        torch_attack=False,
+        torch_attack_restarts=20,
+        torch_attack_steps=200,
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded

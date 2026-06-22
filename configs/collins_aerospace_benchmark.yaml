@@ -1,0 +1,12 @@
+# collins_aerospace_benchmark (extended track, 6 instances, 3600s timeout): YOLOv5-nano
+# (640x640, 60 Conv + LeakyRelu + Sigmoid) object-detection robustness. All 6 instances are
+# sat (ABC ~95s each). vibecheck CAN load/convert the net (no control-flow ops), so we run the
+# generic onnx2torch PGD attack (torch_attack.py): PGD over the small perturbed input patch
+# (~405 of 1.23M dims) to drive the 19-way output disjunction's worst safe-margin < 0, then
+# validate the witness on the ORIGINAL model via CPU onnxruntime. Incomplete / attack-only.
+torch_attack: true
+torch_attack_restarts: 20
+torch_attack_steps: 200
+# Witness is a float32 image; %.9g is float32-exact and compact (1.23M values).
+counterexample_precision: '.9g'
+device: gpu
