@@ -1026,8 +1026,8 @@ def batched_forward_linear_bounds(gg, xl_b, xh_b, device, dtype,
             stride = op.get('stride', (1, 1))
             padding = op.get('padding', (0, 0))
             in_shape_nd = op.get('in_shapes_nd', [None])[0]
-            assert in_shape_nd is not None and len(in_shape_nd) == 2, (
-                f'conv {name!r}: need 2D in_shape_nd (C,H,W) or (C,W); '
+            assert in_shape_nd is not None and len(in_shape_nd) in (2, 3), (
+                f'conv {name!r}: need in_shape_nd (C,W) or (C,H,W); '
                 f'got {in_shape_nd!r}')
             # in_shape_nd is per network.py's convention: 2 dims means
             # (C, W) → treat as (C, H=1, W). 3 dims would be (C, H, W).
