@@ -467,6 +467,8 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
             pts = [l + (h - l) * torch.rand(l.shape, generator=rng).to(dev) for l, h in zip(los, his)]
         best_loss = float('-inf')
         best_pts = [p.detach().clone() for p in pts]
+        best_fq = float('-inf')         # best fake-quant margin seen (the ≈ORT proxy)
+        best_fq_pts = None
         for it in range(steps):
             if time.time() - t0 > timeout:
                 break
@@ -477,21 +479,36 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
             y = (y[0] if isinstance(y, (list, tuple)) else y).reshape(-1)
             loss = viol_loss(y)
             _lv = float(loss.detach())
-            if _lv > best_loss:        # most-violating surrogate point (pre-step)
+            if _lv > best_loss:        # most-violating SURROGATE point (pre-step)
                 best_loss = _lv
-                best_pts = [p.detach().clone() for p in pts]
+                snap = [p.detach().clone() for p in pts]
+                best_pts = snap
+                # EARLY-CONFIRM: this is a newly-promising point — score it with the
+                # accurate fake-quant eval (≈ORT). If fake-quant says it CLEARLY violates,
+                # ORT-confirm it RIGHT NOW (return at the step the CE appears, not after all
+                # `steps`). fq is checked only on surrogate-improving steps to bound its cost.
+                fqm_s = fq_margin(snap)
+                if fqm_s is not None and fqm_s > best_fq:
+                    best_fq, best_fq_pts = fqm_s, snap
+                if fqm_s is not None and fqm_s > 0.0:
+                    res = ort_consider(snap, f'restart{r} step{it} (a={alpha},fq={fqm_s:.3e})')
+                    if res is not None:
+                        _t_fwd += time.time() - _f0
+                        return 'sat', res[1][0]
             grads = torch.autograd.grad(loss, pts)
             with torch.no_grad():
                 pts = [torch.minimum(torch.maximum(p + alpha * (h - l) * g.sign(), l), h)
                        for p, g, l, h in zip(pts, grads, los, his)]
             _t_fwd += time.time() - _f0
             _n_steps += 1
-        # Gate the (expensive) ORT replay with the fake-quant eval (Path B, ≈ORT): only
-        # confirm this restart's best if fake-quant says it at least reaches within-tol
-        # (skip the ORT call when it's clearly safe). No eval oracle -> always confirm.
-        fqm = fq_margin(best_pts)
+        # End of restart: confirm the best candidate. Prefer the best fake-quant point (the
+        # ≈ORT proxy) over the best surrogate point; gate the (slower) ORT replay so we only
+        # confirm when fake-quant says it at least reaches within-tol (skip when clearly safe).
+        # No eval oracle -> always confirm the best surrogate point.
+        cand = best_fq_pts if best_fq_pts is not None else best_pts
+        fqm = best_fq if best_fq_pts is not None else fq_margin(best_pts)
         if fqm is None or fqm >= -atol:
-            res = ort_consider(best_pts, f'restart{r}(a={alpha}'
+            res = ort_consider(cand, f'restart{r}(a={alpha}'
                                + (f',fq={fqm:.3e})' if fqm is not None else ')'))
             if res is not None:
                 return 'sat', res[1][0]
