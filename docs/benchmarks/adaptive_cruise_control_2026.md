@@ -17,7 +17,7 @@ linear DNF over those outputs: `clause = AND of (p_c ≤ 0)`. A nonlinear input
 constraint `g(X) {<,≤} 0` is folded in as another atom. Correctness is gated by an
 onnxruntime oracle (augmented output == polynomial(X, f(X)) within 5e-3). The
 augmented net's bilinear `Mul` routes it through the acopf/trig verifier
-(`verify_graph._verify_trig_graph`).
+(`verify_graph._verify_nonlinear_graph`).
 
 The emitted counterexample carries the **original** net's `X`/`Y` (the augmented
 outputs are the constraint polynomials — wrong shape for the scorer);

@@ -8,17 +8,17 @@ no live Sin/Cos op — the backward-CROWN path applies):
 
   - prop1 (SAT): the spec is violated at the operating point itself (the whole
     input box is unsafe, ORT margin ~-0.006). The nominal-point CE probe
-    (`_acopf_nominal_cex_probe`) finds it on the reference ONNX in ~2 s and
+    (`_nonlinear_nominal_cex_probe`) finds it on the reference ONNX in ~2 s and
     emits the VNNCOMP counterexample. (α,β-CROWN's clean-input attack does the
     same; vibecheck previously returned `unknown` here.)
   - prop2 (UNSAT): closed at the ROOT by backward-CROWN with topo-order
-    intermediate-bound refinement (`_acopf_backward_crown_root`); the spec
+    intermediate-bound refinement (`_nonlinear_backward_crown_root`); the spec
     margin is +3.977, BEATING α,β-CROWN's init-CROWN +3.956. This is the case
     that exercises the gather fan-out adjoint soundness fix (index_add_) — the
     refinement is hugely negative (and unsound) without it.
   - prop3 (UNSAT): the binding constraint is a ReLU-only path (lb(Y_5)); plain
     CROWN gives -0.0096, and ReLU-lower-slope α-optimization in
-    `_acopf_alpha_opt` lifts it to >0 (matching α,β-CROWN, which also closes it
+    `_nonlinear_alpha_opt` lifts it to >0 (matching α,β-CROWN, which also closes it
     purely via ReLU-slope α). Pins the ReLU-α wiring.
 
 The trig path overruns its budget on the big 118/300 nets but the verdict is

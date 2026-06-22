@@ -9055,8 +9055,18 @@ def verify_graph(graph, spec, settings):
             and len([i for i in n.inputs
                      if i in graph.nodes or i == graph.input_name]) == 2
             for n in graph.nodes.values())
-        _route_acopf = _has_trig or _has_mul_bilinear
-        if (_route_acopf and hasattr(spec, 'x_lo')
+        # Non-LP nonlinearity (trig OR a genuine both-vary bilinear Mul) routes to
+        # the dedicated nonlinear bound pipeline (root-zono -> backward-CROWN-root
+        # refine -> alpha-CROWN -> nonlinear-split BaB), the path built for the
+        # ml4acopf physics nets. DEFER, though, to a config that explicitly asked
+        # for the batched input-split BaB (`input_split_batched_enabled`): such a
+        # net has DECLARED its verification strategy, so this heuristic auto-router
+        # must not hijack it. Without the gate, lsnc_relu's Lyapunov quadratic
+        # forms (V=u^T P u -> both-vary Muls) were mis-routed here and the
+        # throughput BaB the config requested got force-disabled -> timeouts.
+        _route_nonlinear = (_has_trig or _has_mul_bilinear) and not bool(
+            getattr(settings, 'input_split_batched_enabled', False))
+        if (_route_nonlinear and hasattr(spec, 'x_lo')
                 and getattr(spec, 'x_lo', None) is not None):
             import torch as _t
             _prev_sig = (settings.get('sigmoid_relaxation', 'box')
@@ -9072,7 +9082,7 @@ def verify_graph(graph, spec, settings):
             # Cheap nominal-point SAT probe (ORT-confirmed) before the bound
             # work: closes specs violated at the operating point itself (e.g.
             # prop1, unsafe across the whole box) that the internal PGD misses.
-            _np = _acopf_nominal_cex_probe(graph, spec, settings, _xl, _xh)
+            _np = _nonlinear_nominal_cex_probe(graph, spec, settings, _xl, _xh)
             if _np is not None:
                 if settings is not None:
                     settings.sigmoid_relaxation = _prev_sig
@@ -9116,32 +9126,32 @@ def verify_graph(graph, spec, settings):
             # easy props are closed by the root-box / α-CROWN instead. Only the
             # small 14_ieee linear nets (n_out~186) benefit, so cap on n_out.
             _bc_nout = int(_zf.center.numel())
-            _bc_max_out = int(getattr(settings, 'acopf_bwd_crown_max_out', 600))
+            _bc_max_out = int(getattr(settings, 'nonlinear_bwd_crown_max_out', 600))
             if (not _has_trig and _bc_nout <= _bc_max_out
-                    and bool(getattr(settings, 'acopf_backward_crown', True))):
+                    and bool(getattr(settings, 'nonlinear_backward_crown', True))):
                 _bc_budget = min(_tot * 0.5, float(getattr(
-                    settings, 'acopf_bwd_crown_budget', 60.0)))
-                _bv, _bd = _acopf_backward_crown_root(
+                    settings, 'nonlinear_bwd_crown_budget', 60.0)))
+                _bv, _bd = _nonlinear_backward_crown_root(
                     _gg64, spec, _sb_fwd, _ob_fwd, _xl, _xh, _zf,
                     settings, _bcdev, _t.float64,
                     deadline=_time_tg.perf_counter() + _bc_budget)
                 if getattr(settings, 'print_progress', False):
-                    print('[verify_graph] acopf backward-CROWN root: '
+                    print('[verify_graph] nonlinear backward-CROWN root: '
                           f'{_bv} worst_margin={_bd.get("worst_margin", 0.0):.3e} '
                           f'({_bd.get("verified_disj", "?")}/'
                           f'{_bd.get("n_disj", "?")} disj)', flush=True)
                 if _bv == 'verified':
                     return 'verified', _bd
-            if bool(getattr(settings, 'acopf_alpha_crown', True)):
+            if bool(getattr(settings, 'nonlinear_alpha_crown', True)):
                 # α-CROWN gets the bulk of the budget (it's the strongest
                 # lever for these bilinear-dominated specs); the BaB mops up.
                 _abudget = min(_tot * 0.8, 150.0)
-                _av, _ad = _acopf_alpha_opt(
+                _av, _ad = _nonlinear_alpha_opt(
                     graph, spec, settings, _t0, _abudget)
                 if _av == 'verified':
                     return 'verified', _ad
             _rem = max(1.0, _deadline - _time_tg.perf_counter())
-            return _verify_trig_graph(
+            return _verify_nonlinear_graph(
                 graph, spec, settings, _time_tg.perf_counter(), _rem)
         if getattr(settings, 'tighten_formulation', 'gen_cone') != 'skip':
             # Count VARYING input dims (these specs typically have a handful
@@ -9574,7 +9584,7 @@ def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):
 _ALPHA_OPS = ('pow', 'sigmoid', 'tanh', 'sin', 'cos', 'exp', 'reciprocal')
 
 
-def _acopf_nominal_cex_probe(graph, spec, settings, xl, xh):
+def _nonlinear_nominal_cex_probe(graph, spec, settings, xl, xh):
     """Cheap SAT pre-check: ACOPF specs are sometimes violated at the nominal
     operating point itself (the whole input box is unsafe — e.g. 14_ieee
     prop1, margin ~-0.006 at every corner). PGD on the internal point-forward
@@ -9594,11 +9604,11 @@ def _acopf_nominal_cex_probe(graph, spec, settings, xl, xh):
         w = cand.detach().cpu().numpy().flatten()
         ok, info = _validate_sat_witness(onnx_p, spec, w, atol=atol)
         if ok and _sat_disposition(graph, spec, settings, w, info) == 'real':
-            return 'sat', {'witness': w, 'phase': 'acopf_nominal_probe'}
+            return 'sat', {'witness': w, 'phase': 'nonlinear_nominal_probe'}
     return None
 
 
-def _acopf_backward_crown_root(gg, spec, sb, op_bounds, xl, xh, zf,
+def _nonlinear_backward_crown_root(gg, spec, sb, op_bounds, xl, xh, zf,
                                settings, device, dtype, deadline):
     """Backward-CROWN root bound with topo-order intermediate-bound refinement
     — the ml4acopf analog of α,β-CROWN's tight-intermediate initial CROWN.
@@ -9619,7 +9629,7 @@ def _acopf_backward_crown_root(gg, spec, sb, op_bounds, xl, xh, zf,
     n_out = int(zf.center.numel())
     queries = spec.as_linear_queries(n_out)
     if not queries:
-        return 'unknown', {'method': 'acopf_bwd_crown', 'reason': 'no_queries'}
+        return 'unknown', {'method': 'nonlinear_bwd_crown', 'reason': 'no_queries'}
     spec_ew = {qi: (_t.as_tensor(w, dtype=dtype, device=device), float(b))
                for qi, (di, w, b) in enumerate(queries)}
     disj_queries = {}
@@ -9650,7 +9660,7 @@ def _acopf_backward_crown_root(gg, spec, sb, op_bounds, xl, xh, zf,
                for di, ql in disj_queries.items()}
     verified_disj = {di for di, m in margins.items() if m > 0}
     worst = min(margins.values()) if margins else -1.0
-    det = {'method': 'acopf_bwd_crown', 'worst_margin': worst,
+    det = {'method': 'nonlinear_bwd_crown', 'worst_margin': worst,
            'margins': margins, 'verified_disj': len(verified_disj),
            'n_disj': len(disj_queries)}
     if len(verified_disj) == len(disj_queries):
@@ -9658,7 +9668,7 @@ def _acopf_backward_crown_root(gg, spec, sb, op_bounds, xl, xh, zf,
     return 'unknown', det
 
 
-def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
+def _nonlinear_alpha_opt(graph, spec, settings, t_start, total_timeout,
                      n_iters=None, lr=None):
     """α-CROWN (forward / α-zono) for the ACOPF trig graphs. Gradient-optimizes
     a per-element relaxation slope α∈[0,1] for every Sqr/Sigmoid/Tanh/Sin/Cos/
@@ -9711,13 +9721,13 @@ def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
                                         device=device, requires_grad=True)
     if not alphas:
         _restore()
-        return 'unknown', {'method': 'acopf_alpha', 'reason': 'no_alpha_ops'}
+        return 'unknown', {'method': 'nonlinear_alpha', 'reason': 'no_alpha_ops'}
     # group spec queries by disjunct (refuted iff ANY query margin > 0)
     n_out = int(_zf0.center.numel())
     qs = spec.as_linear_queries(n_out)
     if not qs:
         _restore()
-        return 'unknown', {'method': 'acopf_alpha', 'reason': 'no_queries'}
+        return 'unknown', {'method': 'nonlinear_alpha', 'reason': 'no_queries'}
     Wq = torch.as_tensor(np.stack([w for _, w, _ in qs]), dtype=dt, device=device)
     bq = torch.as_tensor(np.array([b for _, _, b in qs]), dtype=dt, device=device)
     di = [d for d, _, _ in qs]
@@ -9727,9 +9737,9 @@ def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
     grp_idx = [torch.as_tensor(v, device=device) for v in disj_groups.values()]
 
     n_iters = int(n_iters if n_iters is not None
-                  else getattr(settings, 'acopf_alpha_iters', 400))
+                  else getattr(settings, 'nonlinear_alpha_iters', 400))
     lr = float(lr if lr is not None
-               else getattr(settings, 'acopf_alpha_lr', 0.5))
+               else getattr(settings, 'nonlinear_alpha_lr', 0.5))
     opt = torch.optim.Adam(list(alphas.values()), lr=lr)
     # decay LR as the margin approaches 0 (fine convergence near the boundary)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -9751,9 +9761,9 @@ def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
         if _smf > 0:
             _restore()
             if print_progress:
-                print(f'[acopf_alpha] verified at iter {it}, '
+                print(f'[nl_alpha] verified at iter {it}, '
                       f'margin={_smf:.3e}', flush=True)
-            return 'verified', {'method': 'acopf_alpha', 'iter': it,
+            return 'verified', {'method': 'nonlinear_alpha', 'iter': it,
                                 'worst_margin': _smf, 'margins': {0: _smf}}
         (-spec_margin).backward()   # spec_margin keeps grad for the α update
         opt.step()
@@ -9763,8 +9773,8 @@ def _acopf_alpha_opt(graph, spec, settings, t_start, total_timeout,
                 p_.clamp_(0.0, 1.0)
     _restore()
     if print_progress:
-        print(f'[acopf_alpha] did not close; best margin={best:.3e}', flush=True)
-    return 'unknown', {'method': 'acopf_alpha', 'best_margin': best}
+        print(f'[nl_alpha] did not close; best margin={best:.3e}', flush=True)
+    return 'unknown', {'method': 'nonlinear_alpha', 'best_margin': best}
 
 
 def _resolve_device(settings):
@@ -9779,7 +9789,7 @@ def _resolve_device(settings):
     return str(resolve_torch(settings)[0])
 
 
-def _verify_trig_graph(graph, spec, settings, t_start, total_timeout):
+def _verify_nonlinear_graph(graph, spec, settings, t_start, total_timeout):
     """Self-contained SOUND verifier for graphs whose nonlinearity is trig /
     AC-power-flow physics (ml4acopf: Sin/Cos/Pow/Sigmoid + element-wise
     bilinear Mul). The 9-phase `_run_pipeline` and the batched input-split do

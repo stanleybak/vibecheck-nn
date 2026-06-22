@@ -3987,7 +3987,7 @@ def _crown_refine_intermediate_graph(gg, xl, xh, sb, op_bounds, device, dtype,
     for op in ops:
         if deadline is not None and time.perf_counter() > deadline:
             if print_progress:
-                print(f'[acopf-bwd-crown] refinement deadline hit after '
+                print(f'[nl-bwd-crown] refinement deadline hit after '
                       f'{n_done} nodes', flush=True)
             break
         t = op['type']

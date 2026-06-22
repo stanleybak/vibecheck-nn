@@ -36,6 +36,27 @@ witness is found. Soundness gate: all 12 SAT cases correctly fail to verify
 with PGD disabled (no false-verify). ABC's SAT set:
 {1,26,28,31,34,36,43,45,51,67,68,74}.
 
+### Regression & fix (2026-06-22) — shared-code routing
+
+A later commit (`762cc34`, ml4acopf work) added a nonlinear auto-router in
+`verify_graph` gated on `_has_trig or _has_mul_bilinear` that **force-disabled
+`input_split_batched_enabled`** for any net with a both-vary bilinear `Mul`.
+lsnc's Lyapunov quadratic forms `V = uᵀPu` ARE both-vary Muls, so lsnc was
+silently hijacked into the ml4acopf nonlinear path and its throughput BaB was
+killed → **every UNSAT timed out** (60 s, confirmed). Fix: the router now defers
+to explicit config intent — a config that set `input_split_batched_enabled`
+(lsnc does) keeps its declared BaB strategy; the auto-router only fires when no
+batched strategy was requested (ml4acopf, unchanged). The router/helpers were
+also renamed `acopf_* → nonlinear_*` (`_route_nonlinear`,
+`_verify_nonlinear_graph`, `_nonlinear_{backward_crown_root,alpha_opt,nominal_cex_probe}`,
+`nonlinear_*` settings) since the mechanism is general, not acopf-specific; the
+dead, never-imported `acopf_dual_ascent.py` module was deleted.
+
+Re-confirmed on AWS g5-8x (A10G), 2.0/v2 specs, 25 s budget: **80/80 (12 sat +
+68 unsat), verdicts identical to ABC's per-instance, tightest case ~12.9 s.**
+ml4acopf 14_ieee prop1/2/3 + full-prop3 re-run on the renamed code: verdicts
+unchanged.
+
 ## Bugs fixed to get here
 
 The benchmark was a 100% miss at the start (every case `unknown@2.6s`). The

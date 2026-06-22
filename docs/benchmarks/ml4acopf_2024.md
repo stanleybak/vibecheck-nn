@@ -13,8 +13,8 @@ graph is bilinear + ReLU, no live trig op).
 
 | prop | VC verdict | how | vs ABC |
 |---|---|---|---|
-| prop1 | `sat` (linear) / `unsat` (full) | nominal-point CE probe (`_acopf_nominal_cex_probe`) — the spec is violated at the operating point; full-net center is safe | ABC's clean-input attack does the same |
-| prop2 | `unsat` (+3.977) | backward-CROWN root + topo-order intermediate refinement (`_acopf_backward_crown_root`) | **beats** ABC's init-CROWN (+3.956) |
+| prop1 | `sat` (linear) / `unsat` (full) | nominal-point CE probe (`_nonlinear_nominal_cex_probe`) — the spec is violated at the operating point; full-net center is safe | ABC's clean-input attack does the same |
+| prop2 | `unsat` (+3.977) | backward-CROWN root + topo-order intermediate refinement (`_nonlinear_backward_crown_root`) | **beats** ABC's init-CROWN (+3.956) |
 | prop3 | `unsat` | linear: ReLU-slope α-CROWN closes lb(Y_5); **FULL net: α-CROWN closes Y_6 at +9.88e-7** (see below) | matches ABC (+8.64e-7) |
 | prop4-14 | `unsat` | α-CROWN / backward-CROWN root | parity |
 
@@ -24,7 +24,7 @@ nested power-flow bilinears); no ABC-only misses there.
 ## Method
 
 Production routes ACOPF graphs (detected by `Sin`/`Cos`/`Mul`-bilinear) through a
-self-contained sound pipeline (`verify_graph._verify_trig_graph` and helpers),
+self-contained sound pipeline (`verify_graph._verify_nonlinear_graph` and helpers),
 because the 9-phase LP/MILP pipeline and the batched input-split don't support
 trig/bilinear end-to-end:
 
@@ -33,14 +33,14 @@ trig/bilinear end-to-end:
   (`nonlinear_relax.zono_affine_transform`): `y = λx+μ` (gens scaled by λ,
   preserving input correlation) + one fresh δ error generator per element.
   Bounds are symbolic/closed-form (critical-point enumeration), never sampled.
-- **α-CROWN** (`_acopf_alpha_opt`): Adam-optimizes a per-neuron relaxation slope
+- **α-CROWN** (`_nonlinear_alpha_opt`): Adam-optimizes a per-neuron relaxation slope
   α∈[0,1] for every Sqr/Sigmoid/Tanh/Sin/Cos and the ReLU lower-slopes, through
   the differentiable forward zonotope, against the worst-disjunct spec margin.
-- **Backward-CROWN root** (`_acopf_backward_crown_root`) with topo-order
+- **Backward-CROWN root** (`_nonlinear_backward_crown_root`) with topo-order
   per-node intermediate-bound refinement — gated on `not _has_trig` and a
   net-size cap (the small linear nets only; closes 14_ieee prop2 beating ABC).
 - **SAT**: nominal-point CE probe + `_pgd_attack_general` (ORT-validated, never
-  a false sat) + the nonlinear-split dual-ascent BaB (`acopf_dual_ascent`).
+  a false sat) + the nonlinear-split BaB (`verify_graph._verify_nonlinear_graph`).
 - **BaB**: input-split (few varying dims) / nonlinear-pre-activation split
   (118/300) when the root doesn't close.
 
