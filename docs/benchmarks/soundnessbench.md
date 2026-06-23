@@ -134,3 +134,58 @@ it `sat` in 106.6 s vs its ~80 s median.
 ## Known unsolved
 
 None. 50/50.
+
+---
+
+## 2026 update — `soundnessbench_2026` adds soundness-stress UNSAT-looking instances; **AB-CROWN is UNSOUND on them, vibecheck is correct**
+
+The 2026 set (`soundnessbench_2026`, 60 instances on `model.onnx` and the residual
+variant `model_residual.onnx`) adds instances whose property *looks* UNSAT and
+that AB-CROWN reports `unsat` — but which are soundness-stress cases. **On at
+least `property_009/012/034/042` (all on `model_residual.onnx`), AB-CROWN's
+`unsat` is UNSOUND, and vibecheck's `unknown` is the correct, sound behavior.**
+
+Established 2026-06-23 (AWS g5, float64):
+
+- AB-CROWN verifies all four `unsat` with **init CROWN only** (no β, no BaB;
+  "Verified with initial CROWN!", ~2 s).
+- For `property_012` it verifies by refuting atom `Y_277 ≥ 5.125132`, claiming
+  `Y_277 ≤ 5.05`. **But `onnxruntime` (the authoritative output oracle) gives
+  `Y_277 = 7.388109` at an input inside the VNNLIB box** — the bound excludes
+  reachable values, so the `unsat` is unsound. vibecheck's bound on `Y_277` is
+  `7.84` (sound), so vibecheck cannot prove `unsat` → returns `unknown` (correct).
+- Smoking gun: on the minimal single-atom spec `Y_277 ≥ 5.125132`, AB-CROWN's
+  bound propagation says `unsat` while its own attack says `sat` (PGD finds the
+  witness in 0.47 s) — an internal contradiction.
+- Root cause: the residual net's **carrier branches** (input → `Reshape(1,8,16)`
+  → 3 stacked convs, no intervening ReLU → ReLU → `MatMul` → added to output).
+  Those carrier-ReLU pre-activations are an exact linear function of the input
+  with range ≈ `[-88, 98]`, but AB-CROWN's intermediate bounds for them come out
+  **degenerate** (e.g. `lo == hi == 2.39`, excluding the reachable `[-0.19, 4.38]`
+  confirmed by sampling), poisoning the output bound on `Y_277`. vibecheck
+  computes these carrier bounds exactly.
+
+**Reproduced on the latest AB-CROWN** (fresh clone `e5c7e17` 2026-06-16 +
+auto_LiRPA `5a098e8` 2026-06-10, run locally on CPU): same `initial CROWN bounds
+[-5.049972]` → `Verified with initial CROWN!` → `unsat`. NOT an old-branch
+artifact — the current release still false-verifies `demo_Y277.vnnlib`.
+
+**Bug report package** (send to the soundnessbench / AB-CROWN maintainers):
+`scratch/abc_soundness_bug/` — `model_residual.onnx`, `demo_Y277.vnnlib`,
+`counterexample_X.npy`, `validate_counterexample.py`, `README.md`.
+`md5(model_residual.onnx) = 51f54444f97ba39ddd9a89fd7b446307`.
+
+**Scoring implication:** these are AB-CROWN false-verifications (heavy VNNCOMP
+penalty), **not** vibecheck losses. The SCORING report must not credit AB-CROWN
+for soundnessbench `unsat`s; vibecheck's `unknown`/`sat` is the sound outcome.
+The earlier "4 cases need BaB to prove unsat" framing is wrong — proving them
+`unsat` would itself be unsound. The right goal is to find the planted CEs and
+return `sat`; the witnesses are tight needles (PGD reaches conjunct min-margin
+≈ −2e-4) that neither tool's attack currently finds.
+
+## Known unsolved (2026)
+
+- `property_009/012/034/042` (residual model): vibecheck returns `unknown`
+  (sound); the planted counterexamples are needles below current attack reach.
+  AB-CROWN false-verifies them `unsat`. Closing them for vibecheck means a
+  stronger *attack* (not a soundness-violating `unsat` proof).

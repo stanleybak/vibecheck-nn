@@ -5221,6 +5221,35 @@ def _sat_disposition(graph, spec, settings, witness, info):
     return 'within_tol'
 
 
+def _clamp_witness_to_box(witness, x_lo, x_hi):
+    """Clamp a counterexample witness into the input box `[x_lo, x_hi]` so it
+    stays inside even after the float32 cast ORT / the VNNCOMP scorer applies.
+
+    A box edge (e.g. `x >= 9.2`) is not generally representable in float32, so
+    a witness sitting exactly on it can round to the *outside* of the box when
+    cast (`float32(9.2) < 9.2`), failing the scorer's `x < lb - tol` test. Here
+    we clamp into the box in float64, then pull any component whose float32 cast
+    landed outside back toward the interior by one float32 ULP. The result is a
+    float64 array that is provably within `[x_lo, x_hi]` both as float64 and as
+    float32 (the coarser grid → also safe for float64-input models).
+
+    Pure function: uses `np.nextafter`/`np.clip` only — it does NOT touch any FP
+    rounding mode, so verification arithmetic elsewhere is unaffected (the clamp
+    runs only at witness validation / output time).
+    """
+    w = np.asarray(witness, np.float64).flatten()
+    lo = np.asarray(x_lo, np.float64).flatten()
+    hi = np.asarray(x_hi, np.float64).flatten()
+    w = np.minimum(np.maximum(w, lo), hi)            # into [lo, hi] in float64
+    w32 = w.astype(np.float32)
+    cast = w32.astype(np.float64)                    # value the scorer sees
+    below = cast < lo                                # rounded under the floor
+    above = cast > hi                                # rounded over the ceiling
+    w32 = np.where(below, np.nextafter(w32, np.float32(np.inf)), w32)
+    w32 = np.where(above, np.nextafter(w32, np.float32(-np.inf)), w32)
+    return w32.astype(np.float64)
+
+
 def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
     """Run a SAT witness through ONNXRuntime + check it actually violates
     the spec. Catches spurious counterexamples from PGD/MILP bugs OR from
@@ -5248,6 +5277,11 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
         info['out_of_box'] = (
             float((spec.x_lo - w).max()), float((w - spec.x_hi).max()))
         return False, info
+    # The raw witness is within atol of the box; pull it strictly inside,
+    # float32-safe (see `_clamp_witness_to_box`), and validate / emit THIS
+    # in-box point — never the raw one, whose box edge can round outside.
+    w = _clamp_witness_to_box(w, spec.x_lo, spec.x_hi)
+    info['witness_inbox'] = w
     try:
         import onnxruntime as ort
     except ImportError:
@@ -5795,6 +5829,99 @@ def _zono_input_split_close(gg, xl, xh, w_q, b_q, device, dtype,
     return True, nodes
 
 
+def _bound_stack_unsat(graph, xl_g, xh_g, spec, device, deadline=None,
+                       alpha_iters=80, tol=1e-6, print_progress=False):
+    """Memory-bounded UNSAT prover for big conv-ReLU nets whose dense forward
+    zonotope OOMs (soundnessbench's 98304-wide ReLUs need ~43 GB; this fits
+    ~150 MB). Stack: forward-LiRPA intermediate bounds -> backward-CROWN spec
+    bound + alpha-CROWN, in float64.
+
+    A disjunct's unsafe set (AND of threshold constraints) is empty iff SOME
+    constraint is provably always-violated, i.e. max_j margin_j > 0, where
+    margin_j = backward-CROWN lower bound of (w_j . Y + bias_j):
+      '>=' Y_i >= v  -> w=-e_i, bias=+v  (margin = v - ub(Y_i))
+      '<=' Y_i <= v  -> w=+e_i, bias=-v  (margin = lb(Y_i) - v)
+      pairwise Yc>=Yp -> w=e_p-e_c, bias=0
+    Whole spec is UNSAT iff EVERY disjunct's max-margin > tol.
+
+    SOUND: the margins are valid CROWN lower bounds for any alpha in [0,1] (the
+    max over alpha iterates stays a lower bound), so margin_j > 0 truly implies
+    constraint j is never satisfiable -> the conjunction is empty. On a SAT
+    instance every constraint can hold, so every margin_j <= 0 and this never
+    returns `unsat`. float64 + a positive `tol` guard the near-zero cases.
+
+    Only handles the single-input-box case (no per-disjunct input subboxes);
+    returns None (defer to the normal pipeline) if any disjunct carries one.
+    Returns ('verified', tb) when proven unsat, else None.
+    """
+    from .forward_lirpa import batched_forward_lirpa_layer_bounds_only
+    from .verify_zono_bnb import _spec_backward_graph_batched
+    if any(getattr(c, 'input_lo', None) is not None for c in spec.disjuncts):
+        return None
+    dt = torch.float64
+    gg = graph.gpu_graph(device, dt)
+    xl = xl_g.to(dt).reshape(1, -1)
+    xh = xh_g.to(dt).reshape(1, -1)
+    sb, last = batched_forward_lirpa_layer_bounds_only(gg, xl, xh, device, dt)
+    n_out = last.lo_box.flatten().numel()
+    int_layers = sorted(k for k in sb if isinstance(k, int))
+    worst = float('inf')
+    margins = {}
+    for di, conj in enumerate(spec.disjuncts):
+        ew = {}
+        for j, c in enumerate(conj.constraints):
+            w = torch.zeros(n_out, dtype=dt, device=device)
+            if hasattr(c, 'op') and c.op is not None:
+                if c.op == '>=':
+                    w[c.index] = -1.0
+                    b = float(c.value)
+                else:
+                    w[c.index] = 1.0
+                    b = -float(c.value)
+            else:
+                w[c.pred] = 1.0
+                w[c.comp] = -1.0
+                b = 0.0
+            ew[j] = (w, b)
+        Q = len(ew)
+        alpha = {}
+        for L in int_layers:
+            lo_L, hi_L = sb[L]
+            _, up_s, _, _, _, uns = _make_slopes(lo_L, hi_L)
+            alpha[L] = (((up_s > 0.5).to(dt) * uns.to(dt))
+                        .unsqueeze(1).expand(-1, Q, -1)
+                        .contiguous().requires_grad_(True))
+        opt = torch.optim.Adam([alpha[L] for L in alpha], lr=0.1)
+        best = None
+        for _it in range(alpha_iters):
+            if deadline is not None and time.perf_counter() > deadline:
+                break
+            opt.zero_grad()
+            sl = _spec_backward_graph_batched(
+                sb, xl, xh, gg, ew, device, dt, alpha_at_layer=alpha)
+            best = (sl.detach().clone() if best is None
+                    else torch.maximum(best, sl.detach()))
+            (-sl.sum()).backward()
+            opt.step()
+            with torch.no_grad():
+                for L in alpha:
+                    alpha[L].clamp_(0.0, 1.0)
+        if best is None:
+            return None
+        cm = max(best[0, k].item() for k in range(Q))
+        margins[di] = cm
+        worst = min(worst, cm)
+        if cm <= tol:
+            return None  # this disjunct not proven -> spec not proven unsat
+    if print_progress:
+        print(f'  [bound-stack] proved unsat '
+              f'(worst disjunct margin {worst:+.5f})', flush=True)
+    # 'verified' is verify_graph's convention for a proven-unsat result
+    # (main maps verified -> the `unsat` results-file line + exit 0).
+    return 'verified', {'phase': 'bound_stack', 'worst_margin': worst,
+                        'margins': margins}
+
+
 def _run_pipeline(graph, spec, settings, build_fn, impl):
     """Run the 9-phase graph verification pipeline.
 
@@ -6100,6 +6227,32 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 'width_final': rec.get('width_final', 0.0),
             }
             details['build_time_total'] += rec['build']
+
+    # --- Bound-stack UNSAT route (memory-bounded; for big conv-ReLU nets whose
+    # dense forward zonotope OOMs, e.g. soundnessbench's 98304-wide ReLUs).
+    # forward-LiRPA + backward-CROWN + α in float64, no dense zono. Runs BEFORE
+    # the PGD attack: proves the genuinely-unsat instances in ~seconds; SAT/hard
+    # instances fall through to PGD (the bound-stack margin stays <=0 there, so
+    # it never false-verifies a SAT case — sound on the soundness benchmark). ---
+    if bool(getattr(settings, 'bound_stack_phase0', False)):
+        _bs_dl = time.perf_counter() + float(
+            getattr(settings, 'bound_stack_time', 60.0))
+        try:
+            _bs = _bound_stack_unsat(
+                graph, xl_g, xh_g, spec, device, deadline=_bs_dl,
+                alpha_iters=int(
+                    getattr(settings, 'bound_stack_alpha_iters', 80)),
+                print_progress=print_progress)
+        except torch.cuda.OutOfMemoryError:
+            raise  # never swallow OOM (CLAUDE.md hard rule)
+        except RuntimeError as _bse:
+            # Best-effort UNSAT prover: on a non-OOM failure, log loudly and
+            # fall through to PGD / the rest of the pipeline rather than abort.
+            print(f'  [bound-stack] failed, falling through: '
+                  f'{type(_bse).__name__}: {str(_bse)[:100]}', flush=True)
+            _bs = None
+        if _bs is not None:
+            return _bs
 
     # --- Phase 0: PGD attack BEFORE Phase 1 cascade. Mirrors α,β-CROWN's
     # pgd_order='before' default: try to find a counter-example with attack

@@ -67,6 +67,38 @@ def _small_net(tmp_path, seed=0):
     return load_onnx(p, dtype=np.float64)
 
 
+def _residual_net(tmp_path, seed=0):
+    """Gemm -> Relu -> [Gemm(base) + MatMul(resid)] -> Add(merge) ->
+    Add(bias). r0 forks to two branches; exercises the residual merge add,
+    the affine bias add, and backward fan-in — the op set model_residual.onnx
+    adds over the conv-only nets."""
+    rng = np.random.default_rng(seed)
+    W0 = rng.standard_normal((8, 6)) * 0.5
+    b0 = rng.standard_normal(8) * 0.1
+    W1 = rng.standard_normal((5, 8)) * 0.5
+    b1 = rng.standard_normal(5) * 0.1
+    Wr = rng.standard_normal((8, 5)) * 0.5      # MatMul: r0(8) @ Wr -> (5)
+    bout = rng.standard_normal(5) * 0.1
+    nodes = [
+        helper.make_node('Gemm', ['X', 'W0', 'b0'], ['g0'], transB=1),
+        helper.make_node('Relu', ['g0'], ['r0']),
+        helper.make_node('Gemm', ['r0', 'W1', 'b1'], ['base'], transB=1),
+        helper.make_node('MatMul', ['r0', 'Wr'], ['resid']),
+        helper.make_node('Add', ['base', 'resid'], ['s']),       # merge
+        helper.make_node('Add', ['s', 'bout'], ['Y']),           # bias
+    ]
+    inits = [_init('W0', W0), _init('b0', b0), _init('W1', W1),
+             _init('b1', b1), _init('Wr', Wr), _init('bout', bout)]
+    graph = helper.make_graph(
+        nodes, 'resid',
+        [helper.make_tensor_value_info('X', TensorProto.DOUBLE, (1, 6))],
+        [helper.make_tensor_value_info('Y', TensorProto.DOUBLE, (1, 5))],
+        inits)
+    p = str(tmp_path / 'resid.onnx')
+    onnx.save(helper.make_model(graph), p)
+    return load_onnx(p, dtype=np.float64)
+
+
 def _ibp_bounds(gg, xl, xh):
     """Plain interval bounds at each pre-ReLU (the bbr both builders use)."""
     lo = {gg['input_name']: xl.clone()}
@@ -89,6 +121,15 @@ def _ibp_bounds(gg, xl, xh):
             mc = op['W'] @ mid + (op['bias'] if op['bias'] is not None else 0)
             rc = op['W'].abs() @ rad
             lo[name], hi[name] = mc - rc, mc + rc
+        elif t == 'add':
+            if op.get('is_merge'):
+                lb, hb = lo[op['inputs'][1]], hi[op['inputs'][1]]
+                lo[name], hi[name] = l + lb, h + hb
+            else:
+                bias = op.get('bias')
+                bt = (torch.as_tensor(np.asarray(bias).flatten(), dtype=DT)
+                      if bias is not None else 0.0)
+                lo[name], hi[name] = l + bt, h + bt
         elif t == 'relu':
             if 'layer_idx' in op:
                 bbr[op['layer_idx']] = (l.cpu().numpy(), h.cpu().numpy())
@@ -177,6 +218,17 @@ def _dense_forward_state(gg, xl, xh, bbr, alpha_per_layer):
             for local, j in enumerate(un_by_L[L]):
                 Gm2[new_col_start[L] + local, int(j)] = mu_t[int(j)]
             center[name], G[name] = cc, Gm2
+        elif t == 'add':
+            if op.get('is_merge'):
+                c_b = center[op['inputs'][1]]
+                Gm_b = G[op['inputs'][1]]
+                center[name] = c + c_b
+                G[name] = _grow(Gm, n_gens) + _grow(Gm_b, n_gens)
+            else:
+                bias = op.get('bias')
+                bt = (torch.as_tensor(np.asarray(bias).flatten(), dtype=DT)
+                      if bias is not None else 0.0)
+                center[name], G[name] = c + bt, Gm
         elif t == 'reshape':
             center[name], G[name] = c, Gm
         else:
@@ -235,10 +287,68 @@ def test_backward_matches_dense_forward(tmp_path, net_seed, in_seed):
         f"{np.abs(obj_dense - out_G_gt.cpu().numpy()).max():.2e}")
 
 
+def _assert_state_equivalence(gg_graph, in_seed, eps):
+    """Build the backward state and the independent dense-forward ground
+    truth on the same (net, box, α) and assert they match before any BnB:
+    column layout, lam/mu, c_in, every unstable row, and the spec objective
+    (obj_c_out + obj_G_out)."""
+    gg = gg_graph.gpu_graph(DEV, DT)
+    n = int(np.prod(gg_graph.input_shape))
+    rng = np.random.default_rng(in_seed)
+    c = torch.tensor(rng.uniform(-1, 1, n), dtype=DT)
+    xl, xh = c - eps, c + eps
+    bbr = _ibp_bounds(gg, xl, xh)
+    alpha = {L: rng.uniform(0.0, 1.0, len(bbr[L][0])) for L in bbr}
+
+    gt, n_gens_gt, n_in_gt, out_G_gt, out_c_gt = _dense_forward_state(
+        gg, xl, xh, bbr, alpha)
+    st = build_alpha_zono_state_backward(
+        gg, xl.numpy(), xh.numpy(), bbr,
+        {L: torch.tensor(a, dtype=DT) for L, a in alpha.items()},
+        device=DEV, dtype=DT, chunk=8)
+
+    assert st['n_input'] == n_in_gt
+    assert st['n_gens'] == n_gens_gt
+    assert len(st['unstable_list']) == len(gt)
+    gt_by_key = {(e['layer_idx'], e['neuron_idx']): e for e in gt}
+    assert len(gt_by_key) == len(gt)
+    for e in st['unstable_list']:
+        g = gt_by_key[(e['layer_idx'], e['neuron_idx'])]
+        assert e['e_new_col'] == g['e_new_col']
+        assert abs(e['lam'] - g['lam']) < 1e-12
+        assert abs(e['mu'] - g['mu']) < 1e-12
+        assert abs(e['c_in'] - g['c_in']) < 1e-9
+        row = np.zeros(n_gens_gt)
+        row[e['row_indices']] = e['row_values']
+        gt_row = g['row'].cpu().numpy()
+        assert np.allclose(row, gt_row, atol=1e-9), (
+            f"row mismatch at {(e['layer_idx'], e['neuron_idx'])}: "
+            f"max |Δ|={np.abs(row - gt_row).max():.2e}")
+
+    assert np.allclose(st['obj_c_out'], out_c_gt.cpu().numpy(), atol=1e-9)
+    obj_dense = st['obj_G_out_csr'].toarray()
+    assert obj_dense.shape == tuple(out_G_gt.shape)
+    assert np.allclose(obj_dense, out_G_gt.cpu().numpy(), atol=1e-9), (
+        f"obj_G_out mismatch: max |Δ|="
+        f"{np.abs(obj_dense - out_G_gt.cpu().numpy()).max():.2e}")
+
+
+@pytest.mark.parametrize('net_seed,in_seed', [(1, 3), (4, 9), (7, 2)])
+def test_backward_matches_dense_forward_residual(tmp_path, net_seed, in_seed):
+    """Same equivalence, on a net with a residual merge + bias add + fork —
+    the ops model_residual.onnx (soundnessbench property_012) adds over the
+    conv-only nets."""
+    _assert_state_equivalence(_residual_net(tmp_path, seed=net_seed),
+                              in_seed, eps=0.3)
+
+
 if __name__ == '__main__':
     import tempfile
     import pathlib
     with tempfile.TemporaryDirectory() as d:
         for ns, is_ in [(1, 3), (2, 7), (5, 11)]:
             test_backward_matches_dense_forward(pathlib.Path(d), ns, is_)
-    print('PASS: backward state matches dense forward (3 seeds)')
+        for ns, is_ in [(1, 3), (4, 9), (7, 2)]:
+            test_backward_matches_dense_forward_residual(
+                pathlib.Path(d), ns, is_)
+    print('PASS: backward state matches dense forward (conv + residual)')

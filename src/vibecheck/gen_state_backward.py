@@ -74,6 +74,7 @@ def _forward_center(gg, xl, xh, bbr, alpha_per_layer, device, dtype):
     """
     cen = {gg['input_name']: torch.as_tensor((xl + xh) / 2.0, device=device,
                                               dtype=dtype).flatten()}
+    size_by_op = {gg['input_name']: int(cen[gg['input_name']].numel())}
     c_pre = {}
     for op in gg['ops']:
         t = op['type']
@@ -87,6 +88,15 @@ def _forward_center(gg, xl, xh, bbr, alpha_per_layer, device, dtype):
         elif t == 'fc':
             cen[name] = op['W'] @ c + (op['bias'] if op['bias'] is not None
                                        else 0.0)
+        elif t == 'add':
+            # Residual merge (y = a + b) or affine bias add (y = a + bias).
+            if op.get('is_merge'):
+                cen[name] = c + cen[op['inputs'][1]]
+            else:
+                # Non-merge add = affine bias add (always carries a bias).
+                bt = torch.as_tensor(np.asarray(op['bias']).flatten(),
+                                     device=device, dtype=dtype)
+                cen[name] = c + bt
         elif t == 'relu':
             L = op.get('layer_idx')
             cc = c.detach().cpu().numpy().astype(np.float64)
@@ -106,10 +116,11 @@ def _forward_center(gg, xl, xh, bbr, alpha_per_layer, device, dtype):
             raise NotImplementedError(
                 f'gen_state_backward._forward_center: unsupported op {t!r} '
                 f'at {name!r}')
+        size_by_op[name] = int(cen[name].numel())
     # output center = the final op's centre (no ReLU after the spec layer)
     c_out = cen[gg['ops'][-1]['name']].detach().cpu().numpy().astype(
         np.float64)
-    return c_pre, c_out
+    return c_pre, c_out, size_by_op
 
 
 def _resolve_alpha(alpha_per_layer, L, lo):
@@ -179,8 +190,8 @@ def build_alpha_zono_state_backward(gg, xl, xh, bbr, alpha_per_layer, *,
         running += len(un)
     n_gens = running
 
-    c_pre, c_out = _forward_center(gg, xl, xh, bbr, alpha_per_layer,
-                                   device, dtype)
+    c_pre, c_out, size_by_op = _forward_center(gg, xl, xh, bbr,
+                                               alpha_per_layer, device, dtype)
 
     half_t = torch.as_tensor(half, device=device, dtype=dtype)
     # Precompute per-layer (lam, mu) tensors and the relu op lookup.
@@ -206,7 +217,7 @@ def build_alpha_zono_state_backward(gg, xl, xh, bbr, alpha_per_layer, *,
             rows = _backward_rows(gg, prod_op, tgt, relu_layers, L_j,
                                   lam_mu, half_t, new_col_start,
                                   unstable_by_layer, n_gens, n_input,
-                                  device, dtype)
+                                  device, dtype, size_by_op=size_by_op)
             lo_j, hi_j = bbr[L_j]
             lam_j, mu_j, _ = lam_mu[L_j]
             for r, j in enumerate(tgt):
@@ -234,13 +245,14 @@ def build_alpha_zono_state_backward(gg, xl, xh, bbr, alpha_per_layer, *,
     # reads. Output op has no ReLU after it, so it is a plain linear target.
     import scipy.sparse as _sp
     out_op = gg['ops'][-1]
-    n_out = _op_out_size(out_op)
+    n_out = _op_out_size(out_op, size_by_op)
     blocks = []
     for c0 in range(0, n_out, chunk):
         tgt = np.arange(c0, min(c0 + chunk, n_out))
         G = _backward_rows(gg, out_op, tgt, relu_layers, None, lam_mu,
                            half_t, new_col_start, unstable_by_layer,
-                           n_gens, n_input, device, dtype)
+                           n_gens, n_input, device, dtype,
+                           size_by_op=size_by_op)
         blocks.append(_sp.csr_matrix(
             G.detach().cpu().numpy().astype(np.float64)))
     obj_G_out_csr = _sp.vstack(blocks).tocsr() if blocks else None
@@ -258,7 +270,7 @@ def build_alpha_zono_state_backward(gg, xl, xh, bbr, alpha_per_layer, *,
 
 def _backward_rows(gg, prod_op, tgt, relu_layers, L_j, lam_mu, half_t,
                    new_col_start, unstable_by_layer, n_gens, n_input,
-                   device, dtype):
+                   device, dtype, size_by_op):
     """Backward sweep from z_{L_j}'s `tgt` neurons → full generator rows.
 
     Returns a dense (len(tgt) × n_gens) tensor (only used per-chunk, then
@@ -268,7 +280,7 @@ def _backward_rows(gg, prod_op, tgt, relu_layers, L_j, lam_mu, half_t,
     out = torch.zeros(T, n_gens, device=device, dtype=dtype)
     # ew_at[op_name] = (T × n_out_of_that_op) coefficient of that op's output.
     # Seed: identity over the producing op's output at the target neurons.
-    n_prod = _op_out_size(prod_op)
+    n_prod = _op_out_size(prod_op, size_by_op)
     seed = torch.zeros(T, n_prod, device=device, dtype=dtype)
     seed[torch.arange(T, device=device),
          torch.as_tensor(tgt, device=device, dtype=torch.long)] = 1.0
@@ -294,6 +306,14 @@ def _backward_rows(gg, prod_op, tgt, relu_layers, L_j, lam_mu, half_t,
         elif t == 'fc':
             back = ew @ op['W']                         # (T × n_in)
             _accum(ew_at, op['inputs'][0], back)
+        elif t == 'add':
+            # y = a + b (merge) or y = a + bias: ∂y/∂a = ∂y/∂b = I, so the
+            # coefficient flows unchanged to every (non-bias) input.
+            if op.get('is_merge'):
+                _accum(ew_at, op['inputs'][0], ew)
+                _accum(ew_at, op['inputs'][1], ew)
+            else:
+                _accum(ew_at, op['inputs'][0], ew)
         elif t == 'relu':
             L = op.get('layer_idx')
             if L is None:
@@ -330,10 +350,7 @@ def _accum(ew_at, name, val):
     ew_at[name] = val if name not in ew_at else ew_at[name] + val
 
 
-def _op_out_size(op):
-    if op['type'] == 'conv':
-        return int(np.prod(op['out_shape']))
-    if op['type'] == 'fc':
-        return int(op['W'].shape[0])
-    raise NotImplementedError(
-        f'gen_state_backward: cannot size output of op type {op["type"]!r}')
+def _op_out_size(op, size_by_op):
+    """Output element count of `op`, from the center-forward size map
+    (`_forward_center` records every op's output numel)."""
+    return int(size_by_op[op['name']])

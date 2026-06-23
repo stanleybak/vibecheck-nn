@@ -200,6 +200,18 @@ def default_settings(**overrides):
         # (soundnessbench) where the cascade can't help and the dense zono
         # OOMs — pour all remaining time into attack instead. Default False.
         pgd_phase0_persist_until_budget=False,
+        # Bound-stack UNSAT route (memory-bounded; runs BEFORE Phase-0 PGD).
+        # For big conv-ReLU nets whose dense forward zonotope OOMs (e.g.
+        # soundnessbench's 98304-wide ReLUs): forward-LiRPA intermediate bounds
+        # + backward-CROWN spec bound + α-CROWN, all float64, ~150 MB. Proves
+        # the genuinely-unsat instances in seconds without the 43 GB dense zono.
+        # SOUND: returns `unsat` only when every disjunct's max margin > tol
+        # (some constraint provably always-violated); on a SAT case all margins
+        # stay <=0 so it never false-verifies. SAT/hard instances fall through
+        # to PGD. Default False (gated per-benchmark via config).
+        bound_stack_phase0=False,
+        bound_stack_time=60.0,          # wall-clock budget for the bound-stack
+        bound_stack_alpha_iters=80,     # α-CROWN iterations per disjunct
         # Per-restart disjunct targeting: when True (and >1 disjunct active),
         # restart r descends only disjunct r%n_active's loss instead of one
         # joint loss summed over all disjuncts — every disjunct gets dedicated

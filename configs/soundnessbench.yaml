@@ -53,3 +53,14 @@ pgd_seed: 0
 # `unknown` and skip the cascade (which would otherwise OOM on the 43 GB dense
 # zono). This is the robust fix; pgd_seed just makes round 0 reproducible.
 pgd_phase0_persist_until_budget: true
+
+# Bound-stack UNSAT route (2026 soundnessbench_2026 adds genuinely-unsat
+# instances the attack can't decide). Runs BEFORE Phase-0 PGD: forward-LiRPA +
+# backward-CROWN + α (float64, ~150MB, no dense zono) proves the unsat instances
+# in seconds. SAT/hard instances fall through to PGD; the bound-stack margin
+# stays <=0 on SAT cases so it never false-verifies (sound on the soundness
+# benchmark). The 4 ABC-unsound cases (009/012/034/042) correctly stay `unknown`
+# (VC sound; ABC false-verifies them — see docs/benchmarks/soundnessbench.md).
+bound_stack_phase0: true
+bound_stack_time: 60.0
+bound_stack_alpha_iters: 80

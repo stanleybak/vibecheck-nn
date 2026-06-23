@@ -429,6 +429,10 @@ def _verify(args, sat_state=None):
                       f'({_vinfo_f.get("reason")}) — downgrading, not emitting SAT')
                 line = 'timeout' if timed_out else 'unknown'
                 _w_final = None
+            elif _vinfo_f.get('witness_inbox') is not None:
+                # Emit the float32-safe in-box witness (clamped strictly inside
+                # the box) — not the raw one whose edge can round outside.
+                _w_final = _vinfo_f['witness_inbox']
         if line == 'unknown' and (
                 timed_out or (args.timeout is not None and t_total >= args.timeout - 2.0)):
             line = 'timeout'
@@ -767,6 +771,10 @@ def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0
     y = info.get('out')
     if y is None:
         return None
+    # Write the float32-safe in-box witness as X (same point that produced Y
+    # via ORT), so the scorer's box check passes despite FP edge rounding.
+    if info.get('witness_inbox') is not None:
+        x = np.asarray(info['witness_inbox']).flatten().astype(np.float64)
     y = np.asarray(y).flatten().astype(np.float64)
     return _format_cex(version, onnx_path, x, y, cex_fmt)
 
