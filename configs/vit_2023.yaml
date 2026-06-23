@@ -20,6 +20,12 @@ zono_relu_split_max_nodes: 6000
 # batched no-reforward beta-CROWN BaB (ABC vit recipe: batch 32, 10 it)
 attn_bab_batch: 32
 attn_bab_iters: 12
+# kfsb branching width (split candidates evaluated per branch). k=4 picked poor
+# splits on the ibp family -> domain explosion (ibp_3_3_8_6769: 3193 domains,
+# never closed in 100s); k=8 ~ matches ABC's split quality (6769: 265 domains,
+# closes well under budget). Root bound is already == ABC's; this is the lever
+# that closed the ~10 ibp ABC-only misses.
+attn_bab_kfsb: 8
 # CROWN intermediate refinement: pgd-family roots -7.7 -> -3.0 (alpha)
 # in 0.7s; ibp marginal (+0.002, ~10s). fp32 search is default-on.
 attn_refine_passes: 2
