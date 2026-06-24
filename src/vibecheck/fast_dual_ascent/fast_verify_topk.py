@@ -64,10 +64,23 @@ def node_bound_topk(F, sides, lam0, lam1, nu=None, K_top=256, use_farprobe=False
     rc = F['d_base'].unsqueeze(0) + (rho + sign * (lam0 - lam1)) @ a_g
     x = torch.where(rc < 0, eh.expand(B, n), el.expand(B, n))
     g = c0_path + (rc * x).sum(-1) - (lam0 * b0 + lam1 * b1).sum(-1)
-    best = g
-    pend = (best <= _TOL).to(a_g.dtype)
     p = x @ a_g.t()
     s0 = sign * (p + cin); s1 = torch.where(sides == 0, -p - zlo, p - zhi)
+    # Per-dimension complementary-slackness clamp + box-corner floor (see
+    # node_bound_logbucket): s0/s1 are the subgradients ∂g/∂λ; a dual on a slack
+    # constraint (s<0) only drags g down via its −λ·b term, so zero those (keep
+    # binding dims), re-evaluate, and report best of {warm-start, clamped, λ=0}.
+    # All valid (λ≥0) → the bound is never below the box corner.
+    lam0_c = torch.where(s0 < 0, torch.zeros_like(lam0), lam0)
+    lam1_c = torch.where(s1 < 0, torch.zeros_like(lam1), lam1)
+    rc_c = F['d_base'].unsqueeze(0) + (rho + sign * (lam0_c - lam1_c)) @ a_g
+    x_c = torch.where(rc_c < 0, eh.expand(B, n), el.expand(B, n))
+    g_c = c0_path + (rc_c * x_c).sum(-1) - (lam0_c * b0 + lam1_c * b1).sum(-1)
+    rc0 = F['d_base'].unsqueeze(0) + rho @ a_g
+    x0 = torch.where(rc0 < 0, eh.expand(B, n), el.expand(B, n))
+    g0 = c0_path + (rc0 * x0).sum(-1)
+    best = torch.maximum(torch.maximum(g, g_c), g0)
+    pend = (best <= _TOL).to(a_g.dtype)
     sp0 = torch.where((lam0 <= _TOL) & (s0 < 0), torch.zeros_like(s0), s0)
     sp1 = torch.where((lam1 <= _TOL) & (s1 < 0), torch.zeros_like(s1), s1)
     slope0 = (sp0 * s0 + sp1 * s1).sum(-1)
@@ -123,14 +136,32 @@ def node_bound_logbucket(F, sides, lam0, lam1, nu, Kb=256, use_farprobe=False):
     x = torch.where(rc < 0, eh.expand(B, n), el.expand(B, n))
     g = (c0_path + (rc * x).sum(-1) - (lam0 * b0 + lam1 * b1).sum(-1)
          - (nu * hs_b).sum(-1))
-    best = g
-    pend = (best <= _TOL).to(a_g.dtype)
     p = x @ a_g.t()
     s0 = sign * (p + cin); s1 = torch.where(sides == 0, -p - zlo, p - zhi)
-    sp0 = torch.where((lam0 <= _TOL) & (s0 < 0), torch.zeros_like(s0), s0)
-    sp1 = torch.where((lam1 <= _TOL) & (s1 < 0), torch.zeros_like(s1), s1)
     # static-halfspace subgradient (sibling output constraints, INVPROP-style)
     s2 = x @ hs_a.t() - hs_b                          # (B, M)
+    # Per-dimension complementary-slackness clamp + box-corner floor. s0/s1/s2
+    # are the subgradients ∂g/∂λ; a dual on a slack constraint (s<0) only drags
+    # g down via its −λ·b / −ν·hs_b term, so by complementary slackness it should
+    # be 0. Zero those (keep the binding dims), re-evaluate, and report the best
+    # of {warm-start λ, clamped λ, λ=0} — all valid (λ≥0). Guarantees the bound
+    # is never below the box corner (a split only tightens), fixing the deep-node
+    # frontier blow-up from a stale inherited warm-start.
+    lam0_c = torch.where(s0 < 0, torch.zeros_like(lam0), lam0)
+    lam1_c = torch.where(s1 < 0, torch.zeros_like(lam1), lam1)
+    nu_c = torch.where(s2 < 0, torch.zeros_like(nu), nu)
+    rc_c = (F['d_base'].unsqueeze(0) + (rho + sign * (lam0_c - lam1_c)) @ a_g
+            + nu_c @ hs_a)
+    x_c = torch.where(rc_c < 0, eh.expand(B, n), el.expand(B, n))
+    g_c = (c0_path + (rc_c * x_c).sum(-1) - (lam0_c * b0 + lam1_c * b1).sum(-1)
+           - (nu_c * hs_b).sum(-1))
+    rc0 = F['d_base'].unsqueeze(0) + rho @ a_g
+    x0 = torch.where(rc0 < 0, eh.expand(B, n), el.expand(B, n))
+    g0 = c0_path + (rc0 * x0).sum(-1)
+    best = torch.maximum(torch.maximum(g, g_c), g0)
+    pend = (best <= _TOL).to(a_g.dtype)
+    sp0 = torch.where((lam0 <= _TOL) & (s0 < 0), torch.zeros_like(s0), s0)
+    sp1 = torch.where((lam1 <= _TOL) & (s1 < 0), torch.zeros_like(s1), s1)
     sp2 = torch.where((nu <= _TOL) & (s2 < 0), torch.zeros_like(s2), s2)
     slope0 = (sp0 * s0 + sp1 * s1).sum(-1) + (sp2 * s2).sum(-1)
     da = (sign * (sp0 - sp1)) @ a_g + sp2 @ hs_a
@@ -197,7 +228,130 @@ def node_bound_logbucket(F, sides, lam0, lam1, nu, Kb=256, use_farprobe=False):
     return best, lam0, lam1, nu
 
 
-_KERNELS = {'logbucket': node_bound_logbucket, 'topk': node_bound_topk}
+# EXPLORATORY flags — all default to the PRE-EXISTING production behavior so nothing
+# changes for any benchmark until explicitly enabled (pending user approval).
+_PARENT_FLOOR = os.environ.get('VC_PARENT_FLOOR', '0') not in ('0', 'false', 'False')
+_SG_OPT = os.environ.get('VC_SUBGRAD_OPT', 'adam')          # 'adam' (default) | 'subgrad' — only used when ls='subgrad'
+_SUBGRAD_LR = float(os.environ.get('VC_SUBGRAD_LR', '0.05' if _SG_OPT == 'adam' else '0.5'))
+_SG_COMPILE = os.environ.get('VC_SUBGRAD_COMPILE', '1') not in ('0', 'false', 'False')
+
+
+def _adam_step_body(d_base, rho, sign, l0, l1, nv, m0, v0, m1, v1, mn, vn,
+                    a_g, hs_a, hs_b, el, eh, b0, b1, cin, zlo, zhi, c0_path, sides,
+                    lr, bc1, bc2):
+    """ONE projected-ADAM ascent step on g (broadcast, no sort). ADAM converges to the
+    node dual optimum faster + more reliably than plain subgradient (ablation: reaches
+    the LP opt on all-ON, mixed AND slow all-OFF nodes where plain subgrad under-shoots).
+    Moments m*,v* are per-node/per-dim, reset each node-bound call. β1=0.9, β2=0.999."""
+    rc = d_base + (rho + sign * (l0 - l1)) @ a_g + nv @ hs_a
+    x = torch.where(rc < 0, eh, el)
+    g = c0_path + (rc * x).sum(-1) - (l0 * b0 + l1 * b1).sum(-1) - (nv * hs_b).sum(-1)
+    p = x @ a_g.t()
+    s0 = sign * (p + cin)
+    s1 = torch.where(sides == 0, -p - zlo, p - zhi)
+    s2 = x @ hs_a.t() - hs_b
+    m0 = 0.9 * m0 + 0.1 * s0; v0 = 0.999 * v0 + 0.001 * s0 * s0
+    m1 = 0.9 * m1 + 0.1 * s1; v1 = 0.999 * v1 + 0.001 * s1 * s1
+    mn = 0.9 * mn + 0.1 * s2; vn = 0.999 * vn + 0.001 * s2 * s2
+    l0 = (l0 + lr * (m0 / bc1) / ((v0 / bc2).sqrt() + 1e-8)).clamp_min(0.0)
+    l1 = (l1 + lr * (m1 / bc1) / ((v1 / bc2).sqrt() + 1e-8)).clamp_min(0.0)
+    nv = (nv + lr * (mn / bc1) / ((vn / bc2).sqrt() + 1e-8)).clamp_min(0.0)
+    return g, l0, l1, nv, m0, v0, m1, v1, mn, vn
+
+
+_ADAM_STEP = None
+
+
+def _get_adam_step(compile):
+    global _ADAM_STEP
+    if not compile:
+        return _adam_step_body
+    if _ADAM_STEP is None:
+        _ADAM_STEP = torch.compile(_adam_step_body, dynamic=True)
+    return _ADAM_STEP
+
+
+def _sg_step_body(d_base, rho, sign, l0, l1, nv, a_g, hs_a, hs_b, el, eh,
+                  b0, b1, cin, zlo, zhi, c0_path, sides, step):
+    """ONE projected-subgradient step (broadcast, no sort) — compiled once and reused
+    across depths/iterations (dynamic over B,D). Returns (g, l0', l1', nv')."""
+    rc = d_base + (rho + sign * (l0 - l1)) @ a_g + nv @ hs_a
+    x = torch.where(rc < 0, eh, el)                       # eh/el (n,) broadcast over (B,n)
+    g = c0_path + (rc * x).sum(-1) - (l0 * b0 + l1 * b1).sum(-1) - (nv * hs_b).sum(-1)
+    p = x @ a_g.t()
+    s0 = sign * (p + cin)
+    s1 = torch.where(sides == 0, -p - zlo, p - zhi)
+    s2 = x @ hs_a.t() - hs_b
+    l0 = (l0 + step * s0).clamp_min(0.0)
+    l1 = (l1 + step * s1).clamp_min(0.0)
+    nv = (nv + step * s2).clamp_min(0.0)
+    return g, l0, l1, nv
+
+
+_SG_STEP = None
+
+
+def _get_sg_step(compile):
+    global _SG_STEP
+    if not compile:
+        return _sg_step_body
+    if _SG_STEP is None:
+        _SG_STEP = torch.compile(_sg_step_body, dynamic=True)
+    return _SG_STEP
+
+
+def node_bound_subgrad(F, sides, lam0, lam1, nu, n_steps=64, use_farprobe=True):
+    """max(far-probe, K-step projected SUBGRADIENT) per-node bound — compilable
+    (elementwise + matmul + clamp, NO sort/topk). The logbucket far-probe line
+    search STALLS on mixed on/off nodes (and misses infeasible branch combos whose
+    dual is unbounded), reporting provably-robust nodes ≈box-corner so they never
+    prune and the BaB explodes. A plain projected subgradient (diminishing step
+    lr0/√t, project λ≥0) instead CONVERGES to the node dual optimum where the line
+    search stalls — flipping those nodes positive (prune) and detecting infeasibility
+    (g→+∞). Both are valid lower bounds (g(λ)≤p* ∀λ≥0), so the max is sound and keeps
+    the far-probe's wins on all-OFF nodes. Returns (best, λ') with λ' = the converged
+    subgradient multipliers for the children's warm start."""
+    a_g = F['a_g']; D, n = a_g.shape; B = sides.shape[0]
+    el, eh = F['el'], F['eh']
+    sign = (1 - 2 * sides).to(a_g.dtype)
+    rho = torch.where(sides == 0, F['ratio_off'], F['ratio_on'])
+    c0_path = F['c0'] + torch.where(sides == 0, F['c0_off'], F['c0_on']).sum(1)
+    cin, zlo, zhi = F['c_in'], F['z_lo'], F['z_hi']
+    b0 = torch.where(sides == 0, (-cin).expand(B, D), cin.expand(B, D))
+    b1 = torch.where(sides == 0, zlo.expand(B, D), zhi.expand(B, D))
+    hs_a, hs_b = F['hs_a'], F['hs_b']
+    d_base = F['d_base']
+    # the far-probe (sound, fast) — best on all-OFF nodes; also seeds the warm start
+    best_fp, l0, l1, nv = node_bound_logbucket(F, sides, lam0, lam1, nu, 256, use_farprobe)
+    # projected subgradient from the inherited λ — converges where the line search stalls.
+    # Compiled single step reused across iterations (n_steps unrolled in Python, not the graph).
+    best = best_fp.clone()
+    dev, dt = a_g.device, a_g.dtype
+    if _SG_OPT == 'adam':
+        m0 = torch.zeros_like(l0); v0 = torch.zeros_like(l0)
+        m1 = torch.zeros_like(l1); v1 = torch.zeros_like(l1)
+        mn = torch.zeros_like(nv); vn = torch.zeros_like(nv)
+        lr = torch.tensor(_SUBGRAD_LR, device=dev, dtype=dt)
+        step_fn = _get_adam_step(_SG_COMPILE)
+        for t in range(1, n_steps + 1):
+            bc1 = torch.tensor(1 - 0.9 ** t, device=dev, dtype=dt)
+            bc2 = torch.tensor(1 - 0.999 ** t, device=dev, dtype=dt)
+            g, l0, l1, nv, m0, v0, m1, v1, mn, vn = step_fn(
+                d_base, rho, sign, l0, l1, nv, m0, v0, m1, v1, mn, vn, a_g, hs_a, hs_b,
+                el, eh, b0, b1, cin, zlo, zhi, c0_path, sides, lr, bc1, bc2)
+            best = torch.maximum(best, g)
+    else:
+        step_fn = _get_sg_step(_SG_COMPILE)
+        for t in range(n_steps):
+            step = torch.tensor(_SUBGRAD_LR / ((t + 1) ** 0.5), device=dev, dtype=dt)
+            g, l0, l1, nv = step_fn(d_base, rho, sign, l0, l1, nv, a_g, hs_a, hs_b, el, eh,
+                                    b0, b1, cin, zlo, zhi, c0_path, sides, step)
+            best = torch.maximum(best, g)
+    return best, l0, l1, nv
+
+
+_KERNELS = {'logbucket': node_bound_logbucket, 'topk': node_bound_topk,
+            'subgrad': node_bound_subgrad}
 
 
 class Verifier:
@@ -269,7 +423,7 @@ class Verifier:
         return best, o0, o1, onu
 
     def verify_query(self, state, qw, qb, scored_keys, *, time_limit=120.0,
-                     extra_hs=()):
+                     extra_hs=(), verbose=False):
         # On CUDA, build the split matrix directly on-device (skips the dense
         # host (n_unstable, n_gens) alloc + upload). Identical Problem otherwise.
         # extra_hs (sibling output constraints for conjunctive disjuncts) needs
@@ -280,9 +434,9 @@ class Verifier:
             prob = (parse_problem_gpu(state, qw, qb, scored_keys, self.device)
                     if self.device.type == 'cuda'
                     else parse_problem(state, qw, qb, scored_keys))
-        return self.verify(prob, time_limit=time_limit)
+        return self.verify(prob, time_limit=time_limit, verbose=verbose)
 
-    def verify(self, prob, *, time_limit=120.0):
+    def verify(self, prob, *, time_limit=120.0, verbose=False):
         dev = self.device; G = self._upload(prob)
         # Compile-warmup pre-specialises the kernel at common depths. The
         # Verifier is reused across queries, so a depth warmed once stays
@@ -305,6 +459,14 @@ class Verifier:
         lam0 = torch.zeros(2, 1, device=dev); lam1 = torch.zeros(2, 1, device=dev)
         nu = torch.zeros(2, M, device=dev)
         nodes_total = 0; depth = 1; peak = 2
+        t_prev = 0.0
+        # PARENT-BEST FLOOR: a child's feasible region is a SUBSET of its parent's (it
+        # adds one halfspace), so the parent's bound is a valid lower bound for the
+        # child too. Flooring each node at its parent's bound makes worst_lb monotone
+        # non-decreasing with depth — a node-bound that under-converges (e.g. K-step
+        # ascent on the freshly-added split) can never drag the frontier below what an
+        # ancestor already proved. Sound (max of valid lower bounds). Root has no parent.
+        floor = torch.full((2,), float('-inf'), device=dev)
 
         def _unknown(open_n, reason):
             return 'unknown', dict(nodes=nodes_total, depth=depth, peak_frontier=peak,
@@ -316,8 +478,21 @@ class Verifier:
             try:
                 best, o0, o1, onu = self._bounds(self._F(G, depth), sides, lam0, lam1, nu,
                                                  deadline=deadline)
+                if _PARENT_FLOOR:
+                    best = torch.maximum(best, floor)    # inherit the parent's proven bound (opt-in)
+                if verbose:
+                    _now = elapsed()
+                    _worst = float(best.min())
+                    _ncert = int((best > _TOL).sum())
+                    print(f'  [bnb] depth={depth} frontier={sides.shape[0]} '
+                          f'worst_lb={_worst:+.6f} certified={_ncert}/{sides.shape[0]} '
+                          f'depth_t={_now - t_prev:.2f}s cum={_now:.1f}s', flush=True)
+                    t_prev = _now
+                    self._last_worst_sides = sides[int(best.argmin())].detach().cpu().numpy()
+                    self._last_worst_depth = depth; self._last_worst_lb = _worst
                 keep = best <= _TOL
                 ss = sides[keep]; l0 = o0[keep]; l1 = o1[keep]; nk = onu[keep]
+                pb = best[keep]                          # surviving parents' proven bounds
                 if ss.shape[0] == 0:
                     return 'unsat', dict(nodes=nodes_total, depth=depth, peak_frontier=peak, wall=elapsed())
                 if depth >= prob.n_splits:
@@ -328,6 +503,7 @@ class Verifier:
                 lam0 = torch.cat([torch.cat([l0, zf], 1), torch.cat([l0, zf], 1)], 0)
                 lam1 = torch.cat([torch.cat([l1, zf], 1), torch.cat([l1, zf], 1)], 0)
                 nu = torch.cat([nk, nk], 0)
+                floor = torch.cat([pb, pb])              # each child floored at its parent
             except _DeadlineExceeded:
                 return _unknown(sides.shape[0], 'time_limit')
             except torch.cuda.OutOfMemoryError:
