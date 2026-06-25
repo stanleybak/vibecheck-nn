@@ -679,14 +679,17 @@ def _cex_v2(ins_meta, outs_meta, x_flat, y_flat, fmt):
     return '\n'.join(lines)
 
 
-def _format_cex(version, onnx_path, x_flat, y_flat, fmt):
+def _format_cex(version, onnx_path, x_flat, y_flat, fmt, io_meta=None):
     """Dispatch the counterexample to the v1 (flat X_i/Y_i s-expr) or v2 (per-tensor) format
-    per the resolved spec version. Logs which on-disk format is emitted (so a v1/v2 mismatch
-    against the benchmark's spec version is visible in the run log)."""
+    per the resolved spec version. For v2 the per-tensor headers MUST use the SPEC-declared
+    variable names (from `declare-input`/`declare-output`, e.g. X / Y) so the v2 validator
+    accepts them — passed in as `io_meta=spec.io_decls`. Only if the spec didn't declare them
+    (io_meta is None) do we fall back to the ONNX node names. Logs which format is emitted."""
     if version == '2.0':
-        ins, outs = _onnx_io_meta(onnx_path)
-        print('  [counterexample] format=v2.0 (per-tensor: "NAME dtype [shape]" + '
-              'C-order values per input then output)', flush=True)
+        ins, outs = io_meta if io_meta is not None else _onnx_io_meta(onnx_path)
+        _src = 'spec-declared names' if io_meta is not None else 'ONNX node names'
+        print(f'  [counterexample] format=v2.0 (per-tensor: "NAME dtype [shape]" + '
+              f'C-order values per input then output; using {_src})', flush=True)
         return _cex_v2(ins, outs, x_flat, y_flat, fmt)
     print('  [counterexample] format=v1.0 (flat s-expr: ((X_i <v>) ... (Y_j <v>)))',
           flush=True)
@@ -806,7 +809,9 @@ def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0
     if info.get('witness_inbox') is not None:
         x = np.asarray(info['witness_inbox']).flatten().astype(np.float64)
     y = np.asarray(y).flatten().astype(np.float64)
-    return _format_cex(version, onnx_path, x, y, cex_fmt)
+    # v2: emit with the SPEC's declared I/O names (X / Y ...), not the ONNX node names.
+    return _format_cex(version, onnx_path, x, y, cex_fmt,
+                       io_meta=getattr(spec, 'io_decls', None))
 
 
 def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0'):

@@ -99,6 +99,32 @@ def test_format_cex_v1_v2(tmp_path):
     assert v2[3] == 'Y float32 [1,1]' and v2[4] == '0.6'
 
 
+def test_format_cex_v2_uses_spec_declared_names(tmp_path):
+    # Regression (safenlp): a v2 cex must use the SPEC-declared variable names
+    # passed via io_meta (e.g. X / Y), NOT the ONNX node names.
+    import numpy as np
+    q = _quant_onnx(str(tmp_path / 'q.onnx'))
+    x, y = np.array([0.7, 0.3]), np.array([0.6])
+    io = ((('Xspec', 'float32', (1, 2), 2),), (('Yspec', 'float32', (1, 1), 1),))
+    v2 = vbmain._format_cex('2.0', q, x, y, '.6g', io_meta=io).splitlines()
+    assert v2[0] == 'Xspec float32 [1,2]' and v2[1:3] == ['0.7', '0.3']
+    assert v2[3] == 'Yspec float32 [1,1]' and v2[4] == '0.6'
+
+
+def test_v2_spec_carries_declared_io():
+    # The v2 loader attaches the declare-input/output names so a cex uses them.
+    from vibecheck.vnnlib_loader import parse_vnnlib_text
+    txt = ('(vnnlib-version <2.0>)\n'
+           '(declare-network N (declare-input X float32 [1, 2]) '
+           '(declare-output Y float32 [1, 1]))\n'
+           '(assert (>= X[0,0] 0.0))\n(assert (<= X[0,0] 1.0))\n'
+           '(assert (>= X[0,1] 0.0))\n(assert (<= X[0,1] 1.0))\n'
+           '(assert (<= Y[0,0] 0.0))\n')
+    spec = parse_vnnlib_text(txt)
+    assert spec.io_decls == ((('X', 'float32', (1, 2), 2),),
+                             (('Y', 'float32', (1, 1), 1),))
+
+
 def test_emit_surrogate_result_v2(tmp_path):
     import numpy as np
     q = _quant_onnx(str(tmp_path / 'q.onnx'))

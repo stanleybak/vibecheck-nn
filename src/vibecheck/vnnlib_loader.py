@@ -944,4 +944,13 @@ def _vnnlib_v2_to_spec(prop, dtype=np.float32):
         else:
             disjuncts.append(Conjunct(ycons))
 
-    return VNNSpec(x_lo, x_hi, disjuncts)
+    # Carry the SPEC-declared I/O names/dtypes/shapes so a v2 counterexample uses
+    # the vnnlib's variable names (X / Y ...) rather than the ONNX node names.
+    io_decls = None
+    if prop.networks:
+        net = prop.networks[0]
+        io_decls = (
+            tuple((t.name, t.dtype, tuple(t.shape), t.size) for t in net.inputs),
+            tuple((t.name, t.dtype, tuple(t.shape), t.size) for t in net.outputs),
+        )
+    return VNNSpec(x_lo, x_hi, disjuncts, io_decls=io_decls)
