@@ -1,6 +1,7 @@
 """Coverage for the surrogate-attack hooks in main.py (_maybe_surrogate_attack,
-_surrogate_path, _emit_surrogate_result, the _verify hook, and the --build-surrogate
-CLI handler). Reuses the tiny synthetic quantized ONNX from test_surrogate_pgd."""
+_surrogate_path, _emit_surrogate_result, the _verify hook, and the --prepare-pkl
+CLI handler — quantized builds surrogates, non-quantized writes the pre-parse cache).
+Reuses the tiny synthetic quantized ONNX from test_surrogate_pgd."""
 import argparse
 import os
 import sys
@@ -121,10 +122,12 @@ def test_verify_surrogate_hook_sat(tmp_path):
     assert open(rf).read().startswith('sat')
 
 
-def test_build_surrogate_cli(tmp_path, monkeypatch):
+def test_prepare_pkl_cli_quant(tmp_path, monkeypatch):
+    # --prepare-pkl on a QUANTIZED net folds the float (STE) + fake-quant surrogates
+    # (the graph pre-parse is skipped — that net uses the surrogate-attack path).
     q = _quant_onnx(str(tmp_path / 'q.onnx'))
     monkeypatch.setattr(sys, 'argv',
-                        ['vibecheck', '--net', q, '--spec', 'x', '--build-surrogate'])
+                        ['vibecheck', '--net', q, '--spec', 'x', '--prepare-pkl'])
     with pytest.raises(SystemExit) as e:
         vbmain.main()
     assert e.value.code == 0
@@ -133,10 +136,19 @@ def test_build_surrogate_cli(tmp_path, monkeypatch):
     assert os.path.exists(p[:-5] + '_fq.onnx')     # fake-quant eval surrogate (Path B)
 
 
-def test_build_surrogate_cli_nonquant(tmp_path, monkeypatch):
+def test_prepare_pkl_cli_nonquant(tmp_path, monkeypatch):
+    # --prepare-pkl on a normal net writes the pre-parse .pkl cache. Needs a
+    # graph-parseable spec (non-strict >= on the output; the surrogate-path
+    # _v1_spec's strict > is not accepted by the graph load_vnnlib).
     p = _plain_onnx(str(tmp_path / 'p.onnx'))
+    v = str(tmp_path / 'v.vnnlib')
+    open(v, 'w').write(
+        '(declare-const X_0 Real)\n(declare-const X_1 Real)\n(declare-const Y_0 Real)\n'
+        '(assert (<= X_0 1.0))\n(assert (>= X_0 0.0))\n'
+        '(assert (<= X_1 1.0))\n(assert (>= X_1 0.0))\n'
+        '(assert (>= Y_0 0.5))\n')
     monkeypatch.setattr(sys, 'argv',
-                        ['vibecheck', '--net', p, '--spec', 'x', '--build-surrogate'])
+                        ['vibecheck', '--net', p, '--spec', v, '--prepare-pkl'])
     with pytest.raises(SystemExit) as e:
         vbmain.main()
     assert e.value.code == 0

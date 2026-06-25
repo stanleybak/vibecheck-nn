@@ -41,6 +41,11 @@ from .fast_verify_dual import (parse_problem, parse_problem_gpu, Problem,  # geo
                                _DeadlineExceeded)
 
 _TOL = 1e-9
+# Per-node box-floor + per-dim clamp adds ~2 extra (B,D)@(D,n) matmuls per node-bound
+# (g_c, g0) — wasted cost on working benchmarks, and REDUNDANT with the cheap parent-best
+# floor in verify() (which floors at the parent's bound ≥ box corner with no extra matmul).
+# Default ON for backward-compat; turn OFF (VC_NODE_FLOOR=0) and rely on VC_PARENT_FLOOR.
+_NODE_FLOOR = os.environ.get('VC_NODE_FLOOR', '1') not in ('0', 'false', 'False')
 
 
 def node_bound_topk(F, sides, lam0, lam1, nu=None, K_top=256, use_farprobe=False):
@@ -71,15 +76,18 @@ def node_bound_topk(F, sides, lam0, lam1, nu=None, K_top=256, use_farprobe=False
     # constraint (s<0) only drags g down via its −λ·b term, so zero those (keep
     # binding dims), re-evaluate, and report best of {warm-start, clamped, λ=0}.
     # All valid (λ≥0) → the bound is never below the box corner.
-    lam0_c = torch.where(s0 < 0, torch.zeros_like(lam0), lam0)
-    lam1_c = torch.where(s1 < 0, torch.zeros_like(lam1), lam1)
-    rc_c = F['d_base'].unsqueeze(0) + (rho + sign * (lam0_c - lam1_c)) @ a_g
-    x_c = torch.where(rc_c < 0, eh.expand(B, n), el.expand(B, n))
-    g_c = c0_path + (rc_c * x_c).sum(-1) - (lam0_c * b0 + lam1_c * b1).sum(-1)
-    rc0 = F['d_base'].unsqueeze(0) + rho @ a_g
-    x0 = torch.where(rc0 < 0, eh.expand(B, n), el.expand(B, n))
-    g0 = c0_path + (rc0 * x0).sum(-1)
-    best = torch.maximum(torch.maximum(g, g_c), g0)
+    if _NODE_FLOOR:
+        lam0_c = torch.where(s0 < 0, torch.zeros_like(lam0), lam0)
+        lam1_c = torch.where(s1 < 0, torch.zeros_like(lam1), lam1)
+        rc_c = F['d_base'].unsqueeze(0) + (rho + sign * (lam0_c - lam1_c)) @ a_g
+        x_c = torch.where(rc_c < 0, eh.expand(B, n), el.expand(B, n))
+        g_c = c0_path + (rc_c * x_c).sum(-1) - (lam0_c * b0 + lam1_c * b1).sum(-1)
+        rc0 = F['d_base'].unsqueeze(0) + rho @ a_g
+        x0 = torch.where(rc0 < 0, eh.expand(B, n), el.expand(B, n))
+        g0 = c0_path + (rc0 * x0).sum(-1)
+        best = torch.maximum(torch.maximum(g, g_c), g0)
+    else:
+        best = g           # rely on the cheap parent-best floor in verify()
     pend = (best <= _TOL).to(a_g.dtype)
     sp0 = torch.where((lam0 <= _TOL) & (s0 < 0), torch.zeros_like(s0), s0)
     sp1 = torch.where((lam1 <= _TOL) & (s1 < 0), torch.zeros_like(s1), s1)
@@ -147,18 +155,21 @@ def node_bound_logbucket(F, sides, lam0, lam1, nu, Kb=256, use_farprobe=False):
     # of {warm-start λ, clamped λ, λ=0} — all valid (λ≥0). Guarantees the bound
     # is never below the box corner (a split only tightens), fixing the deep-node
     # frontier blow-up from a stale inherited warm-start.
-    lam0_c = torch.where(s0 < 0, torch.zeros_like(lam0), lam0)
-    lam1_c = torch.where(s1 < 0, torch.zeros_like(lam1), lam1)
-    nu_c = torch.where(s2 < 0, torch.zeros_like(nu), nu)
-    rc_c = (F['d_base'].unsqueeze(0) + (rho + sign * (lam0_c - lam1_c)) @ a_g
-            + nu_c @ hs_a)
-    x_c = torch.where(rc_c < 0, eh.expand(B, n), el.expand(B, n))
-    g_c = (c0_path + (rc_c * x_c).sum(-1) - (lam0_c * b0 + lam1_c * b1).sum(-1)
-           - (nu_c * hs_b).sum(-1))
-    rc0 = F['d_base'].unsqueeze(0) + rho @ a_g
-    x0 = torch.where(rc0 < 0, eh.expand(B, n), el.expand(B, n))
-    g0 = c0_path + (rc0 * x0).sum(-1)
-    best = torch.maximum(torch.maximum(g, g_c), g0)
+    if _NODE_FLOOR:
+        lam0_c = torch.where(s0 < 0, torch.zeros_like(lam0), lam0)
+        lam1_c = torch.where(s1 < 0, torch.zeros_like(lam1), lam1)
+        nu_c = torch.where(s2 < 0, torch.zeros_like(nu), nu)
+        rc_c = (F['d_base'].unsqueeze(0) + (rho + sign * (lam0_c - lam1_c)) @ a_g
+                + nu_c @ hs_a)
+        x_c = torch.where(rc_c < 0, eh.expand(B, n), el.expand(B, n))
+        g_c = (c0_path + (rc_c * x_c).sum(-1) - (lam0_c * b0 + lam1_c * b1).sum(-1)
+               - (nu_c * hs_b).sum(-1))
+        rc0 = F['d_base'].unsqueeze(0) + rho @ a_g
+        x0 = torch.where(rc0 < 0, eh.expand(B, n), el.expand(B, n))
+        g0 = c0_path + (rc0 * x0).sum(-1)
+        best = torch.maximum(torch.maximum(g, g_c), g0)
+    else:
+        best = g           # rely on the cheap parent-best floor in verify()
     pend = (best <= _TOL).to(a_g.dtype)
     sp0 = torch.where((lam0 <= _TOL) & (s0 < 0), torch.zeros_like(s0), s0)
     sp1 = torch.where((lam1 <= _TOL) & (s1 < 0), torch.zeros_like(s1), s1)
@@ -234,6 +245,12 @@ _PARENT_FLOOR = os.environ.get('VC_PARENT_FLOOR', '0') not in ('0', 'false', 'Fa
 _SG_OPT = os.environ.get('VC_SUBGRAD_OPT', 'adam')          # 'adam' (default) | 'subgrad' — only used when ls='subgrad'
 _SUBGRAD_LR = float(os.environ.get('VC_SUBGRAD_LR', '0.05' if _SG_OPT == 'adam' else '0.5'))
 _SG_COMPILE = os.environ.get('VC_SUBGRAD_COMPILE', '1') not in ('0', 'false', 'False')
+# Fuse all K ADAM steps into ONE compiled graph (VC_SUBGRAD_FUSED=1) vs the default
+# small reused per-step compiled kernel in a Python loop. MEASURED (idx_8945/idx_5810):
+# fusing only helps K=64 (fixes a recompile-fallback) but is ~1.4-2.2x SLOWER for K<=32 —
+# the unrolled graph spills the 6 ADAM moment tensors across all K iters (worse codegen).
+# Default OFF: per-step kernel + on-device bias-correction + eager outer is the fastest.
+_SG_FUSED = os.environ.get('VC_SUBGRAD_FUSED', '0') not in ('0', 'false', 'False')
 
 
 def _adam_step_body(d_base, rho, sign, l0, l1, nv, m0, v0, m1, v1, mn, vn,
@@ -269,6 +286,53 @@ def _get_adam_step(compile):
     if _ADAM_STEP is None:
         _ADAM_STEP = torch.compile(_adam_step_body, dynamic=True)
     return _ADAM_STEP
+
+
+def _adam_ksteps_body(d_base, rho, sign, l0, l1, nv, a_g, hs_a, hs_b, el, eh,
+                      b0, b1, cin, zlo, zhi, c0_path, sides, lr, bc1_vec, bc2_vec,
+                      best, n_steps):
+    """ALL `n_steps` projected-ADAM ascent steps fused into ONE graph (the loop is unrolled
+    by torch.compile — `n_steps` is a static Python int), fully on-device: the β-bias
+    correction is precomputed once in `bc1_vec`/`bc2_vec` (NO per-step host `0.9**t` /
+    `torch.tensor(...)` H2D copy), and `best` is the running max seeded by the far probe.
+    Math is identical to `_adam_step_body` iterated `n_steps` times (β1=0.9, β2=0.999),
+    so the bound is unchanged + sound. Returns (best, l0, l1, nv) — λ' is the children's
+    warm start. One kernel launch per chunk instead of `n_steps` Python-dispatched launches,
+    and no outer recompile-limit fallback (the Verifier runs this kernel directly)."""
+    m0 = torch.zeros_like(l0); v0 = torch.zeros_like(l0)
+    m1 = torch.zeros_like(l1); v1 = torch.zeros_like(l1)
+    mn = torch.zeros_like(nv); vn = torch.zeros_like(nv)
+    for t in range(n_steps):
+        rc = d_base + (rho + sign * (l0 - l1)) @ a_g + nv @ hs_a
+        x = torch.where(rc < 0, eh, el)
+        g = c0_path + (rc * x).sum(-1) - (l0 * b0 + l1 * b1).sum(-1) - (nv * hs_b).sum(-1)
+        p = x @ a_g.t()
+        s0 = sign * (p + cin)
+        s1 = torch.where(sides == 0, -p - zlo, p - zhi)
+        s2 = x @ hs_a.t() - hs_b
+        m0 = 0.9 * m0 + 0.1 * s0; v0 = 0.999 * v0 + 0.001 * s0 * s0
+        m1 = 0.9 * m1 + 0.1 * s1; v1 = 0.999 * v1 + 0.001 * s1 * s1
+        mn = 0.9 * mn + 0.1 * s2; vn = 0.999 * vn + 0.001 * s2 * s2
+        b1c = bc1_vec[t]; b2c = bc2_vec[t]            # 0-dim device scalars (no H2D)
+        l0 = (l0 + lr * (m0 / b1c) / ((v0 / b2c).sqrt() + 1e-8)).clamp_min(0.0)
+        l1 = (l1 + lr * (m1 / b1c) / ((v1 / b2c).sqrt() + 1e-8)).clamp_min(0.0)
+        nv = (nv + lr * (mn / b1c) / ((vn / b2c).sqrt() + 1e-8)).clamp_min(0.0)
+        best = torch.maximum(best, g)
+    return best, l0, l1, nv
+
+
+_ADAM_KSTEPS = {}
+
+
+def _get_adam_ksteps(n_steps, compile):
+    """Compiled fused-K-step ADAM, cached per `n_steps` (the unroll count is a compile
+    constant; B and D stay dynamic)."""
+    if not compile:
+        return _adam_ksteps_body
+    key = int(n_steps)
+    if key not in _ADAM_KSTEPS:
+        _ADAM_KSTEPS[key] = torch.compile(_adam_ksteps_body, dynamic=True)
+    return _ADAM_KSTEPS[key]
 
 
 def _sg_step_body(d_base, rho, sign, l0, l1, nv, a_g, hs_a, hs_b, el, eh,
@@ -323,29 +387,40 @@ def node_bound_subgrad(F, sides, lam0, lam1, nu, n_steps=64, use_farprobe=True):
     d_base = F['d_base']
     # the far-probe (sound, fast) — best on all-OFF nodes; also seeds the warm start
     best_fp, l0, l1, nv = node_bound_logbucket(F, sides, lam0, lam1, nu, 256, use_farprobe)
-    # projected subgradient from the inherited λ — converges where the line search stalls.
-    # Compiled single step reused across iterations (n_steps unrolled in Python, not the graph).
+    # projected ascent from the inherited λ — converges where the line search stalls.
     best = best_fp.clone()
     dev, dt = a_g.device, a_g.dtype
     if _SG_OPT == 'adam':
-        m0 = torch.zeros_like(l0); v0 = torch.zeros_like(l0)
-        m1 = torch.zeros_like(l1); v1 = torch.zeros_like(l1)
-        mn = torch.zeros_like(nv); vn = torch.zeros_like(nv)
-        lr = torch.tensor(_SUBGRAD_LR, device=dev, dtype=dt)
-        step_fn = _get_adam_step(_SG_COMPILE)
-        for t in range(1, n_steps + 1):
-            bc1 = torch.tensor(1 - 0.9 ** t, device=dev, dtype=dt)
-            bc2 = torch.tensor(1 - 0.999 ** t, device=dev, dtype=dt)
-            g, l0, l1, nv, m0, v0, m1, v1, mn, vn = step_fn(
-                d_base, rho, sign, l0, l1, nv, m0, v0, m1, v1, mn, vn, a_g, hs_a, hs_b,
-                el, eh, b0, b1, cin, zlo, zhi, c0_path, sides, lr, bc1, bc2)
-            best = torch.maximum(best, g)
+        # β-bias correction precomputed on-device, once (no per-step host pow / H2D copy).
+        lr = torch.as_tensor(_SUBGRAD_LR, device=dev, dtype=dt)
+        _t = torch.arange(1, n_steps + 1, device=dev, dtype=dt)
+        bc1_v = 1.0 - 0.9 ** _t
+        bc2_v = 1.0 - 0.999 ** _t
+        if _SG_FUSED:
+            # All K steps fused in one compiled graph (opt-in; helps only large K — see _SG_FUSED).
+            ksteps = _get_adam_ksteps(n_steps, _SG_COMPILE)
+            best, l0, l1, nv = ksteps(
+                d_base, rho, sign, l0, l1, nv, a_g, hs_a, hs_b, el, eh, b0, b1,
+                cin, zlo, zhi, c0_path, sides, lr, bc1_v, bc2_v, best, n_steps)
+        else:
+            # Default: small reused per-step compiled kernel (best codegen), Python loop.
+            m0 = torch.zeros_like(l0); v0 = torch.zeros_like(l0)
+            m1 = torch.zeros_like(l1); v1 = torch.zeros_like(l1)
+            mn = torch.zeros_like(nv); vn = torch.zeros_like(nv)
+            step_fn = _get_adam_step(_SG_COMPILE)
+            for t in range(n_steps):
+                g, l0, l1, nv, m0, v0, m1, v1, mn, vn = step_fn(
+                    d_base, rho, sign, l0, l1, nv, m0, v0, m1, v1, mn, vn, a_g, hs_a, hs_b,
+                    el, eh, b0, b1, cin, zlo, zhi, c0_path, sides, lr, bc1_v[t], bc2_v[t])
+                best = torch.maximum(best, g)
     else:
+        # plain projected subgradient: diminishing step lr0/√t, precomputed on-device.
+        _t = torch.arange(1, n_steps + 1, device=dev, dtype=dt)
+        steps_v = _SUBGRAD_LR / _t.sqrt()
         step_fn = _get_sg_step(_SG_COMPILE)
         for t in range(n_steps):
-            step = torch.tensor(_SUBGRAD_LR / ((t + 1) ** 0.5), device=dev, dtype=dt)
             g, l0, l1, nv = step_fn(d_base, rho, sign, l0, l1, nv, a_g, hs_a, hs_b, el, eh,
-                                    b0, b1, cin, zlo, zhi, c0_path, sides, step)
+                                    b0, b1, cin, zlo, zhi, c0_path, sides, steps_v[t])
             best = torch.maximum(best, g)
     return best, l0, l1, nv
 
@@ -371,7 +446,13 @@ class Verifier:
         self.use_farprobe = os.environ.get('VC_FARPROBE', '1') not in ('0', 'false', 'False')
         base = _KERNELS[ls]; use_farprobe = self.use_farprobe
         kern = (lambda F, s, l0, l1, nu: base(F, s, l0, l1, nu, K, use_farprobe))
-        self._kernel = torch.compile(kern, dynamic=True) if compile else kern
+        # Don't torch.compile the OUTER kernel for 'subgrad': node_bound_subgrad has a
+        # K-step structure that torch.compile would re-trace on every depth → it hits the
+        # recompile limit and falls back to eager anyway. Its heavy compute is already in
+        # the fused compiled `_adam_ksteps` (+ the far-probe seed), so the outer is left in
+        # eager (cheap glue). The loop-free kernels (logbucket/topk) still compile.
+        _compile_outer = compile and ls != 'subgrad'
+        self._kernel = torch.compile(kern, dynamic=True) if _compile_outer else kern
         self._warm_depths = warm_depths if compile else ()
         self._warmed = set()   # depths already compile-warmed (reused across queries)
 
@@ -423,7 +504,7 @@ class Verifier:
         return best, o0, o1, onu
 
     def verify_query(self, state, qw, qb, scored_keys, *, time_limit=120.0,
-                     extra_hs=(), verbose=False):
+                     extra_hs=(), verbose=False, stop_event=None):
         # On CUDA, build the split matrix directly on-device (skips the dense
         # host (n_unstable, n_gens) alloc + upload). Identical Problem otherwise.
         # extra_hs (sibling output constraints for conjunctive disjuncts) needs
@@ -434,9 +515,10 @@ class Verifier:
             prob = (parse_problem_gpu(state, qw, qb, scored_keys, self.device)
                     if self.device.type == 'cuda'
                     else parse_problem(state, qw, qb, scored_keys))
-        return self.verify(prob, time_limit=time_limit, verbose=verbose)
+        return self.verify(prob, time_limit=time_limit, verbose=verbose,
+                           stop_event=stop_event)
 
-    def verify(self, prob, *, time_limit=120.0, verbose=False):
+    def verify(self, prob, *, time_limit=120.0, verbose=False, stop_event=None):
         dev = self.device; G = self._upload(prob)
         # Compile-warmup pre-specialises the kernel at common depths. The
         # Verifier is reused across queries, so a depth warmed once stays
@@ -474,6 +556,11 @@ class Verifier:
         while sides.shape[0] > 0:
             if elapsed() > time_limit:
                 return _unknown(sides.shape[0], 'time_limit')
+            if stop_event is not None and stop_event.is_set():
+                # Raced sibling (e.g. the parallel high-bin MILP) already closed
+                # this query — bail; the frontier is non-empty so this is 'unknown'
+                # (the verdict comes from the winner, not from here).
+                return _unknown(sides.shape[0], 'stopped')
             nodes_total += sides.shape[0]; peak = max(peak, sides.shape[0])
             try:
                 best, o0, o1, onu = self._bounds(self._F(G, depth), sides, lam0, lam1, nu,

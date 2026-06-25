@@ -1208,6 +1208,54 @@ def _resolve_high_bin_count(raw):
     return int(v)
 
 
+def _solve_high_bin_query(state_q, qw_q, qb_q, scored_keys_q, *, n_bins,
+                          time_limit, n_threads, use_bbs, bbs_tol,
+                          stop_event=None):
+    """Build + solve the high-bin MILP for ONE query (Gurobi, ``n_threads`` cores).
+
+    Returns ``(closed: bool, lb: float | None)``. SOUND: ``closed`` iff Gurobi
+    PROVED ``min(qw·y+qb) >= bbs_tol > 0`` (BestBdStop ObjBound certificate) or
+    (legacy) the spec-halfspace model is INFEASIBLE — never inferred from an
+    early termination. ``stop_event`` (when set mid-solve) makes Gurobi
+    ``terminate()`` so the loser of a BnB∥MILP race stops promptly; a terminated
+    solve that hasn't proved the bound simply returns ``closed=False``.
+
+    This is the same logic as the sequential high-bin fallback below, factored
+    out so the parallel-race path can call it from a worker thread.
+    """
+    import gurobipy as _grb
+    from .gurobi_util import optimize_checked, GurobiNumericTrouble
+    try:
+        m_fb, env_fb, _, _ = verify_gen_lp.build_gen_lp_from_state(
+            state_q, qw_q, qb_q,
+            milp_set=set(scored_keys_q[:n_bins]),
+            n_threads=n_threads,
+            unsafe_halfspace=('none' if use_bbs else 'inequality'))
+        m_fb.setParam('TimeLimit', float(time_limit))
+        m_fb.setParam('BestBdStop', bbs_tol if use_bbs else _grb.GRB.INFINITY)
+        _cb = None
+        if stop_event is not None:
+            def _cb(_m, _where):     # terminate promptly once the race is decided
+                if stop_event.is_set():
+                    _m.terminate()
+        try:
+            optimize_checked(m_fb, user_callback=_cb)
+        except (GurobiNumericTrouble, _grb.GurobiError):
+            m_fb.dispose(); env_fb.dispose()
+            return False, None
+        status = m_fb.Status
+        try:
+            ob = float(m_fb.ObjBound)
+        except (_grb.GurobiError, AttributeError):
+            ob = None
+        m_fb.dispose(); env_fb.dispose()
+    except (_grb.GurobiError, GurobiNumericTrouble):
+        return False, None
+    if use_bbs:
+        return (ob is not None and ob >= bbs_tol), ob
+    return (status == _grb.GRB.INFEASIBLE), ob
+
+
 def _racing_escalation_graph_correct(impl, gg_ops, x_lo, x_hi, bounds_by_relu,
                                        query_w, query_bias, scored_keys,
                                        n_cores, time_left_fn, input_name,
@@ -5949,9 +5997,22 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                              if _phase8_min_frac > 0 else deadline)
     _phase8_started = [False]
 
+    # Clamp the exit buffer to at most 1/4 of the budget so it stays sane for short
+    # timeouts (e.g. a 20s nn4sys instance must not get a 20s buffer -> 0 budget).
+    _sat_exit_buffer = min(float(getattr(settings, 'sat_exit_buffer', 0.0) or 0.0),
+                           0.25 * total_timeout)
+
     def time_left():
         now = time.perf_counter()
         full = max(0.0, deadline - now)
+        # Exit-early buffer: once a within-tol witness is stashed (an acceptable,
+        # scorer-accepted 'sat'), stop `sat_exit_buffer` seconds BEFORE the real
+        # deadline so the recorded solve doesn't overrun the official timeout (which
+        # gets it rejected). Only shrinks the budget when we already have an answer
+        # to emit — searches with no result yet still get the full time.
+        if (_sat_exit_buffer > 0.0
+                and getattr(settings, '_within_tol_witness', None) is not None):
+            full = max(0.0, deadline - now - _sat_exit_buffer)
         if not _phase8_started[0] and _phase8_min_frac > 0:
             return max(0.0, min(full, _phase8_min_deadline - now))
         return full
@@ -8011,9 +8072,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     print(f'  [fast-dual-ascent-gpu] q{qi} branch_score='
                           f'{_bsrc}, {len(scored_keys_q)} unstable; '
                           f'top 5 split neurons: {_top5}', flush=True)
-                # DEBUG: dump state passed to dual-ascent BaB if env var set
+                # DEBUG: dump state passed to dual-ascent BaB if the env var OR the
+                # `dump_da_bab_dir` setting is set (env takes precedence).
                 import os as _os
-                _dump = _os.environ.get('DA_BAB_DUMP_DIR')
+                _dump = _os.environ.get('DA_BAB_DUMP_DIR') or getattr(
+                    settings, 'dump_da_bab_dir', '')
                 if _dump:
                     _os.makedirs(_dump, exist_ok=True)
                     import pickle as _pkl
@@ -8035,8 +8098,10 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                                     'ew_at_relu': _ew_dump}, _f)
                     print(f'  [DA-DUMP] q{qi} → {_path}')
                 # Phase-8 Problem dump (kernel-ready: dict(problem=Problem, extras))
-                # for offline BnB replay / kernel A/B — env-gated, named bnb_<qi>.pkl.
-                _bnb_dir = _os.environ.get('VC_DUMP_BNB_DIR', '')
+                # for offline BnB replay / kernel A/B — gated by the env var OR the
+                # `dump_bnb_dir` setting (env takes precedence), named bnb_<qi>.pkl.
+                _bnb_dir = _os.environ.get('VC_DUMP_BNB_DIR', '') or getattr(
+                    settings, 'dump_bnb_dir', '')
                 if _bnb_dir:
                     from .fast_dual_ascent.fast_verify_dual import (
                         _dump_bnb_instance as _dbi)
@@ -8058,11 +8123,82 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                         _sib_hs = [(queries[qj][1], queries[qj][2])
                                    for qj in range(len(queries))
                                    if queries[qj][0] == _di_q and qj != qi]
-                    vd, info = _fast_verifier.verify_query(
-                        state_q, qw_q, qb_q,
-                        [k for k in scored_keys_q],
-                        time_limit=time_left(),
-                        extra_hs=_sib_hs)
+                    _parallel_milp = bool(getattr(
+                        settings, 'phase8_parallel_milp', False))
+                    if (_parallel_milp
+                            and bool(getattr(settings,
+                                             'phase8_high_bin_fallback', True))
+                            and state_q is not None and scored_keys_q
+                            and time_left() > 5.0):
+                        # Race the GPU BnB against the CPU/Gurobi high-bin MILP;
+                        # take whichever closes the query first, terminate the
+                        # loser. Sound: the MILP worker only reports `closed` on a
+                        # proven ObjBound>=tol (or INFEASIBLE) certificate.
+                        import threading as _thr
+                        _stop_ev = _thr.Event(); _mres = {}
+                        _hbc = _resolve_high_bin_count(
+                            getattr(settings, 'phase8_high_bin_count', 200))
+                        _nb = (len(scored_keys_q) if _hbc is None
+                               else min(_hbc, len(scored_keys_q)))
+                        _tlm = min(float(getattr(
+                            settings, 'phase8_high_bin_time_limit', 60.0)),
+                            time_left())
+                        _ubbs = bool(getattr(
+                            settings, 'phase8_high_bin_bestbdstop', True))
+                        _btol = float(getattr(
+                            settings, 'phase8_high_bin_bestbdstop_tol', 1e-6))
+                        # Cap the racing MILP's Gurobi threads so it doesn't starve the
+                        # GPU BnB's host-side orchestration. 0 = auto (n_cores // 2).
+                        _mthr = int(getattr(settings,
+                                            'phase8_parallel_milp_threads', 0))
+                        if _mthr <= 0:
+                            _mthr = max(1, n_cores // 2)
+                        _mdelay = float(getattr(
+                            settings, 'phase8_parallel_milp_delay', 0.0))
+
+                        def _milp_worker():
+                            # Head start: if the BnB closes (sets _stop_ev) within _mdelay,
+                            # skip the MILP entirely — a fast BnB-closeable case never pays
+                            # the model-build contention. wait() returns True iff set in time.
+                            if _mdelay > 0.0 and _stop_ev.wait(_mdelay):
+                                return
+                            c, lb = _solve_high_bin_query(
+                                state_q, qw_q, qb_q, scored_keys_q,
+                                n_bins=_nb, time_limit=_tlm, n_threads=_mthr,
+                                use_bbs=_ubbs, bbs_tol=_btol,
+                                stop_event=_stop_ev)
+                            _mres['closed'] = c; _mres['lb'] = lb
+                            if c:
+                                _stop_ev.set()
+                        _mt = _thr.Thread(target=_milp_worker, daemon=True)
+                        _mt.start()
+                        vd, info = _fast_verifier.verify_query(
+                            state_q, qw_q, qb_q, [k for k in scored_keys_q],
+                            time_limit=time_left(), extra_hs=_sib_hs,
+                            stop_event=_stop_ev)
+                        if vd == 'unsat':
+                            _stop_ev.set()      # BnB won → cancel the MILP
+                        _mt.join()
+                        if vd != 'unsat' and _mres.get('closed'):
+                            # MILP won the race (BnB OOM/stopped/unknown).
+                            vd = 'unsat'
+                            info = dict(info or {})
+                            info['milp_parallel'] = True
+                            if print_progress:
+                                print(f'  [phase8-parallel] q{qi}: high-bin MILP '
+                                      f'closed (lb={_mres.get("lb")}) — BnB '
+                                      f'{info.get("reason", "running")}',
+                                      flush=True)
+                        elif (vd == 'unsat' and print_progress
+                                and not _mres.get('closed')):
+                            print(f'  [phase8-parallel] q{qi}: BnB closed first '
+                                  f'(MILP cancelled)', flush=True)
+                    else:
+                        vd, info = _fast_verifier.verify_query(
+                            state_q, qw_q, qb_q,
+                            [k for k in scored_keys_q],
+                            time_limit=time_left(),
+                            extra_hs=_sib_hs)
                     try:
                         if _p8prof and torch.cuda.is_available():
                             torch.cuda.synchronize()
@@ -8106,8 +8242,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                 _da_witness = info.get('sat_witness') if vd == 'sat' else None
                 race_levels = [{'n_bins': 0, 'result': vd,
                                 'lb': 1.0 if vd == 'unsat' else 0.0,
-                                'time': info['wall'],
+                                'time': info.get('wall', 0.0),
                                 'source': 'dual_ascent',
+                                'milp_parallel': bool(info.get('milp_parallel')),
                                 'nodes': info.get('nodes', 0),
                                 'witness_source': 'dual_ascent_bab' if vd == 'sat' else None}]
                 raw.append((qi, vd, race_levels, _da_witness))
@@ -8161,7 +8298,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     'levels': race_levels}
             if verdict == 'unsat':
                 spec_lbs[qi] = 1.0
-                details.setdefault('phase8_close_src', {})[qi] = 'bnb'
+                _src = ('milp_parallel' if (race_levels
+                        and race_levels[0].get('milp_parallel')) else 'bnb')
+                details.setdefault('phase8_close_src', {})[qi] = _src
             elif (verdict == 'sat' and witness is not None
                     and milp_witness is None
                     and not _disable_sat):
@@ -9987,29 +10126,37 @@ def _verify_nonlinear_graph(graph, spec, settings, t_start, total_timeout):
     # First validate that the PGD point forward (_forward_batch_graph)
     # faithfully reproduces the network: compare it to the zono forward
     # evaluated at the box CENTER (a zero-radius zonotope's center IS the exact
-    # network output). If it diverges or raises (some ml4acopf-linear graphs
-    # hit op-shapes the batched point forward doesn't support), PGD would be
-    # untrustworthy — a wrong forward could confirm a bogus witness (false sat)
-    # — so we SKIP sat-finding. Skipping is SOUND: it never yields a false
-    # unsat/sat; the UNSAT input-split below is unaffected.
+    # network output). A wrong forward could confirm a bogus witness (false
+    # sat), so PGD must only run when the point-forward is trustworthy.
+    #
+    # The ONLY tolerated failure is `NotImplementedError` — the point-forward
+    # genuinely lacks an op of this graph. Then sat-finding is skipped (SOUND:
+    # never a false verdict; the UNSAT input-split below is unaffected), but
+    # LOUDLY (it flags an op to add to _forward_batch_graph). EVERY other
+    # exception (e.g. a shape RuntimeError in an *implemented* op) is a BUG and
+    # PROPAGATES — we do NOT silently swallow it: a broad silent catch here once
+    # hid a real fc-shape bug that disabled PGD on all ml4acopf-linear graphs.
     if not bool(getattr(settings, 'disable_sat_finding', False)):
         from .verify_zono_bnb import _forward_batch_graph
         gg32 = graph.gpu_graph(device=device, dtype=torch.float32)
         xc = (0.5 * (xl0 + xh0))
         _, _zc = _forward_zonotope_graph(xc, xc, gg, device, dt, settings=settings)
-        pgd_ok = True
         try:
             _pf = _forward_batch_graph(xc.float().unsqueeze(0), gg32)
+        except NotImplementedError as e:
+            pgd_ok = False
+            print(f'[trig_bab] WARNING: point-forward op unimplemented '
+                  f'({e}); sat-finding DISABLED for this run', flush=True)
+        else:
             pgd_ok = bool(torch.allclose(
                 _pf.flatten().double(), _zc.center.double(),
                 atol=1e-2, rtol=1e-2))
-        except (RuntimeError, ValueError, KeyError) as e:
-            # batched point forward doesn't support some op of this graph;
-            # sat-finding is best-effort, so skip it (sound).
-            pgd_ok = False
-            if print_progress:
-                print(f'[trig_bab] PGD point forward unusable '
-                      f'({type(e).__name__}): skipping sat-finding', flush=True)
+            if not pgd_ok:
+                _dev = float((_pf.flatten().double()
+                              - _zc.center.double()).abs().max())
+                print(f'[trig_bab] WARNING: point-forward DIVERGES from the '
+                      f'zono center by {_dev:.3g} (>1e-2) — a forward bug; '
+                      f'sat-finding DISABLED for this run', flush=True)
         if pgd_ok:
             _onnx_p = getattr(graph, 'onnx_path', None)
             _atol = float(settings.sat_validate_atol
@@ -10117,9 +10264,15 @@ def _verify_nonlinear_graph(graph, spec, settings, t_start, total_timeout):
     closed = 0
     opened = 0
     abandoned = 0
+    # Exit-early buffer: once a within-tol witness is in hand (accepted result), stop
+    # `sat_exit_buffer` s before the real deadline so the recorded solve doesn't overrun
+    # the official timeout (e.g. adaptive_cruise instance_44 was landing at 100.99s).
+    _eb = float(getattr(settings, 'sat_exit_buffer', 0.0) or 0.0)
     try:
         while queue:
-            if _time.perf_counter() >= deadline:
+            _dl = (deadline - _eb if (_eb > 0.0 and getattr(
+                settings, '_within_tol_witness', None) is not None) else deadline)
+            if _time.perf_counter() >= _dl:
                 _restore()
                 return 'unknown', {'method': 'trig_input_split',
                                    'reason': 'timeout', 'leaves_closed': closed}
@@ -10258,8 +10411,11 @@ def _verify_trig_nonlinear_split(graph, spec, settings, gg, xl0, xh0, dt,
     max_depth = int(getattr(settings, 'trig_nl_max_depth', 10**9))
     queue = [(xl0, xh0, {}, 0)]
     closed = 0; opened = 0; abandoned = 0
+    _eb = float(getattr(settings, 'sat_exit_buffer', 0.0) or 0.0)
     while queue:
-        if _time.perf_counter() >= deadline:
+        _dl = (deadline - _eb if (_eb > 0.0 and getattr(
+            settings, '_within_tol_witness', None) is not None) else deadline)
+        if _time.perf_counter() >= _dl:
             _restore()
             if print_progress:
                 print(f'[trig_nl] timeout: closed={closed} opened={opened}',

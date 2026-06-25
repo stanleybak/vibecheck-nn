@@ -25,3 +25,7 @@ pgd_alpha_multi: true
 pgd_restarts: 512
 pgd_iter: 200
 pgd_sat_min_time: 14.0
+
+# Stop the SAT-search ~8s before the 100s timeout once a within-tol CE is in hand,
+# so the recorded solve stays under budget (was overrunning to ~103s = scorer-rejected).
+sat_exit_buffer: 8.0

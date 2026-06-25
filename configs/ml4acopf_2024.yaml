@@ -23,3 +23,4 @@ raise_on_oom: true     # default, explicit: OOM raises (no slow/misleading CPU f
 # 21.2) — small nets where float64 + Gurobi-LP + cuda<->cpu transfers make GPU
 # overhead net-negative. So pin CPU.
 device: cpu
+

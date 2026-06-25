@@ -571,7 +571,20 @@ def _forward_batch_graph(x, gg):
 
         elif t == 'fc':
             a = act[op['inputs'][0]]
-            act[name] = a @ op['W'].T + op['bias']
+            W = op['W']
+            in_nd = op.get('in_shapes_nd', [None])[0]
+            if (W.ndim == 2 and in_nd is not None and len(in_nd) >= 2
+                    and a.shape[1] != W.shape[1] and in_nd[-1] == W.shape[1]):
+                # ND matmul: input is (batch, *lead, K) and W=(M,K) maps the
+                # LAST dim (e.g. the piecewise-linear sigmoid decomposition's
+                # per-row MatMul in ml4acopf-linear: (438,54) @ (54,1)). The
+                # flat handler below assumes W maps the FULL flat dim and would
+                # raise. Mirrors GemmNode.zonotope_propagate's ND branch
+                # (network.py: center_nd @ W.T + b).
+                a_nd = a.reshape(batch, *in_nd)
+                act[name] = (a_nd @ W.T + op['bias']).reshape(batch, -1)
+            else:
+                act[name] = a @ W.T + op['bias']
 
         elif t == 'relu':
             act[name] = F.relu(act[op['inputs'][0]])
@@ -729,7 +742,7 @@ def _forward_batch_graph(x, gg):
             act[name] = 1.0 / act[op['inputs'][0]]
 
         else:
-            raise ValueError(
+            raise NotImplementedError(
                 f'_forward_batch_graph: unknown op type {t!r} at {name!r}')
 
     return act[gg['ops'][-1]['name']]

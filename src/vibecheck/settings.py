@@ -913,6 +913,23 @@ def default_settings(**overrides):
         # a magic 'bigger than any net' integer.
         phase8_high_bin_count=200,
         phase8_high_bin_time_limit=60.0,
+        # Race the GPU dual-ascent BnB against the (CPU/Gurobi) high-bin MILP
+        # fallback PER QUERY instead of running BnB-then-fallback sequentially.
+        # On diffuse-gap cases the BnB explodes to OOM and produces nothing while
+        # the MILP closes in ~20s; racing takes whichever finishes first (the
+        # loser is terminated), so it's a strict win for MILP-closed cases and
+        # neutral for BnB-closed ones. Default OFF (opt-in / under evaluation).
+        phase8_parallel_milp=False,
+        # Gurobi thread cap for the RACING MILP. All-cores starves the GPU BnB's
+        # host-side orchestration (measured: +23% on a BnB-closeable case). 0 = auto
+        # (n_cores // 2, leaving cores for the BnB); a positive int overrides.
+        phase8_parallel_milp_threads=0,
+        # Head-start (seconds) before the racing MILP builds/solves. A BnB-closeable case
+        # that finishes within the delay never pays the MILP model-build contention (which
+        # thread-capping alone does NOT remove). 0 = start immediately. Set near the BnB
+        # close-time of the fast cases (e.g. ~50s for a 100s budget) so only genuinely
+        # stuck cases pay for the MILP.
+        phase8_parallel_milp_delay=0.0,
         # High-bin fallback proof method. Default-on: minimize the spec margin
         # and stop via BestBdStop once its proven lower bound >= tol > 0 (an
         # explicit, auditable certificate). Disable to use the legacy
@@ -1356,6 +1373,12 @@ def default_settings(**overrides):
         # False, commit the within-tol sat immediately and stop. (A GENUINE
         # violation, margin < 0, always commits 'sat' immediately regardless.)
         keep_searching_within_tol=True,
+        # Exit-early buffer (seconds): stop the SAT-search PGD this many seconds BEFORE
+        # its time budget so an already-found within-tol witness is emitted+validated
+        # without the last restart pushing the recorded solve PAST the official timeout
+        # (which the scorer rejects). Per-benchmark (default 0 = off); set for SAT-region
+        # families whose CE is found well within budget (e.g. adaptive_cruise).
+        sat_exit_buffer=0.0,
         # Per-value precision for the counterexample written to the results file
         # (used by BOTH the graph and surrogate-attack emit paths). '.17g'
         # round-trips float64 losslessly, so the scorer replays the exact witness
@@ -1488,6 +1511,11 @@ def default_settings(**overrides):
         # looser than zono bounds, so only large-input nets where the
         # zonotope cannot fit should set this.
         phase1_ibp_input_dim_threshold=0,
+        # BnB-instance dump dirs for offline kernel A/B replay (empty = off).
+        # Read by the phase-8 dual-ascent hook in verify_graph; the env vars
+        # VC_DUMP_BNB_DIR / DA_BAB_DUMP_DIR still work and take precedence.
+        dump_bnb_dir='',
+        dump_da_bab_dir='',
     )
     s.update(overrides)
     assert s.tighten_formulation in _TIGHTEN_FORMULATIONS, (

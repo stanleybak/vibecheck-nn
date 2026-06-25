@@ -66,7 +66,7 @@ def _source_stamp(onnx_path, vnnlib_path, dtype):
 def write_cache(onnx_path, vnnlib_path, dtype):
     """Parse the instance and pickle (graph, spec, stamp) to its cache path.
 
-    Returns the cache path. Called by prepare_instance.sh (via `--write-pkl`).
+    Returns the cache path. Called by prepare_instance.sh (via `--prepare-pkl`).
     """
     from .network import ComputeGraph
     from .vnnlib_loader import load_vnnlib

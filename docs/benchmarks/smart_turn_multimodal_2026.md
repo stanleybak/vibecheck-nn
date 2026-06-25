@@ -34,7 +34,8 @@ L∞ verification over 1.27 M dims through a 41 M-param transformer is intractab
 Incomplete / attack-only (never returns unsat). The verdict is decided **only** by replaying
 the witness on the ORIGINAL quantized model via CPU onnxruntime (the scoring engine):
 
-1. **Two folded surrogates** (built untimed in `--build-surrogate`): the **float (STE)
+1. **Two folded surrogates** (built untimed in `--prepare-pkl`, which folds surrogates for
+   quantized nets): the **float (STE)
    surrogate** (activation Q/DQ → Identity, differentiable — the gradient oracle) and the
    **fake-quant surrogate** (activation Q/DQ → `Round`+`Clip`, reproduces the INT8 rounding —
    a fast GPU eval oracle to rank candidates).
@@ -77,9 +78,9 @@ ties: 0/12, and over 12 800 random accumulated points: 0/12 800, bit-identical l
 ## Reproduce
 
 ```bash
-# prepare (untimed): build both surrogates
+# prepare (untimed): folds both surrogates for the quantized net
 .venv/bin/python -m vibecheck.main --net  .../2.0/onnx/smart-turn-multimodal-cpu.onnx \
-  --spec .../2.0/vnnlib/instance_0.vnnlib --build-surrogate
+  --spec .../2.0/vnnlib/instance_0.vnnlib --prepare-pkl
 # one instance
 .venv/bin/python -m vibecheck.main \
   --net  .../2.0/onnx/smart-turn-multimodal-cpu.onnx \

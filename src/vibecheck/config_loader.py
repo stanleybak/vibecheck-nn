@@ -31,3 +31,25 @@ def load_config(path):
         f'unknown setting keys in {path}: {unknown}\n'
         f'(known keys: see configs/default.yaml)')
     return overrides
+
+
+def parse_set_overrides(pairs):
+    """Parse repeated ``--set KEY=VALUE`` CLI strings into a validated overrides dict.
+
+    VALUE is YAML-coerced (so ``K=2`` -> int 2, ``ls=subgrad`` -> str, ``flag=true`` ->
+    bool), consistent with how ``--config`` YAML values are parsed. Every KEY must exist
+    in `default_settings()`, so a typo raises immediately instead of silently doing
+    nothing. Returns {} for an empty/None list.
+    """
+    out = {}
+    if not pairs:
+        return out
+    known = set(default_settings().keys())
+    for item in pairs:
+        assert '=' in item, f'--set expects KEY=VALUE, got {item!r}'
+        key, raw = item.split('=', 1)
+        key = key.strip()
+        assert key in known, (
+            f'unknown --set key {key!r} (known keys: see configs/default.yaml)')
+        out[key] = yaml.safe_load(raw)
+    return out

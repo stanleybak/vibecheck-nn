@@ -46,6 +46,14 @@ def main():
                              'precedence over CLI knobs; when omitted, '
                              'default_settings_for(graph, spec) auto-detects '
                              'a profile.')
+    parser.add_argument('--set', action='append', default=[], dest='set_kv',
+                        metavar='KEY=VALUE',
+                        help='Override any single setting by name (repeatable). '
+                             'VALUE is YAML-coerced, e.g. '
+                             '--set phase8_fast_dual_ascent_K=2 '
+                             '--set phase8_fast_dual_ascent_ls=subgrad '
+                             '--set dump_bnb_dir=/tmp/dumps. Applied AFTER --config '
+                             '(so --set wins); the key must exist in default_settings().')
     parser.add_argument('--results-file', default=None,
                         help='If set, write a single VNNCOMP-style line to '
                              "this file: 'unsat' (verified), 'sat' "
@@ -70,19 +78,22 @@ def main():
                              'pickle is unsafe (arbitrary code execution on load), '
                              'so this is OFF by default; only enable for inputs '
                              'you produced yourself.')
-    parser.add_argument('--write-pkl', action='store_true',
-                        help='Parse --net/--spec into a pre-parse .pkl cache '
-                             '(deterministic path keyed by the onnx/vnnlib/dtype) '
-                             'and exit WITHOUT verifying. Used by '
-                             'prepare_instance.sh; the timed run then loads it '
-                             'via --allow-unsafe-pkl-loading.')
-    parser.add_argument('--build-surrogate', action='store_true',
-                        help='If --net is INT8-quantized (DequantizeLinear/'
-                             'QuantizeLinear), fold a continuous float surrogate ONNX to '
-                             'the deterministic surrogate path and exit (no verification). '
-                             'Used by prepare_instance.sh so the timed surrogate-attack '
-                             'run skips the fold. No-op for non-quantized models.')
+    parser.add_argument('--prepare-pkl', action='store_true',
+                        help='Untimed prepare step (used by prepare_instance.sh), then '
+                             'exit WITHOUT verifying. For a normal model: parse --net/'
+                             '--spec into a pre-parse .pkl cache (deterministic path keyed '
+                             'by the onnx/vnnlib/dtype) that the timed run loads via '
+                             '--allow-unsafe-pkl-loading. For an INT8-quantized model '
+                             '(DequantizeLinear/QuantizeLinear): fold the float (STE) + '
+                             'fake-quant surrogates instead (that model uses the '
+                             'surrogate-attack path, not the graph load).')
     args = parser.parse_args()
+
+    # Parse --set KEY=VALUE overrides once (validated against default_settings());
+    # applied to the built settings at every construction site below + in the
+    # attack-mode paths. Stored on args so the attack helpers can see them too.
+    from .config_loader import parse_set_overrides
+    args.set_overrides = parse_set_overrides(args.set_kv)
 
     if args.verbose:
         # Line-buffer stdout so per-phase progress flushes on every newline.
@@ -107,26 +118,23 @@ def main():
               else '[verbose] gurobi license file: none found '
                    '(gurobipy bundled size-limited license)', flush=True)
 
-    if args.write_pkl:
-        # Prepare step: parse + cache, no verification.
-        from .preparse import write_cache
-        path = write_cache(args.net, args.spec, _DTYPES[args.dtype])
-        print(f'Wrote pre-parse cache: {path}')
-        sys.exit(0)
-
-    if args.build_surrogate:
-        # Prepare step for quantized models: fold BOTH surrogates (untimed) so the timed
-        # surrogate-attack run only pays the cheap onnx2torch convert — the float (STE)
-        # surrogate for gradients and the fake-quant surrogate for the GPU eval oracle.
+    if args.prepare_pkl:
+        # Untimed prepare step: parse + cache, no verification. For a QUANTIZED model the
+        # graph pre-parse fails on the dequantized (non-constant) conv kernel after ~70s —
+        # that model uses the surrogate-attack path, not the graph load — so fold the
+        # float (STE) + fake-quant surrogates here (the actual untimed prep) instead of a
+        # cache that can't be used. Non-quantized: write the pre-parse cache.
         from . import surrogate_pgd as sp
         if sp.has_quantized_ops(args.net):
             p = _surrogate_path(args.net)
             sp.build_float_surrogate(args.net, p)
             fq = (p[:-5] if p.endswith('.onnx') else p) + '_fq.onnx'
             sp.build_fakequant_surrogate(args.net, fq)
-            print(f'Built float surrogate: {p}\nBuilt fake-quant surrogate: {fq}')
-        else:
-            print('No quantized ops detected; surrogate not needed.')
+            print(f'Quantized model: built surrogates (skipped graph pre-parse): {p}, {fq}')
+            sys.exit(0)
+        from .preparse import write_cache
+        path = write_cache(args.net, args.spec, _DTYPES[args.dtype])
+        print(f'Wrote pre-parse cache: {path}')
         sys.exit(0)
 
     # Resolve the counterexample on-disk FORMAT version once, from the original spec
@@ -272,6 +280,7 @@ def _verify(args, sat_state=None):
             bnb_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        settings.update(args.set_overrides)
         if args.verbose:
             settings.print_progress = True
         graph.optimize(settings)
@@ -287,6 +296,7 @@ def _verify(args, sat_state=None):
             total_timeout=args.timeout,
             pgd_restarts=args.pgd_restarts,
         )
+        settings.update(args.set_overrides)
         if args.verbose:
             settings.print_progress = True
         graph.optimize(settings)
@@ -321,6 +331,7 @@ def _verify(args, sat_state=None):
             )
             if args.disable_sat_finding:
                 settings.disable_sat_finding = True
+        settings.update(args.set_overrides)   # --set wins over config/profile
         if args.verbose:
             settings.print_progress = True
         # SAT/counterexample policy: the pipeline may find a *within-tolerance*
@@ -507,6 +518,7 @@ def _maybe_surrogate_attack(args, sat_state):
     from .settings import default_settings
     overrides.setdefault('total_timeout', args.timeout)
     settings = default_settings(**overrides)
+    settings.update(getattr(args, 'set_overrides', {}) or {})
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Surrogate-attack mode: quantized ONNX -> PGD via float surrogate '
           f'(restarts={settings.surrogate_attack_restarts}, '
@@ -540,6 +552,7 @@ def _maybe_sign_attack(args, sat_state):
     from .settings import default_settings
     overrides.setdefault('total_timeout', args.timeout)
     settings = default_settings(**overrides)
+    settings.update(getattr(args, 'set_overrides', {}) or {})
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Sign-BNN attack mode: STE-PGD on Sign surrogate '
           f'(restarts={settings.sign_attack_restarts}, steps={settings.sign_attack_steps}, '
@@ -569,6 +582,7 @@ def _maybe_torch_attack(args, sat_state):
     from .settings import default_settings
     overrides.setdefault('total_timeout', args.timeout)
     settings = default_settings(**overrides)
+    settings.update(getattr(args, 'set_overrides', {}) or {})
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Torch-attack mode: onnx2torch PGD '
           f'(restarts={settings.torch_attack_restarts}, steps={settings.torch_attack_steps}, '
@@ -598,6 +612,7 @@ def _maybe_cctsdb_yolo(args, sat_state):
     from .settings import default_settings
     overrides.setdefault('total_timeout', args.timeout)
     settings = default_settings(**overrides)
+    settings.update(getattr(args, 'set_overrides', {}) or {})
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'cctsdb_yolo mode: discrete patch-position enumeration (timeout={timeout}s)')
     verdict, witness = cy.cctsdb_yolo_verify(
@@ -749,10 +764,20 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
         if ce is None:
             print('  [warn] sat verdict but could not build a counterexample '
                   '(no ORT output); results file has the verdict only.')
-    with open(args.results_file, 'w') as f:
+    # ATOMIC write: a hard process kill at the deadline (run_instance.sh's
+    # `timeout`) can strike mid-write. A plain truncate+write would then leave a
+    # 'sat' with a partial/missing counterexample, which the official scorer
+    # rejects. Write to a temp file in the same dir + os.replace (atomic rename
+    # on POSIX) so the results file is ALWAYS either the prior content or the
+    # complete new content — never a torn 'sat'.
+    tmp = f'{args.results_file}.tmp'
+    with open(tmp, 'w') as f:
         f.write(line + '\n')
         if ce is not None:
             f.write(ce + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, args.results_file)
     if line == 'sat':
         sat_state['emitted'] = True
 
