@@ -31,6 +31,50 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# Fuse the maxpool->relu decomposition's backward data movement: share merge
+# branches (no clone) and place disjoint phase-slice channel blocks in one tensor
+# (no per-slice zero-fill + channel-dim add). Bit-identical to the naive path;
+# a toggle only so the A/B harness can measure it. See backward_add_merge /
+# backward_slice / _accumulate.
+_FAST_MAXPOOL_BWD = [True]
+
+# Backward the maxpool 1-hot phase-extraction conv as a pure strided SCATTER
+# instead of a winograd conv_transpose2d (it computes a 1-hot map — running cuDNN
+# winograd for it is wasted FLOPs AND adds non-deterministic dgrad atomics). The
+# scatter is EXACT. Toggle for the A/B harness. See _detect_phase_conv /
+# PatchesA._backward_phase_scatter.
+_FAST_PHASE_CONV = [True]
+
+
+def _detect_phase_conv(op):
+    """Is ``op`` the 1-hot maxpool phase-extraction conv (C -> P*C, stride =
+    kernel = P window, out_ch ``p*C+c`` reads in_ch ``c`` at window position
+    ``(p//kW, p%kW)``, zero bias, zero pad)? Its CROWN adjoint is a strided
+    scatter, not a real conv. Returns ``(kH, kW, sH, sW)`` if so, else ``False``.
+    Verified ONCE per op (the caller caches the result on the op dict)."""
+    kernel = op['kernel']
+    k = (kernel.detach().cpu().numpy() if isinstance(kernel, torch.Tensor)
+         else np.asarray(kernel))
+    C_out, C_in, kH, kW = k.shape
+    sH, sW = op['stride']
+    if C_out != kH * kW * C_in or (sH, sW) != (kH, kW):
+        return False
+    if tuple(op.get('padding', (0, 0))) != (0, 0):
+        return False
+    bias = op.get('bias')
+    if bias is not None:
+        bt = (bias.detach().cpu().numpy() if isinstance(bias, torch.Tensor)
+              else np.asarray(bias))
+        if bt.size and np.any(bt != 0):
+            return False
+    expect = np.zeros_like(k)
+    for p in range(kH * kW):
+        for c in range(C_in):
+            expect[p * C_in + c, c, p // kW, p % kW] = 1.0
+    if not np.array_equal(k, expect):
+        return False
+    return (kH, kW, sH, sW)
+
 
 def _window_index(offsets, shape, ph, pw):
     """Flat gather index ``(B*ph*pw,)`` for the ``(ph, pw)`` window at each of
@@ -128,6 +172,10 @@ class PatchesA:
         self.offsets = offsets
         self.shape = shape
         self.acc = acc
+        # Set by backward_slice to (c0, C_out): the relation is a CHANNEL BLOCK
+        # (C_out channels at offset c0 in the C_in input) not yet materialized to
+        # the full width. _accumulate resolves it. None = a normal full relation.
+        self._block = None
 
     @property
     def B(self):
@@ -165,10 +213,38 @@ class PatchesA:
         valid = (vy.view(B, ph, 1) & vx.view(B, 1, pw)).view(B, 1, ph, pw)
         self.patches = self.patches * valid.to(self.patches.dtype)
 
+    def _backward_phase_scatter(self, pc_info, op):
+        """Adjoint of the 1-hot phase-extraction conv: phase block ``p``
+        (channels ``[p*C_in:(p+1)*C_in]``) lands on the sub-grid
+        ``(p//kW :: sH, p%kW :: sW)`` of the ``(sH*ph, sW*pw)`` upsampled input
+        patch — exactly what ``conv_transpose2d`` with the 1-hot kernel computes,
+        but as pure copies (no winograd FLOPs, no non-deterministic dgrad). Bias
+        is zero by construction (checked in detection); ``acc`` passes through."""
+        kH, kW, sH, sW = pc_info
+        in_shape = tuple(op['in_shapes_nd'][0])
+        C_in = in_shape[0]
+        B, _, ph, pw = self.patches.shape
+        new = torch.zeros(B, C_in, sH * ph, sW * pw,
+                          dtype=self.patches.dtype, device=self.patches.device)
+        for p in range(kH * kW):
+            py, px = p // kW, p % kW
+            new[:, :, py::sH, px::sW] = self.patches[:, p * C_in:(p + 1) * C_in]
+        new_off = torch.stack([self.offsets[:, 0] * sH,
+                               self.offsets[:, 1] * sW], dim=1)
+        out = PatchesA(new, new_off, in_shape, self.acc)
+        out._zero_phantoms()
+        return out
+
     def backward_conv(self, op, device, dtype):
         """Adjoint of a forward conv: bias -> acc, then ``conv_transpose2d``
         moves the relation to the conv input; offset shifts by ``o*s - p`` and
         the window grows by ``k-1`` (stride 1)."""
+        pc_info = op.get('_phase_conv')
+        if pc_info is None:
+            pc_info = _detect_phase_conv(op)
+            op['_phase_conv'] = pc_info
+        if pc_info and _FAST_PHASE_CONV[0]:
+            return self._backward_phase_scatter(pc_info, op)
         kernel = op['kernel'].to(device=device, dtype=dtype)
         bias = op['bias']
         C_out, C_in, kh, kw = kernel.shape
@@ -250,6 +326,15 @@ class PatchesA:
                     f'flat_idx[0]={first}')
             c0 = first // HW
             op['_patches_chanblock_c0'] = c0
+        if _FAST_MAXPOOL_BWD[0]:
+            # Return a CHANNEL-BLOCK relation (C_out channels living at offset c0
+            # inside the C_in input) WITHOUT materializing the full (B,C_in,ph,pw)
+            # zero tensor. ``_accumulate`` places the P disjoint phase blocks of a
+            # maxpool into one tensor in place — saving P-1 full zero-fills and the
+            # P-1 big channel-dim adds that the old per-slice zeros+merge incurred.
+            res = PatchesA(self.patches, self.offsets, in_shape, self.acc)
+            res._block = (c0, C_out)
+            return res
         B, _, ph, pw = self.patches.shape
         new_patches = torch.zeros(B, C_in, ph, pw,
                                   dtype=self.patches.dtype, device=self.patches.device)
@@ -269,8 +354,17 @@ class PatchesA:
         """Adjoint of ``y = a + b`` (skip/merge): both inputs get +A; the
         constant flows to input0 only."""
         a = PatchesA(self.patches, self.offsets, self.shape, self.acc)
-        b = PatchesA(self.patches.clone(), self.offsets, self.shape,
-                     torch.zeros_like(self.acc))
+        if _FAST_MAXPOOL_BWD[0]:
+            # No clone: every backward op REASSIGNS ``patches`` (relu/conv/phantom
+            # all build a fresh tensor) rather than mutating it in place, so the
+            # two merge branches can safely SHARE the tensor — a join that later
+            # re-adds them computes ``T + T`` (correct: both branches carry +A).
+            # Saves a full (B,C,ph,pw) clone + DtoD copy per merge (≈2% on VGG16).
+            b = PatchesA(self.patches, self.offsets, self.shape,
+                         torch.zeros_like(self.acc))
+        else:
+            b = PatchesA(self.patches.clone(), self.offsets, self.shape,
+                         torch.zeros_like(self.acc))
         return a, b
 
     def backward_add_bias(self, op, device, dtype):
@@ -401,6 +495,29 @@ def crown_backward_patches(gg, xl, xh, sb, start_op_name, init_A, device, dtype)
 
 
 def _accumulate(A_at, name, res):
+    blk = res._block
+    if blk is not None:
+        c0, C_out = blk
+        res._block = None
+        tgt = A_at.get(name)
+        C_in = res.shape[0]
+        B, _, ph, pw = res.patches.shape
+        if (tgt is not None and tgt._block is None
+                and tgt.patches.shape[1] == C_in
+                and tgt.patches.shape[2:] == res.patches.shape[2:]
+                and torch.equal(tgt.offsets, res.offsets)):
+            # The full channel tensor already exists (an earlier phase block of
+            # the same maxpool) — drop this block into its slot in place. No new
+            # zero tensor, no channel-dim add over the (mostly-zero) full width.
+            tgt.patches[:, c0:c0 + C_out] += res.patches
+            tgt.acc = tgt.acc + res.acc
+            return
+        # First block (or a shape/offset mismatch fallback): materialize the full
+        # (B,C_in,ph,pw) tensor once, then accumulate normally below.
+        full = torch.zeros(B, C_in, ph, pw, dtype=res.patches.dtype,
+                           device=res.patches.device)
+        full[:, c0:c0 + C_out] = res.patches
+        res = PatchesA(full, res.offsets, res.shape, res.acc)
     if name in A_at:
         A_at[name].add_(res)
     else:
