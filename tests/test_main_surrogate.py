@@ -99,30 +99,35 @@ def test_format_cex_v1_v2(tmp_path):
     assert v2[3] == 'Y float32 [1,1]' and v2[4] == '0.6'
 
 
-def test_format_cex_v2_uses_spec_declared_names(tmp_path):
-    # Regression (safenlp): a v2 cex must use the SPEC-declared variable names
-    # passed via io_meta (e.g. X / Y), NOT the ONNX node names.
+def test_format_cex_v2_mirrors_spec_decl(tmp_path):
+    # Regression (safenlp/smart_turn): a v2 cex MIRRORS the spec's declared name + dtype +
+    # shape (io_meta) verbatim — here the dtype `real` is echoed, NOT the ONNX's float32.
+    # The values under each header are plain numbers.
     import numpy as np
-    q = _quant_onnx(str(tmp_path / 'q.onnx'))
+    q = _quant_onnx(str(tmp_path / 'q.onnx'))   # ONNX I/O float32, but io_meta overrides
     x, y = np.array([0.7, 0.3]), np.array([0.6])
-    io = ((('Xspec', 'float32', (1, 2), 2),), (('Yspec', 'float32', (1, 1), 1),))
+    io = ((('Xspec', 'real', (1, 2), 2),), (('Yspec', 'real', (1, 1), 1),))
     v2 = vbmain._format_cex('2.0', q, x, y, '.6g', io_meta=io).splitlines()
-    assert v2[0] == 'Xspec float32 [1,2]' and v2[1:3] == ['0.7', '0.3']
-    assert v2[3] == 'Yspec float32 [1,1]' and v2[4] == '0.6'
+    assert v2[0] == 'Xspec real [1,2]' and v2[1:3] == ['0.7', '0.3']
+    assert v2[3] == 'Yspec real [1,1]' and v2[4] == '0.6'
 
 
-def test_v2_spec_carries_declared_io():
-    # The v2 loader attaches the declare-input/output names so a cex uses them.
-    from vibecheck.vnnlib_loader import parse_vnnlib_text
-    txt = ('(vnnlib-version <2.0>)\n'
-           '(declare-network N (declare-input X float32 [1, 2]) '
-           '(declare-output Y float32 [1, 1]))\n'
-           '(assert (>= X[0,0] 0.0))\n(assert (<= X[0,0] 1.0))\n'
-           '(assert (>= X[0,1] 0.0))\n(assert (<= X[0,1] 1.0))\n'
-           '(assert (<= Y[0,0] 0.0))\n')
-    spec = parse_vnnlib_text(txt)
-    assert spec.io_decls == ((('X', 'float32', (1, 2), 2),),
-                             (('Y', 'float32', (1, 1), 1),))
+def test_resolve_cex_io_meta(tmp_path):
+    # The single resolver reads the declare-input/output NAMES from the v2 header (dtype/
+    # shape come from the model) — used by ALL three emit paths.
+    p = str(tmp_path / 'v2.vnnlib')
+    open(p, 'w').write(
+        '(vnnlib-version <2.0>)\n'
+        '(declare-network N (declare-input X1 float32 [1, 2]) '
+        '(declare-input X2 real [1, 3]) (declare-output Y float32 [1, 1]))\n'
+        '(assert (<= Y[0,0] 0.0))\n')
+    assert vbmain._resolve_cex_io_meta(p) == (
+        (('X1', 'float32', (1, 2), 2), ('X2', 'real', (1, 3), 3)),
+        (('Y', 'float32', (1, 1), 1),))
+    # v1 spec (no declare-network) -> None: the cex keeps the ONNX node names.
+    p1 = str(tmp_path / 'v1.vnnlib')
+    open(p1, 'w').write('(declare-const X_0 Real)\n(assert (<= X_0 1.0))\n')
+    assert vbmain._resolve_cex_io_meta(p1) is None
 
 
 def test_emit_surrogate_result_v2(tmp_path):

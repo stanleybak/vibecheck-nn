@@ -103,11 +103,6 @@ class VNNSpec:
     x_lo: np.ndarray
     x_hi: np.ndarray
     disjuncts: list  # list of Conjunct
-    # v2 specs only: the SPEC-declared I/O tensors as ((name, dtype, shape, size), ...)
-    # for inputs then outputs, from the vnnlib `declare-input`/`declare-output`. A v2
-    # counterexample must use THESE variable names (e.g. X / Y) — not the ONNX node
-    # names — so the v2 validator accepts it. None for v1 (generic X_i/Y_i s-expr).
-    io_decls: tuple = None
 
     def check(self, output_lo, output_hi):
         """Check spec against output bounds.

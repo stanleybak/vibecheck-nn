@@ -147,12 +147,16 @@ def main():
         _cf = load_config(args.config).get('counterexample_format', 'auto')
     try:
         args.cex_version = _resolve_cex_version(_cf, args.spec)
+        # The spec-declared I/O names/dtypes/shapes for a v2 cex, resolved ONCE here so all
+        # three emit paths use them (not the ONNX node names). See _resolve_cex_io_meta.
+        args.cex_io_decls = _resolve_cex_io_meta(args.spec)
     except OSError:
         # 'auto' reads the spec head to detect its version; if it isn't readable yet (a dummy
         # path with a monkeypatched loader, or a not-yet-materialized file), fall back to v1
         # FORMAT. This is cosmetic only — a genuinely-missing spec still fails LOUDLY at the
         # verification load (graph/spec loaders), which the crash handler records as 'error'.
         args.cex_version = '1.0'
+        args.cex_io_decls = None
 
     # Shared across _verify and this crash handler: tracks whether a 'sat'
     # (+counterexample) was already written to the results file, so a later
@@ -681,13 +685,14 @@ def _cex_v2(ins_meta, outs_meta, x_flat, y_flat, fmt):
 
 def _format_cex(version, onnx_path, x_flat, y_flat, fmt, io_meta=None):
     """Dispatch the counterexample to the v1 (flat X_i/Y_i s-expr) or v2 (per-tensor) format
-    per the resolved spec version. For v2 the per-tensor headers MUST use the SPEC-declared
-    variable names (from `declare-input`/`declare-output`, e.g. X / Y) so the v2 validator
-    accepts them — passed in as `io_meta=spec.io_decls`. Only if the spec didn't declare them
-    (io_meta is None) do we fall back to the ONNX node names. Logs which format is emitted."""
+    per the resolved spec version. For v2 the per-tensor headers MUST MIRROR the spec's
+    `declare-input`/`declare-output` — name, dtype (e.g. `real`/`float32`, echoed verbatim),
+    and shape — so the v2 validator accepts them (`io_meta` = the spec-declared tensors).
+    Only if the spec didn't declare them (`io_meta is None`) do we fall back to the ONNX node
+    metadata. The values under each header are plain numbers regardless. Logs the source."""
     if version == '2.0':
         ins, outs = io_meta if io_meta is not None else _onnx_io_meta(onnx_path)
-        _src = 'spec-declared names' if io_meta is not None else 'ONNX node names'
+        _src = 'spec-declared tensors' if io_meta is not None else 'ONNX node metadata'
         print(f'  [counterexample] format=v2.0 (per-tensor: "NAME dtype [shape]" + '
               f'C-order values per input then output; using {_src})', flush=True)
         return _cex_v2(ins, outs, x_flat, y_flat, fmt)
@@ -720,6 +725,40 @@ def _resolve_cex_version(cf, spec_path):
     return _vnnlib_version(spec_path)
 
 
+def _resolve_cex_io_meta(spec_path):
+    """The SPEC-declared I/O for a v2 counterexample, as
+    ``((name, dtype, shape, size) inputs..., (...) outputs...)`` — so EVERY emit path
+    (standard / augmented / surrogate-multi-input) writes the vnnlib's variable names
+    (X / X1,X2 / Y) AND mirrors the spec's declared dtype + shape, instead of the ONNX node
+    metadata. The cex header MUST match the spec's `declare-input`/`declare-output` (the v2
+    validator compares them, so `real`/`float32` is echoed verbatim); the values underneath
+    are plain numbers regardless. Parsed CHEAPLY from just the `declare-network` header so a
+    spec with millions of input-bound asserts is never fully read. Returns ``None`` for v1 /
+    on a read error (the cex then keeps the ONNX node names). Resolved ONCE in ``main`` from
+    the ORIGINAL spec (before any pair/augment rewrite of ``args.spec``)."""
+    import re
+    p = spec_path
+    if not os.path.exists(p) and os.path.exists(p + '.gz'):
+        p = p + '.gz'
+    try:
+        opener = gzip.open if p.endswith('.gz') else open
+        with opener(p, 'rt') as fh:
+            head = fh.read(16384)
+    except OSError:
+        return None
+    if 'declare-network' not in head:
+        return None
+    ins, outs = [], []
+    for kind, name, dt, shp in re.findall(
+            r'\(declare-(input|output)\s+(\S+)\s+(\S+)\s+\[([^\]]*)\]', head):
+        shape = tuple(int(s.strip()) for s in shp.split(',') if s.strip())
+        size = 1
+        for d in shape:
+            size *= d
+        (ins if kind == 'input' else outs).append((name, dt, shape, size))
+    return (tuple(ins), tuple(outs)) if (ins or outs) else None
+
+
 def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
     """Write the surrogate verdict; for sat, a counterexample over the multi-input witness
     (ORIGINAL-model order) + the ORT-CPU output, in the format matching the input spec's
@@ -730,7 +769,8 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
     if verdict == 'sat' and witness is not None:
         x = np.concatenate([np.asarray(w).ravel() for w in witness]).astype(np.float64)
         y = np.asarray(sp._ort_eval(args.net, witness)).ravel().astype(np.float64)
-        ce = _format_cex(getattr(args, 'cex_version', '1.0'), args.net, x, y, cex_fmt)
+        ce = _format_cex(getattr(args, 'cex_version', '1.0'), args.net, x, y, cex_fmt,
+                         io_meta=getattr(args, 'cex_io_decls', None))
         with open(args.results_file, 'w') as f:
             f.write('sat\n' + ce + '\n')
         sat_state['emitted'] = True
@@ -761,14 +801,15 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
         # output dim. The harness re-runs the ONNX on the X's to confirm. We
         # reuse the same ORT forward the soundness validator uses so Y matches.
         _ver = getattr(args, 'cex_version', '1.0')
+        _io = getattr(args, 'cex_io_decls', None)   # spec-declared v2 names (resolved once)
         _orig = getattr(args, 'orig_net_for_cex', None)
         if _orig is not None:
             # Nonlinear-augmented instance: the loaded net's outputs are the
             # constraint polynomials, not the original net's output. Emit Y from
             # the ORIGINAL net so the cex has the benchmark's true output shape.
-            ce = _counterexample_sexpr_orig(_orig, witness, cex_fmt, _ver)
+            ce = _counterexample_sexpr_orig(_orig, witness, cex_fmt, _ver, io_meta=_io)
         else:
-            ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt, _ver)
+            ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt, _ver, io_meta=_io)
         if ce is None:
             print('  [warn] sat verdict but could not build a counterexample '
                   '(no ORT output); results file has the verdict only.')
@@ -790,7 +831,8 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
         sat_state['emitted'] = True
 
 
-def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0'):
+def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0',
+                          io_meta=None):
     """Build the counterexample for a SAT witness in the v1 (flat) or v2 (per-tensor)
     format. Returns the cex string or None if the ONNX output can't be computed (e.g.
     onnxruntime missing). Y is obtained from the same ORT forward the soundness validator
@@ -809,15 +851,16 @@ def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0
     if info.get('witness_inbox') is not None:
         x = np.asarray(info['witness_inbox']).flatten().astype(np.float64)
     y = np.asarray(y).flatten().astype(np.float64)
-    # v2: emit with the SPEC's declared I/O names (X / Y ...), not the ONNX node names.
-    return _format_cex(version, onnx_path, x, y, cex_fmt,
-                       io_meta=getattr(spec, 'io_decls', None))
+    # v2: emit with the SPEC's declared I/O names (io_meta), not the ONNX node names.
+    return _format_cex(version, onnx_path, x, y, cex_fmt, io_meta=io_meta)
 
 
-def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0'):
+def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0',
+                               io_meta=None):
     """Counterexample for a nonlinear-AUGMENTED instance: X is the witness, Y is the
     ORIGINAL net's output recomputed in float32 CPU ORT (the same arithmetic the VNNCOMP
-    scorer uses), formatted per the spec version. Returns None if ORT can't run."""
+    scorer uses), formatted per the spec version (v2 uses io_meta = the original spec's
+    declared I/O names). Returns None if ORT can't run."""
     import numpy as np
     try:
         import onnxruntime as ort
@@ -840,7 +883,8 @@ def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0'
     except (RuntimeError, OSError, ValueError):
         return None
     return _format_cex(version, orig_onnx, x,
-                       np.asarray(y).flatten().astype(np.float64), cex_fmt)
+                       np.asarray(y).flatten().astype(np.float64), cex_fmt,
+                       io_meta=io_meta)
 
 
 if __name__ == '__main__':
