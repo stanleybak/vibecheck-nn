@@ -1321,6 +1321,16 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             hi = torch.maximum(hi, lo)
         return lo, hi
 
+    # Track whether the forward patch-zono has been box-reduced yet. The
+    # torch.compile'd retighten core has a higher transient peak than the eager
+    # path; invoking it WHILE the forward still carries its full input-generator
+    # set (the heavy pre-box-reduce relus, which alone are the largest alloc of
+    # the full-image pass) OOMs the GPU. So compile is gated to AFTER box-reduce,
+    # i.e. the deep layers — which is exactly where it helps most (2.3x at the
+    # deepest conv) and where the forward zono is already small. Before that the
+    # eager retighten runs (cheap: shallow layers have few unstable neurons).
+    _fwd_box_reduced = False
+
     for op_idx, op in enumerate(gg['ops']):
         name = op['name']
         t = op['type']
@@ -1361,11 +1371,28 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             # (skips the generic prefix-preserving default below).
             if _did_reduce:
                 col_ids_state[name] = _alloc_ids(z.n_gens)
+                _fwd_box_reduced = True
 
         elif t == 'fc':
             z = _get(op['inputs'][0])
             in_shape_nd = op.get('in_shapes_nd', [None])[0]
             W = op['W']; bias = op['bias']
+            # Pre-FC box-reduce (full-image VGG): an FC materialises the patch
+            # zono to a dense (n_in, K) generator matrix. After many conv layers
+            # K can be >> n_in (one generator per perturbed pixel), so the dense
+            # matrix OOMs. When a per-pixel-perturbation patch zono reaches the
+            # first FC with more generators than neurons, collapse to a
+            # per-neuron box first (sound; the box strictly contains the zono).
+            # Gated on the box_reduce budget being set so other benchmarks (few
+            # generators) are untouched. Mirrors the conv-op budget reduce above.
+            _brb_fc = (getattr(settings, 'box_reduce_patch_budget', None)
+                       if settings is not None else None)
+            if (isinstance(_brb_fc, (int, float)) and _brb_fc > 0
+                    and isinstance(z, PatchesZonotope) and z._mode == 'patches'
+                    and z._patches is not None and z.out_shape is not None
+                    and z.n_gens > z.center.numel()):
+                z.box_reduce()
+                col_ids_state[name] = _alloc_ids(z.n_gens)
             # Standard 1D case: input is flat (n_in,), W is (n_out, n_in).
             # Batched MatMul case (nn4sys mscn, ≥2D in_shape): apply
             # F.linear over the last dim by reshaping center/gens to
@@ -1460,6 +1487,17 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             # off (no effect on any other path).
             _crt = (settings is not None and layer_idx is not None
                     and getattr(settings, 'crown_retighten_forward', False))
+            # Skip retighten for very deep relus (block5 maxpool sub-relus + FC):
+            # their receptive field is ~the whole image so their per-neuron
+            # backward is the slowest, and (esp. the maxpool sub-relus, which are
+            # FULLY unstable at block5) they dominate the wall. The final spec
+            # backward-CROWN re-relaxes them anyway using the (tight) earlier sb.
+            # None = no limit (retighten all). Sound (only skips tightening).
+            if _crt:
+                _crt_maxL = getattr(settings, 'crown_retighten_max_layer_idx',
+                                    None)
+                if _crt_maxL is not None and layer_idx > int(_crt_maxL):
+                    _crt = False
             need_pre_bounds = _crt or (
                 rec_zono is not None and layer_idx is not None
             ) or (tight_bounds is not None and layer_idx in (tight_bounds or {}))
@@ -1498,13 +1536,22 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                         # conv layers; the neuron batch self-splits on OOM.
                         # Retightens ALL unstable (the cap is a dense-only
                         # crutch). Validated bit-equivalent to the dense path.
+                        from . import patches_crown
                         from .patches_crown import patches_bounds
                         pre_op = op['inputs'][0]
                         out_shape = tuple(op['in_shapes_nd'][0])
+                        # Compile the relu-backward core only once the forward
+                        # zono is box-reduced (deep layers) — see _fwd_box_reduced
+                        # above. Honour an explicit off-switch via settings.
+                        patches_crown._RELU_COMPILE[0] = bool(
+                            _fwd_box_reduced and getattr(
+                                settings, 'crown_retighten_compile', True))
                         if getattr(settings, 'crown_retighten_debug', False):
                             print(f'  [retighten L={layer_idx} '
                                   f'pre_unstable={uns.numel()} '
-                                  f'shape={out_shape}]', flush=True)
+                                  f'shape={out_shape} '
+                                  f'compile={patches_crown._RELU_COMPILE[0]}]',
+                                  flush=True)
                         lb, ub = patches_bounds(
                             gg, xl, xh, sb, pre_op, out_shape, uns,
                             device, dtype)
@@ -1534,6 +1581,13 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                         z, layer_idx,
                         (pre_lo.cpu().numpy(), pre_hi.cpu().numpy()),
                         rec_zono)
+                # The patches-CROWN retighten (esp. its torch.compile'd relu
+                # core) leaves transient/cached allocations that fragment the
+                # pool; release them before the forward zono's own apply_relu,
+                # whose pre-box-reduce generator gather is the single largest
+                # alloc in the full-image pass (it OOMs ~0.3 GB short otherwise).
+                if _crt and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 lo, hi = z.apply_relu(tight_lo=pre_lo, tight_hi=pre_hi)
             else:
                 lo, hi = z.apply_relu()

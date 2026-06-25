@@ -4,4 +4,19 @@
 # Keep verify_graph on its OWN zono+CROWN+input-split path (which has a sound
 # box-approximation max_pool); do NOT auto-route conv graphs to milp_verify/
 # gpu_layers, which has no MaxPool handler.
+#
+# This solves spec0–14 (15/15). The 3 full-image cases (spec15/16/17, ALL 150528
+# px perturbed) are NOT solved here: the forward zono explodes under box-reduce,
+# and a sound bound needs retightening ~all unstable deep-layer ReLUs via backward
+# CROWN — ~2.7x over the 1200 s budget at the current engine speed (see
+# docs/benchmarks/vggnet16_2022.md). A WIP patches-mode backward-CROWN engine
+# exists (sound, bit-equivalent, gated OFF by default) but is too slow for these.
+# To experiment with it on the full-image cases (will exceed 1200 s today), add:
+#   --set crown_retighten_forward=true  --set crown_retighten_patches=true
+#   --set box_reduce_patch_budget=6.0e+9  --set box_reduce_on_oom=true
+#   --set phase1_method=plain  --set tighten_formulation=skip
+#   --set max_tighten_layer=0  --set max_tighten_layer_lp=0
+#   --set crown_retighten_chunk=64   (avoids the FC dense-backward OOM)
+# Capping (crown_retighten_max_neurons) does NOT help: it leaves un-retightened
+# neurons at exploded box bounds, so the final bound explodes (cap=10000 → -1.5e8).
 auto_route_milp_for_conv: false

@@ -489,6 +489,29 @@ def default_settings(**overrides):
         # machinery (no backend has a real MaxPool handler). No-op without
         # MaxPool; exact, so on by default.
         maxpool_to_relu=True,
+        # Forward-zono ReLU pre-activation retighten via backward CROWN (deep
+        # conv nets where the box-reduced forward zono is too loose, e.g.
+        # full-image VGG16). `_forward`: enable; `_patches`: use the patches-mode
+        # backward (the backward dual of the patch zonotope) instead of the
+        # dense matrix backward; `_max_neurons`: cap the retighten to the
+        # widest-N unstable neurons per layer (None=all; sound — the rest keep
+        # their looser zono bounds); `_chunk`: dense-path neuron chunk;
+        # `_debug`: print per-layer retighten progress. All default OFF/None so
+        # every other benchmark is unaffected.
+        crown_retighten_forward=False,
+        crown_retighten_patches=False,
+        crown_retighten_max_neurons=None,
+        crown_retighten_max_layer_idx=None,
+        crown_retighten_compile=True,
+        crown_retighten_chunk=512,
+        crown_retighten_debug=False,
+        # Patch-zonotope order-reduction to a per-neuron box (sound, loses
+        # cross-neuron correlation) to keep a deep forward zono in memory:
+        # `_patch_budget` bytes triggers a proactive reduce when a conv's patch
+        # tensor exceeds it; `_on_oom` reduces + retries on a CUDA OOM. Both
+        # off/None by default (no effect when the zono stays small).
+        box_reduce_patch_budget=None,
+        box_reduce_on_oom=False,
         bnb_max_depth=128,
         total_timeout=120.0,
         milp_sample_timeout=5.0,

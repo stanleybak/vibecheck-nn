@@ -32,27 +32,83 @@ import torch
 import torch.nn.functional as F
 
 
-def _gather_windows(maps_chw, offsets, ph, pw):
-    """Gather, for each of B spec rows, the ``(C, ph, pw)`` window of
-    ``maps_chw`` (a ``(C, H, W)`` tensor) at that row's top-left ``offset``.
-    Positions outside ``[0,H) x [0,W)`` are zeroed (phantom mask). Returns
-    ``(B, C, ph, pw)``."""
-    C, H, W = maps_chw.shape
+def _window_index(offsets, shape, ph, pw):
+    """Flat gather index ``(B*ph*pw,)`` for the ``(ph, pw)`` window at each of
+    B rows' top-left ``offset`` into a ``(C, H, W)`` map. Out-of-range
+    positions point at index ``H*W`` (a sentinel zero column appended by
+    ``_gather_at``) so phantom positions gather 0 with NO separate mask
+    multiply — saving a full ``(B, C, ph, pw)`` pass per gather (the masked
+    multiply was a measured hot spot on VGG's 130x130 deep-neuron windows)."""
+    C, H, W = shape
     B = offsets.shape[0]
-    dev = maps_chw.device
-    dy = torch.arange(ph, device=dev)
-    dx = torch.arange(pw, device=dev)
-    ty = offsets[:, 0].view(B, 1) + dy.view(1, ph)      # (B, ph)
-    tx = offsets[:, 1].view(B, 1) + dx.view(1, pw)      # (B, pw)
-    vy = (ty >= 0) & (ty < H)
-    vx = (tx >= 0) & (tx < W)
-    tyc = ty.clamp(0, H - 1)
-    txc = tx.clamp(0, W - 1)
-    spatial = (tyc.view(B, ph, 1) * W + txc.view(B, 1, pw)).reshape(-1)  # (B*ph*pw,)
-    maps_flat = maps_chw.reshape(C, H * W)
-    g = maps_flat[:, spatial].reshape(C, B, ph, pw).permute(1, 0, 2, 3)  # (B,C,ph,pw)
-    valid = (vy.view(B, ph, 1) & vx.view(B, 1, pw)).view(B, 1, ph, pw)
-    return g * valid.to(maps_chw.dtype)
+    dev = offsets.device
+    HW = H * W
+    ty = offsets[:, 0].view(B, 1) + torch.arange(ph, device=dev).view(1, ph)
+    tx = offsets[:, 1].view(B, 1) + torch.arange(pw, device=dev).view(1, pw)
+    inb = (ty >= 0) & (ty < H)                          # (B, ph)
+    inx = (tx >= 0) & (tx < W)                          # (B, pw)
+    flat = (ty.clamp(0, H - 1).view(B, ph, 1) * W
+            + tx.clamp(0, W - 1).view(B, 1, pw))        # (B, ph, pw)
+    valid = inb.view(B, ph, 1) & inx.view(B, 1, pw)
+    return torch.where(valid, flat, flat.new_full((), HW)).reshape(-1)
+
+
+def _gather_at(map_chw, spatial, B, ph, pw):
+    """Gather a single ``(C, H, W)`` map at the precomputed ``spatial`` index
+    (from ``_window_index``) -> ``(B, C, ph, pw)``. A zero column is appended
+    so sentinel ``H*W`` indices gather 0 (phantom)."""
+    C, H, W = map_chw.shape
+    mf = map_chw.reshape(C, H * W)
+    mf = torch.cat([mf, mf.new_zeros(C, 1)], dim=1)     # (C, H*W+1); zero col
+    return mf[:, spatial].reshape(C, B, ph, pw).permute(1, 0, 2, 3)
+
+
+def _gather_windows(maps_chw, offsets, ph, pw):
+    """Compat shim: gather the ``(C, ph, pw)`` window per row (phantom->0).
+    Kept for callers/tests; prefer ``_window_index`` + ``_gather_at`` to gather
+    one map at a time (lower peak memory)."""
+    spatial = _window_index(offsets, maps_chw.shape, ph, pw)
+    return _gather_at(maps_chw, spatial, offsets.shape[0], ph, pw)
+
+
+# torch.compile the ReLU-backward hot core (gather + clamps + products). This is
+# the single biggest cost of the deep-layer backward (~53% on VGG conv10) — a
+# chain of small elementwise kernels over the (B,C,ph,pw) patch that the
+# compiler fuses (gather epilogue + clamp + multiply + addcmul) into far fewer
+# launches, which is exactly where AB-CROWN's single fused slope-multiply beats
+# the eager chain. Compiles per (B,ph,pw) shape (cached); first call pays the
+# compile. Numerically equivalent up to fp32 reassociation (validated against
+# the dense backward by the bit-equivalence test). Toggle with _RELU_COMPILE.
+_RELU_COMPILE = [True]
+
+
+def _relu_bwd_eager(patches, up_s, up_t, eff_slope, spatial, B, ph, pw):
+    C = up_s.shape[0]
+    ep = patches.clamp(min=0)
+    en = patches.clamp(max=0)
+
+    def gat(m):
+        mf = torch.cat([m.reshape(C, -1), m.new_zeros(C, 1)], dim=1)
+        return mf[:, spatial].reshape(C, B, ph, pw).permute(1, 0, 2, 3)
+
+    ut_w = gat(up_t)
+    acc_c = (en * ut_w).sum(dim=(-1, -2, -3))
+    us_w = gat(up_s)
+    new = en * us_w
+    sl_w = gat(eff_slope)
+    new = new.addcmul(ep, sl_w)
+    return new, acc_c
+
+
+_relu_bwd_compiled = [None]
+
+
+def _relu_bwd_core(patches, up_s, up_t, eff_slope, spatial, B, ph, pw):
+    if not _RELU_COMPILE[0]:
+        return _relu_bwd_eager(patches, up_s, up_t, eff_slope, spatial, B, ph, pw)
+    if _relu_bwd_compiled[0] is None:
+        _relu_bwd_compiled[0] = torch.compile(_relu_bwd_eager)
+    return _relu_bwd_compiled[0](patches, up_s, up_t, eff_slope, spatial, B, ph, pw)
 
 
 class PatchesA:
@@ -149,15 +205,17 @@ class PatchesA:
         unstable = ((lo < 0) & (hi > 0)).to(self.patches.dtype)
         eff_slope = active + unstable * (up_s > 0.5).to(self.patches.dtype)
         B, _, ph, pw = self.patches.shape
-        # One stacked gather (3C channels) instead of three separate scattered
-        # gathers -> 1/3 the kernel launches per relu.
-        stk = torch.cat([eff_slope, up_s, up_t], dim=0)         # (3C, H, W)
-        g = _gather_windows(stk, self.offsets, ph, pw)          # (B, 3C, ph, pw)
-        sl = g[:, :C]; us = g[:, C:2 * C]; ut = g[:, 2 * C:3 * C]
-        ep = self.patches.clamp(min=0)
-        en = self.patches.clamp(max=0)
-        self.acc = self.acc + (en * ut).sum(dim=(-1, -2, -3))
-        self.patches = ep * sl + en * us
+        # Gather the three (C,H,W) maps into the patch frame and combine. The
+        # old code cat'd them into a (B,3C,ph,pw) tensor (3x the patch) before
+        # consuming — a peak-memory hog. The fused core gathers one map at a
+        # time (low peak) AND torch.compile fuses the gather+clamp+multiply
+        # chain into few kernels (the deep-layer hot spot). `new = ep*eff_slope
+        # + en*up_s`, `acc += sum(en*up_t)` (en=patch∧≤0, ep=patch∧≥0).
+        spatial = _window_index(self.offsets, (C, H, W), ph, pw)
+        new, acc_c = _relu_bwd_core(self.patches, up_s, up_t, eff_slope,
+                                    spatial, B, ph, pw)
+        self.acc = self.acc + acc_c
+        self.patches = new
         return self
 
     def backward_slice(self, op, device):
@@ -273,12 +331,15 @@ class PatchesA:
         xl_chw = xl.reshape(C, H, W).to(self.patches.dtype)
         xh_chw = xh.reshape(C, H, W).to(self.patches.dtype)
         B, _, ph, pw = self.patches.shape
-        g = _gather_windows(torch.cat([xl_chw, xh_chw], dim=0),
-                            self.offsets, ph, pw)              # (B, 2C, ph, pw)
-        xl_w = g[:, :C]; xh_w = g[:, C:2 * C]
+        spatial = _window_index(self.offsets, (C, H, W), ph, pw)
         ep = self.patches.clamp(min=0)
         en = self.patches.clamp(max=0)
-        return self.acc + (ep * xl_w).sum(dim=(-1, -2, -3)) + (en * xh_w).sum(dim=(-1, -2, -3))
+        xl_w = _gather_at(xl_chw, spatial, B, ph, pw)
+        out = self.acc + (ep * xl_w).sum(dim=(-1, -2, -3))
+        del xl_w
+        xh_w = _gather_at(xh_chw, spatial, B, ph, pw)
+        out = out + (en * xh_w).sum(dim=(-1, -2, -3))
+        return out
 
 
 def crown_backward_patches(gg, xl, xh, sb, start_op_name, init_A, device, dtype):
@@ -351,14 +412,19 @@ def _accumulate(A_at, name, res):
 # instead of re-running the full->halve cascade (each failed attempt builds GB
 # of patches before OOMing). Shrinks monotonically as layers deepen (bigger
 # patches); a module global so it persists across layers within a forward.
-# Cap the per-pass neuron batch. Measured sweet spot ~256 (L16): big batches
-# (~2048 -> 20 GB) are ~2x SLOWER (memory-bound conv) AND OOM-thrash at depth;
-# ~256 keeps conv tensors small/cache-friendly (ABC's small-chunk strategy).
-# The half-split below still shrinks further on OOM at deeper layers.
+# Per-pass neuron batch (each of the two lb/ub walks processes this many rows).
+# 256 is the measured sweet spot on VGG16's deepest conv (peak ~14.6 G): bigger
+# batches are memory-bound and OOM-thrash at depth, smaller waste GPU. The
+# half-split below still shrinks further on OOM at deeper layers.
 _LAST_OK_BATCH = [256]
 
 
 def _bounds_one(gg, xl, xh, sb, start_op_name, out_shape, idx, device, dtype):
+    # Two SEPARATE backward walks (lower then upper), one at a time. Combining
+    # them into a single 2B-row walk was MEASURED slower at the deep layers:
+    # carrying both directions at once ~doubles peak memory, and the deep VGG
+    # layers are memory-bound (conv12: 512-row walk OOM-thrashes the 23 G A10G
+    # -> chunk collapses). Sequential walks free the first before the second.
     A_lo = PatchesA.one_hot(idx, out_shape, 1.0, device, dtype)
     lb = crown_backward_patches(gg, xl, xh, sb, start_op_name, A_lo,
                                 device, dtype)
