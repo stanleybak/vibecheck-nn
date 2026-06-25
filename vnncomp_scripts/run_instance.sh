@@ -5,6 +5,11 @@
 # unsat / sat / unknown / timeout; for `sat` the counterexample s-expression
 # follows (the harness splits it into <instance>.counterexample.gz).
 set -u
+# Opt out of any xtrace inherited from the harness (`bash -x` / exported SHELLOPTS):
+# the 0.5s sat-commit poll loop below would otherwise flood the captured per-instance
+# log with `+ kill -0 / + head -c3 / + sleep 0.5` lines every tick. The intended log
+# is vibecheck's own --verbose phase trace (its stdout), not this script's plumbing.
+{ set +x; } 2>/dev/null
 
 TOOL_NAME=vibecheck
 VERSION_STRING=v1
