@@ -681,10 +681,15 @@ def _cex_v2(ins_meta, outs_meta, x_flat, y_flat, fmt):
 
 def _format_cex(version, onnx_path, x_flat, y_flat, fmt):
     """Dispatch the counterexample to the v1 (flat X_i/Y_i s-expr) or v2 (per-tensor) format
-    per the resolved spec version."""
+    per the resolved spec version. Logs which on-disk format is emitted (so a v1/v2 mismatch
+    against the benchmark's spec version is visible in the run log)."""
     if version == '2.0':
         ins, outs = _onnx_io_meta(onnx_path)
+        print('  [counterexample] format=v2.0 (per-tensor: "NAME dtype [shape]" + '
+              'C-order values per input then output)', flush=True)
         return _cex_v2(ins, outs, x_flat, y_flat, fmt)
+    print('  [counterexample] format=v1.0 (flat s-expr: ((X_i <v>) ... (Y_j <v>)))',
+          flush=True)
     return _cex_sexpr(x_flat, y_flat, fmt)
 
 
