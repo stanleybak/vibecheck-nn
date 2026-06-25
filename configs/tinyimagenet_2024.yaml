@@ -40,8 +40,3 @@ phase26_pre_cascade_enabled: false
 # CUDA-only (falls back to the forward build on CPU).
 phase8_reverse_g: true
 phase8_reverse_g_batched: true
-
-# Within-tol-sat cases overran to ~104s (keep_searching ran the full pipeline past the
-# 100s timeout). Stop ~8s early once a within-tol CE is in hand (time_left buffer), so the
-# recorded solve stays under budget. Only affects within-tol-sat cases (unsat unaffected).
-sat_exit_buffer: 8.0

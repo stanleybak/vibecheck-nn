@@ -5265,7 +5265,6 @@ def _sat_disposition(graph, spec, settings, witness, info):
     sink = getattr(settings, 'result_sink', None)
     if sink is not None:
         sink(w)   # write 'sat' + counterexample now (never-downgrade keeps it)
-    settings._within_tol_witness = w
     return 'within_tol'
 
 
@@ -5997,22 +5996,9 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                              if _phase8_min_frac > 0 else deadline)
     _phase8_started = [False]
 
-    # Clamp the exit buffer to at most 1/4 of the budget so it stays sane for short
-    # timeouts (e.g. a 20s nn4sys instance must not get a 20s buffer -> 0 budget).
-    _sat_exit_buffer = min(float(getattr(settings, 'sat_exit_buffer', 0.0) or 0.0),
-                           0.25 * total_timeout)
-
     def time_left():
         now = time.perf_counter()
         full = max(0.0, deadline - now)
-        # Exit-early buffer: once a within-tol witness is stashed (an acceptable,
-        # scorer-accepted 'sat'), stop `sat_exit_buffer` seconds BEFORE the real
-        # deadline so the recorded solve doesn't overrun the official timeout (which
-        # gets it rejected). Only shrinks the budget when we already have an answer
-        # to emit — searches with no result yet still get the full time.
-        if (_sat_exit_buffer > 0.0
-                and getattr(settings, '_within_tol_witness', None) is not None):
-            full = max(0.0, deadline - now - _sat_exit_buffer)
         if not _phase8_started[0] and _phase8_min_frac > 0:
             return max(0.0, min(full, _phase8_min_deadline - now))
         return full
@@ -10264,15 +10250,9 @@ def _verify_nonlinear_graph(graph, spec, settings, t_start, total_timeout):
     closed = 0
     opened = 0
     abandoned = 0
-    # Exit-early buffer: once a within-tol witness is in hand (accepted result), stop
-    # `sat_exit_buffer` s before the real deadline so the recorded solve doesn't overrun
-    # the official timeout (e.g. adaptive_cruise instance_44 was landing at 100.99s).
-    _eb = float(getattr(settings, 'sat_exit_buffer', 0.0) or 0.0)
     try:
         while queue:
-            _dl = (deadline - _eb if (_eb > 0.0 and getattr(
-                settings, '_within_tol_witness', None) is not None) else deadline)
-            if _time.perf_counter() >= _dl:
+            if _time.perf_counter() >= deadline:
                 _restore()
                 return 'unknown', {'method': 'trig_input_split',
                                    'reason': 'timeout', 'leaves_closed': closed}
@@ -10411,11 +10391,8 @@ def _verify_trig_nonlinear_split(graph, spec, settings, gg, xl0, xh0, dt,
     max_depth = int(getattr(settings, 'trig_nl_max_depth', 10**9))
     queue = [(xl0, xh0, {}, 0)]
     closed = 0; opened = 0; abandoned = 0
-    _eb = float(getattr(settings, 'sat_exit_buffer', 0.0) or 0.0)
     while queue:
-        _dl = (deadline - _eb if (_eb > 0.0 and getattr(
-            settings, '_within_tol_witness', None) is not None) else deadline)
-        if _time.perf_counter() >= _dl:
+        if _time.perf_counter() >= deadline:
             _restore()
             if print_progress:
                 print(f'[trig_nl] timeout: closed={closed} opened={opened}',

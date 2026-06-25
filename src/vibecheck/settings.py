@@ -1373,12 +1373,6 @@ def default_settings(**overrides):
         # False, commit the within-tol sat immediately and stop. (A GENUINE
         # violation, margin < 0, always commits 'sat' immediately regardless.)
         keep_searching_within_tol=True,
-        # Exit-early buffer (seconds): stop the SAT-search PGD this many seconds BEFORE
-        # its time budget so an already-found within-tol witness is emitted+validated
-        # without the last restart pushing the recorded solve PAST the official timeout
-        # (which the scorer rejects). Per-benchmark (default 0 = off); set for SAT-region
-        # families whose CE is found well within budget (e.g. adaptive_cruise).
-        sat_exit_buffer=0.0,
         # Per-value precision for the counterexample written to the results file
         # (used by BOTH the graph and surrogate-attack emit paths). '.17g'
         # round-trips float64 losslessly, so the scorer replays the exact witness
