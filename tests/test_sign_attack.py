@@ -162,12 +162,12 @@ def test_sign_attack_per_disjunct(tmp_path):
     assert verdict in ('sat', 'unknown')
 
 
-def test_sign_attack_unknown(tmp_path):
-    # tiny box around a point that stays class 0 -> no CE reachable
+def test_sign_attack_no_ce_timeout(tmp_path):
+    # tiny box around a point that stays class 0 -> no CE reachable. Incomplete -> timeout.
     q = _bnn_onnx(str(tmp_path / 'b.onnx'), w2=((5.0, -5.0), (5.0, -5.0)))   # class 0 dominates
     v = _vnnlib(str(tmp_path / 'v.vnnlib'), lo=(0.4, 0.4), hi=(0.40001, 0.40001))
     verdict, wit = sa.sign_attack(q, v, _S(), timeout=30, log=lambda _m: None)
-    assert verdict == 'unknown' and wit is None
+    assert verdict == 'timeout' and wit is None
 
 
 def test_sign_attack_timeout(tmp_path):

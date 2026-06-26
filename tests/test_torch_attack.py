@@ -92,12 +92,12 @@ def test_torch_attack_fixed_box_within_tol(tmp_path):
     assert verdict == 'sat' and wit is not None
 
 
-def test_torch_attack_unknown(tmp_path):
-    # tiny box where class 0 dominates -> no CE reachable
+def test_torch_attack_no_ce_timeout(tmp_path):
+    # tiny box where class 0 dominates -> no CE reachable. Incomplete mode -> timeout.
     q = _net(str(tmp_path / 'n.onnx'), w2=((5.0, -5.0), (5.0, -5.0)))
     v = _vnnlib(str(tmp_path / 'v.vnnlib'), lo=(0.4, 0.4), hi=(0.40001, 0.40001))
     verdict, wit = ta.torch_attack(q, v, _S(), timeout=30, log=lambda _m: None)
-    assert verdict == 'unknown' and wit is None
+    assert verdict == 'timeout' and wit is None
 
 
 def test_torch_attack_timeout(tmp_path):

@@ -59,7 +59,7 @@ def cctsdb_yolo_verify(onnx_path, vnnlib_path, settings, timeout, log=print):
     t0 = time.time()
     spec = load_vnnlib(ensure_decompressed(vnnlib_path))
     lo = np.asarray(spec.x_lo, np.float64); hi = np.asarray(spec.x_hi, np.float64)
-    atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    atol = float(getattr(settings, 'sat_validate_atol', 1e-4))   # INPUT-box tolerance only
     max_pos = int(getattr(settings, 'cctsdb_max_positions', 1_000_000))
     free = [d for d in range(lo.size) if hi[d] - lo[d] > 1e-6]
     for d in free:
@@ -82,13 +82,9 @@ def cctsdb_yolo_verify(onnx_path, vnnlib_path, settings, timeout, log=print):
     base = lo.copy()
     log(f'[cctsdb] enumerating {total} integer patch positions over free dims {free}')
 
-    within_tol = [None]
     n = 0
     for combo in itertools.product(*ranges):
         if time.time() - t0 > timeout:
-            if within_tol[0] is not None:
-                log(f'[cctsdb] timeout after {n}/{total} — emitting within-tol CE')
-                return 'sat', within_tol[0]
             log(f'[cctsdb] timeout after {n}/{total} positions')
             return 'timeout', None
         x = base.copy()
@@ -98,14 +94,12 @@ def cctsdb_yolo_verify(onnx_path, vnnlib_path, settings, timeout, log=print):
         y = np.asarray(sess.run([oname], {iname: feed})[0]).ravel()
         n += 1
         m = _worst_margin_np(y, spec.disjuncts)
-        if m < 0.0:
+        # m <= 0 is an output violation under the spec's `<=`/`>=` comparison at zero
+        # tolerance (boundary inclusive) — a counterexample. m > 0 does NOT violate
+        # (no within-output-tolerance fallback under the 2026 rule).
+        if m <= 0.0:
             log(f'[cctsdb] CLEAR SAT at position {tuple(combo)} (worst_margin={m:.3e})')
             return 'sat', [feed]
-        if m <= atol and within_tol[0] is None:
-            within_tol[0] = [feed]
-            log(f'[cctsdb] within-tol CE at {tuple(combo)} (worst_margin={m:.3e}, atol={atol:g})')
-    if within_tol[0] is not None:
-        log(f'[cctsdb] no clear CE — emitting within-tol CE (t={time.time()-t0:.1f}s)')
-        return 'sat', within_tol[0]
+    # Complete enumeration finished with no violating position -> unsat.
     log(f'[cctsdb] all {n} positions safe -> unsat (complete) (t={time.time()-t0:.1f}s)')
     return 'unsat', None

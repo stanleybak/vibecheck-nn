@@ -1380,22 +1380,26 @@ def default_settings(**overrides):
         parallel_pgd_max_attacks=20,
         # ONNXRuntime SAT-witness validation (defense-in-depth).
         # Before returning 'sat' from any path, run the witness through
-        # the ORIGINAL ONNX model + check it actually violates the spec
-        # within `sat_validate_atol` (mirrors VNNCOMP scoring's
-        # COUNTEREXAMPLE_ATOL=1e-4). Spurious witnesses are downgraded
-        # to 'unknown' with `details['spurious_witness']` populated.
+        # the ORIGINAL ONNX model + check it actually violates the spec.
+        # Spurious witnesses are downgraded to 'unknown' with
+        # `details['spurious_witness']` populated.
         # `skip_sat_validation=True` opts out (e.g. for ORT-free envs).
+        #
+        # VNN-COMP 2026 ruling (evaluation chairs): the `sat_validate_atol`
+        # (1e-4) absolute tolerance applies ONLY to the INPUT box — a witness up
+        # to `sat_validate_atol` outside the box scores CORRECT_WITH_TOLERANCE
+        # (no penalty, but not SAT ground truth). The replayed OUTPUT must
+        # violate the spec with NO tolerance. That output tolerance is therefore
+        # FIXED at 0.0 and is deliberately NOT a setting (hard-wired `out_atol=0.0`
+        # at every `_validate_sat_witness` call site and in the vendored
+        # competition checker vnncomp_cex_v2.py), so no config can ever loosen it.
+        # (VC also clamps the emitted witness strictly in-box, so its inputs are
+        # exact and it scores CORRECT, not merely CORRECT_WITH_TOLERANCE.)
         sat_validate_atol=1e-4,
         skip_sat_validation=False,
-        # On a WITHIN-TOLERANCE counterexample (the witness does NOT actually
-        # violate — un-banded ORT margin >= 0 — but is within `sat_validate_atol`
-        # of violating, so the scorer accepts it as CORRECT_UP_TO_TOLERANCE):
-        # when True (default), persist it as the fallback 'sat' but KEEP SEARCHING
-        # for a genuine CE (margin < 0) or an unsat proof — the within-tol sat is
-        # only the back-pocket result a later clear sat / unsat can override. When
-        # False, commit the within-tol sat immediately and stop. (A GENUINE
-        # violation, margin < 0, always commits 'sat' immediately regardless.)
-        keep_searching_within_tol=True,
+        # (The old `keep_searching_within_tol` setting was removed: under the 2026
+        # output-strict rule there is no within-output-tolerance sat to keep searching
+        # past — VC emits `sat` only for a genuine violation and returns immediately.)
         # Per-value precision for the counterexample written to the results file
         # (used by BOTH the graph and surrogate-attack emit paths). '.17g'
         # round-trips float64 losslessly, so the scorer replays the exact witness

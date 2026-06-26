@@ -232,12 +232,14 @@ def test_surrogate_attack_sat(tmp_path):
     assert y[0] > 0.5                                        # validated on original
 
 
-def test_surrogate_attack_unknown(tmp_path):
+def test_surrogate_attack_no_ce_timeout(tmp_path):
+    # No reachable CE. Incomplete (attack-only) mode cannot prove unsat, so "didn't
+    # find one in the budget" is reported as timeout, not unknown (2026 semantics).
     q = _quant_onnx(str(tmp_path / 'q.onnx'))
     v = _v1_spec(str(tmp_path / 'v1.vnnlib'), thr=0.99)      # unreachable -> no CE
     verdict, wit = sp.surrogate_attack(q, v, _S(), timeout=30,
                                        surrogate_path=str(tmp_path / 's.onnx'), log=lambda _m: None)
-    assert verdict == 'unknown' and wit is None
+    assert verdict == 'timeout' and wit is None
 
 
 def test_surrogate_attack_timeout(tmp_path):
@@ -371,30 +373,32 @@ def test_build_fakequant_raises_per_axis_activation_dq(tmp_path):
         sp.build_fakequant_surrogate(p, str(tmp_path / 'o.onnx'))
 
 
-# ------------------------------------------------- within-tolerance SAT disposition
+# ----------------------------------------- output-strict boundary disposition (2026 rule)
 
-def test_surrogate_attack_within_tol_emit(tmp_path):
-    # Constant model: Y==0.5 for all X; spec `Y > 0.5` is never strictly crossed, but the
-    # center is within sat_validate_atol of violating -> within-tolerance SAT, emitted after
-    # the search finds no clear CE (keep_searching_within_tol default True).
+def test_surrogate_attack_boundary_not_sat(tmp_path):
+    # Constant model: Y==0.5 for all X; spec `Y > 0.5` is a STRICT constraint never
+    # strictly crossed. Under the VNN-COMP 2026 output-strict rule a boundary point
+    # (Y == threshold, margin 0) is NOT a counterexample (matches the competition
+    # checker, which rejects `0.5 > 0.5` at zero tolerance) — so no clear CE exists
+    # and the surrogate returns unknown, NOT a within-tolerance sat. (This is the
+    # smart_turn situation: Y pinned at the threshold.)
     q = _quant_onnx(str(tmp_path / 'q0.onnx'), w=(0, 0))
     v = _v1_spec(str(tmp_path / 'v.vnnlib'), thr=0.5)
     verdict, wit = sp.surrogate_attack(q, v, _S(), timeout=30,
                                        surrogate_path=str(tmp_path / 's.onnx'), log=lambda _m: None)
-    assert verdict == 'sat' and wit is not None
-    y = sp._ort_eval(q, wit)
-    assert abs(y[0] - 0.5) <= 1e-4 and not (y[0] > 0.5)      # within-tol, not a strict crossing
+    assert verdict in ('unknown', 'timeout') and wit is None
 
 
-def test_surrogate_attack_within_tol_immediate(tmp_path):
-    # keep_searching_within_tol=False -> accept the within-tol CE at the center immediately.
+def test_surrogate_attack_boundary_not_sat_keep_search_off(tmp_path):
+    # keep_searching_within_tol is now a no-op (within-tol output is not scorer-
+    # accepted); a boundary-only model still yields unknown regardless of the flag.
     class _Simm(_S):
         keep_searching_within_tol = False
     q = _quant_onnx(str(tmp_path / 'q0.onnx'), w=(0, 0))
     v = _v1_spec(str(tmp_path / 'v.vnnlib'), thr=0.5)
     verdict, wit = sp.surrogate_attack(q, v, _Simm(), timeout=30,
                                        surrogate_path=str(tmp_path / 's.onnx'), log=lambda _m: None)
-    assert verdict == 'sat' and wit is not None
+    assert verdict in ('unknown', 'timeout') and wit is None
 
 
 def test_surrogate_attack_quant_eval_off(tmp_path):

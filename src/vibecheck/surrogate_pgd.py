@@ -239,12 +239,19 @@ def _parse_v2(txt):
         n = int(np.prod(shape))
         lo = np.full(n, -np.inf, np.float64)
         hi = np.full(n, np.inf, np.float64)
-        # box asserts: (>= NAME[i,j,..] LO) and (<= NAME[i,j,..] HI)
-        strides = _c_strides(shape)
-        for mm in re.finditer(rf'\(>=\s*{name}\[([\d,]+)\]\s*([-\d.eE]+)\)', txt):
-            lo[_flat(mm.group(1), strides)] = float(mm.group(2))
-        for mm in re.finditer(rf'\(<=\s*{name}\[([\d,]+)\]\s*([-\d.eE]+)\)', txt):
-            hi[_flat(mm.group(1), strides)] = float(mm.group(2))
+        # box asserts: (>= NAME[i,j,..] LO) and (<= NAME[i,j,..] HI).
+        # VECTORIZED scatter: a high-dim spec (smart_turn ~1.2M bounds, 124 MB)
+        # parsed per-match with a Python _flat() call took ~7 s/case; batching the
+        # index/value extraction + numpy stride-dot + scatter cuts it to <1 s.
+        strides = np.asarray(_c_strides(shape), dtype=np.int64)
+        for op, arr in (('>=', lo), ('<=', hi)):
+            pairs = re.findall(rf'\({op}\s*{name}\[([\d,]+)\]\s*([-\d.eE]+)\)', txt)
+            if not pairs:
+                continue
+            idx_strs, val_strs = zip(*pairs)
+            flat = np.array([s.split(',') for s in idx_strs],
+                            dtype=np.int64) @ strides
+            arr[flat] = np.asarray(val_strs, dtype=np.float64)
         inputs.append((name, shape, lo, hi))
     # output name (single output tensor assumed)
     om = re.search(r'\(declare-output\s+(\w+)\s', txt)
@@ -267,10 +274,12 @@ def _parse_v1(txt):
     n = len(re.findall(r'\(declare-const\s+X_\d+\s+Real\)', txt))
     lo = np.full(n, -np.inf, np.float64)
     hi = np.full(n, np.inf, np.float64)
-    for mm in re.finditer(r'\(>=\s*X_(\d+)\s*([-\d.eE]+)\)', txt):
-        lo[int(mm.group(1))] = float(mm.group(2))
-    for mm in re.finditer(r'\(<=\s*X_(\d+)\s*([-\d.eE]+)\)', txt):
-        hi[int(mm.group(1))] = float(mm.group(2))
+    # VECTORIZED scatter (same rationale as _parse_v2): batch index/value extract.
+    for op, arr in (('>=', lo), ('<=', hi)):
+        pairs = re.findall(rf'\({op}\s*X_(\d+)\s*([-\d.eE]+)\)', txt)
+        if pairs:
+            idx, val = zip(*pairs)
+            arr[np.asarray(idx, dtype=np.int64)] = np.asarray(val, dtype=np.float64)
     out_dnf = []
     for mm in re.finditer(r'\(>\s*Y_(\d+)\s*([-\d.eE]+)\)', txt):
         out_dnf.append([(int(mm.group(1)), 'gt', float(mm.group(2)))])
@@ -328,12 +337,10 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     authoritative oracle): the box CENTER, the box CORNERS, and each PGD restart's best
     point. PGD gradients come from the float (STE) surrogate; the FAKE-QUANT surrogate
     (Path B), which reproduces the INT8 rounding and so tracks ORT, RANKS candidates so the
-    most promising hits ORT first. Disposition mirrors CLAUDE's within-tolerance policy: a
-    CLEAR CE (strict output crossing) returns 'sat' immediately; a WITHIN-TOLERANCE CE (the
-    output is within `sat_validate_atol` of violating — e.g. a quantization-pinned Y==rhs)
-    is stashed as a back-pocket witness while the search continues for a clear CE, and is
-    emitted as 'sat' only if no clear CE is found (`keep_searching_within_tol`, default
-    True)."""
+    most promising hits ORT first. Disposition (VNN-COMP 2026 output-strict rule): only a
+    CLEAR CE (the output STRICTLY crosses the threshold) returns 'sat'. A boundary point
+    (output == threshold, e.g. a quantization-pinned Y==rhs) is NOT a counterexample, so if
+    no strict CE is found this incomplete mode returns 'timeout' (not a within-tol sat)."""
     import torch
     from onnx2torch import convert
 
@@ -347,8 +354,11 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
             f'surrogate spec inputs ({len(spec.inputs)}) != model inputs ({len(mshapes)})')
     restarts = int(getattr(settings, 'surrogate_attack_restarts', 1))
     steps = int(getattr(settings, 'surrogate_attack_steps', 50))
+    # `sat_validate_atol` (1e-4) is the INPUT-box tolerance only (used for the
+    # in-box assertion). The replayed OUTPUT must violate with NO tolerance
+    # (VNN-COMP 2026), so a CE is accepted iff a candidate STRICTLY crosses the
+    # output threshold; there is no within-output-tolerance fallback.
     atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
-    keep_searching = bool(getattr(settings, 'keep_searching_within_tol', True))
     use_quant_eval = bool(getattr(settings, 'surrogate_quant_eval', True))
 
     if surrogate_path is None or not os.path.exists(surrogate_path):
@@ -407,13 +417,11 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
 
     _t_val = _t_fwd = 0.0
     _n_steps = _n_val = 0
-    within_tol = [None]   # back-pocket within-tolerance witness (feed, y)
 
     def ort_consider(pts, tag):
-        """ORT-CPU replay of the ORIGINAL quantized model. CLEAR CE (strict crossing) ->
-        return ('sat', (feed,y)). WITHIN-TOLERANCE CE (within sat_validate_atol of the
-        boundary) -> stash + keep searching (or accept now if keep_searching is off).
-        Otherwise -> None."""
+        """ORT-CPU replay of the ORIGINAL quantized model. CLEAR CE (strict output
+        crossing, margin > 0) -> return ('sat', (feed,y)). Otherwise -> None (a
+        boundary/non-violating point is not a counterexample)."""
         nonlocal _t_val, _n_val
         feed = [p.detach().cpu().numpy().reshape(mshapes[k]) for k, p in enumerate(pts)]
         # in-box invariant: every candidate is built inside [lo,hi] (center/corner/projected
@@ -427,15 +435,17 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
         _t_val += time.time() - _v0
         _n_val += 1
         m = margin_np(y)
+        # The surrogate spec uses STRICT output constraints (`>`/`<`, parsed as
+        # 'gt'/'lt'); the competition checker requires a strict violation at zero
+        # output tolerance, so a boundary point (m == 0, e.g. quantization-pinned
+        # Y == threshold) is NOT a counterexample. Require m > 0 (strict), which
+        # matches the competition exactly — smart_turn's Y==0.5 boundary is not a CE.
         if m > 0.0:
             log(f'[surrogate] CLEAR SAT at {tag} (ORT margin={m:.3e})')
             return ('sat', (feed, y))
-        if m > -atol and within_tol[0] is None:
-            within_tol[0] = (feed, y)
-            log(f'[surrogate] within-tol CE at {tag} (ORT margin={m:.3e}, atol={atol:g}) — '
-                + ('stashed; keep searching for a clear CE' if keep_searching else 'accepting (keep_searching off)'))
-            if not keep_searching:
-                return ('sat', within_tol[0])
+        # m <= 0: the output does NOT strictly violate -> not a counterexample
+        # (VNN-COMP 2026 output-strict rule). There is no within-tolerance fallback
+        # any more; keep searching for a strict CE.
         return None
 
     rng = torch.Generator(device='cpu')
@@ -513,14 +523,9 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
             if res is not None:
                 return 'sat', res[1][0]
 
-    # 3) No clear CE: emit the back-pocket within-tolerance CE if we found one (the VNNCOMP
-    #    scorer accepts it, CORRECT_UP_TO_TOLERANCE); else unknown/timeout (this incomplete
-    #    mode can't prove unsat for a quantized model).
-    timed_out = (time.time() - t0) > timeout
-    if within_tol[0] is not None:
-        log(f'[surrogate] no clear CE — emitting within-tol CE (t={time.time()-t0:.1f}s; '
-            f'steps={_n_steps} fwd={_t_fwd:.1f}s validate={_t_val:.1f}s/{_n_val})')
-        return 'sat', within_tol[0][0]
+    # 3) No strict CE found. This is an incomplete (attack-only) mode that cannot
+    #    prove unsat, so "didn't find one in the budget" is a timeout (more
+    #    time/restarts might find a CE), not a definitive unknown.
     log(f'[surrogate] no CE (t={time.time()-t0:.1f}s; steps={_n_steps} '
         f'fwd={_t_fwd:.1f}s validate={_t_val:.1f}s/{_n_val})')
-    return ('timeout' if timed_out else 'unknown'), None
+    return 'timeout', None

@@ -78,13 +78,12 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     if len(mshapes) != 1:
         raise NotImplementedError(f'sign_attack expects a single-input model, got {len(mshapes)}')
     in_shape = mshapes[0]
-    atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    atol = float(getattr(settings, 'sat_validate_atol', 1e-4))   # INPUT-box tolerance only
     restarts = int(getattr(settings, 'sign_attack_restarts', 50))
     steps = int(getattr(settings, 'sign_attack_steps', 200))
     pen_coef = float(getattr(settings, 'sign_preact_penalty', 1.0))
     fracs = [float(f) for f in getattr(settings, 'sign_attack_clip_fracs', [0.05, 0.2, 0.1, 0.02])]
     per_disjunct = bool(getattr(settings, 'sign_per_disjunct', False))
-    keep_searching = bool(getattr(settings, 'keep_searching_within_tol', True))
     _bs = getattr(settings, 'pgd_seed', None)
     base_seed = int(_bs) if isinstance(_bs, (int, float)) else 0
     _want_gpu = (getattr(settings, 'device', 'gpu') == 'gpu')
@@ -145,7 +144,6 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     hi = torch.tensor(np.asarray(spec.x_hi, np.float32).reshape(in_shape), device=dev)
     cen = (lo + hi) / 2
     half = (hi - lo) / 2
-    within_tol = [None]
     n_val = [0]
 
     def logits(pts):
@@ -155,8 +153,10 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
 
     def ort_consider(pts, tag):
         """Validate the witness on the ORIGINAL (true-Sign) model via ORT-CPU. CLEAR CE
-        (worst_margin < 0) -> return ('sat', witness). WITHIN-TOL (0 <= worst <= atol) ->
-        stash + keep searching (or accept now). Else None."""
+        (worst_margin <= 0, boundary inclusive) -> return ('sat', witness). Under the
+        2026 output-strict rule an output-near-boundary point (worst_margin > 0) is
+        INCORRECT, not a usable CE; the within-tol stash is reachable only when
+        out_atol>0 is configured (not scorer-accepted). Else None."""
         feed = [pts.detach().cpu().numpy().reshape(in_shape).astype(np.float32)]
         ff = feed[0].ravel()
         assert (ff >= spec.x_lo - atol).all() and (ff <= spec.x_hi + atol).all(), \
@@ -164,16 +164,10 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
         y = _ort_eval(onnx_path, feed)
         n_val[0] += 1
         m = _worst_margin_np(y, spec.disjuncts)
-        if m < 0.0:
+        if m <= 0.0:
             log(f'[sign] CLEAR SAT at {tag} (worst_margin={m:.3e})')
             return ('sat', feed)
-        if m <= atol and within_tol[0] is None:
-            within_tol[0] = feed
-            log(f'[sign] within-tol CE at {tag} (worst_margin={m:.3e}, atol={atol:g})'
-                + ('' if keep_searching else ' — accepting (keep_searching off)'))
-            if not keep_searching:
-                return ('sat', feed)
-        return None
+        return None        # m > 0: no violation, no within-output-tol fallback (2026 rule)
 
     rng = torch.Generator(device='cpu')
     n_targets = len(spec.disjuncts) if per_disjunct else 1
@@ -210,9 +204,6 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
                 res = ort_consider(x, f'restart{r}(frac={frac_box[0]}) step{it}')
                 if res is not None:
                     return 'sat', res[1]
-    timed_out = (time.time() - t0) > timeout
-    if within_tol[0] is not None:
-        log(f'[sign] no clear CE — emitting within-tol CE (t={time.time()-t0:.1f}s, val={n_val[0]})')
-        return 'sat', within_tol[0]
+    # Incomplete (attack-only) mode: no strict CE found -> timeout (cannot prove unsat).
     log(f'[sign] no CE (t={time.time()-t0:.1f}s, restarts={restarts}, val={n_val[0]})')
-    return ('timeout' if timed_out else 'unknown'), None
+    return 'timeout', None

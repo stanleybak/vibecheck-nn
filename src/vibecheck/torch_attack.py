@@ -32,10 +32,9 @@ def torch_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     if len(mshapes) != 1:
         raise NotImplementedError(f'torch_attack expects a single-input model, got {len(mshapes)}')
     in_shape = mshapes[0]
-    atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    atol = float(getattr(settings, 'sat_validate_atol', 1e-4))   # INPUT-box tolerance only
     restarts = int(getattr(settings, 'torch_attack_restarts', 20))
     steps = int(getattr(settings, 'torch_attack_steps', 200))
-    keep_searching = bool(getattr(settings, 'keep_searching_within_tol', True))
     _bs = getattr(settings, 'pgd_seed', None)
     base_seed = int(_bs) if isinstance(_bs, (int, float)) else 0
     _want_gpu = (getattr(settings, 'device', 'gpu') == 'gpu')
@@ -50,7 +49,6 @@ def torch_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     log(f'[torch] loaded on {dev} in {time.time()-t0:.1f}s; in={list(in_shape)} free={free} '
         f'disjuncts={len(spec.disjuncts)} restarts={restarts} steps={steps}')
 
-    within_tol = [None]
     n_val = [0]
 
     def flat_out(x):
@@ -66,15 +64,12 @@ def torch_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
         y = _ort_eval(onnx_path, feed)
         n_val[0] += 1
         m = _worst_margin_np(y, spec.disjuncts)
-        if m < 0.0:
+        # m <= 0 is an output violation under the spec's `<=`/`>=` comparison at zero
+        # tolerance (boundary inclusive) — a counterexample; emit it. m > 0 does NOT
+        # violate (no within-output-tolerance fallback under the 2026 rule).
+        if m <= 0.0:
             log(f'[torch] CLEAR SAT at {tag} (worst_margin={m:.3e})')
             return ('sat', feed)
-        if m <= atol and within_tol[0] is None:
-            within_tol[0] = feed
-            log(f'[torch] within-tol CE at {tag} (worst_margin={m:.3e}, atol={atol:g})'
-                + ('' if keep_searching else ' — accepting (keep_searching off)'))
-            if not keep_searching:
-                return ('sat', feed)
         return None
 
     rng = torch.Generator(device='cpu')
@@ -105,9 +100,6 @@ def torch_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
                 res = ort_consider(x, f'restart{r} step{it}')
                 if res is not None:
                     return 'sat', res[1]
-    timed_out = (time.time() - t0) > timeout
-    if within_tol[0] is not None:
-        log(f'[torch] no clear CE — emitting within-tol CE (t={time.time()-t0:.1f}s, val={n_val[0]})')
-        return 'sat', within_tol[0]
+    # Incomplete (attack-only) mode: no strict CE found -> timeout (cannot prove unsat).
     log(f'[torch] no CE (t={time.time()-t0:.1f}s, restarts={restarts}, val={n_val[0]})')
-    return ('timeout' if timed_out else 'unknown'), None
+    return 'timeout', None

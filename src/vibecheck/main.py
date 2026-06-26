@@ -338,20 +338,10 @@ def _verify(args, sat_state=None):
         settings.update(args.set_overrides)   # --set wins over config/profile
         if args.verbose:
             settings.print_progress = True
-        # SAT/counterexample policy: the pipeline may find a *within-tolerance*
-        # counterexample (a near-boundary point that violates only within the
-        # VNNCOMP atol) before it finds a clear one or proves unsat. Hand it a
-        # sink that writes that CE to the results file IMMEDIATELY (so a later
-        # timeout/crash can't lose it) without committing the run — the search
-        # continues for a clear CE or an unsat proof. `_emit_result`'s
-        # never-downgrade rule keeps that early 'sat' unless a later 'sat'
-        # (clearer CE) or 'unsat' (proof — the near-miss was spurious) overrides.
-        # (_sat_disposition decides real-vs-within-tol from the un-banded ORT margin
-        # `m<0` + the sat_validate_atol band in _validate_sat_witness; no separate
-        # sat_tol buffer — a strictly-negative margin is a genuine CE.)
-        settings.result_sink = (lambda w: _emit_result(
-            args, spec, 'sat', w, sat_state,
-            settings.counterexample_precision)) if args.results_file else None
+        # SAT policy (VNN-COMP 2026 output-strict): VC only ever emits a `sat` for a
+        # GENUINE counterexample (output strictly violates, input in-box), and it
+        # returns immediately when it finds one — there is no within-output-tolerance
+        # "emit early then keep searching" path any more, so no result_sink is needed.
         graph.optimize(settings)
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
@@ -425,8 +415,10 @@ def _verify(args, sat_state=None):
                     else None)
         # UNIVERSAL SAT-validation chokepoint (matches the VNNCOMP scoring
         # step): before emitting `sat`, replay the witness through CPU
-        # onnxruntime and confirm it violates the spec within
-        # `sat_validate_atol`. verify_graph already validates internally at
+        # onnxruntime and confirm it violates the spec. The 2026 rule applies
+        # the 1e-4 tolerance only to the INPUT box (`sat_validate_atol`); the
+        # replayed OUTPUT must violate with NO tolerance (`sat_validate_out_atol`,
+        # default 0.0 = strict). verify_graph already validates internally at
         # `_finalize` (this re-check is idempotent), but the milp/bnb/hybrid
         # and conv→milp auto-route paths do NOT — this is their gate. Only a
         # witnessed `sat` that ORT rejects is downgraded (no false SAT, no
@@ -437,17 +429,32 @@ def _verify(args, sat_state=None):
             from .verify_graph import _validate_sat_witness
             _atol_f = float(settings.sat_validate_atol
                             if 'sat_validate_atol' in settings else 1e-4)
+            # Output tolerance is FIXED at 0.0 (VNN-COMP 2026 rule: the replayed
+            # output must violate with NO tolerance) — NOT configurable, so a
+            # config can never loosen it. Only the INPUT box gets `atol`.
             _ok_f, _vinfo_f = _validate_sat_witness(
-                getattr(graph, 'onnx_path', None), spec, _w_final, atol=_atol_f)
+                getattr(graph, 'onnx_path', None), spec, _w_final,
+                atol=_atol_f, out_atol=0.0)
             if not _ok_f:
                 print('  [validate] final SAT witness rejected by ORT '
                       f'({_vinfo_f.get("reason")}) — downgrading, not emitting SAT')
                 line = 'timeout' if timed_out else 'unknown'
                 _w_final = None
-            elif _vinfo_f.get('witness_inbox') is not None:
-                # Emit the float32-safe in-box witness (clamped strictly inside
-                # the box) — not the raw one whose edge can round outside.
-                _w_final = _vinfo_f['witness_inbox']
+            else:
+                if _vinfo_f.get('witness_inbox') is not None:
+                    # Emit the float32-safe in-box witness (clamped strictly inside
+                    # the box) — not the raw one whose edge can round outside.
+                    _w_final = _vinfo_f['witness_inbox']
+                if args.verbose:
+                    _log_cex_values(_w_final, _vinfo_f.get('out'))
+            # NOTE: VC's own `_validate_sat_witness` above (input box <=atol, output
+            # STRICT at out_atol=0) is the production gate — it is ~4 ms even on a
+            # 1.27M-dim spec, vs ~24 s for the vendored competition checker (which
+            # Python-evaluates every input-bound assertion). We keep the vendored
+            # `vnncomp_cex_v2` module only as a TEST ORACLE: tests assert VC's
+            # verdict is bit-identical to the competition checker (see
+            # tests/test_competition_cex_equiv.py), so we get the competition's
+            # exact semantics without paying its per-assertion cost in the sweep.
         if line == 'unknown' and (
                 timed_out or (args.timeout is not None and t_total >= args.timeout - 2.0)):
             line = 'timeout'
@@ -499,6 +506,10 @@ def _maybe_nonlinear_augment(args):
     aug_onnx, aug_spec = nla.build_augmented_instance(args.net, args.spec)
     print(f'Nonlinear v2 spec: augmented {args.net} -> {aug_onnx}')
     args.orig_net_for_cex = args.net
+    # Preserve the ORIGINAL net+spec so the competition CE validator
+    # (_validate_cex_v2_competition) replays/parses the real v2 instance, not the
+    # augmented v1 net/spec we hand the internal pipeline.
+    args.orig_spec_for_cex = args.spec
     args.net = aug_onnx
     args.spec = aug_spec
 
@@ -769,6 +780,8 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
     if verdict == 'sat' and witness is not None:
         x = np.concatenate([np.asarray(w).ravel() for w in witness]).astype(np.float64)
         y = np.asarray(sp._ort_eval(args.net, witness)).ravel().astype(np.float64)
+        if getattr(args, 'verbose', False):
+            _log_cex_values(x, y)
         ce = _format_cex(getattr(args, 'cex_version', '1.0'), args.net, x, y, cex_fmt,
                          io_meta=getattr(args, 'cex_io_decls', None))
         with open(args.results_file, 'w') as f:
@@ -779,16 +792,29 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
             f.write(verdict + '\n')
 
 
+def _log_cex_values(x, y, log=print):
+    """Verbose preview of a validated counterexample: the first few input and output
+    values (X on one line, Y on the next, each truncated with '...' if longer)."""
+    import numpy as np
+
+    def _fmt(a):
+        if a is None:
+            return '(none)'
+        flat = np.asarray(a, dtype=np.float64).ravel()
+        head = ', '.join(f'{v:.6g}' for v in flat[:3])
+        return head + (' ...' if flat.size > 3 else '')
+
+    log(f'  [counterexample] validated witness  X: {_fmt(x)}')
+    log(f'  [counterexample] validated witness  Y: {_fmt(y)}')
+
+
 def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
     """Write the VNNCOMP results file: verdict on line 1, then (for 'sat') the
     counterexample s-expression. Never-downgrade rule: once a 'sat' (with a
     counterexample) has been written, a later 'timeout'/'unknown'/'error' will
     NOT overwrite it — a found counterexample is sticky against running out of
-    budget. A later 'sat' (a clearer counterexample) or 'unsat' (a proof — the
-    earlier within-tolerance near-miss was spurious) DOES override.
-
-    Called both for the final verdict and, mid-run, by `settings.result_sink`
-    to persist a within-tolerance counterexample early. Idempotent/repeatable.
+    budget. A later 'sat' (a clearer counterexample) or 'unsat' (a proof) DOES
+    override. Idempotent/repeatable.
     """
     if not args.results_file:
         return
@@ -829,6 +855,45 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
     os.replace(tmp, args.results_file)
     if line == 'sat':
         sat_state['emitted'] = True
+
+
+def _validate_cex_v2_competition(args, spec, witness, cex_fmt='.17g'):
+    """Validate the v2 counterexample vibecheck would emit using the VENDORED
+    competition checker (`vnncomp_cex_v2.validate_cex_v2`, bit-identical to the
+    VNN-COMP 2026 scorer). Builds the exact CE string we'd write, drops it in a
+    temp file, and runs the scorer's validator against the original --net/--spec.
+
+    Returns (accepted, result_str, message). `accepted` is True iff the scorer
+    would award the instance (CORRECT or CORRECT_UP_TO_TOLERANCE). A build
+    failure (no CE) returns (False, 'no_ce', ...) so a non-validatable witness is
+    never emitted.
+    """
+    import tempfile
+    from .vnncomp_cex_v2 import validate_cex_v2, ACCEPTED_RESULTS
+    _io = getattr(args, 'cex_io_decls', None)
+    _orig = getattr(args, 'orig_net_for_cex', None)
+    # The competition replays/parses the ORIGINAL v2 instance. For augmented runs
+    # args.net/args.spec are the internal augmented v1 versions, so fall back to the
+    # preserved originals (orig_net_for_cex / orig_spec_for_cex).
+    val_net = _orig if _orig is not None else args.net
+    val_spec = getattr(args, 'orig_spec_for_cex', None) or args.spec
+    if _orig is not None:
+        ce = _counterexample_sexpr_orig(_orig, witness, cex_fmt, '2.0', io_meta=_io)
+    else:
+        ce = _counterexample_sexpr(args.net, spec, witness, cex_fmt, '2.0', io_meta=_io)
+    if ce is None:
+        return False, 'no_ce', 'could not build counterexample (no ORT output)'
+    tf = tempfile.NamedTemporaryFile('w', suffix='.counterexample', delete=False)
+    try:
+        tf.write(ce + '\n')
+        tf.close()
+        res, msg = validate_cex_v2(val_net, val_spec, tf.name)
+    finally:
+        try:
+            os.remove(tf.name)
+        except OSError:
+            pass
+    return (res in ACCEPTED_RESULTS), res, msg
 
 
 def _counterexample_sexpr(onnx_path, spec, witness, cex_fmt='.17g', version='1.0',

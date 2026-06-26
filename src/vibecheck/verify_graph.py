@@ -5220,52 +5220,16 @@ def _compute_avg_layer_width(gg, bounds_by_relu):
 
 
 def _sat_disposition(graph, spec, settings, witness, info):
-    """Classify an ORT-VALIDATED sat witness (from `_validate_sat_witness`,
-    ok=True) as a CLEAR counterexample ('real') or a within-tolerance near-miss
-    ('within_tol').
+    """Classify an ORT-VALIDATED sat witness (from `_validate_sat_witness`, ok=True).
 
-    Real iff the ORT output GENUINELY violates the spec (un-banded worst margin
-    `m < 0`) — the float32 ORT margin IS the ground truth (same engine the scorer
-    uses), and a strictly-negative margin is a clear violation that the scorer
-    scores CORRECT (it holds without needing the tolerance), so commit 'sat' and
-    stop. NO extra buffer: we do NOT require `m <= -atol` (that wrongly demoted a
-    genuine CE like `m=-5e-5` to "keep searching", grinding to the timeout).
-
-    Otherwise `0 <= m <= +atol` (all that `_validate_sat_witness` lets through,
-    since it gates on the +/-atol band): a point that does NOT actually violate
-    (m >= 0) but which the VNNCOMP scorer accepts ONLY via the tolerance
-    (CORRECT_UP_TO_TOLERANCE) — a true near-boundary case that might really be
-    unsat. Persist it to the results file NOW via `settings.result_sink` (so a
-    later timeout can't lose the acceptable fallback) but signal the caller to
-    KEEP SEARCHING for a genuine CE (m<0) or an unsat proof. `main._emit_result`'s
-    never-downgrade rule keeps this early 'sat' unless a clearer 'sat' or an
-    'unsat' proof later overrides it. e.g. 14_ieee full prop3 (true margin ~+1e-6,
-    within tol): VC can't prove unsat, so the within-tol sat is the fallback.
-
-    Disjunctive-X counterexamples (validated via `check_witness`, no scalar
-    margin) are treated as 'real'.
+    Always returns 'real'. Under the VNN-COMP 2026 output-strict rule the validation
+    gate runs with out_atol=0 and only admits a genuine violation (worst margin
+    <= 0 for the spec's `<=`/`>=` comparison), so any witness reaching here IS a real
+    counterexample — commit 'sat' and stop. There is no within-output-tolerance
+    near-miss any more (that emit-early-then-keep-searching path is removed); the
+    return value is kept for the call sites that branch on it.
     """
-    out = info.get('out') if isinstance(info, dict) else None
-    m = None
-    if (out is not None
-            and not any(getattr(c, 'input_lo', None) is not None
-                        for c in spec.disjuncts)):
-        _, _ci = spec.check(np.asarray(out), np.asarray(out))
-        m = _ci.get('worst_margin')
-    if m is None or m < 0.0:
-        return 'real'
-    # m >= 0: the witness does NOT actually violate, but it's within +atol of
-    # violating (all `_validate_sat_witness` lets through) — the scorer accepts it
-    # CORRECT_UP_TO_TOLERANCE. By default keep searching for a genuine CE / unsat
-    # and hold this as the fallback; `keep_searching_within_tol=False` commits it
-    # now instead.
-    if not bool(getattr(settings, 'keep_searching_within_tol', True)):
-        return 'real'
-    w = np.asarray(witness).flatten()
-    sink = getattr(settings, 'result_sink', None)
-    if sink is not None:
-        sink(w)   # write 'sat' + counterexample now (never-downgrade keeps it)
-    return 'within_tol'
+    return 'real'
 
 
 def _clamp_witness_to_box(witness, x_lo, x_hi):
@@ -5297,17 +5261,27 @@ def _clamp_witness_to_box(witness, x_lo, x_hi):
     return w32.astype(np.float64)
 
 
-def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
+def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0):
     """Run a SAT witness through ONNXRuntime + check it actually violates
     the spec. Catches spurious counterexamples from PGD/MILP bugs OR from
     graph-builder bugs (vibecheck's internal forward might compute a
     different value than the original ONNX). Mirrors VNNCOMP scoring's
-    counterexample-validation step (COUNTEREXAMPLE_ATOL=1e-4).
+    counterexample-validation step.
+
+    VNN-COMP 2026 ruling (evaluation chairs): a witness is CORRECT iff its
+    input satisfies the VNN-LIB input constraints AND the *replayed* ORT
+    output satisfies the output constraints. The 1e-4 absolute tolerance
+    applies ONLY to the INPUT box (a witness up to `atol` outside the box is
+    CORRECT_WITH_TOLERANCE — no penalty, but not SAT ground truth). The
+    OUTPUT must violate the spec with NO tolerance. Hence `atol` gates the
+    input box and `out_atol` (default 0.0 = strict) gates the output. Output
+    tolerance is NOT scorer-accepted under the 2026 rule — keep `out_atol=0`.
 
     Returns (ok, info_dict). `ok=True` iff witness is in the input box
-    (within atol) AND its ORT output satisfies the unsafe condition
-    (i.e., `spec.check(out, out)` returns 'unknown', within atol on
-    constraint margins).
+    (within `atol`) AND its ORT output satisfies the unsafe condition
+    (i.e., `spec.check(out, out)` returns 'unknown', i.e. worst margin <= 0
+    within `out_atol` on constraint margins — inclusive of the boundary,
+    matching the official checker's `<=`/`>=` comparison at zero tolerance).
     """
     info = {'ok': False, 'reason': None}
     if onnx_path is None:
@@ -5380,12 +5354,13 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
             "whose X-subrange contains the witness "
             '(check_witness rejected)')
         return False, info
-    # Default Y-only path: spec.check returns 'unknown' iff worst
-    # margin <= 0. Apply atol slack by shifting output: pass
-    # (out-atol, out+atol) so margins are computed against a generous
-    # output band — a witness near the boundary counts as a valid SAT
-    # if any output in the +/-atol envelope violates.
-    check_res, check_info = spec.check(out_flat - atol, out_flat + atol)
+    # Default Y-only path: spec.check returns 'unknown' iff worst margin
+    # <= 0. The 2026 rule requires a STRICT output violation, so the output
+    # band is `out_atol` (default 0.0), NOT the input `atol`: pass
+    # (out-out_atol, out+out_atol). With out_atol=0 this is the exact ORT
+    # output, so only a genuine violation (worst margin <= 0, boundary
+    # inclusive — matching the official `<=`/`>=` comparison) counts.
+    check_res, check_info = spec.check(out_flat - out_atol, out_flat + out_atol)
     info['spec_check'] = check_res
     info['worst_margin'] = check_info.get('worst_margin')
     if check_res == 'unknown':
@@ -5393,7 +5368,7 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4):
         return True, info
     info['reason'] = (f'ORT output does not violate spec '
                        f'(worst_margin={info["worst_margin"]:.4g}, '
-                       f'atol={atol})')
+                       f'out_atol={out_atol})')
     return False, info
 
 
@@ -6051,9 +6026,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     settings, 'skip_sat_validation', False))):
             _atol = float(settings.sat_validate_atol
                            if 'sat_validate_atol' in settings else 1e-4)
+            # Output tolerance FIXED at 0.0 (2026 rule) — not configurable.
             _onnx_path = getattr(graph, 'onnx_path', None)
             _ok, _info = _validate_sat_witness(
-                _onnx_path, spec, extra['witness'], atol=_atol)
+                _onnx_path, spec, extra['witness'], atol=_atol,
+                out_atol=0.0)
             if not _ok:
                 if print_progress:
                     print(f'  [validate] SPURIOUS SAT from {phase}: '
@@ -6155,9 +6132,10 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             return _finalize('sat', phase, witness=witness)
         _atol = float(settings.sat_validate_atol
                        if 'sat_validate_atol' in settings else 1e-4)
+        # Output tolerance FIXED at 0.0 (2026 rule) — not configurable.
         _onnx_path = getattr(graph, 'onnx_path', None)
         _ok, _info = _validate_sat_witness(_onnx_path, spec, witness,
-                                           atol=_atol)
+                                           atol=_atol, out_atol=0.0)
         if _ok:
             if _sat_disposition(graph, spec, settings, witness,
                                 _info) == 'real':

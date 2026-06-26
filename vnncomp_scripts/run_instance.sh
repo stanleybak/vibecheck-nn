@@ -71,23 +71,18 @@ T_START=$(date +%s.%N)
 
 # TIMEOUT HANDLING. VNNCOMP times THIS script and kills it at $TIMEOUT, so the
 # hard deadline is the harness's job — we don't re-implement it. main.py pre-seeds
-# $RESULTS_FILE with 'timeout' and writes any within-tolerance counterexample
-# EARLY and ATOMICALLY (temp + os.replace, which a kill cannot tear), and that
-# file's result string is all the scorer reads (no wall-time check, time bonus
-# off). So whenever the tool stops, the file holds a correct, complete verdict.
+# $RESULTS_FILE with 'timeout' and writes the verdict (incl. any counterexample)
+# ATOMICALLY (temp + os.replace, which a kill cannot tear), and that file's result
+# string is all the scorer reads (no wall-time check, time bonus off). So whenever
+# the tool stops, the file holds a correct, complete verdict.
 #
-# The one thing we add is an EARLY SAT-COMMIT: main.py keeps searching for a
-# clearer CE / an unsat proof for robustness, but once a counterexample is already
-# written ('sat' on line 1) and we're within SAT_CUTOFF of the deadline, there is
-# nothing to gain by searching to the wire — kill the tool and commit the CE we
-# have (a found CE is sticky / never downgraded). If the tool finishes on its own
-# first, we just use its verdict. (If the harness kills THIS script, the trap
-# takes the tool down too.) main.py also gets a small startup reserve so a no-CE
-# run self-stops and WRITES its verdict before the wall-clock kill.
+# VC emits a `sat` ONLY for a genuine counterexample and returns IMMEDIATELY (there
+# is no within-tolerance "write a sat early then keep searching" path any more), so
+# there is nothing to gain by polling/early-killing a running tool — we just let it
+# run and `wait` for it. main.py gets a small startup reserve (TIMEOUT-RESERVE) so a
+# no-CE run self-stops and WRITES its verdict before the harness's wall-clock kill.
 RESERVE=2
-SAT_CUTOFF=5
-MAIN_TIMEOUT=$(awk "BEGIN{t=$TIMEOUT-$RESERVE;    h=$TIMEOUT/2; if(t<h)t=h; if(t<1)t=1; print t}")
-SAT_KILL=$(awk     "BEGIN{t=$TIMEOUT-$SAT_CUTOFF;              if(t<1)t=$TIMEOUT*0.5;   print t}")
+MAIN_TIMEOUT=$(awk "BEGIN{t=$TIMEOUT-$RESERVE; h=$TIMEOUT/2; if(t<h)t=h; if(t<1)t=1; print t}")
 
 # mode=graph, bits=32, device=gpu are vibecheck's CLI defaults, so omitted.
 # --allow-unsafe-pkl-loading reuses prepare_instance.sh's pre-parse cache.
@@ -112,18 +107,10 @@ reap() { [ -n "$SETSID" ] && kill -9 "-$TOOL_PID" 2>/dev/null; kill -9 "$TOOL_PI
 trap 'reap; exit 143' TERM INT
 trap reap EXIT
 
-RUN_RC=0
-while kill -0 "$TOOL_PID" 2>/dev/null; do
-	# early sat-commit: 'sat' is exactly the first 3 bytes (NOT 'unsat'/'timeout').
-	if [ "$(head -c3 "$RESULTS_FILE" 2>/dev/null)" = sat ]; then
-		NOW=$(awk "BEGIN{print $(date +%s.%N) - $T_START}")
-		awk "BEGIN{exit !($NOW >= $SAT_KILL)}" && { RUN_RC=124; break; }
-	fi
-	sleep 0.5
-done
-reap
+# Just wait for the tool (it self-stops at MAIN_TIMEOUT and writes its verdict; the
+# harness kills THIS script at $TIMEOUT, and the trap reaps the tool if so).
 wait "$TOOL_PID" 2>/dev/null
-[ "$RUN_RC" = 124 ] || RUN_RC=$?   # 124 = we sat-committed; else the tool's own exit code
+RUN_RC=$?
 trap - TERM INT EXIT
 # The pre-seeded/early-emitted verdict in the results file is authoritative
 # regardless of how the tool stopped, so we just read it below.

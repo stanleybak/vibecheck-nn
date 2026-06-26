@@ -39,6 +39,10 @@ dependencies = [
     # INT8-quantized model to torch for gradient-PGD. onnx2torch handles transformer ops
     # (Softmax/Erf/LayerNorm) that vibecheck's own forward graph does not.
     "onnx2torch",
+    # VNNLIB-2.0 parser used by the VENDORED competition counterexample checker
+    # (vnncomp_cex_v2.py). PINNED to the exact version the VNN-COMP 2026 scorer
+    # uses so our v2 CE validation is bit-identical to the official scoring.
+    "vnnlib==1.0.2",
 ]
 
 [project.optional-dependencies]
