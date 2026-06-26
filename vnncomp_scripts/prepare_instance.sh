@@ -111,7 +111,7 @@ if [ -n "$gpu_alarm" ]; then
 	fi
 fi
 
-# 3. Prepare cache (--prepare-pkl): for a normal model, parse onnx+vnnlib (handles
+# 3. Prepare cache (--prepare-pkl-unsafe): for a normal model, parse onnx+vnnlib (handles
 #    .gz) into a .pkl the timed run loads via --allow-unsafe-pkl-loading, skipping
 #    the ONNX parse / shape inference / folding (subsumes a plain gunzip — caches
 #    the fully parsed graph, not just decompressed bytes). For a QUANTIZED model
@@ -125,8 +125,8 @@ PREP_DEBUG="--verbose"
 [ "${VIBECHECK_QUIET:-0}" = "1" ] && PREP_DEBUG=""
 case "$ONNX_FILE" in *.gz) echo "Note: onnx is gzipped (.gz); decompressed and parsed transparently." ;; esac
 case "$VNNLIB_FILE" in *.gz) echo "Note: vnnlib is gzipped (.gz); decompressed and parsed transparently." ;; esac
-echo "Preparing cache (--prepare-pkl)..."
-"$PY" -m vibecheck.main --net "$ONNX_FILE" --spec "$VNNLIB_FILE" --prepare-pkl $PREP_DEBUG \
+echo "Preparing cache (--prepare-pkl-unsafe)..."
+"$PY" -m vibecheck.main --net "$ONNX_FILE" --spec "$VNNLIB_FILE" --prepare-pkl-unsafe $PREP_DEBUG \
 	|| echo "WARNING: prepare-pkl failed; timed run will parse / fold normally"
 
 # 4. Warmup: a short real run (5s) to trigger torch.compile / CUDA kernel

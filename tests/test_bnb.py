@@ -1281,6 +1281,8 @@ class TestMainDirect:
         """Call main() with BnB mode on a tiny graph."""
         import sys
         g = _tiny_fc_graph()
+        # loaders are mocked + paths are fake -> skip the on-disk existence check
+        monkeypatch.setattr('vibecheck.main._require_input_file', lambda *a, **k: None)
         monkeypatch.setattr('vibecheck.main.ComputeGraph.from_onnx',
                             lambda *a, **kw: g)
         monkeypatch.setattr('vibecheck.main.load_vnnlib',
@@ -1300,6 +1302,8 @@ class TestMainDirect:
         """Call main() with BnB mode that finds SAT."""
         import sys
         g = _easy_sat_graph()
+        # loaders are mocked + paths are fake -> skip the on-disk existence check
+        monkeypatch.setattr('vibecheck.main._require_input_file', lambda *a, **k: None)
         monkeypatch.setattr('vibecheck.main.ComputeGraph.from_onnx',
                             lambda *a, **kw: g)
         monkeypatch.setattr('vibecheck.main.load_vnnlib',

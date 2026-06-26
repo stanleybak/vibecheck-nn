@@ -15,6 +15,18 @@ _DTYPES = {'float32': np.float32, 'float64': np.float64,
            'f32': np.float32, 'f64': np.float64}
 
 
+def _require_input_file(path, label):
+    """Exit cleanly (code 1) with an informative message if an input file is
+    missing. A missing/typo'd --net or --spec path is one of the most common
+    mistakes, and a clear early error beats a deep stack trace. A `.gz` sibling
+    counts as present (the benchmarks ship gzipped; the loaders decompress)."""
+    if not path or not (os.path.isfile(path) or os.path.isfile(str(path) + '.gz')):
+        print(f'Error: {label} file not found: {path!r}\n'
+              f'       check the path for typos (a .gz of the same name is also '
+              f'accepted).', file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='VibeCheck — Neural Network Verification via Zonotope Analysis')
@@ -78,15 +90,18 @@ def main():
                              'pickle is unsafe (arbitrary code execution on load), '
                              'so this is OFF by default; only enable for inputs '
                              'you produced yourself.')
-    parser.add_argument('--prepare-pkl', action='store_true',
+    parser.add_argument('--prepare-pkl-unsafe', action='store_true',
                         help='Untimed prepare step (used by prepare_instance.sh), then '
                              'exit WITHOUT verifying. For a normal model: parse --net/'
-                             '--spec into a pre-parse .pkl cache (deterministic path keyed '
-                             'by the onnx/vnnlib/dtype) that the timed run loads via '
-                             '--allow-unsafe-pkl-loading. For an INT8-quantized model '
+                             '--spec into SEPARATE per-source .pkl caches (<onnx>.pkl and '
+                             '<vnnlib>.pkl, keyed by content sha1) that the timed run loads '
+                             'via --allow-unsafe-pkl-loading. For an INT8-quantized model '
                              '(DequantizeLinear/QuantizeLinear): fold the float (STE) + '
                              'fake-quant surrogates instead (that model uses the '
-                             'surrogate-attack path, not the graph load).')
+                             'surrogate-attack path, not the graph load). UNSAFE: the .pkl '
+                             'is loaded via pickle (arbitrary code exec) — only use in a '
+                             'trusted directory you control. -unsafe is in the name to '
+                             'make that explicit.')
     args = parser.parse_args()
 
     # Parse --set KEY=VALUE overrides once (validated against default_settings());
@@ -94,6 +109,10 @@ def main():
     # attack-mode paths. Stored on args so the attack helpers can see them too.
     from .config_loader import parse_set_overrides
     args.set_overrides = parse_set_overrides(args.set_kv)
+
+    # Clean error for a missing --net (a path typo is the most common mistake).
+    # The spec is checked later — the quantized prepare path doesn't use it.
+    _require_input_file(args.net, 'network (--net)')
 
     if args.verbose:
         # Line-buffer stdout so per-phase progress flushes on every newline.
@@ -118,12 +137,12 @@ def main():
               else '[verbose] gurobi license file: none found '
                    '(gurobipy bundled size-limited license)', flush=True)
 
-    if args.prepare_pkl:
+    if args.prepare_pkl_unsafe:
         # Untimed prepare step: parse + cache, no verification. For a QUANTIZED model the
         # graph pre-parse fails on the dequantized (non-constant) conv kernel after ~70s —
         # that model uses the surrogate-attack path, not the graph load — so fold the
         # float (STE) + fake-quant surrogates here (the actual untimed prep) instead of a
-        # cache that can't be used. Non-quantized: write the pre-parse cache.
+        # cache that can't be used. Non-quantized: write the per-source pre-parse caches.
         from . import surrogate_pgd as sp
         if sp.has_quantized_ops(args.net):
             p = _surrogate_path(args.net)
@@ -132,9 +151,10 @@ def main():
             sp.build_fakequant_surrogate(args.net, fq)
             print(f'Quantized model: built surrogates (skipped graph pre-parse): {p}, {fq}')
             sys.exit(0)
+        _require_input_file(args.spec, 'spec (--spec)')   # non-quant prepare needs the spec
         from .preparse import write_cache
-        path = write_cache(args.net, args.spec, _DTYPES[args.dtype])
-        print(f'Wrote pre-parse cache: {path}')
+        onnx_pkl, vnnlib_pkl = write_cache(args.net, args.spec, _DTYPES[args.dtype])
+        print(f'Wrote pre-parse caches:\n  graph: {onnx_pkl}\n  spec:  {vnnlib_pkl}')
         sys.exit(0)
 
     # Resolve the counterexample on-disk FORMAT version once, from the original spec
@@ -202,6 +222,10 @@ def _verify(args, sat_state=None):
     if sat_state is None:
         sat_state = {'emitted': False}
 
+    # Clean error for missing input files (typo'd path) before any heavy work.
+    _require_input_file(args.net, 'network (--net)')
+    _require_input_file(args.spec, 'spec (--spec)')
+
     # Network-pair benchmarks (isomorphic_acasxu / monotonic_acasxu): `--net` is a
     # pair list `[('f',a),('g',b)]` and `--spec` relates the two nets. Convert to a
     # single MERGED onnx + v1 spec up front, then verify normally. Must run BEFORE the
@@ -242,19 +266,19 @@ def _verify(args, sat_state=None):
     if _cct is not None:
         sys.exit(_cct)
 
-    # Fast path: load the pre-parsed graph+spec from prepare_instance.sh's
-    # cache, skipping the (potentially multi-second) ONNX parse. Gated behind
-    # the explicit unsafe-pkl flag; falls back to a normal parse on any miss.
+    # Fast path: load the pre-parsed graph and/or spec from prepare_instance.sh's
+    # per-source caches, skipping the (potentially multi-second) ONNX parse. The
+    # graph and spec are cached separately (keyed by content sha1), so each is
+    # reused independently; falls back to a normal parse on any miss. Gated behind
+    # the explicit unsafe-pkl flag.
     graph = spec = None
     if args.allow_unsafe_pkl_loading:
-        from .preparse import load_cache, pkl_cache_path
-        cached = load_cache(args.net, args.spec, dtype)
-        if cached is not None:
-            graph, spec = cached
-            print(f'Loaded pre-parse cache: '
-                  f'{pkl_cache_path(args.net, args.spec, dtype)}')
-            print(f'  network: {args.net}')
-            print(f'  spec:    {args.spec}')
+        from .preparse import load_cache
+        graph, spec = load_cache(args.net, args.spec, dtype)
+        if graph is not None:
+            print(f'Loaded pre-parse graph cache for {os.path.basename(args.net)}')
+        if spec is not None:
+            print(f'Loaded pre-parse spec cache for {os.path.basename(args.spec)}')
 
     if graph is None:
         print(f'Loading network: {args.net}')
@@ -747,6 +771,7 @@ def _resolve_cex_io_meta(spec_path):
     spec with millions of input-bound asserts is never fully read. Returns ``None`` for v1 /
     on a read error (the cex then keeps the ONNX node names). Resolved ONCE in ``main`` from
     the ORIGINAL spec (before any pair/augment rewrite of ``args.spec``)."""
+    import gzip
     import re
     p = spec_path
     if not os.path.exists(p) and os.path.exists(p + '.gz'):
@@ -780,14 +805,35 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
     if verdict == 'sat' and witness is not None:
         x = np.concatenate([np.asarray(w).ravel() for w in witness]).astype(np.float64)
         y = np.asarray(sp._ort_eval(args.net, witness)).ravel().astype(np.float64)
-        if getattr(args, 'verbose', False):
-            _log_cex_values(x, y)
-        ce = _format_cex(getattr(args, 'cex_version', '1.0'), args.net, x, y, cex_fmt,
-                         io_meta=getattr(args, 'cex_io_decls', None))
-        with open(args.results_file, 'w') as f:
-            f.write('sat\n' + ce + '\n')
-        sat_state['emitted'] = True
-    elif not sat_state.get('emitted'):
+        # Defense-in-depth: the surrogate/attack paths bypass the universal
+        # _validate_sat_witness gate, so re-verify here (in float64) that the
+        # ORT-recomputed output GENUINELY (strictly) violates the spec before
+        # committing 'sat'. Catches any search-side acceptance bug — e.g. a point
+        # sitting exactly on a strict `>`/`<` threshold (margin 0) is NOT a CE.
+        _m = None
+        _spec_path = getattr(args, 'spec', None)
+        if _spec_path:
+            try:
+                _odnf = sp.parse_box_and_output(_spec_path).out_dnf
+                _m = max(min((float(y[i]) - rhs) if op == 'gt' else (rhs - float(y[i]))
+                             for i, op, rhs in clause) for clause in _odnf)
+            except (NotImplementedError, OSError, IndexError, ValueError,
+                    AttributeError):
+                _m = None                   # can't re-check -> don't block (rare path)
+        if _m is not None and _m <= 0.0:
+            print(f'  [surrogate] witness does NOT strictly violate spec '
+                  f'(margin={_m:.3e}) — NOT emitting SAT', flush=True)
+            verdict = 'timeout'
+        else:
+            if getattr(args, 'verbose', False):
+                _log_cex_values(x, y)
+            ce = _format_cex(getattr(args, 'cex_version', '1.0'), args.net, x, y, cex_fmt,
+                             io_meta=getattr(args, 'cex_io_decls', None))
+            with open(args.results_file, 'w') as f:
+                f.write('sat\n' + ce + '\n')
+            sat_state['emitted'] = True
+            return
+    if not sat_state.get('emitted'):
         with open(args.results_file, 'w') as f:
             f.write(verdict + '\n')
 

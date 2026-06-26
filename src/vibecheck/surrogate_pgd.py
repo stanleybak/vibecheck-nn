@@ -359,6 +359,12 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     # (VNN-COMP 2026), so a CE is accepted iff a candidate STRICTLY crosses the
     # output threshold; there is no within-output-tolerance fallback.
     atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    # Strict output constraints (`>`/`<`): require the output to cross the threshold
+    # by at least this buffer (in float64) so a point sitting exactly on the
+    # threshold (e.g. a quantization-pinned Y == c) is NOT a counterexample and an
+    # emitted CE robustly satisfies the strict, zero-tolerance competition check.
+    # (A bare next-float shift is invisible in float32 and gave false sats.)
+    strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
     use_quant_eval = bool(getattr(settings, 'surrogate_quant_eval', True))
 
     if surrogate_path is None or not os.path.exists(surrogate_path):
@@ -399,10 +405,15 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
         return torch.stack(clause_vals).max()
 
     def margin_np(y):
-        # violation margin on a numpy output: >0 strict crossing, in (-atol,0] within-tol.
+        # Violation margin on a numpy output, computed in FLOAT64. (A float32 y minus
+        # a python-float rhs collapses to float32 under numpy-2 NEP-50 promotion,
+        # which would hide a sub-float32 strict buffer — so cast each element to
+        # float64 first.) margin >= strict_buffer means the output crossed the
+        # threshold by a robust amount.
         best = -np.inf
         for clause in spec.out_dnf:
-            m = min((y[i] - rhs) if op == 'gt' else (rhs - y[i]) for i, op, rhs in clause)
+            m = min((float(y[i]) - rhs) if op == 'gt' else (rhs - float(y[i]))
+                    for i, op, rhs in clause)
             best = max(best, m)
         return float(best)
 
@@ -435,12 +446,12 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
         _t_val += time.time() - _v0
         _n_val += 1
         m = margin_np(y)
-        # The surrogate spec uses STRICT output constraints (`>`/`<`, parsed as
-        # 'gt'/'lt'); the competition checker requires a strict violation at zero
-        # output tolerance, so a boundary point (m == 0, e.g. quantization-pinned
-        # Y == threshold) is NOT a counterexample. Require m > 0 (strict), which
-        # matches the competition exactly — smart_turn's Y==0.5 boundary is not a CE.
-        if m > 0.0:
+        # Strict `>`/`<`: accept only if the output crosses the threshold by at
+        # least strict_buffer (float64). A point exactly on the threshold (e.g.
+        # quantization-pinned Y == 0.5 for `Y > 0.5`) has m == 0 < buffer and is
+        # skipped; m >= buffer means Y robustly satisfies the strict, zero-tolerance
+        # competition check.
+        if m >= strict_buffer:
             log(f'[surrogate] CLEAR SAT at {tag} (ORT margin={m:.3e})')
             return ('sat', (feed, y))
         # m <= 0: the output does NOT strictly violate -> not a counterexample
@@ -500,7 +511,7 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
                 fqm_s = fq_margin(snap)
                 if fqm_s is not None and fqm_s > best_fq:
                     best_fq, best_fq_pts = fqm_s, snap
-                if fqm_s is not None and fqm_s > 0.0:
+                if fqm_s is not None and fqm_s >= strict_buffer:
                     res = ort_consider(snap, f'restart{r} step{it} (a={alpha},fq={fqm_s:.3e})')
                     if res is not None:
                         _t_fwd += time.time() - _f0

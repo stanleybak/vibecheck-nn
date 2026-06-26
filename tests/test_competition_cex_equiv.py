@@ -58,16 +58,22 @@ def _write_ce(x0, x1, y):
     return p.name
 
 
+_STRICT_BUFFER = 1e-9  # surrogate_pgd default sat_strict_buffer
+
+
 def _vc_surrogate_accepts(spec_path, x, y, atol=1e-4):
     """VC's surrogate acceptance gate (surrogate_pgd.ort_consider): the witness is
-    in the input box (within atol) AND the output strictly violates (margin > 0)."""
+    in the input box (within atol) AND the output crosses the strict `>`/`<`
+    threshold by at least the strict buffer (margin computed in float64). A point
+    exactly on the threshold has margin 0 < buffer and is rejected — matching the
+    competition checker, which evaluates `>`/`<` strictly at zero tolerance."""
     spec = parse_box_and_output(spec_path)
     inbox = all((np.asarray(x).ravel() >= lo - atol).all()
                 and (np.asarray(x).ravel() <= hi + atol).all()
                 for _, _, lo, hi in spec.inputs)
-    margin = max(min((y[i] - rhs) if op == 'gt' else (rhs - y[i])
+    margin = max(min((float(y[i]) - rhs) if op == 'gt' else (rhs - float(y[i]))
                      for i, op, rhs in clause) for clause in spec.out_dnf)
-    return bool(inbox and margin > 0.0)
+    return bool(inbox and margin >= _STRICT_BUFFER)
 
 
 def _mk(out_op, thr, x0, x1, lo=(0.0, 0.0), hi=(1.0, 1.0)):

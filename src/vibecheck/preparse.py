@@ -5,14 +5,31 @@ topo sort) plus the VNNLIB spec can take a noticeable slice of a tight
 per-instance budget. `prepare_instance.sh` runs once per instance *before* the
 timed run, so it is the natural place to do that work and stash the result.
 
-This module pickles the parsed `(ComputeGraph, VNNSpec)` pair to a deterministic
-sidecar path keyed by the (onnx, vnnlib, dtype) triple. `run_instance.sh` then
-loads it back (when `--allow-unsafe-pkl-loading` is passed) and skips the parse.
+We cache the ONNX graph and the VNNLIB spec SEPARATELY, each pickled to a file
+named after its source so it is obvious what it corresponds to:
 
-SECURITY: pickle executes arbitrary code on load. The cache is therefore only
-read when the caller explicitly opts in via `--allow-unsafe-pkl-loading`, and
-only for caches *this* tool wrote (validated by a stamped format version + the
-recorded source paths/mtimes). Never point it at an untrusted .pkl.
+    <cache_dir>/<onnx-basename>.pkl     e.g. vgg16-7.onnx.pkl   -> ComputeGraph
+    <cache_dir>/<vnnlib-basename>.pkl   e.g. instance_0.vnnlib.pkl -> VNNSpec
+
+Splitting them means an ONNX shared across many specs (e.g. smart_turn's 50
+instances, or acasxu nets reused across properties) is parsed ONCE and reused
+for every spec, instead of rebuilding per (onnx, vnnlib) pair.
+
+Each cache file stores a small METADATA record (the content sha1 of its source,
+the format version, and for the graph the dtype) as the FIRST pickle object,
+followed by the parsed object. The metadata is read first to decide whether the
+cache is up to date for the current source bytes — so prepare can skip a rebuild
+and a run can skip the graph load on a content mismatch, all without
+materializing the big object.
+
+SAFETY: pickle executes arbitrary code on load. The cache is therefore only READ
+when the caller explicitly opts in via `--allow-unsafe-pkl-loading`, and it is
+only ever WRITTEN by `--prepare-pkl-unsafe` (named to make the trust requirement
+obvious). The content sha1 here is a STALENESS/correctness check (is this the
+cache for these exact bytes?), NOT a security boundary — a recomputable hash
+cannot stop someone who can write the cache directory from planting a malicious
+pkl. Security comes from the cache directory being trusted; never point this at
+an untrusted location.
 
 The cached graph is the PRE-`optimize()` form (optimize is settings-dependent,
 so it stays a per-run step) — the expensive `from_onnx` parse is what we skip.
@@ -23,11 +40,14 @@ import pickle
 
 import numpy as np
 
-# Bump when the pickled object layout changes so stale caches are ignored
-# rather than silently mis-loaded.
-CACHE_FORMAT_VERSION = 2
+# Bump when the pickled object layout OR the cache scheme changes so stale caches
+# are ignored rather than silently mis-loaded.
+CACHE_FORMAT_VERSION = 4
 
 _DEFAULT_CACHE_DIR = '/tmp/vibecheck_pkl'
+
+_PKL_ERRORS = (pickle.UnpicklingError, EOFError, OSError, AttributeError,
+               ImportError, ValueError, IndexError)
 
 
 def cache_dir():
@@ -35,86 +55,136 @@ def cache_dir():
     return os.environ.get('VIBECHECK_PKL_CACHE_DIR', _DEFAULT_CACHE_DIR)
 
 
-def pkl_cache_path(onnx_path, vnnlib_path, dtype):
-    """Deterministic cache path for an (onnx, vnnlib, dtype) instance.
-
-    Keyed by the realpaths + dtype so `prepare_instance.sh` and
-    `run_instance.sh` independently derive the same path for the same instance.
-    """
-    key = '|'.join([
-        os.path.realpath(onnx_path),
-        os.path.realpath(vnnlib_path),
-        np.dtype(dtype).name,
-        f'v{CACHE_FORMAT_VERSION}',
-    ])
-    digest = hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]
-    return os.path.join(cache_dir(), f'{digest}.pkl')
+def _file_sha1(path):
+    """Streaming sha1 of a file's raw bytes (chunked so a 500 MB ONNX doesn't
+    land in memory all at once)."""
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def _source_stamp(onnx_path, vnnlib_path, dtype):
-    """Identity stamp recorded in the cache to detect staleness on load."""
-    return {
-        'version': CACHE_FORMAT_VERSION,
-        'onnx': os.path.realpath(onnx_path),
-        'vnnlib': os.path.realpath(vnnlib_path),
-        'dtype': np.dtype(dtype).name,
-        'onnx_mtime': os.path.getmtime(onnx_path),
-        'vnnlib_mtime': os.path.getmtime(vnnlib_path),
-    }
+def onnx_pkl_path(onnx_path):
+    """Graph cache path: <cache_dir>/<onnx-basename>.pkl (e.g. vgg16-7.onnx.pkl)."""
+    return os.path.join(cache_dir(), os.path.basename(onnx_path) + '.pkl')
 
 
-def write_cache(onnx_path, vnnlib_path, dtype):
-    """Parse the instance and pickle (graph, spec, stamp) to its cache path.
-
-    Returns the cache path. Called by prepare_instance.sh (via `--prepare-pkl`).
-    """
-    from .network import ComputeGraph
-    from .vnnlib_loader import load_vnnlib
-
-    graph = ComputeGraph.from_onnx(onnx_path, dtype=dtype)
-    spec = load_vnnlib(vnnlib_path)
-
-    out_path = pkl_cache_path(onnx_path, vnnlib_path, dtype)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    payload = {
-        'stamp': _source_stamp(onnx_path, vnnlib_path, dtype),
-        'graph': graph,
-        'spec': spec,
-    }
-    # Write to a temp file + atomic rename so a concurrent/aborted prepare
-    # never leaves a half-written cache that a run would load.
-    tmp_path = out_path + f'.tmp{os.getpid()}'
-    with open(tmp_path, 'wb') as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp_path, out_path)
-    return out_path
+def vnnlib_pkl_path(vnnlib_path):
+    """Spec cache path: <cache_dir>/<vnnlib-basename>.pkl (e.g. prop_1.vnnlib.pkl)."""
+    return os.path.join(cache_dir(), os.path.basename(vnnlib_path) + '.pkl')
 
 
-def load_cache(onnx_path, vnnlib_path, dtype):
-    """Load a pre-parsed (graph, spec) for this instance, or None.
-
-    Returns None (caller parses normally) if no cache exists, the cache is
-    stale (version / source path / mtime mismatch), or it fails to load. Only
-    call this when the user passed --allow-unsafe-pkl-loading.
-    """
-    path = pkl_cache_path(onnx_path, vnnlib_path, dtype)
+def _read_meta(path):
+    """Read ONLY the metadata record (first pickle object) of a cache file, or
+    None if missing/unreadable/old-format. Does not load the big object."""
     if not os.path.isfile(path):
         return None
     try:
         with open(path, 'rb') as f:
-            payload = pickle.load(f)
-    except (pickle.UnpicklingError, EOFError, OSError, AttributeError,
-            ImportError, ValueError) as e:
-        # Corrupt / version-skewed cache → fall back to a normal parse. Narrow
-        # set: these are the failure modes of loading a stale-but-present pkl.
-        print(f'  [pkl] ignoring unreadable cache {path}: '
+            meta = pickle.load(f)
+    except _PKL_ERRORS:
+        return None
+    if not isinstance(meta, dict) or meta.get('version') != CACHE_FORMAT_VERSION:
+        return None
+    return meta
+
+
+def _write(path, meta, obj):
+    """Atomically write (meta, obj) as two sequential pickle objects."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = path + f'.tmp{os.getpid()}'
+    with open(tmp, 'wb') as f:
+        pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------- ONNX graph
+def write_onnx_cache(onnx_path, dtype):
+    """Parse + cache the ONNX graph, keyed by content sha1 (+ dtype). Skips the
+    parse if an up-to-date cache for these exact bytes already exists. Returns
+    the cache path."""
+    sha1 = _file_sha1(onnx_path)
+    dt = np.dtype(dtype).name
+    path = onnx_pkl_path(onnx_path)
+    meta = _read_meta(path)
+    if meta and meta.get('kind') == 'onnx' and meta.get('sha1') == sha1 \
+            and meta.get('dtype') == dt:
+        return path                                   # up to date, no rebuild
+    from .network import ComputeGraph
+    graph = ComputeGraph.from_onnx(onnx_path, dtype=dtype)
+    _write(path, {'kind': 'onnx', 'version': CACHE_FORMAT_VERSION, 'sha1': sha1,
+                  'dtype': dt, 'source': os.path.realpath(onnx_path)}, graph)
+    return path
+
+
+def load_onnx_cache(onnx_path, dtype):
+    """Return the cached ComputeGraph for this ONNX (content sha1 + dtype match),
+    or None. Only call when --allow-unsafe-pkl-loading was passed."""
+    path = onnx_pkl_path(onnx_path)
+    if not os.path.isfile(path):
+        return None
+    sha1 = _file_sha1(onnx_path)
+    dt = np.dtype(dtype).name
+    try:
+        with open(path, 'rb') as f:
+            meta = pickle.load(f)
+            if not (isinstance(meta, dict) and meta.get('kind') == 'onnx'
+                    and meta.get('version') == CACHE_FORMAT_VERSION
+                    and meta.get('sha1') == sha1 and meta.get('dtype') == dt):
+                return None                           # stale/wrong: don't load graph
+            return pickle.load(f)                     # the ComputeGraph
+    except _PKL_ERRORS as e:
+        print(f'  [pkl] ignoring unreadable graph cache {path}: '
               f'{type(e).__name__}: {e}')
         return None
-    stamp = payload.get('stamp', {})
-    expected = _source_stamp(onnx_path, vnnlib_path, dtype)
-    if stamp != expected:
-        # Source files changed (or different instance hashed to this path):
-        # don't trust it.
-        print(f'  [pkl] cache {path} is stale (source changed); reparsing')
+
+
+# --------------------------------------------------------------------- VNNLIB spec
+def write_vnnlib_cache(vnnlib_path):
+    """Parse + cache the VNNLIB spec, keyed by content sha1. Skips the parse if an
+    up-to-date cache already exists. Returns the cache path."""
+    sha1 = _file_sha1(vnnlib_path)
+    path = vnnlib_pkl_path(vnnlib_path)
+    meta = _read_meta(path)
+    if meta and meta.get('kind') == 'vnnlib' and meta.get('sha1') == sha1:
+        return path
+    from .vnnlib_loader import load_vnnlib
+    spec = load_vnnlib(vnnlib_path)
+    _write(path, {'kind': 'vnnlib', 'version': CACHE_FORMAT_VERSION, 'sha1': sha1,
+                  'source': os.path.realpath(vnnlib_path)}, spec)
+    return path
+
+
+def load_vnnlib_cache(vnnlib_path):
+    """Return the cached VNNSpec for this VNNLIB (content sha1 match), or None.
+    Only call when --allow-unsafe-pkl-loading was passed."""
+    path = vnnlib_pkl_path(vnnlib_path)
+    if not os.path.isfile(path):
         return None
-    return payload['graph'], payload['spec']
+    sha1 = _file_sha1(vnnlib_path)
+    try:
+        with open(path, 'rb') as f:
+            meta = pickle.load(f)
+            if not (isinstance(meta, dict) and meta.get('kind') == 'vnnlib'
+                    and meta.get('version') == CACHE_FORMAT_VERSION
+                    and meta.get('sha1') == sha1):
+                return None
+            return pickle.load(f)                     # the VNNSpec
+    except _PKL_ERRORS as e:
+        print(f'  [pkl] ignoring unreadable spec cache {path}: '
+              f'{type(e).__name__}: {e}')
+        return None
+
+
+# ------------------------------------------------------------------- combined API
+def write_cache(onnx_path, vnnlib_path, dtype):
+    """Cache both the ONNX graph and the VNNLIB spec. Returns (onnx_pkl, vnnlib_pkl)."""
+    return write_onnx_cache(onnx_path, dtype), write_vnnlib_cache(vnnlib_path)
+
+
+def load_cache(onnx_path, vnnlib_path, dtype):
+    """Load both caches independently. Returns (graph_or_None, spec_or_None) — each
+    is None on a miss so the caller parses just that part."""
+    return load_onnx_cache(onnx_path, dtype), load_vnnlib_cache(vnnlib_path)

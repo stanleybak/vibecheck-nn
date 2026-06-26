@@ -1396,6 +1396,16 @@ def default_settings(**overrides):
         # (VC also clamps the emitted witness strictly in-box, so its inputs are
         # exact and it scores CORRECT, not merely CORRECT_WITH_TOLERANCE.)
         sat_validate_atol=1e-4,
+        # STRICT output constraints (`>`/`<`): the incomplete attack modes require
+        # the replayed output to cross the threshold by at least this buffer (in
+        # float64) before accepting a counterexample. This keeps a point sitting
+        # exactly on the threshold (e.g. a quantization-pinned Y == c, common in
+        # smart_turn's `Y > 0.5`) from being a false sat, and makes emitted CEs
+        # robustly satisfy the strict, zero-tolerance competition check. A bare
+        # next-float shift is invisible in float32 (numpy-2 promotion), so this is
+        # an explicit, configurable margin. Only widens the strict bound (never
+        # produces a CE the scorer would reject), so it is safe to tune up.
+        sat_strict_buffer=1e-9,
         skip_sat_validation=False,
         # (The old `keep_searching_within_tol` setting was removed: under the 2026
         # output-strict rule there is no within-output-tolerance sat to keep searching

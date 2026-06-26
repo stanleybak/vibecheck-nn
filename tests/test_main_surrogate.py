@@ -1,5 +1,5 @@
 """Coverage for the surrogate-attack hooks in main.py (_maybe_surrogate_attack,
-_surrogate_path, _emit_surrogate_result, the _verify hook, and the --prepare-pkl
+_surrogate_path, _emit_surrogate_result, the _verify hook, and the --prepare-pkl-unsafe
 CLI handler — quantized builds surrogates, non-quantized writes the pre-parse cache).
 Reuses the tiny synthetic quantized ONNX from test_surrogate_pgd."""
 import argparse
@@ -154,11 +154,11 @@ def test_verify_surrogate_hook_sat(tmp_path):
 
 
 def test_prepare_pkl_cli_quant(tmp_path, monkeypatch):
-    # --prepare-pkl on a QUANTIZED net folds the float (STE) + fake-quant surrogates
+    # --prepare-pkl-unsafe on a QUANTIZED net folds the float (STE) + fake-quant surrogates
     # (the graph pre-parse is skipped — that net uses the surrogate-attack path).
     q = _quant_onnx(str(tmp_path / 'q.onnx'))
     monkeypatch.setattr(sys, 'argv',
-                        ['vibecheck', '--net', q, '--spec', 'x', '--prepare-pkl'])
+                        ['vibecheck', '--net', q, '--spec', 'x', '--prepare-pkl-unsafe'])
     with pytest.raises(SystemExit) as e:
         vbmain.main()
     assert e.value.code == 0
@@ -168,7 +168,7 @@ def test_prepare_pkl_cli_quant(tmp_path, monkeypatch):
 
 
 def test_prepare_pkl_cli_nonquant(tmp_path, monkeypatch):
-    # --prepare-pkl on a normal net writes the pre-parse .pkl cache. Needs a
+    # --prepare-pkl-unsafe on a normal net writes the pre-parse .pkl cache. Needs a
     # graph-parseable spec (non-strict >= on the output; the surrogate-path
     # _v1_spec's strict > is not accepted by the graph load_vnnlib).
     p = _plain_onnx(str(tmp_path / 'p.onnx'))
@@ -179,7 +179,26 @@ def test_prepare_pkl_cli_nonquant(tmp_path, monkeypatch):
         '(assert (<= X_1 1.0))\n(assert (>= X_1 0.0))\n'
         '(assert (>= Y_0 0.5))\n')
     monkeypatch.setattr(sys, 'argv',
-                        ['vibecheck', '--net', p, '--spec', v, '--prepare-pkl'])
+                        ['vibecheck', '--net', p, '--spec', v, '--prepare-pkl-unsafe'])
     with pytest.raises(SystemExit) as e:
         vbmain.main()
     assert e.value.code == 0
+
+
+def test_missing_net_exits_1(monkeypatch):
+    # A typo'd / missing --net path -> clean exit code 1 (not a stack trace).
+    monkeypatch.setattr(sys, 'argv',
+                        ['vibecheck', '--net', '/no/such/net.onnx', '--spec', 'x'])
+    with pytest.raises(SystemExit) as e:
+        vbmain.main()
+    assert e.value.code == 1
+
+
+def test_missing_spec_exits_1(tmp_path, monkeypatch):
+    # Real net, missing --spec (run path) -> clean exit code 1.
+    p = _plain_onnx(str(tmp_path / 'p.onnx'))
+    monkeypatch.setattr(sys, 'argv',
+                        ['vibecheck', '--net', p, '--spec', str(tmp_path / 'nope.vnnlib')])
+    with pytest.raises(SystemExit) as e:
+        vbmain.main()
+    assert e.value.code == 1
