@@ -192,6 +192,46 @@ def test_input_box_tol_still_applies_when_output_strictly_violates():
     os.unlink(onnx_p)
 
 
+def _two_input_add_onnx():
+    """ONNX with two inputs A[1,1], B[1,1] and output Y = A + B."""
+    inp1 = helper.make_tensor_value_info('A', TensorProto.FLOAT, [1, 1])
+    inp2 = helper.make_tensor_value_info('B', TensorProto.FLOAT, [1, 1])
+    out = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 1])
+    node = helper.make_node('Add', ['A', 'B'], ['Y'])
+    g = helper.make_graph([node], 'm', [inp1, inp2], [out])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 13)])
+    m.ir_version = 7
+    return _save(m)
+
+
+def test_validate_witness_ort_multi_input():
+    """The unified validator handles MULTI-input witnesses (the surrogate/attack
+    case): per-input box check + clamp, multi-tensor ORT feed, caller-supplied
+    output rule."""
+    from vibecheck.verify_graph import _validate_witness_ort
+    onnx_p = _two_input_add_onnx()
+    box = (np.array([0.0]), np.array([1.0]))
+
+    def _viol(inbox, y):                 # unsafe: Y > 0.5 (strict)
+        return (float(y[0]) > 0.5), {'worst_margin': float(y[0]) - 0.5}
+
+    # A=0.4, B=0.4 -> Y=0.8 > 0.5 -> violated -> accept
+    ok, info = _validate_witness_ort(
+        onnx_p, [np.array([0.4]), np.array([0.4])], [box, box], _viol)
+    assert ok and abs(info['out'][0] - 0.8) < 1e-6
+
+    # A=0.1, B=0.1 -> Y=0.2 -> not violated -> reject
+    ok2, _ = _validate_witness_ort(
+        onnx_p, [np.array([0.1]), np.array([0.1])], [box, box], _viol)
+    assert not ok2
+
+    # A=1.5 is outside its box [0,1] beyond atol -> reject (even though Y would violate)
+    ok3, info3 = _validate_witness_ort(
+        onnx_p, [np.array([1.5]), np.array([0.4])], [box, box], _viol)
+    assert not ok3 and 'outside input box' in info3['reason']
+    os.unlink(onnx_p)
+
+
 def test_sat_disposition_boundary_is_real():
     """`_sat_disposition`: a boundary violation (worst margin == 0) is a CLEAR
     counterexample ('real') under the inclusive output rule — it is NOT a

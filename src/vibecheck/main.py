@@ -558,6 +558,10 @@ def _maybe_surrogate_attack(args, sat_state):
     overrides.setdefault('total_timeout', args.timeout)
     settings = default_settings(**overrides)
     settings.update(getattr(args, 'set_overrides', {}) or {})
+    # Stash the validation knobs so the unified emit gate (_emit_surrogate_result
+    # -> _validate_witness_ort) uses the same buffer/atol the search used.
+    args._strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
+    args._sat_atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Surrogate-attack mode: quantized ONNX -> PGD via float surrogate '
           f'(restarts={settings.surrogate_attack_restarts}, '
@@ -592,6 +596,10 @@ def _maybe_sign_attack(args, sat_state):
     overrides.setdefault('total_timeout', args.timeout)
     settings = default_settings(**overrides)
     settings.update(getattr(args, 'set_overrides', {}) or {})
+    # Stash the validation knobs so the unified emit gate (_emit_surrogate_result
+    # -> _validate_witness_ort) uses the same buffer/atol the search used.
+    args._strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
+    args._sat_atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Sign-BNN attack mode: STE-PGD on Sign surrogate '
           f'(restarts={settings.sign_attack_restarts}, steps={settings.sign_attack_steps}, '
@@ -622,6 +630,10 @@ def _maybe_torch_attack(args, sat_state):
     overrides.setdefault('total_timeout', args.timeout)
     settings = default_settings(**overrides)
     settings.update(getattr(args, 'set_overrides', {}) or {})
+    # Stash the validation knobs so the unified emit gate (_emit_surrogate_result
+    # -> _validate_witness_ort) uses the same buffer/atol the search used.
+    args._strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
+    args._sat_atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Torch-attack mode: onnx2torch PGD '
           f'(restarts={settings.torch_attack_restarts}, steps={settings.torch_attack_steps}, '
@@ -652,6 +664,10 @@ def _maybe_cctsdb_yolo(args, sat_state):
     overrides.setdefault('total_timeout', args.timeout)
     settings = default_settings(**overrides)
     settings.update(getattr(args, 'set_overrides', {}) or {})
+    # Stash the validation knobs so the unified emit gate (_emit_surrogate_result
+    # -> _validate_witness_ort) uses the same buffer/atol the search used.
+    args._strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
+    args._sat_atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'cctsdb_yolo mode: discrete patch-position enumeration (timeout={timeout}s)')
     verdict, witness = cy.cctsdb_yolo_verify(
@@ -803,28 +819,50 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
     import numpy as np
     from . import surrogate_pgd as sp
     if verdict == 'sat' and witness is not None:
-        x = np.concatenate([np.asarray(w).ravel() for w in witness]).astype(np.float64)
-        y = np.asarray(sp._ort_eval(args.net, witness)).ravel().astype(np.float64)
-        # Defense-in-depth: the surrogate/attack paths bypass the universal
-        # _validate_sat_witness gate, so re-verify here (in float64) that the
-        # ORT-recomputed output GENUINELY (strictly) violates the spec before
-        # committing 'sat'. Catches any search-side acceptance bug — e.g. a point
-        # sitting exactly on a strict `>`/`<` threshold (margin 0) is NOT a CE.
-        _m = None
+        # Route the surrogate/attack witness through the SAME unified ORT gate as
+        # the graph path (verify_graph._validate_witness_ort) — multi-input, box
+        # check + float32-safe clamp, and the surrogate's strict `>`/`<` output
+        # rule (margin >= sat_strict_buffer, float64). This replaces the old
+        # bespoke re-check and gives every path one validation gate. If the spec
+        # can't be parsed for a re-check we don't block (rare).
+        from .verify_graph import _validate_witness_ort
+        _buf = float(getattr(args, '_strict_buffer', 1e-9))
+        _atol = float(getattr(args, '_sat_atol', 1e-4))
+        _wits = [np.asarray(w).ravel().astype(np.float64) for w in witness]
+        _ok, _vinfo = True, {}
         _spec_path = getattr(args, 'spec', None)
         if _spec_path:
             try:
-                _odnf = sp.parse_box_and_output(_spec_path).out_dnf
-                _m = max(min((float(y[i]) - rhs) if op == 'gt' else (rhs - float(y[i]))
-                             for i, op, rhs in clause) for clause in _odnf)
+                _sspec = sp.parse_box_and_output(_spec_path)
+                _boxes = [(lo, hi) for _, _, lo, hi in _sspec.inputs]
+
+                def _violated(inbox, yv):
+                    m = max(min((float(yv[i]) - rhs) if op == 'gt'
+                                else (rhs - float(yv[i]))
+                                for i, op, rhs in clause)
+                            for clause in _sspec.out_dnf)
+                    return (m >= _buf), {'worst_margin': m}
+
+                _ok, _vinfo = _validate_witness_ort(args.net, _wits, _boxes,
+                                                    _violated, _atol)
             except (NotImplementedError, OSError, IndexError, ValueError,
                     AttributeError):
-                _m = None                   # can't re-check -> don't block (rare path)
-        if _m is not None and _m <= 0.0:
+                _ok, _vinfo = True, {}       # can't re-check -> don't block (rare)
+        if not _ok:
             print(f'  [surrogate] witness does NOT strictly violate spec '
-                  f'(margin={_m:.3e}) — NOT emitting SAT', flush=True)
+                  f'(margin={_vinfo.get("worst_margin")}) — NOT emitting SAT',
+                  flush=True)
             verdict = 'timeout'
         else:
+            # Emit the validated ORT output as Y + the clamped in-box witness as X.
+            inbox = _vinfo.get('witnesses_inbox')
+            if inbox is not None:
+                x = np.concatenate([np.asarray(w).ravel() for w in inbox]).astype(np.float64)
+            else:
+                x = np.concatenate([np.asarray(w).ravel() for w in witness]).astype(np.float64)
+            y = (np.asarray(_vinfo['out']).ravel().astype(np.float64)
+                 if _vinfo.get('out') is not None
+                 else np.asarray(sp._ort_eval(args.net, witness)).ravel().astype(np.float64))
             if getattr(args, 'verbose', False):
                 _log_cex_values(x, y)
             ce = _format_cex(getattr(args, 'cex_version', '1.0'), args.net, x, y, cex_fmt,

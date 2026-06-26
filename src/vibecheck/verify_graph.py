@@ -5261,6 +5261,108 @@ def _clamp_witness_to_box(witness, x_lo, x_hi):
     return w32.astype(np.float64)
 
 
+_ORT_VALIDATE_SESSIONS = {}
+
+
+def _ort_session_for(onnx_path):
+    """Cached CPU InferenceSession for `onnx_path` (handles `.onnx.gz`)."""
+    sess = _ORT_VALIDATE_SESSIONS.get(onnx_path)
+    if sess is None:
+        import onnxruntime as ort
+        if onnx_path.endswith('.gz'):
+            import gzip
+            with gzip.open(onnx_path, 'rb') as _f:
+                sess = ort.InferenceSession(_f.read(),
+                                            providers=['CPUExecutionProvider'])
+        else:
+            sess = ort.InferenceSession(onnx_path,
+                                        providers=['CPUExecutionProvider'])
+        _ORT_VALIDATE_SESSIONS[onnx_path] = sess
+    return sess
+
+
+def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-4):
+    """Unified ORT-CPU witness validator for EVERY path (graph + surrogate/attack).
+
+    This is the single authoritative gate: load the ORIGINAL ONNX, replay the
+    witness on CPU onnxruntime, and check it actually violates the spec — catching
+    spurious counterexamples from PGD/MILP/graph-builder bugs. It is multi-input
+    (the surrogate/attack paths produce multi-tensor witnesses) and the
+    output-violation rule is supplied by the caller (`output_violated`), so each
+    spec representation keeps its own correct semantics (the graph path's inclusive
+    `spec.check`/disjunctive `check_witness`; the surrogate's strict `>`/`<` margin
+    with `sat_strict_buffer`).
+
+    witnesses: list of per-input flat float arrays (single-input -> 1-element list).
+    boxes:     list of (lo, hi) flat arrays per input, or None to skip the box check.
+    output_violated(inbox_list, y_flat) -> (violated: bool, info_updates: dict).
+
+    Returns (proceed, info). proceed=True means "emit this sat" — the output
+    genuinely violates, OR validation was skipped (no onnx_path / onnxruntime
+    missing, so we don't reject what we cannot check). proceed=False means
+    reject/downgrade (out-of-box, ORT failure, or output does not violate). info
+    carries 'out', 'witness_inbox'/'witnesses_inbox', 'spec_check', and any
+    `output_violated` updates (e.g. 'worst_margin').
+    """
+    info = {'ok': False, 'reason': None}
+    if onnx_path is None:
+        info['reason'] = 'no onnx_path stashed on graph; skipping validation'
+        return True, info
+    try:
+        import onnxruntime  # noqa: F401
+    except ImportError:
+        info['reason'] = 'onnxruntime not installed; skipping validation'
+        return True, info
+    # Per-input box check (witness up to `atol` outside is allowed) + float32-safe
+    # clamp into the box (a box edge can round outside under the float32 cast ORT
+    # and the scorer apply; see `_clamp_witness_to_box`). Validate / emit the
+    # clamped in-box point, never the raw one.
+    inbox = []
+    for k, w in enumerate(witnesses):
+        w = np.asarray(w, np.float64).ravel()
+        box = boxes[k] if boxes is not None else None
+        if box is not None:
+            lo = np.asarray(box[0], np.float64).ravel()
+            hi = np.asarray(box[1], np.float64).ravel()
+            if w.shape != lo.shape:
+                info['reason'] = (f'witness[{k}] shape {w.shape} != box shape '
+                                  f'{lo.shape}')
+                return False, info
+            if np.any(w < lo - atol) or np.any(w > hi + atol):
+                info['reason'] = f'witness[{k}] outside input box (atol={atol})'
+                info['out_of_box'] = (float((lo - w).max()), float((w - hi).max()))
+                return False, info
+            w = _clamp_witness_to_box(w, lo, hi)
+        inbox.append(w)
+    info['witnesses_inbox'] = inbox
+    info['witness_inbox'] = inbox[0] if len(inbox) == 1 else None
+    try:
+        sess = _ort_session_for(onnx_path)
+        model_inputs = sess.get_inputs()
+        feeds = {}
+        for k, im in enumerate(model_inputs):
+            shp = [d if isinstance(d, int) and d > 0 else 1 for d in im.shape]
+            feeds[im.name] = inbox[k].reshape(shp).astype(np.float32)
+        out = sess.run(None, feeds)[0]
+        y = np.asarray(out).flatten().astype(np.float64)
+    except (RuntimeError, OSError, ValueError, IndexError, KeyError) as e:
+        # ORT load/run failure (malformed onnx, missing op, shape mismatch):
+        # treat as a failed witness (reject) rather than a silent pass.
+        info['reason'] = f'ORT forward failed: {type(e).__name__}: {e}'
+        return False, info
+    info['out'] = y
+    violated, updates = output_violated(inbox, y)
+    if updates:
+        info.update(updates)
+    info['spec_check'] = 'unknown' if violated else 'verified'
+    if violated:
+        info['ok'] = True
+        return True, info
+    if not info.get('reason'):
+        info['reason'] = 'ORT output does not violate spec'
+    return False, info
+
+
 def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0):
     """Run a SAT witness through ONNXRuntime + check it actually violates
     the spec. Catches spurious counterexamples from PGD/MILP bugs OR from
@@ -5283,93 +5385,32 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0):
     within `out_atol` on constraint margins — inclusive of the boundary,
     matching the official checker's `<=`/`>=` comparison at zero tolerance).
     """
-    info = {'ok': False, 'reason': None}
-    if onnx_path is None:
-        info['reason'] = 'no onnx_path stashed on graph; skipping validation'
-        return True, info
+    # Single-input VNNSpec wrapper over the unified `_validate_witness_ort`. The
+    # output-violation rule is the graph path's: a per-disjunct X-subrange spec
+    # (nn4sys lindex, acasxu prop_6) uses `check_witness(x, y)` (else `spec.check`
+    # ignores the X constraints and could report a false SAT); otherwise the
+    # Y-only `spec.check` with the output band `out_atol` (default 0.0 = strict,
+    # boundary inclusive per the official `<=`/`>=` comparison).
     w = np.asarray(witness).flatten().astype(np.float64)
-    if w.shape != spec.x_lo.shape:
-        info['reason'] = (f'witness shape {w.shape} != x_lo shape '
-                           f'{spec.x_lo.shape}')
-        return False, info
-    if (np.any(w < spec.x_lo - atol)
-            or np.any(w > spec.x_hi + atol)):
-        info['reason'] = (f'witness outside input box (atol={atol})')
-        info['out_of_box'] = (
-            float((spec.x_lo - w).max()), float((w - spec.x_hi).max()))
-        return False, info
-    # The raw witness is within atol of the box; pull it strictly inside,
-    # float32-safe (see `_clamp_witness_to_box`), and validate / emit THIS
-    # in-box point — never the raw one, whose box edge can round outside.
-    w = _clamp_witness_to_box(w, spec.x_lo, spec.x_hi)
-    info['witness_inbox'] = w
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        info['reason'] = 'onnxruntime not installed; skipping validation'
-        return True, info
-    # ORT can't read .gz natively. Decompress to a bytes buffer first so
-    # the validator works on the VNNCOMP-shipped `.onnx.gz` files. A
-    # prior version called `ort.InferenceSession(path)` directly and
-    # rejected every PGD witness on cersyve as "spurious" because the
-    # session-load itself raised. Validation failures must come from
-    # the witness being wrong, not from file format.
-    try:
-        if onnx_path.endswith('.gz'):
-            import gzip
-            with gzip.open(onnx_path, 'rb') as _f:
-                _model_bytes = _f.read()
-            sess = ort.InferenceSession(
-                _model_bytes, providers=['CPUExecutionProvider'])
-        else:
-            sess = ort.InferenceSession(
-                onnx_path, providers=['CPUExecutionProvider'])
-        in_meta = sess.get_inputs()[0]
-        in_shape = [d if isinstance(d, int) and d > 0 else 1
-                    for d in in_meta.shape]
-        x = w.reshape(in_shape).astype(np.float32)
-        out = sess.run(None, {in_meta.name: x})[0]
-        out_flat = np.asarray(out).flatten().astype(np.float64)
-    except (RuntimeError, OSError, ValueError) as e:
-        # ORT InferenceSession / run failures: malformed onnx, missing op,
-        # shape mismatch. Witness validation falls back to 'failed-to-check'
-        # which the caller treats as a failed witness (no false SAT).
-        info['reason'] = f'ORT forward failed: {type(e).__name__}: {e}'
-        return False, info
-    info['out'] = out_flat
-    # When ANY conjunct carries per-disjunct X subranges (e.g., nn4sys
-    # lindex, acasxu prop_6), `spec.check(out)` ignores those X
-    # constraints and may report 'unknown' on a witness whose x is
-    # outside every disjunct's subbox — yielding a false SAT. Use
-    # `check_witness(x, y)` which evaluates each conjunct's full
-    # X-AND-Y unsafe region at the witness point.
-    if any(c.input_lo is not None for c in spec.disjuncts):
-        is_ce, _ = spec.check_witness(w.astype(np.float64), out_flat)
-        info['spec_check'] = 'unknown' if is_ce else 'verified'
-        if is_ce:
-            info['ok'] = True
-            return True, info
-        info['reason'] = (
-            'ORT output does not violate any disjunct '
-            "whose X-subrange contains the witness "
-            '(check_witness rejected)')
-        return False, info
-    # Default Y-only path: spec.check returns 'unknown' iff worst margin
-    # <= 0. The 2026 rule requires a STRICT output violation, so the output
-    # band is `out_atol` (default 0.0), NOT the input `atol`: pass
-    # (out-out_atol, out+out_atol). With out_atol=0 this is the exact ORT
-    # output, so only a genuine violation (worst margin <= 0, boundary
-    # inclusive — matching the official `<=`/`>=` comparison) counts.
-    check_res, check_info = spec.check(out_flat - out_atol, out_flat + out_atol)
-    info['spec_check'] = check_res
-    info['worst_margin'] = check_info.get('worst_margin')
-    if check_res == 'unknown':
-        info['ok'] = True
-        return True, info
-    info['reason'] = (f'ORT output does not violate spec '
-                       f'(worst_margin={info["worst_margin"]:.4g}, '
-                       f'out_atol={out_atol})')
-    return False, info
+    _disjunctive = any(getattr(c, 'input_lo', None) is not None
+                       for c in spec.disjuncts)
+
+    def _output_violated(inbox, y):
+        if _disjunctive:
+            is_ce, _ = spec.check_witness(inbox[0].astype(np.float64), y)
+            return is_ce, ({} if is_ce else {
+                'reason': ('ORT output does not violate any disjunct whose '
+                           'X-subrange contains the witness (check_witness rejected)')})
+        check_res, check_info = spec.check(y - out_atol, y + out_atol)
+        upd = {'worst_margin': check_info.get('worst_margin')}
+        if check_res != 'unknown':
+            upd['reason'] = (f'ORT output does not violate spec '
+                             f'(worst_margin={check_info.get("worst_margin"):.4g}, '
+                             f'out_atol={out_atol})')
+        return (check_res == 'unknown'), upd
+
+    return _validate_witness_ort(onnx_path, [w], [(spec.x_lo, spec.x_hi)],
+                                 _output_violated, atol)
 
 
 def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
