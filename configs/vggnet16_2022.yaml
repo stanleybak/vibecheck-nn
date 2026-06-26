@@ -5,18 +5,27 @@
 # box-approximation max_pool); do NOT auto-route conv graphs to milp_verify/
 # gpu_layers, which has no MaxPool handler.
 #
-# This solves spec0–14 (15/15). The 3 full-image cases (spec15/16/17, ALL 150528
-# px perturbed) are NOT solved here: the forward zono explodes under box-reduce,
-# and a sound bound needs retightening ~all unstable deep-layer ReLUs via backward
-# CROWN — ~2.7x over the 1200 s budget at the current engine speed (see
-# docs/benchmarks/vggnet16_2022.md). A WIP patches-mode backward-CROWN engine
-# exists (sound, bit-equivalent, gated OFF by default) but is too slow for these.
-# To experiment with it on the full-image cases (will exceed 1200 s today), add:
-#   --set crown_retighten_forward=true  --set crown_retighten_patches=true
-#   --set box_reduce_patch_budget=6.0e+9  --set box_reduce_on_oom=true
-#   --set phase1_method=plain  --set tighten_formulation=skip
-#   --set max_tighten_layer=0  --set max_tighten_layer_lp=0
-#   --set crown_retighten_chunk=64   (avoids the FC dense-backward OOM)
-# Capping (crown_retighten_max_neurons) does NOT help: it leaves un-retightened
-# neurons at exploded box bounds, so the final bound explodes (cap=10000 → -1.5e8).
+# This solves spec0–14 (15/15) via input-split + forward-zono. The 3 full-image
+# cases (spec15/16/17, ALL 150528 px perturbed) explode the forward zono and need
+# the patches-mode backward-CROWN retighten engine (src/vibecheck/patches_crown.py)
+# enabled below. With the torch.compile + maxpool-fusion speedups (commit 2493ff6),
+# **spec15 verifies `unsat` in ~1108 s (Phase1+2 1079 s, worst=+5.3291 == ABC)**,
+# in budget. spec16 (~1376 s) and spec17 (forward-zono OOM at 100× ε) still exceed
+# 1200 s — ABC also clears only spec15 (16/18 == ABC). See docs/benchmarks/
+# vggnet16_2022.md. NOTE: the retighten engine internally activates only when the
+# forward bounds need it (full-image specs); the few-pixel spec0–14 stay on the
+# input-split path, so these flags are sound + verdict-preserving for them (the
+# `tests/integration` vggnet pins guard against regression). `phase1_method=plain`
+# / `tighten_formulation=skip` / `max_tighten_layer*=0` are what the full-image
+# path requires; capping crown_retighten_max_neurons does NOT help (un-retightened
+# neurons keep exploded box bounds → bound explodes, cap=10000 → -1.5e8).
 auto_route_milp_for_conv: false
+crown_retighten_forward: true
+crown_retighten_patches: true
+box_reduce_patch_budget: 6.0e+9
+box_reduce_on_oom: true
+phase1_method: plain
+tighten_formulation: skip
+max_tighten_layer: 0
+max_tighten_layer_lp: 0
+crown_retighten_chunk: 64

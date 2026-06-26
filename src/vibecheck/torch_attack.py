@@ -22,7 +22,7 @@ def torch_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     in {'sat','timeout','unknown'} and witness a list holding the single input np.ndarray (None
     unless sat). The verdict is decided ONLY by the original model on ORT-CPU."""
     import torch
-    from onnx2torch import convert
+    from .surrogate_pgd import convert_onnx_to_torch
     from .io_util import ensure_decompressed
     from .vnnlib_loader import load_vnnlib
 
@@ -40,9 +40,15 @@ def torch_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     _want_gpu = (getattr(settings, 'device', 'gpu') == 'gpu')
     dev = 'cuda' if (_want_gpu and torch.cuda.is_available()) else 'cpu'
 
-    model = convert(onnx_path).eval().to(dev)
+    from .pgd import expand_search_box
+
+    model = convert_onnx_to_torch(onnx_path).eval().to(dev)
     lo = torch.tensor(np.asarray(spec.x_lo, np.float32).reshape(in_shape), device=dev)
     hi = torch.tensor(np.asarray(spec.x_hi, np.float32).reshape(in_shape), device=dev)
+    # SEARCH-ONLY widening: clamp/sample to a box up to sat_validate_atol outside the
+    # real one. The in-box assert below still uses spec.x_lo/x_hi (original), so a
+    # widened-edge witness stays within [x_lo-atol, x_hi+atol] and validates.
+    lo, hi = expand_search_box(lo, hi, settings)
     cen = (lo + hi) / 2
     half = (hi - lo) / 2
     free = int((half > 0).sum())

@@ -1406,6 +1406,22 @@ def default_settings(**overrides):
         # an explicit, configurable margin. Only widens the strict bound (never
         # produces a CE the scorer would reject), so it is safe to tune up.
         sat_strict_buffer=1e-9,
+        # SEARCH-ONLY input-box widening for counterexample search. Because the
+        # 2026 input tolerance accepts a witness up to `sat_validate_atol` OUTSIDE
+        # the box, every PGD/attack search can loosen each input bound by this much
+        # (each side) to find a CE sitting just outside the box that the scorer still
+        # accepts. Never touches the unsat proof (bounds/CROWN/BaB/LP/MILP keep the
+        # original box) nor the validation gate (original box ± sat_validate_atol).
+        # Must be <= sat_validate_atol (`expand_search_box` asserts it).
+        #
+        # DEFAULT 0.0 (OFF). Measured net-zero benefit (0 extra sats across
+        # smart_turn / ml4acopf / vggnet) AND it REGRESSES tiny-eps SAT cases: e.g.
+        # vggnet spec0 (eps~1e-5) flips sat->error because at expand == atol the PGD
+        # rides the tolerance boundary, float32 rounding puts the witness just past
+        # `hi+atol`, the gate rejects it as spurious, and the missed sat falls through
+        # to an unrelated crash. Opt in per-benchmark (--set) only where the box is
+        # large enough that a boundary CE is genuinely useful.
+        pgd_input_box_expand=0.0,
         skip_sat_validation=False,
         # (The old `keep_searching_within_tol` setting was removed: under the 2026
         # output-strict rule there is no within-output-tolerance sat to keep searching

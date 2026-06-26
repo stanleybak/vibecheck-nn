@@ -68,7 +68,7 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
     {'sat','timeout','unknown'} and witness is a list with the single input np.ndarray
     (None unless sat). The verdict is decided ONLY by the original model on ORT-CPU."""
     import torch
-    from onnx2torch import convert
+    from .surrogate_pgd import convert_onnx_to_torch
     from .io_util import ensure_decompressed
     from .vnnlib_loader import load_vnnlib
 
@@ -115,7 +115,7 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
             return g
 
     frac_box = [fracs[0]]                         # mutable; cycled over clip_fracs per restart
-    model = convert(onnx_path).eval().to(dev)
+    model = convert_onnx_to_torch(onnx_path).eval().to(dev)
 
     def _leaf(name):                             # last path component of an onnx2torch module name
         return name.rsplit('/', 1)[-1]
@@ -140,8 +140,11 @@ def sign_attack(onnx_path, vnnlib_path, settings, timeout, log=print):
         f'restarts={restarts} steps={steps} disjuncts={len(spec.disjuncts)} '
         f'{"per-disjunct" if per_disjunct else "general"}')
 
+    from .pgd import expand_search_box
     lo = torch.tensor(np.asarray(spec.x_lo, np.float32).reshape(in_shape), device=dev)
     hi = torch.tensor(np.asarray(spec.x_hi, np.float32).reshape(in_shape), device=dev)
+    # SEARCH-ONLY widening (see torch_attack); the in-box assert keeps spec.x_lo/x_hi.
+    lo, hi = expand_search_box(lo, hi, settings)
     cen = (lo + hi) / 2
     half = (hi - lo) / 2
     n_val = [0]

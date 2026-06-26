@@ -34,6 +34,7 @@ from .verify_zono_bnb import (
     _find_shared_gens_count,
 )
 from .zonotope import TorchZonotope, make_input_zonotope
+from .pgd import pgd_box_expand_amount
 from . import verify_gen_lp
 
 
@@ -4576,6 +4577,15 @@ def _forward_keep_pre_gpu(xl, xh, gg, device, dtype, override_tight=None,
         elif t == 'reshape':
             zono_state[name] = _get(op['inputs'][0])
         else:
+            # NOTE: the maxpool->relu lowering (mp2relu) emits a chain of
+            # specialised ops — `slice` (phase gather) then `sub_bilinear` (the
+            # nonlinear max relaxation) — that this DENSE keep-pre forward does not
+            # implement (full-image maxpool uses the patches forward in
+            # verify_zono_bnb instead). Raising here is the sound behaviour: a
+            # silent skip would propagate a stale pre-activation snapshot. This path
+            # is not reached in normal operation (sat cases resolve via PGD first;
+            # full-image cases use patches), so we keep the honest refusal rather
+            # than a half-ported maxpool that still breaks at `sub_bilinear`.
             raise NotImplementedError(
                 f'_forward_keep_pre_gpu: unsupported op {t!r} '
                 f'(name={name!r}). Silent skip would propagate stale zono.')
@@ -5232,25 +5242,33 @@ def _sat_disposition(graph, spec, settings, witness, info):
     return 'real'
 
 
-def _clamp_witness_to_box(witness, x_lo, x_hi):
-    """Clamp a counterexample witness into the input box `[x_lo, x_hi]` so it
-    stays inside even after the float32 cast ORT / the VNNCOMP scorer applies.
+def _clamp_witness_to_box(witness, x_lo, x_hi, slack=0.0):
+    """Clamp a counterexample witness into the input box `[x_lo, x_hi]` (widened
+    by `slack` on each side) so it stays inside even after the float32 cast ORT /
+    the VNNCOMP scorer applies.
 
     A box edge (e.g. `x >= 9.2`) is not generally representable in float32, so
     a witness sitting exactly on it can round to the *outside* of the box when
     cast (`float32(9.2) < 9.2`), failing the scorer's `x < lb - tol` test. Here
     we clamp into the box in float64, then pull any component whose float32 cast
     landed outside back toward the interior by one float32 ULP. The result is a
-    float64 array that is provably within `[x_lo, x_hi]` both as float64 and as
-    float32 (the coarser grid → also safe for float64-input models).
+    float64 array that is provably within `[x_lo-slack, x_hi+slack]` both as
+    float64 and as float32 (the coarser grid → also safe for float64 models).
+
+    `slack` (default 0.0) widens the clamp target to `[lo-slack, hi+slack]` for
+    the box-expansion path: a counterexample that the box-expanded PGD found just
+    OUTSIDE the box must be kept there (clamping it strictly to `[lo, hi]` would
+    re-evaluate the output at the boundary and lose the violation). With
+    `slack <= sat_validate_atol` the result is still within the scorer's
+    `[lo-atol, hi+atol]` acceptance region (scores CORRECT_WITH_TOLERANCE).
 
     Pure function: uses `np.nextafter`/`np.clip` only — it does NOT touch any FP
     rounding mode, so verification arithmetic elsewhere is unaffected (the clamp
     runs only at witness validation / output time).
     """
     w = np.asarray(witness, np.float64).flatten()
-    lo = np.asarray(x_lo, np.float64).flatten()
-    hi = np.asarray(x_hi, np.float64).flatten()
+    lo = np.asarray(x_lo, np.float64).flatten() - slack
+    hi = np.asarray(x_hi, np.float64).flatten() + slack
     w = np.minimum(np.maximum(w, lo), hi)            # into [lo, hi] in float64
     w32 = w.astype(np.float32)
     cast = w32.astype(np.float64)                    # value the scorer sees
@@ -5281,7 +5299,8 @@ def _ort_session_for(onnx_path):
     return sess
 
 
-def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-4):
+def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-4,
+                          emit_slack=0.0):
     """Unified ORT-CPU witness validator for EVERY path (graph + surrogate/attack).
 
     This is the single authoritative gate: load the ORIGINAL ONNX, replay the
@@ -5313,11 +5332,16 @@ def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-
     except ImportError:
         info['reason'] = 'onnxruntime not installed; skipping validation'
         return True, info
-    # Per-input box check (witness up to `atol` outside is allowed) + float32-safe
-    # clamp into the box (a box edge can round outside under the float32 cast ORT
-    # and the scorer apply; see `_clamp_witness_to_box`). Validate / emit the
-    # clamped in-box point, never the raw one.
-    inbox = []
+    # Per-input box check (witness up to `atol` outside is allowed). Validation +
+    # emission then run on the float32-safe CLAMPED point (a box edge can round
+    # outside under the float32 cast ORT/the scorer apply; see
+    # `_clamp_witness_to_box`), never the raw one. Try the STRICT in-box clamp
+    # first (scores CORRECT); only if that does NOT violate and `emit_slack` > 0 do
+    # we retry keeping the witness up to `emit_slack` OUTSIDE the box — the case
+    # where box-expanded PGD found a CE just outside (clamping it strictly in would
+    # re-evaluate the output at the boundary and lose the violation; the just-
+    # outside witness scores CORRECT_WITH_TOLERANCE, no penalty).
+    raw, boxes_lh = [], []
     for k, w in enumerate(witnesses):
         w = np.asarray(w, np.float64).ravel()
         box = boxes[k] if boxes is not None else None
@@ -5332,26 +5356,42 @@ def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-
                 info['reason'] = f'witness[{k}] outside input box (atol={atol})'
                 info['out_of_box'] = (float((lo - w).max()), float((w - hi).max()))
                 return False, info
-            w = _clamp_witness_to_box(w, lo, hi)
-        inbox.append(w)
+            box = (lo, hi)
+        raw.append(w)
+        boxes_lh.append(box)
+
+    def _eval_at(slack):
+        """Clamp each witness into [lo-slack, hi+slack], ORT-replay the ORIGINAL
+        model. Returns (violated, inbox, y, updates); violated is None on ORT
+        error (then updates carries the 'reason')."""
+        inbox = [(_clamp_witness_to_box(w, b[0], b[1], slack=slack)
+                  if b is not None else w)
+                 for w, b in zip(raw, boxes_lh)]
+        try:
+            sess = _ort_session_for(onnx_path)
+            feeds = {}
+            for k, im in enumerate(sess.get_inputs()):
+                shp = [d if isinstance(d, int) and d > 0 else 1 for d in im.shape]
+                feeds[im.name] = inbox[k].reshape(shp).astype(np.float32)
+            out = sess.run(None, feeds)[0]
+            y = np.asarray(out).flatten().astype(np.float64)
+        except (RuntimeError, OSError, ValueError, IndexError, KeyError) as e:
+            return None, inbox, None, {
+                'reason': f'ORT forward failed: {type(e).__name__}: {e}'}
+        violated, updates = output_violated(inbox, y)
+        return violated, inbox, y, updates
+
+    violated, inbox, y, updates = _eval_at(0.0)
+    if violated is False and float(emit_slack) > 0.0:
+        b_violated, b_inbox, b_y, b_updates = _eval_at(float(emit_slack))
+        if b_violated is True:                      # CE only holds just outside box
+            violated, inbox, y, updates = b_violated, b_inbox, b_y, b_updates
     info['witnesses_inbox'] = inbox
     info['witness_inbox'] = inbox[0] if len(inbox) == 1 else None
-    try:
-        sess = _ort_session_for(onnx_path)
-        model_inputs = sess.get_inputs()
-        feeds = {}
-        for k, im in enumerate(model_inputs):
-            shp = [d if isinstance(d, int) and d > 0 else 1 for d in im.shape]
-            feeds[im.name] = inbox[k].reshape(shp).astype(np.float32)
-        out = sess.run(None, feeds)[0]
-        y = np.asarray(out).flatten().astype(np.float64)
-    except (RuntimeError, OSError, ValueError, IndexError, KeyError) as e:
-        # ORT load/run failure (malformed onnx, missing op, shape mismatch):
-        # treat as a failed witness (reject) rather than a silent pass.
-        info['reason'] = f'ORT forward failed: {type(e).__name__}: {e}'
+    if violated is None:                            # ORT failure -> reject
+        info['reason'] = updates.get('reason', 'ORT forward failed')
         return False, info
     info['out'] = y
-    violated, updates = output_violated(inbox, y)
     if updates:
         info.update(updates)
     info['spec_check'] = 'unknown' if violated else 'verified'
@@ -5363,7 +5403,8 @@ def _validate_witness_ort(onnx_path, witnesses, boxes, output_violated, atol=1e-
     return False, info
 
 
-def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0):
+def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0,
+                          emit_slack=0.0):
     """Run a SAT witness through ONNXRuntime + check it actually violates
     the spec. Catches spurious counterexamples from PGD/MILP bugs OR from
     graph-builder bugs (vibecheck's internal forward might compute a
@@ -5410,7 +5451,7 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0):
         return (check_res == 'unknown'), upd
 
     return _validate_witness_ort(onnx_path, [w], [(spec.x_lo, spec.x_hi)],
-                                 _output_violated, atol)
+                                 _output_violated, atol, emit_slack=emit_slack)
 
 
 def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
@@ -6071,7 +6112,7 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             _onnx_path = getattr(graph, 'onnx_path', None)
             _ok, _info = _validate_sat_witness(
                 _onnx_path, spec, extra['witness'], atol=_atol,
-                out_atol=0.0)
+                out_atol=0.0, emit_slack=pgd_box_expand_amount(settings))
             if not _ok:
                 if print_progress:
                     print(f'  [validate] SPURIOUS SAT from {phase}: '
@@ -6176,7 +6217,8 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
         # Output tolerance FIXED at 0.0 (2026 rule) — not configurable.
         _onnx_path = getattr(graph, 'onnx_path', None)
         _ok, _info = _validate_sat_witness(_onnx_path, spec, witness,
-                                           atol=_atol, out_atol=0.0)
+                                           atol=_atol, out_atol=0.0,
+                                           emit_slack=pgd_box_expand_amount(settings))
         if _ok:
             if _sat_disposition(graph, spec, settings, witness,
                                 _info) == 'real':
@@ -9714,7 +9756,8 @@ def verify_graph(graph, spec, settings):
                 _w = _hres.get('witness')
                 if _onnx_p is not None and _w is not None:
                     _ok, _info = _validate_sat_witness(
-                        _onnx_p, spec, np.asarray(_w).flatten())
+                        _onnx_p, spec, np.asarray(_w).flatten(),
+                        emit_slack=pgd_box_expand_amount(settings))
                     if not _ok:
                         _hres['spurious_witness'] = _info
                         return 'unknown', _hres
@@ -9812,7 +9855,7 @@ def verify_graph(graph, spec, settings):
                        if 'sat_validate_atol' in settings else 1e-4)
         _ok, _info = _validate_sat_witness(
             getattr(graph, 'onnx_path', None), spec, details['witness'],
-            atol=_atol)
+            atol=_atol, emit_slack=pgd_box_expand_amount(settings))
         details['witness_validated_at_topvel'] = True
         if not _ok:
             if getattr(settings, 'print_progress', False):
@@ -9899,7 +9942,8 @@ def _nonlinear_nominal_cex_probe(graph, spec, settings, xl, xh):
                  if 'sat_validate_atol' in settings else 1e-4)
     for cand in (0.5 * (xl + xh), xl, xh):
         w = cand.detach().cpu().numpy().flatten()
-        ok, info = _validate_sat_witness(onnx_p, spec, w, atol=atol)
+        ok, info = _validate_sat_witness(onnx_p, spec, w, atol=atol,
+                                         emit_slack=pgd_box_expand_amount(settings))
         if ok and _sat_disposition(graph, spec, settings, w, info) == 'real':
             return 'sat', {'witness': w, 'phase': 'nonlinear_nominal_probe'}
     return None
@@ -10174,7 +10218,8 @@ def _verify_nonlinear_graph(graph, spec, settings, t_start, total_timeout):
                 or a witness ORT rejects."""
                 _w = np.asarray(_w).flatten()
                 _ok, _vinfo = _validate_sat_witness(_onnx_p, spec, _w,
-                                                    atol=_atol)
+                                                    atol=_atol,
+                                                    emit_slack=pgd_box_expand_amount(settings))
                 if _ok and _sat_disposition(
                         graph, spec, settings, _w, _vinfo) == 'real':
                     return 'sat', {'witness': _w}

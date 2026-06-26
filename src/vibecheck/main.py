@@ -10,6 +10,7 @@ import numpy as np
 from .network import ComputeGraph
 from .vnnlib_loader import load_vnnlib
 from .verify import zonotope_verify
+from .pgd import pgd_box_expand_amount
 
 _DTYPES = {'float32': np.float32, 'float64': np.float64,
            'f32': np.float32, 'f64': np.float64}
@@ -211,8 +212,14 @@ def main():
         # Don't clobber a counterexample we already wrote (early within-tol /
         # real-CE write) with 'error' on a late crash.
         if args.results_file and not sat_state['emitted']:
+            # Record the CAUSE on line 2, not just 'error': a sweep/harness that
+            # DEVNULLs stderr (e.g. sweep_runner.py) otherwise loses the traceback
+            # and leaves an undiagnosable 'error'. The verdict is still line 1, so
+            # readers that take only content[0] are unaffected.
+            _exc = sys.exc_info()[1]
             with open(args.results_file, 'w') as f:
                 f.write('error\n')
+                f.write(f'{type(_exc).__name__}: {str(_exc)[:500]}\n')
         sys.exit(2)
 
 
@@ -458,7 +465,8 @@ def _verify(args, sat_state=None):
             # config can never loosen it. Only the INPUT box gets `atol`.
             _ok_f, _vinfo_f = _validate_sat_witness(
                 getattr(graph, 'onnx_path', None), spec, _w_final,
-                atol=_atol_f, out_atol=0.0)
+                atol=_atol_f, out_atol=0.0,
+                emit_slack=pgd_box_expand_amount(settings))
             if not _ok_f:
                 print('  [validate] final SAT witness rejected by ORT '
                       f'({_vinfo_f.get("reason")}) — downgrading, not emitting SAT')
@@ -466,8 +474,9 @@ def _verify(args, sat_state=None):
                 _w_final = None
             else:
                 if _vinfo_f.get('witness_inbox') is not None:
-                    # Emit the float32-safe in-box witness (clamped strictly inside
-                    # the box) — not the raw one whose edge can round outside.
+                    # Emit the float32-safe clamped witness (strictly in-box, or up
+                    # to pgd_input_box_expand outside when the CE only holds there)
+                    # — not the raw one whose edge can round outside the scorer's box.
                     _w_final = _vinfo_f['witness_inbox']
                 if args.verbose:
                     _log_cex_values(_w_final, _vinfo_f.get('out'))
@@ -562,6 +571,7 @@ def _maybe_surrogate_attack(args, sat_state):
     # -> _validate_witness_ort) uses the same buffer/atol the search used.
     args._strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
     args._sat_atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    args._emit_slack = pgd_box_expand_amount(settings)
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Surrogate-attack mode: quantized ONNX -> PGD via float surrogate '
           f'(restarts={settings.surrogate_attack_restarts}, '
@@ -600,6 +610,7 @@ def _maybe_sign_attack(args, sat_state):
     # -> _validate_witness_ort) uses the same buffer/atol the search used.
     args._strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
     args._sat_atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    args._emit_slack = pgd_box_expand_amount(settings)
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Sign-BNN attack mode: STE-PGD on Sign surrogate '
           f'(restarts={settings.sign_attack_restarts}, steps={settings.sign_attack_steps}, '
@@ -634,6 +645,7 @@ def _maybe_torch_attack(args, sat_state):
     # -> _validate_witness_ort) uses the same buffer/atol the search used.
     args._strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
     args._sat_atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    args._emit_slack = pgd_box_expand_amount(settings)
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'Torch-attack mode: onnx2torch PGD '
           f'(restarts={settings.torch_attack_restarts}, steps={settings.torch_attack_steps}, '
@@ -668,6 +680,7 @@ def _maybe_cctsdb_yolo(args, sat_state):
     # -> _validate_witness_ort) uses the same buffer/atol the search used.
     args._strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
     args._sat_atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    args._emit_slack = pgd_box_expand_amount(settings)
     timeout = float(args.timeout if args.timeout else 100.0)
     print(f'cctsdb_yolo mode: discrete patch-position enumeration (timeout={timeout}s)')
     verdict, witness = cy.cctsdb_yolo_verify(
@@ -843,8 +856,9 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
                             for clause in _sspec.out_dnf)
                     return (m >= _buf), {'worst_margin': m}
 
-                _ok, _vinfo = _validate_witness_ort(args.net, _wits, _boxes,
-                                                    _violated, _atol)
+                _ok, _vinfo = _validate_witness_ort(
+                    args.net, _wits, _boxes, _violated, _atol,
+                    emit_slack=float(getattr(args, '_emit_slack', 0.0)))
             except (NotImplementedError, OSError, IndexError, ValueError,
                     AttributeError):
                 _ok, _vinfo = True, {}       # can't re-check -> don't block (rare)

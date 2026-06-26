@@ -206,6 +206,30 @@ def _gpu_witness_candidates(margins_per_disj):
     return overall_min <= 0.0
 
 
+def pgd_box_expand_amount(settings):
+    """Validated input-box widening (per side) for the CE SEARCH, from
+    `settings.pgd_input_box_expand` (default 0 if absent). Returns 0.0 when
+    disabled. Asserts the amount is <= `sat_validate_atol` so the search can
+    never produce a witness the validation gate / VNN-COMP scorer would reject
+    (a witness up to `sat_validate_atol` outside the box is still accepted)."""
+    b = float(getattr(settings, 'pgd_input_box_expand', 0.0) or 0.0)
+    if b <= 0.0:
+        return 0.0
+    atol = float(getattr(settings, 'sat_validate_atol', 1e-4))
+    assert b <= atol + 1e-12, (
+        f'pgd_input_box_expand ({b}) must be <= sat_validate_atol ({atol}); a '
+        'wider search would yield a counterexample the scorer rejects')
+    return b
+
+
+def expand_search_box(lo, hi, settings):
+    """Widen an input box `(lo, hi)` by `pgd_box_expand_amount(settings)` on every
+    side, for the CE SEARCH only. Works on torch tensors and numpy arrays (and
+    scalars). The PROOF and the validation gate keep the ORIGINAL `(lo, hi)`."""
+    b = pgd_box_expand_amount(settings)
+    return (lo, hi) if b == 0.0 else (lo - b, hi + b)
+
+
 def pgd_attack_general(xl, xh, spec, gg, settings,
                         restrict_disj=None, time_budget=None,
                         per_restart_disj=None, seed=None):
@@ -237,6 +261,10 @@ def pgd_attack_general(xl, xh, spec, gg, settings,
     """
     _freeze_weight_grads(gg)  # idempotent, cheap flag flip
 
+    # SEARCH-ONLY box widening: loosen the clamp/sample box so PGD can reach a CE
+    # up to `sat_validate_atol` outside the original box (still scorer-accepted).
+    # `spec` is untouched, so the witness screen / outer validation use the real box.
+    xl, xh = expand_search_box(xl, xh, settings)
     dev = xl.device
     dt = xl.dtype
     # Deterministic seeding (reproducible attacks for seed-0..9 tuning). Only the
@@ -524,6 +552,9 @@ def pgd_attack_from_init(x_init_batch, xl, xh, spec, gg, settings, *,
     Returns (is_sat: bool, witness: np.ndarray or None).
     """
     _freeze_weight_grads(gg)
+    # SEARCH-ONLY box widening (see pgd_attack_general). Widen before clamping the
+    # caller's init points so refinement can walk just outside the original box.
+    xl, xh = expand_search_box(xl, xh, settings)
     dev = xl.device; dt = xl.dtype
     lr_decay = float(getattr(settings, 'pgd_lr_decay', 0.99))
     hinge_thr = float(getattr(settings, 'pgd_hinge_threshold', -1e-5))

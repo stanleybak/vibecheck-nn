@@ -40,6 +40,31 @@ def _load_onnx_model(path):
     return onnx.load(path)
 
 
+def convert_onnx_to_torch(onnx_path):
+    """`onnx2torch.convert` with an opset upgrade so OLD-opset conv nets load.
+
+    Some models ship ops in versions onnx2torch has no converter for — e.g.
+    `vgg16-7.onnx` is opset 8 and its Flatten is version-1, which raises
+    `NotImplementedError(Flatten v1)`. Upgrading the model to opset 13 first
+    (`onnx.version_converter`) resolves these, and the resulting torch forward
+    matches ORT to float32 precision (verified max|Δ|≈1.7e-6 on vgg16). Returns
+    an nn.Module; the caller does `.eval().to(device)`.
+
+    Soundness note: the returned module is only a GRADIENT ORACLE for the attack
+    — every counterexample is re-validated on the ORIGINAL model via ORT-CPU (the
+    `_validate_witness_ort` chokepoint), so any conversion drift can only cost a
+    found CE, never produce a false `sat`.
+    """
+    from onnx import version_converter
+    from onnx2torch import convert
+    m = _load_onnx_model(onnx_path)
+    opset = max((oi.version for oi in m.opset_import
+                 if oi.domain in ('', 'ai.onnx')), default=0)
+    if 0 < opset < 13:
+        m = version_converter.convert_version(m, 13)
+    return convert(m)
+
+
 def _model_input_shapes(onnx_path):
     """Free-input (non-initializer) shapes of the ONNX, in graph order — the authoritative
     tensor shapes for feeding the model (the spec only carries a flat per-index box)."""
@@ -392,8 +417,15 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
 
     def to_t(a, shp):
         return torch.tensor(a.astype(np.float32).reshape(tuple(shp)), device=dev)
-    los = [to_t(lo, mshapes[k]) for k, (_, _, lo, _) in enumerate(spec.inputs)]
-    his = [to_t(hi, mshapes[k]) for k, (_, _, _, hi) in enumerate(spec.inputs)]
+    # SEARCH-ONLY input-box widening (see pgd.expand_search_box): loosen every
+    # per-input box by `pgd_input_box_expand` so center/corner/PGD candidates may
+    # sit up to sat_validate_atol outside the real box. The in-box assert in
+    # `ort_consider` keeps the ORIGINAL spec.inputs bounds, so widened-edge
+    # witnesses stay within +/-atol and validate.
+    from .pgd import pgd_box_expand_amount
+    _be = pgd_box_expand_amount(settings)
+    los = [to_t(lo, mshapes[k]) - _be for k, (_, _, lo, _) in enumerate(spec.inputs)]
+    his = [to_t(hi, mshapes[k]) + _be for k, (_, _, _, hi) in enumerate(spec.inputs)]
     cens = [(l + h) / 2 for l, h in zip(los, his)]
 
     def viol_loss(y):

@@ -32,13 +32,13 @@ from vibecheck.verify_zono_bnb import (
     _forward_zonotope_graph_batched, _spec_backward_graph_batched,
     _forward_batch_graph, _make_slopes,
 )
-from vibecheck.pgd import pgd_attack_general
+from vibecheck.pgd import pgd_attack_general, pgd_box_expand_amount
 from vibecheck.settings import default_settings
 
 
 def _simple_pgd(xl, xh, spec, gg, n_output, device, dtype,
                   n_restarts=10000, n_iter=50, lr=0.1, seed=0,
-                  min_restarts=64):
+                  min_restarts=64, box_expand=0.0):
     """Simple sign-gradient PGD over the input box. Multi-disjunct DNF:
     SAT iff ∃ disjunct d such that all its constraints' margins ≤ 0.
     Per-restart loss = min_d(max_c margin_dc); SAT if min ≤ 0.
@@ -49,7 +49,7 @@ def _simple_pgd(xl, xh, spec, gg, n_output, device, dtype,
     this halving we silently miss every imgSz64 SAT case.
 
     Returns (sat: bool, witness: np.ndarray or None)."""
-    xl0 = xl.flatten(); xh0 = xh.flatten()
+    xl0 = xl.flatten() - box_expand; xh0 = xh.flatten() + box_expand   # SEARCH-ONLY widen
     n_in = xl0.numel()
     Ws = []; bs = []
     for conj in spec.disjuncts:
@@ -101,7 +101,7 @@ def _simple_pgd(xl, xh, spec, gg, n_output, device, dtype,
 
 
 def _simple_pgd_batched(xl, xh, spec, gg, n_output, device, dtype,
-                          n_restarts=128, n_iter=50, lr=0.1, seed=0):
+                          n_restarts=128, n_iter=50, lr=0.1, seed=0, box_expand=0.0):
     """Sign-gradient PGD over MANY distinct input boxes at once.
 
     `xl`, `xh`: (B, n_in) — one box per leaf. Samples `n_restarts` points
@@ -114,6 +114,8 @@ def _simple_pgd_batched(xl, xh, spec, gg, n_output, device, dtype,
     Returns (sat: bool, witness: np.ndarray or None).
     """
     B, n_in = xl.shape
+    if box_expand:
+        xl = xl - box_expand; xh = xh + box_expand     # SEARCH-ONLY widen (per leaf)
     Ws = []; bs = []
     for conj in spec.disjuncts:
         n_c = len(conj.constraints)
@@ -361,7 +363,8 @@ def verify_hybrid(graph, spec, settings=None, timeout=120.0,
     if bool(getattr(settings, 'pgd_phase0_enabled', True)) and not _disable_sat:
         sat, witness = _simple_pgd(
             xl_root, xh_root, spec, gg, n_output, device, dtype,
-            n_restarts=10000, n_iter=50, lr=0.1)
+            n_restarts=10000, n_iter=50, lr=0.1,
+            box_expand=pgd_box_expand_amount(settings))
         if sat:
             return {'verdict': 'sat', 'time': time.perf_counter() - t_start,
                      'phase': 'root_pgd', 'witness': witness}
@@ -493,7 +496,8 @@ def verify_hybrid(graph, spec, settings=None, timeout=120.0,
                 xh_a = batch_entries[j_global][1][None, :]
                 sat, witness = _simple_pgd(
                     xl_a, xh_a, spec, gg, n_output, device, dtype,
-                    n_restarts=pgd_between_restarts, n_iter=pgd_between_iter)
+                    n_restarts=pgd_between_restarts, n_iter=pgd_between_iter,
+                    box_expand=pgd_box_expand_amount(settings))
                 if sat:
                     return {'verdict': 'sat',
                              'time': time.perf_counter() - t_start,
