@@ -28,6 +28,23 @@ def _require_input_file(path, label):
         sys.exit(1)
 
 
+def _require_net(net_field, spec_path):
+    """Validate `--net`: either a single onnx path, OR every onnx in a network-pair
+    list-string `[('f', a.onnx), ('g', b.onnx)]` (isomorphic/monotonic_acasxu). A
+    malformed list or any missing constituent exits cleanly (code 1)."""
+    from . import network_pair as npair
+    if not npair.is_network_pair_net_field(net_field):
+        _require_input_file(net_field, 'network (--net)')
+        return
+    try:
+        label_paths = npair.resolve_pair_paths(net_field, spec_path)
+    except ValueError as e:
+        print(f'Error: {e}', file=sys.stderr)
+        sys.exit(1)
+    for lbl, p in label_paths.items():
+        _require_input_file(p, f'network {lbl!r} (--net pair)')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='VibeCheck — Neural Network Verification via Zonotope Analysis')
@@ -113,7 +130,7 @@ def main():
 
     # Clean error for a missing --net (a path typo is the most common mistake).
     # The spec is checked later — the quantized prepare path doesn't use it.
-    _require_input_file(args.net, 'network (--net)')
+    _require_net(args.net, args.spec)
 
     if args.verbose:
         # Line-buffer stdout so per-phase progress flushes on every newline.
@@ -145,6 +162,10 @@ def main():
         # float (STE) + fake-quant surrogates here (the actual untimed prep) instead of a
         # cache that can't be used. Non-quantized: write the per-source pre-parse caches.
         from . import surrogate_pgd as sp
+        # Network-pair (--net is a list-string): do the untimed merge HERE so the cache
+        # is keyed on the merged onnx + v1 spec (the same deterministic artifacts the
+        # timed run rebuilds and loads). args.net/args.spec become real files below.
+        _maybe_network_pair(args)
         if sp.has_quantized_ops(args.net):
             p = _surrogate_path(args.net)
             sp.build_float_surrogate(args.net, p)
@@ -230,7 +251,7 @@ def _verify(args, sat_state=None):
         sat_state = {'emitted': False}
 
     # Clean error for missing input files (typo'd path) before any heavy work.
-    _require_input_file(args.net, 'network (--net)')
+    _require_net(args.net, args.spec)
     _require_input_file(args.spec, 'spec (--spec)')
 
     # Network-pair benchmarks (isomorphic_acasxu / monotonic_acasxu): `--net` is a

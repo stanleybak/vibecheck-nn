@@ -29,6 +29,7 @@ Self-contained (no vibecheck imports) so it can run in prepare_instance before t
 graph is built. The emitted Min/Max are rewritten to ReLU+affine at load time by
 onnx_optimizer.min_max_to_relu.
 """
+import ast
 import os
 import re
 import gzip
@@ -71,15 +72,65 @@ def _serialize(path):
     return _load_onnx(path).SerializeToString()
 
 
-def _onnx_paths_from_field(field):
-    """Extract the onnx paths from an instances.csv pair field
-    `[('f', a.onnx), ('g', b.onnx)]` (in order)."""
-    return re.findall(r"([^'\"\[\]() ,]+\.onnx)", field)
-
-
 def is_network_pair_net_field(net_field):
     """True if `--net` is a pair list-string rather than a single path."""
     return isinstance(net_field, str) and net_field.lstrip().startswith('[')
+
+
+def parse_network_field(net_field):
+    """Parse the `--net` argument. Returns `[(label, path), ...]` for a network-PAIR
+    list-string `[('f', a.onnx), ('g', b.onnx)]` (the form the competition harness
+    passes for isomorphic/monotonic_acasxu), or `None` for a single onnx path.
+
+    Uses `ast.literal_eval` (robust to the `/`, `.`, `_` etc. in real paths that a
+    regex split mishandled) and rejects a malformed list loudly rather than silently
+    dropping entries."""
+    if not is_network_pair_net_field(net_field):
+        return None
+    try:
+        nets = ast.literal_eval(net_field)
+    except (ValueError, SyntaxError) as e:
+        raise ValueError(f"--net is not a valid network list: {net_field!r} ({e})")
+    if not (isinstance(nets, list) and nets and all(
+            isinstance(t, (tuple, list)) and len(t) == 2
+            and isinstance(t[0], str) and isinstance(t[1], str) for t in nets)):
+        raise ValueError(
+            f"--net network list must be a non-empty list of (label, path) "
+            f"pairs, got: {nets!r}")
+    return [(str(lbl), str(path)) for lbl, path in nets]
+
+
+def _onnx_paths_from_field(field):
+    """Ordered onnx paths from a pair field (back-compat; prefer parse_network_field)."""
+    parsed = parse_network_field(field)
+    return [p for _, p in parsed] if parsed else []
+
+
+def declared_networks(vnnlib_text):
+    """Labels of every `(declare-network LABEL ...)` in the spec, in declaration
+    order (the first is the base the others relate to, e.g. f then g)."""
+    return re.findall(r'\(declare-network\s+(\w+)', vnnlib_text)
+
+
+def _resolve_onnx_path(p, base_dir):
+    """Resolve an onnx path that may be absolute, relative to the CWD (the harness
+    passes `./benchmarks/<cat>/2.0/onnx/x.onnx`), or relative to the benchmark
+    version dir (instances.csv passes `onnx/x.onnx`). Prefer the form that exists."""
+    if os.path.isabs(p):
+        return p
+    if os.path.exists(p) or os.path.exists(p + '.gz'):
+        return p                                   # CWD-relative (harness form)
+    return os.path.join(base_dir, p)               # version-dir-relative (csv form)
+
+
+def resolve_pair_paths(net_field, vnnlib_path, base_dir=None):
+    """`{label: resolved_onnx_path}` for a pair `--net`, or None for a single net.
+    Same base-dir convention as `build_merged_instance`."""
+    parsed = parse_network_field(net_field)
+    if parsed is None:
+        return None
+    base_dir = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(vnnlib_path)))
+    return {lbl: _resolve_onnx_path(p, base_dir) for lbl, p in parsed}
 
 
 def detect_kind(vnnlib_text):
@@ -352,14 +403,20 @@ def build_merged_instance(net_field, vnnlib_path, base_dir=None, run_oracle=True
     relative to base_dir). vnnlib_path: the v2 pair spec. Raises if the spec isn't a
     recognized pair or if the onnx-merge oracle exceeds ORACLE_TOL.
     """
-    rels = _onnx_paths_from_field(net_field)
-    assert rels, f"no onnx paths in net field: {net_field!r}"
-    base_dir = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(vnnlib_path)))
-    paths = [p if os.path.isabs(p) else os.path.join(base_dir, p) for p in rels]
     text = _read_vnnlib_text(vnnlib_path)
     assert detect_kind(text), f"spec is not a network-pair (no isomorphic-to/equal-to): {vnnlib_path}"
-    # f is paths[0]; g is paths[1] if a distinct net (isomorphic), else f (equal-to).
-    nf = paths[0]; ng = paths[1] if len(paths) > 1 else paths[0]
+    label_paths = resolve_pair_paths(net_field, vnnlib_path, base_dir)
+    assert label_paths, f"--net is not a network-pair list: {net_field!r}"
+    # MATCH BY NAME: the spec declares networks (f, g); pick each subnet's onnx by
+    # its label, not by list position. f = the base (first declared); g = the second
+    # (or f itself for an `equal-to` spec that reuses one net).
+    decl = declared_networks(text)
+    assert decl, f"spec declares no networks: {vnnlib_path}"
+    missing = [lbl for lbl in decl if lbl not in label_paths]
+    assert not missing, (f"--net provides networks {sorted(label_paths)} but the spec "
+                         f"declares {decl} (missing {missing}): {net_field!r}")
+    nf = label_paths[decl[0]]
+    ng = label_paths[decl[1]] if len(decl) > 1 else nf
     out_onnx, out_vnnlib = _cache_paths(net_field, vnnlib_path)
     ir = parse_multinet(text)
     out_dim = merge(nf, ng, ir, out_onnx)

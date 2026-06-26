@@ -203,3 +203,81 @@ def test_build_rejects_non_pair(tmp_path):
     _tiny_acasxu(f); open(spec, 'w').write('(assert (<= X_0 1))\n')
     with pytest.raises(AssertionError):
         npair.build_merged_instance(f"[('f', '{f}')]", spec)
+
+
+# --------------------------------------------------------------------------- #
+# --net argument parsing: single path vs network-pair list-string (the harness
+# form), ast-based, label-matched, CWD/version-dir tolerant resolution.
+# --------------------------------------------------------------------------- #
+
+def test_parse_network_field_single_is_none():
+    assert npair.parse_network_field('onnx/a.onnx') is None
+    assert npair.parse_network_field('/abs/a.onnx') is None
+
+
+def test_parse_network_field_pair_ast():
+    p = npair.parse_network_field("[('f', 'a.onnx'), ('g', 'b.onnx')]")
+    assert p == [('f', 'a.onnx'), ('g', 'b.onnx')]
+    # robust to real paths with / . _ and a perturbed-N suffix (the harness form)
+    real = ("[('f', './benchmarks/iso/2.0/onnx/original/ACASXU_2_9.onnx'), "
+            "('g', './benchmarks/iso/2.0/onnx/perturbed/ACASXU_2_9_perturbed_15.onnx')]")
+    p2 = npair.parse_network_field(real)
+    assert p2[0][0] == 'f' and p2[1][0] == 'g'
+    assert p2[1][1].endswith('perturbed_15.onnx')
+    # back-compat helper still returns the ordered paths
+    assert npair._onnx_paths_from_field("[('f', 'a.onnx'), ('g', 'b.onnx')]") == ['a.onnx', 'b.onnx']
+
+
+@pytest.mark.parametrize('bad', [
+    "[('f',)]", "[('f', 'a', 'x')]", "[]", "[('f', 5)]", "['a.onnx']", "[oops"])
+def test_parse_network_field_malformed_raises(bad):
+    with pytest.raises(ValueError):
+        npair.parse_network_field(bad)
+
+
+def test_declared_networks():
+    txt = ('(declare-network f (declare-input X_f real [5]))\n'
+           '(declare-network g (equal-to f))')
+    assert npair.declared_networks(txt) == ['f', 'g']
+
+
+def test_resolve_onnx_path_cwd_vs_basedir(tmp_path):
+    assert npair._resolve_onnx_path('/abs/x.onnx', '/base') == '/abs/x.onnx'   # absolute
+    f = tmp_path / 'x.onnx'; f.write_text('x')
+    here = os.getcwd()
+    try:                                                # CWD-relative + EXISTS -> as-is
+        os.chdir(tmp_path)
+        assert npair._resolve_onnx_path('x.onnx', '/unused/base') == 'x.onnx'
+    finally:
+        os.chdir(here)
+    # relative + not at CWD -> joined to the benchmark version dir (instances.csv form)
+    assert npair._resolve_onnx_path('onnx/x.onnx', '/b/2.0') == os.path.join('/b/2.0', 'onnx/x.onnx')
+
+
+def test_resolve_pair_paths(tmp_path):
+    vdir = tmp_path / '2.0' / 'vnnlib'; vdir.mkdir(parents=True)
+    spec = str(vdir / 's.vnnlib'); open(spec, 'w').write('x')
+    m = npair.resolve_pair_paths("[('f', 'onnx/f.onnx'), ('g', 'onnx/g.onnx')]", spec)
+    base = str(tmp_path / '2.0')
+    assert m == {'f': os.path.join(base, 'onnx/f.onnx'),
+                 'g': os.path.join(base, 'onnx/g.onnx')}
+    assert npair.resolve_pair_paths('single.onnx', spec) is None
+
+
+def test_build_matches_by_name_not_position(tmp_path):
+    """The list-string can come in any order; networks are matched to the spec's
+    declared (f, g) BY LABEL, not by position — reversed order merges identically."""
+    f = str(tmp_path / 'f.onnx'); g = str(tmp_path / 'g.onnx'); spec = str(tmp_path / 's.vnnlib')
+    _tiny_acasxu(f, seed=1); _tiny_acasxu(g, seed=2); _iso_spec(spec)
+    mo_rev, _ = npair.build_merged_instance(f"[('g', '{g}'), ('f', '{f}')]", spec)   # g first
+    mo_fwd, _ = npair.build_merged_instance(f"[('f', '{f}'), ('g', '{g}')]", spec)
+    sm_rev = ort.InferenceSession(mo_rev); sm_fwd = ort.InferenceSession(mo_fwd)
+    x = np.random.default_rng(0).random((1, 5)).astype(np.float32) * 2 - 1
+    assert np.abs(sm_rev.run(None, {'X': x})[0] - sm_fwd.run(None, {'X': x})[0]).max() < 1e-5
+
+
+def test_build_missing_declared_network_raises(tmp_path):
+    f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
+    _tiny_acasxu(f, seed=1); _iso_spec(spec)            # iso declares BOTH f and g
+    with pytest.raises(AssertionError):                # list provides only f -> g missing
+        npair.build_merged_instance(f"[('f', '{f}')]", spec)

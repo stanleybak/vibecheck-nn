@@ -34,8 +34,8 @@ export OPENBLAS_NUM_THREADS=1
 
 # 1. Kill stale vibecheck verifier processes from a previous (possibly killed)
 #    instance, then VERIFY they are actually gone before proceeding. A SIGKILL'd
-#    GPU process can take several seconds to release its CUDA context (a busy
-#    run_instance that got sat-committed / deadline-killed lingers a moment), and
+#    GPU process can take several seconds to release its CUDA context (a
+#    run_instance that was deadline-killed lingers a moment), and
 #    if it is still holding GPU memory when this instance starts it can OOM the
 #    timed run. prepare is UNTIMED, so we poll-and-wait (up to ~30s), escalating
 #    to SIGKILL, rather than a single fire-and-forget pkill + sleep. NARROW match
@@ -128,25 +128,10 @@ case "$VNNLIB_FILE" in *.gz) echo "Note: vnnlib is gzipped (.gz); decompressed a
 echo "Preparing cache (--prepare-pkl-unsafe)..."
 "$PY" -m vibecheck.main --net "$ONNX_FILE" --spec "$VNNLIB_FILE" --prepare-pkl-unsafe $PREP_DEBUG \
 	|| echo "WARNING: prepare-pkl failed; timed run will parse / fold normally"
-
-# 4. Warmup: a short real run (5s) to trigger torch.compile / CUDA kernel
-#    compilation for this graph so the timed run doesn't pay first-call JIT.
-#    Result is discarded.
-echo "Warmup (5s)..."
-CONFIG_ARG=""
-CFG="$TOOL_DIR/configs/${CATEGORY}.yaml"
-[ -f "$CFG" ] && CONFIG_ARG="--config $CFG"
-TMP_RES=$(mktemp)
-timeout -k 5 60 "$PY" -m vibecheck.main \
-	--net "$ONNX_FILE" --spec "$VNNLIB_FILE" --timeout 5 \
-	$CONFIG_ARG --allow-unsafe-pkl-loading --results-file "$TMP_RES" \
-	>/dev/null 2>&1 || true
-rm -f "$TMP_RES"
-echo "Warmup done."
-
-# Clean up the warmup verifier (narrow; see note above).
-pkill -f 'vibecheck\.main' 2>/dev/null || true
-sleep 1
+# (No CUDA/torch.compile "warmup" run: the two torch.compile sites — patches_crown's
+# retighten core and the dual-ascent BaB kernel — are reached only deep in a verify,
+# never within a few-second warmup, and CUDA-context / cuDNN-algo state is per-process
+# so a separate warmup process gives the timed run no carryover.)
 
 ELAPSED=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $T_START}")
 echo "================================================================"
