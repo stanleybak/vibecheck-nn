@@ -49,22 +49,26 @@ ORACLE_TOL = 1e-3      # max |merged - reference| allowed before we refuse the m
 # --------------------------------------------------------------------------- io
 
 def _load_onnx(path):
-    """Load an onnx model, preferring the .gz (git-authoritative; the loose sibling
-    may be a stale leftover — the 2.0/ stale-.gz trap)."""
+    """Load an onnx model from the EXACT path given; the `.gz` sibling is only a
+    fallback when the exact path doesn't exist. (The caller is handed a concrete
+    path by the harness/instances.csv — that file is authoritative; reaching for a
+    `.gz` first read a stale sibling and merged the wrong network.)"""
+    if os.path.exists(path):
+        return onnx.load(path)
     if os.path.exists(path + '.gz'):
         with gzip.open(path + '.gz') as fh:
             return onnx.load_model_from_string(fh.read())
-    if os.path.exists(path):
-        return onnx.load(path)
     raise FileNotFoundError(path)
 
 
 def _read_vnnlib_text(path):
+    """Read the spec from the EXACT path given; `.gz` is only a fallback when the
+    exact path doesn't exist (same rationale as `_load_onnx`)."""
+    if os.path.exists(path):
+        return open(path).read()
     if os.path.exists(path + '.gz'):
         with gzip.open(path + '.gz', 'rt') as fh:
             return fh.read()
-    if os.path.exists(path):
-        return open(path).read()
     raise FileNotFoundError(path)
 
 
@@ -186,6 +190,15 @@ def parse_multinet(text):
       atoms      [{'lhs':{('f',i):coef,('g',i):coef}, 'op':'>='|'<=', 'rhs':float}]
       dnf        'or' | 'and'   how atoms combine
     """
+    # Normalize multi-dim batch-indexed refs to the flat `X_f[i]` form every regex
+    # below expects. The 2026 benchmarks were updated to VNN-LIB 2.0 shaped refs —
+    # 4-D inputs `X_f[0,0,0,i]` (shape [1,1,1,5]) and 2-D outputs `Y_g[0,i]` (shape
+    # [1,5]). Every leading dim is size 1 (index 0), so the flat index is the LAST
+    # comma-separated component; take it. Plain 1-D refs `X_f[i]` are left untouched,
+    # so both spec versions parse. (Does not touch `declare-input X_f real [..]` —
+    # that has a space before `[`, so the `X_f[` pattern doesn't match it.)
+    text = re.sub(r'([XY]_[fg])\[([\d\s,]+)\]',
+                  lambda m: f"{m.group(1)}[{m.group(2).split(',')[-1].strip()}]", text)
     n = max(int(i) for i in re.findall(r'X_[fg]\[(\d+)\]', text)) + 1
     f_lo = [None] * n; f_hi = [None] * n
     # f input box: (<= X_f[i] HI) ... (>= X_f[i] LO)
