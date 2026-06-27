@@ -245,6 +245,28 @@ def _cache_paths(net_path, vnnlib_path):
             os.path.join(d, f'vibecheck_nlaug_{h}.vnnlib'))
 
 
+def _tighten_xbox(prop, xbox, n_in):
+    """Contract the emitted input box with the nonlinear input constraints
+    (input_feasibility.tighten_input_box) so the verifier propagates over a
+    smaller box. SOUND: the contracted box still contains the true input region
+    (the nonlinear atoms remain enforced exactly in the spec, so the verdict is
+    unchanged — only the bounds tighten). A tiny inflation, clamped to the
+    declared box, absorbs any float rounding in the root solve so a near-boundary
+    counterexample is never cut. No-op if nothing tightens / region is empty (the
+    empty case is handled upstream by main._maybe_empty_input)."""
+    from .input_feasibility import tighten_input_box
+    init = [list(xbox.get(i, [-1e6, 1e6])) for i in range(n_in)]
+    tb = tighten_input_box(prop, n_in=n_in, init_box=init)
+    if tb is None or len(tb) < n_in:    # empty (handled upstream) or indeterminate
+        return xbox
+    INFL = 1e-6
+    out = dict(xbox)
+    for i in range(n_in):
+        dlo, dhi = init[i]
+        out[i] = [max(dlo, tb[i][0] - INFL), min(dhi, tb[i][1] + INFL)]
+    return out
+
+
 def build_augmented_instance(net_path, vnnlib_path, run_oracle=True):
     """Convert a nonlinear-v2 instance to (aug_onnx_path, aug_v1_spec_path).
     Raises if the oracle (augmented output vs the true polynomial) exceeds 5e-3."""
@@ -253,6 +275,7 @@ def build_augmented_instance(net_path, vnnlib_path, run_oracle=True):
     prop = parse_vnnlib_v2(text)
     out_onnx, out_vnnlib = _cache_paths(net_path, vnnlib_path)
     feats, cons, clauses, xbox, n_in, in_shape = augment(net_path, prop, out_onnx)
+    xbox = _tighten_xbox(prop, xbox, n_in)
     emit_v1(cons, clauses, xbox, n_in, out_vnnlib)
     if run_oracle:
         w = oracle(net_path, out_onnx, feats, cons, xbox, n_in, in_shape)

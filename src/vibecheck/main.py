@@ -260,6 +260,15 @@ def _verify(args, sat_state=None):
     # graph load. See network_pair.py (the merge is exact + onnxruntime-oracle-gated).
     _maybe_network_pair(args)
 
+    # Empty-input check (nonlinear specs, e.g. adaptive_cruise_control): if the
+    # input constraints are jointly infeasible the input region is EMPTY, the
+    # property is vacuously true, and the verdict is `unsat` with no verification.
+    # Sound + milliseconds; runs on the ORIGINAL v2 spec BEFORE the augment. See
+    # input_feasibility.py.
+    _empty = _maybe_empty_input(args)
+    if _empty is not None:
+        sys.exit(_empty)
+
     # Nonlinear v2 specs (adaptive_cruise_control): transpile to an augmented
     # ONNX + linear v1 spec up front, then verify normally. Must run BEFORE the
     # graph load. See nonlinear_augment.py (transpile is ORT-oracle-gated).
@@ -530,6 +539,38 @@ def _maybe_network_pair(args):
           f'pair -> {merged_onnx}')
     args.net = merged_onnx
     args.spec = merged_spec
+
+
+def _maybe_empty_input(args):
+    """If `--spec` is a nonlinear v2 spec whose input constraints are jointly
+    INFEASIBLE (empty input region), emit `unsat` (vacuously true) and return a
+    process exit code 0. Otherwise return None to fall through to verification.
+
+    Sound: `input_feasibility.empty_input_region` never reports a non-empty
+    region as empty, so this can only ever produce a CORRECT `unsat`. Runs on the
+    ORIGINAL v2 spec, before the augment rewrites args.spec. Same best-effort
+    pre-read as `_maybe_nonlinear_augment` (a truly-bad spec still raises loudly
+    at the verification load)."""
+    from . import nonlinear_augment as nla
+    from . import input_feasibility as inf
+    from .vnnlib_loader import parse_vnnlib_v2
+    try:
+        text = nla._read_vnnlib_text(args.spec)
+    except (OSError, ValueError):
+        return None
+    if not nla.is_nonlinear_v2_spec(text):
+        return None
+    if not inf.empty_input_region(parse_vnnlib_v2(text)):
+        return None
+    print('Empty input region (input constraints jointly infeasible): '
+          'property vacuously holds -> unsat')
+    if args.results_file:
+        tmp = f'{args.results_file}.tmp'
+        with open(tmp, 'w') as f:
+            f.write('unsat\n')
+        os.replace(tmp, args.results_file)
+    print('\nResult: unsat')
+    return 0
 
 
 def _maybe_nonlinear_augment(args):
