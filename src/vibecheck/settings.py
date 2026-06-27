@@ -1112,6 +1112,16 @@ def default_settings(**overrides):
         # staleness <= K keeps the search near the full-rederivation
         # trajectory and bounds search-vs-cert drift. 0 = never.
         attn_joint_freeze_refresh=8,
+        # SPARSE intermediate refinement (ABC's sparse_interm idea): when >0,
+        # each attention target is re-derived differentiably on only its K
+        # WIDEST rows (frozen enclosure for the rest), so EVERY node gets
+        # node-level alpha within memory instead of the per-row walk capping
+        # coverage to ~2/27 nodes. 0 = off (per-row path, the default).
+        attn_joint_sparse_rows=0,
+        # per-start-node alphas (each target its own alpha set) — pairs with
+        # sparse_rows to give all nodes independent node-level alpha (ABC's
+        # share_alphas covers all nodes). Default False (shared spec set).
+        attn_joint_per_start_alpha=False,
         # joint-alpha optimization schedule (ABC: lr 0.5 decay ~0.98,
         # ~50 iterations REQUIRED on the pgd family per ablation)
         attn_joint_iters=60,
@@ -1126,6 +1136,19 @@ def default_settings(**overrides):
         # split candidates per domain (one batched eval), pick
         # max(min(children)) — FSB. 1 = plain heuristic pick.
         attn_bab_kfsb=4,
+        # Per-domain backward-sensitivity (|lA|) branching weight in the attn
+        # BaB (ABC's BaBSR): one batched no-beta walk per round gives each
+        # domain its own spec-sensitivity at every relu, replacing the STATIC
+        # root ew_w (which under-ranks neurons critical in sub-domains). Cheap
+        # (~1/12 of a bound_batch). Branching-only -> soundness-irrelevant.
+        attn_bab_perdom_ew=False,
+        # HOT-SET warmup branching: first N rounds use a wide FSB (attn_bab_hot_kfsb)
+        # to discover the high-value split neurons, then restrict to that set at the
+        # cheap attn_bab_kfsb. Combines wide-FSB accuracy with restricted-set speed
+        # (the forced-neuron experiment showed kfsb=4 closes fast on the right set).
+        # 0 = off. Branching-only -> soundness-irrelevant.
+        attn_bab_hot_warmup=0,
+        attn_bab_hot_kfsb=16,
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         # Phase 8 minimum-budget floor as fraction of total_timeout. The
         # pipeline rebudgets so Phase 8 always gets at least this fraction

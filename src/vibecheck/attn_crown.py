@@ -50,6 +50,7 @@ alpha-CROWN argument.
 `attn_crown_lb` evaluates the bound (differentiable); `attn_crown_alpha`
 runs the optimization for one query and returns (best_lb, params).
 """
+import os
 import time
 from functools import partial
 
@@ -432,7 +433,7 @@ def _apply_beta_b(acc, ew_in, cl, ch, bt, dtype):
 
 def attn_crown_lb_batch(gg, xl, xh, sb_b, op_bounds_b, w_q, b_q, params_b,
                         op_clamps_b=None, relu_clamps_b=None,
-                        start_name=None, ew0=None):
+                        start_name=None, ew0=None, return_ew=False):
     """Batched attn_crown_lb over B domains; returns lb (B,).
 
     sb_b: {L: (lo (B,n), hi (B,n))}; op_bounds_b mirrors op_bounds with a
@@ -477,6 +478,7 @@ def attn_crown_lb_batch(gg, xl, xh, sb_b, op_bounds_b, w_q, b_q, params_b,
             ew_at = {ops[-1]['name']:
                      w_t.unsqueeze(0).expand(B, -1).clone()}
     acc = torch.zeros(B, device=device, dtype=dtype) + float(b_q)
+    ew_relu = {} if return_ew else None
 
     def _push(inp, ew_b):
         ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_b)) + ew_b
@@ -502,6 +504,10 @@ def attn_crown_lb_batch(gg, xl, xh, sb_b, op_bounds_b, w_q, b_q, params_b,
             _push(op['inputs'][0], ew_b)
         elif t == 'relu':
             L = op.get('layer_idx')
+            if ew_relu is not None:
+                # per-domain backward sensitivity at this relu's output
+                # (|lA|) — the BaBSR weight, replacing the static root ew_w.
+                ew_relu[L] = ew.detach().abs()
             lo_t, hi_t = sb_b[L]
             lo_t = lo_t.to(dtype); hi_t = hi_t.to(dtype)
             ub_r = hi_t.clamp(min=0)
@@ -667,13 +673,16 @@ def attn_crown_lb_batch(gg, xl, xh, sb_b, op_bounds_b, w_q, b_q, params_b,
         raise NotImplementedError('attn_crown batch: no ew reached input')
     lb = acc + ew_inp.clamp(min=0) @ xl.to(dtype) \
         + ew_inp.clamp(max=0) @ xh.to(dtype)
+    if return_ew:
+        return lb, ew_relu
     return lb
 
 
 def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
                   time_left, ew_w=None, batch=16, n_iters=12, lr=0.1,
                   max_domains=200000, print_progress=False,
-                  gg_work=None, work_dtype=None, kfsb_k=4):
+                  gg_work=None, work_dtype=None, kfsb_k=4, perdom_ew=True,
+                  hot_warmup=0, hot_kfsb=16):
     """Batched no-reforward beta-CROWN BaB on ONE open query.
 
     Returns (ok, n_domains, reason). The ABC vit recipe: each domain's
@@ -706,6 +715,16 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
     xl_w = xl.to(wdt); xh_w = xh.to(wdt)
     w_w = w_t.to(wdt)
     exp_names = [op['name'] for op in gg['ops'] if op['type'] == 'exp']
+    # DIAGNOSTIC: restrict BaB relu candidates to an external (block,neuron) set
+    # (e.g. ABC's chosen splits) to isolate branching-scoring vs bounding.
+    _force_set = None
+    _fp = os.environ.get('VC_FORCE_NEURONS')
+    if _fp:
+        _force_set = set()
+        for _ln in open(_fp):
+            _p = _ln.split()
+            if len(_p) == 2:
+                _force_set.add((int(_p[0]), int(_p[1])))
     sb_root = {L: (lo.detach(), hi.detach()) for L, (lo, hi) in sb0.items()}
     base_params = {k: v.detach() for k, v in (root_params or {}).items()}
 
@@ -787,6 +806,49 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
             hi2[j] = max(float(hi2[j]), float(lo2[j]))
         return lo2, hi2
 
+    def batch_dom_ew(clamps_list):
+        """Per-domain backward sensitivity |lA| at each relu layer for a batch
+        of domains, via ONE no-beta backward walk (root alpha, the domain's
+        tightened relu/exp bounds). Returns {L: (B, n)} or None. This is the
+        BaBSR weight ABC uses (per-domain), replacing the static root ew_w —
+        the relaxation planes reflect each domain's clamps via dom_sb, so the
+        sensitivity is domain-specific. Soundness-irrelevant (branching only)."""
+        B = len(clamps_list)
+        if B == 0:
+            return None
+        sb_b = {}
+        for L in sb_root:
+            los = []; his = []
+            for clamps in clamps_list:
+                lo_d, hi_d = dom_sb(clamps)[L]
+                los.append(lo_d); his.append(hi_d)
+            sb_b[L] = (torch.stack(los).to(wdt), torch.stack(his).to(wdt))
+        ob_b = {}
+        for nm, v in ob0.items():
+            if isinstance(v[0], tuple):
+                (xlb, xhb), (ylb, yhb) = v
+                ob_b[nm] = (
+                    (xlb.unsqueeze(0).expand(B, -1).to(wdt),
+                     xhb.unsqueeze(0).expand(B, -1).to(wdt)),
+                    (ylb.unsqueeze(0).expand(B, -1).to(wdt),
+                     yhb.unsqueeze(0).expand(B, -1).to(wdt)))
+            elif nm in exp_names:
+                los = []; his = []
+                for clamps in clamps_list:
+                    lo_d, hi_d = dom_exp_bounds(clamps, nm)
+                    los.append(lo_d); his.append(hi_d)
+                ob_b[nm] = (torch.stack(los).to(wdt), torch.stack(his).to(wdt))
+            else:
+                ob_b[nm] = (v[0].unsqueeze(0).expand(B, -1).to(wdt),
+                            v[1].unsqueeze(0).expand(B, -1).to(wdt))
+        pb = {k: v.unsqueeze(0).expand(B, *v.shape).to(wdt)
+              for k, v in base_params.items() if k[0] not in ('beta', 'rbeta')}
+        with torch.no_grad():
+            _lb, ew_relu = attn_crown_lb_batch(
+                wgg, xl_w, xh_w, sb_b, ob_b, w_w, float(b_q), pb,
+                return_ew=True)
+        return ew_relu
+
     def pick_split(clamps):
         best = None; best_score = -1.0
         sb_d = dom_sb(clamps)
@@ -825,11 +887,15 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
                 best = ('exp', nm, j, float(lo[j]), float(hi[j]))
         return best
 
-    def pick_candidates(clamps, kk):
+    def pick_candidates(clamps, kk, dom_ew=None, allow=None):
         """Top-kk relu split candidates by the BaBSR-style heuristic
         (global across layers); exp-input fallback when no unstable
         relu remains. Returns a list of split descriptors (possibly
-        length < kk), or [] when nothing is splittable."""
+        length < kk), or [] when nothing is splittable.
+
+        dom_ew: optional {L: (n,)} per-domain backward sensitivity |lA|
+        (from batch_dom_ew) — the BaBSR weight ABC uses. Falls back to the
+        static root ew_w when not provided."""
         cands = []
         sb_d = dom_sb(clamps)
         for L, (lo, hi) in sb_d.items():
@@ -837,16 +903,28 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
             if not bool(uns.any()):
                 continue
             score = torch.minimum(-lo, hi) * uns
-            if ew_w is not None and L in ew_w \
-                    and ew_w[L].numel() == score.numel():
-                score = score * (ew_w[L] + 1e-12)
+            _w = (dom_ew.get(L) if dom_ew is not None else None)
+            if _w is None and ew_w is not None and L in ew_w:
+                _w = ew_w[L]
+            if _w is not None and _w.numel() == score.numel():
+                score = score * (_w.to(score.dtype) + 1e-12)
             for (L2, j2) in clamps:
                 if L2 == L:
                     score[j2] = -1.0
+            _allow = _force_set if _force_set is not None else allow
+            if _allow is not None:
+                mask = torch.zeros_like(score, dtype=torch.bool)
+                for (fb, fn) in _allow:
+                    if fb == L and fn < score.numel():
+                        mask[fn] = True
+                score = torch.where(mask, score,
+                                    torch.full_like(score, -1.0))
             kk_l = min(kk, score.numel())
             v, idx = torch.topk(score, kk_l)
             for s_, j_ in zip(v.tolist(), idx.tolist()):
                 if s_ > 0 and (L, int(j_)) not in clamps:
+                    if _allow is not None and (L, int(j_)) not in _allow:
+                        continue
                     cands.append((s_, ('relu', L, int(j_))))
         if cands:
             cands.sort(key=lambda t: -t[0])
@@ -1017,23 +1095,45 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
     if not pick_candidates({}, 1):
         return False, 1, 'no_split'
     heapq.heappush(heap, (-0.0, cnt, {}, None))
+    # HOT-SET warmup: the first `hot_warmup` rounds use a WIDE FSB (hot_kfsb) to
+    # DISCOVER the high-value split neurons (FSB ranks by actual child-bound
+    # improvement); after warmup, restrict candidates to that discovered set at
+    # the cheap kfsb_k (the forced-neuron-set experiment showed kfsb=4 closes
+    # fast once the candidate set is right). Combines wide-FSB accuracy (brief)
+    # with restricted-set speed. Branching-only -> soundness-irrelevant.
+    _hot = set(); _round = 0
+    _prof = os.environ.get('VC_BAB_PROF')
+    _t_fsb = _t_bnd = _t_ew = 0.0
     while heap:
         if time_left() <= 2.0:
             return False, n_domains, 'time'
         if n_domains >= max_domains:
             return False, n_domains, 'cap'
+        _round += 1
+        _in_warmup = bool(hot_warmup) and _round <= hot_warmup
+        _kk = hot_kfsb if _in_warmup else kfsb_k
+        _allow = (_hot if (hot_warmup and not _in_warmup and _hot) else None)
         # pop up to batch//2 worst domains; kfsb-pick each one's split
         popped = []
         while heap and (len(popped) + 1) * 2 <= batch:
             lb_p, _, clamps, wp = heapq.heappop(heap)
             popped.append((clamps, wp))
         cand_lists = []
-        for clamps, wp in popped:
-            cands = pick_candidates(clamps, kfsb_k)
+        # per-domain backward sensitivity for this round's popped domains
+        # (one batched no-beta walk); the BaBSR weight (ABC-style), replacing
+        # the static root ew_w. Gated by attn_bab_perdom_ew (default on).
+        _te = time.perf_counter()
+        _dom_ews = (batch_dom_ew([c for c, _ in popped])
+                    if perdom_ew else None)
+        _t_ew += time.perf_counter() - _te
+        for _di, (clamps, wp) in enumerate(popped):
+            _dew = ({L: _dom_ews[L][_di] for L in _dom_ews}
+                    if _dom_ews is not None else None)
+            cands = pick_candidates(clamps, _kk, _dew, _allow)
             if not cands:
                 return False, n_domains, 'exhausted'
             cand_lists.append(cands)
-        if kfsb_k > 1 and any(len(c) > 1 for c in cand_lists):
+        if _kk > 1 and any(len(c) > 1 for c in cand_lists):
             # FSB: one cheap batched eval of every candidate's two
             # children (parent params, no new betas — ranks the plane /
             # clamp effect; the chosen split still gets the full beta
@@ -1043,7 +1143,9 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
                 for sp in cands:
                     rows.append((child_clamps(clamps, sp, 0), wp))
                     rows.append((child_clamps(clamps, sp, 1), wp))
+            _tf = time.perf_counter()
             lbs_c, _ = bound_batch(rows, eval_only=True)
+            _t_fsb += time.perf_counter() - _tf
             chosen = []
             r = 0
             for (clamps, wp), cands in zip(popped, cand_lists):
@@ -1056,11 +1158,24 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
                 chosen.append(best_sp)
         else:
             chosen = [c[0] for c in cand_lists]
+        if _in_warmup:
+            for sp in chosen:
+                if sp is not None and sp[0] == 'relu':
+                    _hot.add((sp[1], sp[2]))
+        if os.environ.get('VC_DUMP_SPLITS'):
+            with open(os.environ['VC_DUMP_SPLITS'], 'a') as _f:
+                _f.write(repr(chosen) + '\n')
         children = []
         for (clamps, wp), sp in zip(popped, chosen):
             for side in (0, 1):
                 children.append((child_clamps(clamps, sp, side), wp))
+        _tb = time.perf_counter()
         lbs, out_params = bound_batch(children)
+        _t_bnd += time.perf_counter() - _tb
+        if _prof and _round % 20 == 0:
+            print(f'    [bab-prof] round {_round} dom {n_domains}: '
+                  f'fsb {_t_fsb:.1f}s bound {_t_bnd:.1f}s ew {_t_ew:.1f}s',
+                  flush=True)
         n_domains += len(children)
         for i, (c2, _) in enumerate(children):
             lb_i = float(lbs[i])
@@ -1262,7 +1377,7 @@ def attn_alpha_joint(gg, xl, xh, sb, ob, W_q, b_vec, *,
                      freeze_tol=0.0, freeze_patience=2,
                      refresh_every=1, freeze_refresh=8,
                      sign_jump_passes=5, sign_jump_beta=0.6,
-                     mem_fns=None):
+                     mem_fns=None, sparse_rows=0):
     """JOINT alpha over all open queries with DIFFERENTIABLE
     intermediate bounds — the alpha,beta-CROWN mechanism that closes
     vit pgd instances in ~2 gradient steps (their `sparse_interm:
@@ -1417,7 +1532,7 @@ def attn_alpha_joint(gg, xl, xh, sb, ob, W_q, b_vec, *,
     if mem_fns is None and device.type == 'cuda':
         mem_fns = (partial(_cuda_free_bytes, device),
                    partial(torch.cuda.memory_allocated, device))
-    if mem_fns is not None and targets:
+    if mem_fns is not None and targets and not sparse_rows:
         bpr = _probe_row_bytes(wgg, xl_w, xh_w, sb_frozen, ob_frozen,
                                base_p, targets[-1][0],
                                _t_width(targets[-1]), device, wdt,
@@ -1428,7 +1543,7 @@ def attn_alpha_joint(gg, xl, xh, sb, ob, W_q, b_vec, *,
                   f'measured -> {cap} differentiable rows affordable',
                   flush=True)
             max_rows = cap
-    if max_rows and total_rows > max_rows:
+    if max_rows and total_rows > max_rows and not sparse_rows:
         kept = []
         acc_rows = 0
         for t in reversed(targets):
@@ -1448,7 +1563,7 @@ def attn_alpha_joint(gg, xl, xh, sb, ob, W_q, b_vec, *,
     # and sacrifices the spec-critical coordinates). Index 0 = lower
     # (+I) walk, 1 = upper (-I) walk — decoupled like ABC's 4-slice.
     prow = {}
-    if per_row_alpha:
+    if per_row_alpha and not sparse_rows:
         # per-row autograd is the memory driver (each row keeps its
         # walk graph + its own param slices): only the LATEST targets
         # up to per_row_rows get per-row alphas (the localization put
@@ -1544,9 +1659,34 @@ def attn_alpha_joint(gg, xl, xh, sb, ob, W_q, b_vec, *,
                 _d0 = next(iter(_d0.values()), None)
             eye = torch.eye(n, device=device,
                             dtype=_d0.dtype if _d0 is not None else wdt)
+            # SPARSE intermediate refinement: differentiably re-derive only the
+            # K WIDEST rows of this node (the loosest coords, most to gain) and
+            # keep the frozen forward enclosure for the rest. Sound: un-walked
+            # rows retain a valid CROWN enclosure; walked rows are intersected
+            # as before. Lets EVERY target be refined within memory (the full
+            # +-I walk of all nodes OOMs -> only ~2/27 nodes fit otherwise).
+            # Node-level (pstart) alphas only (prow is empty when sparse_rows>0).
+            sel = None
+            if sparse_rows and n > sparse_rows:
+                # base = this node's CURRENT dynamic enclosure (right precision
+                # for the search vs fp64 cert pass, and a valid CROWN bound);
+                # the un-walked rows keep it (intersection no-op).
+                _kc, _kk, _ks = consumers[prod][0]
+                if _kc == 'ob1':
+                    _fl, _fh = ob_dyn[_kk]
+                elif _kc == 'ob2':
+                    _fl, _fh = ob_dyn[_kk][_ks]
+                else:
+                    _fl, _fh = sb_dyn[_kk]
+                sel = torch.sort(torch.topk(
+                    (_fh - _fl).detach(), int(sparse_rows)).indices).values
+                walk_eye = eye[sel]
+                base_lo, base_hi = _fl.detach(), _fh.detach()
+            else:
+                walk_eye = eye
             los = []; his = []
-            for s0 in range(0, n, refine_chunk):
-                rows = eye[s0:s0 + refine_chunk]
+            for s0 in range(0, walk_eye.shape[0], refine_chunk):
+                rows = walk_eye[s0:s0 + refine_chunk]
                 B = rows.shape[0]
                 sb_b = {L: (lo.unsqueeze(0).expand(B, -1),
                             hi.unsqueeze(0).expand(B, -1))
@@ -1582,7 +1722,15 @@ def attn_alpha_joint(gg, xl, xh, sb, ob, W_q, b_vec, *,
                         use_gg, use_xl, use_xh, sb_b, ob_b, None, 0.0,
                         p_hi, start_name=prod, ew0=-rows)
                 los.append(lo_r); his.append(hi_r)
-            lo_r = torch.cat(los); hi_r = torch.cat(his)
+            lo_w = torch.cat(los); hi_w = torch.cat(his)
+            if sel is not None:
+                # scatter the K walked rows into the frozen full-length bound;
+                # un-walked rows keep the (detached) frozen enclosure -> their
+                # intersection below is a no-op (no spurious tightening).
+                lo_r = base_lo.clone().index_copy(0, sel, lo_w)
+                hi_r = base_hi.clone().index_copy(0, sel, hi_w)
+            else:
+                lo_r, hi_r = lo_w, hi_w
             if raw_out is not None:
                 raw_out[prod] = (lo_r.detach(), hi_r.detach())
             for kind, key, side in consumers[prod]:

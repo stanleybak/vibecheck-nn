@@ -7398,7 +7398,11 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     refresh_every=int(getattr(
                         settings, 'attn_joint_refresh_every', 1)),
                     freeze_refresh=int(getattr(
-                        settings, 'attn_joint_freeze_refresh', 8)))
+                        settings, 'attn_joint_freeze_refresh', 8)),
+                    per_start_alpha=bool(getattr(
+                        settings, 'attn_joint_per_start_alpha', False)),
+                    sparse_rows=int(getattr(
+                        settings, 'attn_joint_sparse_rows', 0)))
                 for _qi, _lb in zip(_jq, _lb_j):
                     if _lb > 0:
                         _joint_closed.add(_qi)
@@ -7492,7 +7496,13 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     print_progress=print_progress,
                     gg_work=gg_pgd if _bab_fp32 else None,
                     work_dtype=torch.float32 if _bab_fp32 else None,
-                    kfsb_k=int(getattr(settings, 'attn_bab_kfsb', 4)))
+                    kfsb_k=int(getattr(settings, 'attn_bab_kfsb', 4)),
+                    perdom_ew=bool(getattr(
+                        settings, 'attn_bab_perdom_ew', True)),
+                    hot_warmup=int(getattr(
+                        settings, 'attn_bab_hot_warmup', 0)),
+                    hot_kfsb=int(getattr(
+                        settings, 'attn_bab_hot_kfsb', 16)))
                 _zis_nodes += n_used
                 if print_progress:
                     print(f'  [beta-bab] q{qi} '
