@@ -185,6 +185,77 @@ class TorchZonotope:
                 g4d, kernel, stride=stride, padding=padding)
         self._gen_2d = None
 
+    def propagate_conv_transpose(self, kernel, bias, input_shape, stride,
+                                 padding, output_padding=(0, 0)):
+        """Propagate through a ConvTranspose2d layer (kernel layout C_in,C_out,kH,kW).
+
+        ConvTranspose is LINEAR (the conv adjoint), so propagation is EXACT: apply
+        F.conv_transpose2d to the center (with bias) and each generator (no bias).
+        Mirrors `propagate_conv` (4D-native, chunked for large K)."""
+        self.center = F.conv_transpose2d(
+            self.center.reshape(1, *input_shape), kernel, bias=bias, stride=stride,
+            padding=padding, output_padding=output_padding).flatten()
+        n_out = self.center.numel()
+        if self._gen_4d is None:
+            if self._gen_2d is None or self._gen_2d.shape[1] == 0:
+                self._gen_2d = torch.zeros(n_out, 0, dtype=self.center.dtype,
+                                           device=self.center.device)
+                return
+            K = self._gen_2d.shape[1]
+            g4d = self._gen_2d.t().contiguous().reshape(K, *input_shape)
+        else:
+            g4d = self._gen_4d
+            if g4d.shape[0] == 0:
+                self._gen_4d = None
+                self._gen_2d = torch.zeros(n_out, 0, dtype=self.center.dtype,
+                                           device=self.center.device)
+                return
+            K = g4d.shape[0]
+        chunk_size = 512
+        if K > chunk_size:
+            sample = F.conv_transpose2d(g4d[:1], kernel, stride=stride,
+                                        padding=padding, output_padding=output_padding)
+            out = torch.empty((K,) + tuple(sample.shape[1:]), dtype=g4d.dtype,
+                              device=g4d.device)
+            out[:1] = sample
+            del sample
+            for start in range(1, K, chunk_size):
+                end = min(start + chunk_size, K)
+                out[start:end] = F.conv_transpose2d(
+                    g4d[start:end], kernel, stride=stride, padding=padding,
+                    output_padding=output_padding)
+            self._gen_4d = out
+        else:
+            self._gen_4d = F.conv_transpose2d(
+                g4d, kernel, stride=stride, padding=padding,
+                output_padding=output_padding)
+        self._gen_2d = None
+
+    def propagate_upsample(self, input_shape, scale):
+        """Propagate through a nearest-neighbor Upsample (scale = (sH, sW)). Nearest
+        interpolation is LINEAR (a gather/repeat), so propagation is EXACT: apply it to
+        the center and each generator identically."""
+        sf = (float(scale[0]), float(scale[1]))
+        self.center = F.interpolate(self.center.reshape(1, *input_shape),
+                                    scale_factor=sf, mode='nearest').flatten()
+        n_out = self.center.numel()
+        if self._gen_4d is None:
+            if self._gen_2d is None or self._gen_2d.shape[1] == 0:
+                self._gen_2d = torch.zeros(n_out, 0, dtype=self.center.dtype,
+                                           device=self.center.device)
+                return
+            K = self._gen_2d.shape[1]
+            g4d = self._gen_2d.t().contiguous().reshape(K, *input_shape)
+        else:
+            g4d = self._gen_4d
+            if g4d.shape[0] == 0:
+                self._gen_4d = None
+                self._gen_2d = torch.zeros(n_out, 0, dtype=self.center.dtype,
+                                           device=self.center.device)
+                return
+        self._gen_4d = F.interpolate(g4d, scale_factor=sf, mode='nearest')
+        self._gen_2d = None
+
     def propagate_fc(self, W, bias):
         """Propagate through a fully-connected layer (forces 2D form)."""
         self.center = F.linear(self.center, W, bias)

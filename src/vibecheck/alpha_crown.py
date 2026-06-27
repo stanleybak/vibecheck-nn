@@ -525,6 +525,26 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
                 output_padding=op['output_padding']).reshape(B, -1)
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+        elif t == 'conv_transpose':
+            # ConvTranspose forward is linear; exact adjoint is Conv2d (same kernel/stride/pad).
+            out_shape = op['out_shape']
+            kernel = op['kernel'].to(dtype=dtype, device=device)
+            C_out, H_out, W_out = out_shape
+            ew_4d = ew.reshape(B, C_out, H_out, W_out)
+            if op['bias'] is not None:
+                bias = op['bias'].to(dtype=dtype, device=device)
+                acc = acc + (ew_4d.sum(dim=(-1, -2)) * bias).sum(dim=-1)
+            ew_back = F.conv2d(ew_4d, kernel, stride=op['stride'],
+                               padding=op['padding']).reshape(B, -1)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+        elif t == 'upsample':
+            # Nearest upsample is linear; adjoint sums each sH x sW output block.
+            C, H, W = op['in_shape']
+            sH, sW = int(op['scale'][0]), int(op['scale'][1])
+            ew_back = ew.reshape(B, C, H, sH, W, sW).sum(dim=(3, 5)).reshape(B, -1)
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
         elif t == 'fc':
             W = op['W'].to(dtype=dtype, device=device)
             bias = op['bias'].to(dtype=dtype, device=device)

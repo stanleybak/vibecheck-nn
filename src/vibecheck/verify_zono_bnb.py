@@ -1373,6 +1373,22 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                 col_ids_state[name] = _alloc_ids(z.n_gens)
                 _fwd_box_reduced = True
 
+        elif t == 'conv_transpose':
+            # ConvTranspose is linear (the conv adjoint) -> EXACT zonotope propagation
+            # (apply to center + every generator). Col-ids are gen-count-preserving, so the
+            # generic prefix-preserving default below carries them.
+            z = _get(op['inputs'][0])
+            z.propagate_conv_transpose(
+                op['kernel'], op['bias'], op['in_shape'], op['stride'],
+                op['padding'], op['output_padding'])
+            zono_state[name] = z
+
+        elif t == 'upsample':
+            # Nearest-neighbor upsample is linear -> EXACT zonotope propagation.
+            z = _get(op['inputs'][0])
+            z.propagate_upsample(op['in_shape'], op['scale'])
+            zono_state[name] = z
+
         elif t == 'fc':
             z = _get(op['inputs'][0])
             in_shape_nd = op.get('in_shapes_nd', [None])[0]
@@ -2413,6 +2429,29 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                     ew.reshape(1, *op['out_shape']), op['kernel'],
                     stride=op['stride'], padding=op['padding'],
                     output_padding=op['output_padding']).flatten()
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif t == 'conv_transpose':
+                # ConvTranspose forward is linear; its exact adjoint (transpose) is Conv2d with
+                # the SAME kernel/stride/padding (verified bit-exact vs autograd, incl.
+                # output_padding). Bias adds per output channel (out_shape[0]).
+                if op['bias'] is not None:
+                    acc += float(
+                        ew.reshape(1, *op['out_shape']).reshape(
+                            op['out_shape'][0], -1).sum(dim=1) @ op['bias'])
+                ew_back = F.conv2d(
+                    ew.reshape(1, *op['out_shape']), op['kernel'],
+                    stride=op['stride'], padding=op['padding']).flatten()
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif t == 'upsample':
+                # Nearest upsample is linear; its adjoint sums each sH x sW output block back
+                # to its source input pixel (no bias).
+                C, H, W = op['in_shape']
+                sH, sW = op['scale']
+                ew_back = ew.reshape(C, H, int(sH), W, int(sW)).sum(dim=(2, 4)).flatten()
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
