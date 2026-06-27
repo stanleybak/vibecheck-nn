@@ -63,6 +63,27 @@ running locally.**
     `sudo shutdown -h now` to stop the ~$1/hr billing. Don't shut down if a justifying long
     sweep is producing results.
 
+### GPU lock (cooperative — use for EVERY GPU job, including Claude's)
+
+The box has ONE GPU and is shared (everyone, including Claude, SSHes as the same `ubuntu`
+user). A cooperative mutex + FIFO queue lives at **`~/gpulock`** (source tracked at
+`vnncomp_scripts/gpulock`; deploy/refresh with
+`rsync -az -e "ssh -i \"$AWS_GPU_PEM\"" vnncomp_scripts/gpulock "$AWS_GPU_HOST":~/gpulock && ssh ... 'chmod +x ~/gpulock'`).
+**Never run a GPU job (`vibecheck.main` / `abcrown` / GPU pytest / sweeps) without holding the
+lock — this includes Claude.**
+
+- **One job (RAII):** `~/gpulock run "claude: <what>" -- <cmd>` — queues (FIFO), waits its turn,
+  runs, auto-releases. The lock is held only while `<cmd>` runs.
+- **Sweeps:** wrap EACH instance in its own `gpulock run` *inside* the loop, NOT the whole sweep,
+  so it yields between instances and a waiting one-off job interleaves one-by-one (FIFO-fair)
+  instead of being blocked for the full sweep.
+- **Interactive GPU session:** `~/gpulock hold "claude: <what>"` (Ctrl-C / exit releases).
+- **`~/gpulock status`** — current holder + queue + GPU mem + free disk.
+- Lock is keyed to the holder's live PID, so dead holders **auto-reap** (never stuck). After a box
+  REBOOT, `rm -rf ~/gpu_lock` once (PIDs get reused). Release prints a **clean-disk reminder** —
+  do it (see Run discipline).
+- Prompt for collaborators is in the script header (`vnncomp_scripts/gpulock`).
+
 The 2026 benchmark set lives locally and is rsync'd to AWS before first use (see the
 `vnncomp2026` skill). Sync vibecheck with
 `rsync -az --exclude '.venv' --exclude '__pycache__' <local-repo>/ -e "ssh -i \"$AWS_GPU_PEM\"" "$AWS_GPU_HOST":~/vibecheck/`
@@ -70,8 +91,9 @@ The 2026 benchmark set lives locally and is rsync'd to AWS before first use (see
 
 ### Run discipline
 
-- **One GPU job at a time.** Timing-sensitive verdicts (anything near the timeout) are invalid
-  under contention — check `nvidia-smi` + `ps` before and after, re-run contaminated probes.
+- **One GPU job at a time — hold `~/gpulock`** (see the GPU lock section above). Timing-sensitive
+  verdicts (anything near the timeout) are invalid under contention; the lock prevents it. Still
+  check `nvidia-smi` + `ps` before/after and re-run any contaminated probe.
 - **Detached runs:** `nohup setsid`, results to `~/persistent_runs/` (survives reboot, unlike
   `/tmp`), with a done-flag file. Beware self-matching process greps. Kill only specific PIDs
   you started.
@@ -80,6 +102,9 @@ The 2026 benchmark set lives locally and is rsync'd to AWS before first use (see
   Keep diagnostic scripts in the local repo (e.g. `scratch/`) and `rsync` them up so they can be
   re-pushed after any restart; write results/oracles to `~/persistent_runs/`. (Learned the hard
   way 2026-06: an idle-shutdown mid-session wiped the harness + ABC oracle and rotated the IP.)
+- **Fresh IP after a restart needs `-o StrictHostKeyChecking=accept-new`** (plus `BatchMode=yes`):
+  a rotated public IP isn't in `known_hosts`, so ssh silently blocks on the host-key prompt and
+  every command appears to hang. Always include it when reconnecting to a new IP.
 - **Cache `details` to `~/persistent_runs/`.** When running an experiment for the user, pickle the
   returned `details` dict to `~/persistent_runs/vibecheck_runs/{slug}.pkl` (include instance id +
   config in the slug) so re-views of the same run ("Phase 7 timing?", "unstable count at L3?")

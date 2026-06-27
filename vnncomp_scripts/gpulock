@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# gpulock — cooperative single-GPU mutex + FIFO queue for the shared AWS box.
+#
+# Everyone SSHes as the same `ubuntu` user, so liveness = `kill -0 <holder-pid>`
+# (dead holders are auto-reaped — no stuck locks). Primary interface is `run`
+# (RAII: the lock is held ONLY while your command runs, then auto-released).
+#
+#   gpulock run "<who>: <what>" -- <command...>   # queue -> wait turn -> run -> release
+#   gpulock hold "<who>: <what>"                   # interactive: hold until Ctrl-C
+#   gpulock status                                 # holder + queue + GPU + disk
+#   gpulock release                                # manual clear (your own / a dead lock)
+#
+# SWEEPS: wrap EACH instance in its own `gpulock run`, not the whole sweep, so it
+# releases between instances and others interleave one-by-one (FIFO-fair).
+set -u
+ROOT="$HOME/gpu_lock"; HELD="$ROOT/held"; Q="$ROOT/queue"
+mkdir -p "$Q"
+WHO="${GPULOCK_WHO:-$(whoami)}"
+
+_reap(){   # drop a dead holder + any dead queue tickets (keyed to live PIDs)
+  if [ -d "$HELD" ]; then
+    p=$(cat "$HELD/pid" 2>/dev/null)
+    if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+      echo "[gpulock] reaping dead lock: $(cat "$HELD/who" 2>/dev/null)" >&2
+      rm -rf "$HELD"
+    fi
+  fi
+  for t in "$Q"/*; do
+    [ -e "$t" ] || continue
+    kill -0 "${t##*.}" 2>/dev/null || rm -f "$t"
+  done
+}
+
+_acquire(){   # $1 = description; blocks (FIFO) until the lock is ours
+  local desc="$1" tk; tk="$Q/$(date +%s%N).$$"
+  echo "$WHO :: $desc" >"$tk"
+  local waited=0
+  while :; do
+    _reap
+    if [ "$(ls "$Q" 2>/dev/null | sort -n | head -1)" = "${tk##*/}" ] \
+        && mkdir "$HELD" 2>/dev/null; then
+      echo $$ >"$HELD/pid"
+      echo "$WHO :: $desc :: since $(date '+%F %T')" >"$HELD/who"
+      rm -f "$tk"
+      return 0
+    fi
+    [ $((waited % 30)) -eq 0 ] && echo "[gpulock] waiting for GPU... ($(cat "$HELD/who" 2>/dev/null) ahead)" >&2
+    sleep 3; waited=$((waited + 3))
+  done
+}
+
+_release(){
+  rm -rf "$HELD"
+  echo "[gpulock] released. >>> CLEAN DISK after measurements: df -h ~ ;"
+  echo "          remove stale runs + *.counterexample (the box fills up fast)."
+}
+
+cmd="${1:-status}"; shift 2>/dev/null || true
+case "$cmd" in
+  run)
+    desc="${1:?need a description}"; shift
+    [ "${1:-}" = "--" ] && shift
+    _acquire "$desc"
+    trap '_release' EXIT INT TERM
+    "$@"; rc=$?
+    trap - EXIT INT TERM; _release
+    exit $rc;;
+  hold)
+    desc="${1:-interactive}"
+    _acquire "$desc"
+    trap '_release; exit 0' INT TERM
+    echo "[gpulock] HELD for '$desc'. Run GPU jobs now; Ctrl-C to release."
+    while kill -0 $$ 2>/dev/null; do sleep 5; done;;
+  release) _release;;
+  status)
+    _reap
+    if [ -d "$HELD" ]; then echo "HELD : $(cat "$HELD/who" 2>/dev/null)"; else echo "FREE"; fi
+    echo "QUEUE:"
+    for t in $(ls "$Q" 2>/dev/null | sort -n); do echo "   - $(cat "$Q/$t" 2>/dev/null)"; done
+    echo "GPU  : $(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null | head -1)"
+    echo "DISK : $(df -h "$HOME" | tail -1 | awk '{print $4" free of "$2}')";;
+  *) echo "usage: gpulock {run \"<who>: <what>\" -- <cmd> | hold \"<who>: <what>\" | status | release}";;
+esac
