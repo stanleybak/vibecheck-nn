@@ -260,11 +260,33 @@ def _verify(args, sat_state=None):
     # graph load. See network_pair.py (the merge is exact + onnxruntime-oracle-gated).
     _maybe_network_pair(args)
 
+    # Attack / custom-handler modes run FIRST — before the nonlinear-spec
+    # pre-checks below. Each is gated on an explicit config flag + a cheap ONNX
+    # probe (~0.1s) and returns None for non-applicable models, but when one
+    # FIRES it fully handles the instance, so the (potentially very expensive)
+    # nonlinear-spec detection must not run first. smart_turn's spec is 121 MB
+    # (~1.3M input-box constraints); `is_nonlinear_v2_spec` regexes the whole
+    # thing in ~37s and ran TWICE (empty-input + augment) = ~74s of pure waste
+    # before the quantized surrogate attack even started. These modes all run
+    # BEFORE the graph load too (which would fail on the quantized / unsupported
+    # ONNX). See surrogate_pgd.py / sign_attack.py / torch_attack.py / cctsdb_yolo.py.
+    _surr = _maybe_surrogate_attack(args, sat_state)   # INT8-quantized (smart_turn)
+    if _surr is not None:
+        sys.exit(_surr)
+    _sgn = _maybe_sign_attack(args, sat_state)          # binarized `Sign` nets
+    if _sgn is not None:
+        sys.exit(_sgn)
+    _tch = _maybe_torch_attack(args, sat_state)         # generic onnx2torch PGD
+    if _tch is not None:
+        sys.exit(_tch)
+    _cct = _maybe_cctsdb_yolo(args, sat_state)          # YOLO patch grid
+    if _cct is not None:
+        sys.exit(_cct)
+
     # Empty-input check (nonlinear specs, e.g. adaptive_cruise_control): if the
     # input constraints are jointly infeasible the input region is EMPTY, the
     # property is vacuously true, and the verdict is `unsat` with no verification.
-    # Sound + milliseconds; runs on the ORIGINAL v2 spec BEFORE the augment. See
-    # input_feasibility.py.
+    # Sound; runs on the ORIGINAL v2 spec BEFORE the augment. See input_feasibility.py.
     _empty = _maybe_empty_input(args)
     if _empty is not None:
         sys.exit(_empty)
@@ -273,35 +295,6 @@ def _verify(args, sat_state=None):
     # ONNX + linear v1 spec up front, then verify normally. Must run BEFORE the
     # graph load. See nonlinear_augment.py (transpile is ORT-oracle-gated).
     _maybe_nonlinear_augment(args)
-
-    # Surrogate-attack mode (incomplete; INT8-quantized / unsupported ONNX). Must run
-    # BEFORE the graph load below, which would fail on DequantizeLinear/QuantizeLinear.
-    # Gated on an explicit config with surrogate_attack=True AND the ONNX having
-    # quantized ops; emits the verdict and exits. See surrogate_pgd.py.
-    _surr = _maybe_surrogate_attack(args, sat_state)
-    if _surr is not None:
-        sys.exit(_surr)
-
-    # Sign-BNN attack mode (incomplete; binarized nets with `Sign` activations vibecheck can't
-    # bound). Gated on config sign_attack=True AND the ONNX having `Sign` ops; emits the verdict
-    # via the surrogate-attack emit path (same witness shape). See sign_attack.py.
-    _sgn = _maybe_sign_attack(args, sat_state)
-    if _sgn is not None:
-        sys.exit(_sgn)
-
-    # Generic onnx2torch PGD attack mode (incomplete; differentiable nets vibecheck can't bound
-    # soundly/cheaply, e.g. collins_aerospace YOLOv5-nano). Gated on config torch_attack=True;
-    # emits via the surrogate-attack emit path (same witness shape). See torch_attack.py.
-    _tch = _maybe_torch_attack(args, sat_state)
-    if _tch is not None:
-        sys.exit(_tch)
-
-    # cctsdb_yolo custom handler (COMPLETE; YOLO patch nets vibecheck/onnx2torch can't load).
-    # Gated on config cctsdb_yolo=True; enumerates the integer patch-position grid through the
-    # original net on ORT-CPU. Emits via the surrogate emit path. See cctsdb_yolo.py.
-    _cct = _maybe_cctsdb_yolo(args, sat_state)
-    if _cct is not None:
-        sys.exit(_cct)
 
     # Fast path: load the pre-parsed graph and/or spec from prepare_instance.sh's
     # per-source caches, skipping the (potentially multi-second) ONNX parse. The

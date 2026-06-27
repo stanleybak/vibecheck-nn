@@ -48,6 +48,14 @@ def is_nonlinear_v2_spec(vnnlib_text):
     (i.e. the linear-only adapter can't handle it -> needs augmentation)."""
     if detect_version(vnnlib_text) != '2.0':
         return False
+    # Fast-path (SOUND): a degree>=2 monomial — the only thing the linear adapter
+    # can't handle, and the thing the augment exists for (a nonlinear INPUT like
+    # `200*X0 >= X1^2`, written `(* X1 X1)`) — can ONLY arise from a multiplication
+    # `(*` (or a variable division `(/`) node; the parser has only `+ - * /`. A spec
+    # with neither is linear, so skip the full parse, which is O(spec size) — ~37s
+    # on smart_turn's 121 MB input box (~1.3M `(<= X_i c)` constraints, all linear).
+    if '(*' not in vnnlib_text and '(/' not in vnnlib_text:
+        return False
     try:
         prop = parse_vnnlib_v2(vnnlib_text)
     except VnnlibParseError:

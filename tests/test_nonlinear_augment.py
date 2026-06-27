@@ -73,6 +73,25 @@ def test_is_nonlinear_v2_spec():
         "(assert (badop X[0] 0))") is False
 
 
+def test_is_nonlinear_fast_path_skips_parse(monkeypatch):
+    """A linear v2 spec (no `(*`/`(/` node) returns False via the fast-path —
+    WITHOUT the O(spec-size) `parse_vnnlib_v2` (which is ~37s on smart_turn's
+    121 MB input box). Proven by making the parser blow up if reached."""
+    def _boom(*a, **k):
+        raise AssertionError('parse_vnnlib_v2 must not run for a linear spec')
+    monkeypatch.setattr(nla, 'parse_vnnlib_v2', _boom)
+    lin = ('(vnnlib-version <2.0>)\n(declare-network N (declare-input X float32 '
+           '[1,2]) (declare-output Y float32 [1,1]))\n'
+           '(assert (<= X[0,0] 1.0))\n(assert (> Y[0,0] 0.5))\n')
+    assert nla.is_nonlinear_v2_spec(lin) is False
+    monkeypatch.undo()
+    # A spec WITH a multiplication is NOT short-circuited -> parsed -> nonlinear.
+    nl = ('(vnnlib-version <2.0>)\n(declare-network N (declare-input X float32 '
+          '[1,2]) (declare-output Y float32 [1,1]))\n'
+          '(assert (>= (* X[0,0] X[0,0]) 1.0))\n')
+    assert nla.is_nonlinear_v2_spec(nl) is True
+
+
 def test_analyze_feats_cons_xbox():
     prop = parse_vnnlib_v2(_V2)
     feats, cons, clauses, xbox = nla.analyze(prop)
