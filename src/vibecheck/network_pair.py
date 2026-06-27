@@ -436,8 +436,15 @@ def reconstruct_pair_cex(nf_path, ng_path, ir, merged_witness):
 # ----------------------------------------------------------------- entry point
 
 def _cache_paths(net_field, vnnlib_path):
-    """Deterministic temp paths keyed on the instance (onnx field + spec)."""
-    h = hashlib.md5((net_field + '|' + os.path.abspath(vnnlib_path)).encode()).hexdigest()[:12]
+    """Where to write the merged-pair onnx + v1 spec. Prefer NEXT TO THE SPEC with a clear,
+    instance-named suffix (`instance_33.vnnlib.pair.onnx` / `.pair.vnnlib`) so the artifacts
+    are obvious and co-located instead of hash-named files buried in /tmp; fall back to a
+    hashed /tmp path only when the spec's directory is read-only (e.g. a packaged benchmark)."""
+    spec_abs = os.path.abspath(vnnlib_path)
+    base = spec_abs[:-3] if spec_abs.endswith('.gz') else spec_abs   # strip a trailing .gz
+    if os.access(os.path.dirname(base), os.W_OK):
+        return base + '.pair.onnx', base + '.pair.vnnlib'
+    h = hashlib.md5((net_field + '|' + spec_abs).encode()).hexdigest()[:12]
     d = tempfile.gettempdir()
     return (os.path.join(d, f'vibecheck_pair_{h}.onnx'),
             os.path.join(d, f'vibecheck_pair_{h}.vnnlib'))
