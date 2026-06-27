@@ -17,9 +17,15 @@ phase1_method: plain
 zono_input_split_enabled: true
 zono_input_split_max_nodes: 0
 zono_relu_split_max_nodes: 6000
-# batched no-reforward beta-CROWN BaB (ABC vit recipe: batch 32, 10 it)
-attn_bab_batch: 32
+# batched no-reforward beta-CROWN BaB. BBPS branching (ABC's actual vit
+# nonlinear-branching heuristic, ported) + restrict-to-top-K + cheap kfsb=4
+# closes ibp_3_3_8 in budget (2157: 52s vs kfsb=16 timeout). batch=192 for
+# throughput. BaBSR (VC's old scorer) captured only 8/20 of ABC's neurons.
+attn_bab_batch: 192
 attn_bab_iters: 12
+attn_bab_kfsb: 4
+attn_bab_bbps_score: true
+attn_bab_bbps_topk: 12
 # CROWN intermediate refinement: pgd-family roots -7.7 -> -3.0 (alpha)
 # in 0.7s; ibp marginal (+0.002, ~10s). fp32 search is default-on.
 attn_refine_passes: 2

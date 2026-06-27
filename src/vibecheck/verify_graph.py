@@ -7502,7 +7502,15 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     hot_warmup=int(getattr(
                         settings, 'attn_bab_hot_warmup', 0)),
                     hot_kfsb=int(getattr(
-                        settings, 'attn_bab_hot_kfsb', 16)))
+                        settings, 'attn_bab_hot_kfsb', 16)),
+                    bh_score=bool(getattr(
+                        settings, 'attn_bab_bh_score', False)),
+                    perdom_la=bool(getattr(
+                        settings, 'attn_bab_perdom_la', False)),
+                    bbps_score=bool(getattr(
+                        settings, 'attn_bab_bbps_score', False)),
+                    bbps_topk=int(getattr(
+                        settings, 'attn_bab_bbps_topk', 12)))
                 _zis_nodes += n_used
                 if print_progress:
                     print(f'  [beta-bab] q{qi} '

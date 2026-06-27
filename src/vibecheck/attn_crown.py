@@ -431,9 +431,35 @@ def _apply_beta_b(acc, ew_in, cl, ch, bt, dtype):
     return acc, ew_in
 
 
+# Optional torch.compile of the batched bound walk (the FSB eval_only hot path).
+# Gated by VC_COMPILE_WALK (probe) / settings.attn_bab_compile_walk; default OFF.
+# The walk is a launch-bound op-dispatch loop (~17% GPU util at batch=192), so
+# fusing it should cut FSB wall-time without changing any bound (compile is
+# semantics-preserving). dynamic=True avoids recompiles as the FSB batch varies.
+_COMPILED_WALK = None
+
+
+def _compiled_walk():
+    global _COMPILED_WALK
+    if _COMPILED_WALK is None:
+        # The full-run walk is called with varying batch B and varying clamp
+        # dict KEY-SETS (which layers/exp-ops are clamped this round) -> Dynamo
+        # re-traces per distinct structure and the default recompile_limit(8)
+        # exhausts -> it gives up to eager (slower). The number of distinct
+        # (clamp-key-set, B) combos is small and bounded, so raise the limit;
+        # dynamic=True keeps B from being a recompile axis.
+        import torch._dynamo as _dyn
+        for _attr in ('recompile_limit', 'cache_size_limit'):
+            if hasattr(_dyn.config, _attr):
+                setattr(_dyn.config, _attr, 32)
+        _COMPILED_WALK = torch.compile(attn_crown_lb_batch, dynamic=True)
+    return _COMPILED_WALK
+
+
 def attn_crown_lb_batch(gg, xl, xh, sb_b, op_bounds_b, w_q, b_q, params_b,
                         op_clamps_b=None, relu_clamps_b=None,
-                        start_name=None, ew0=None, return_ew=False):
+                        start_name=None, ew0=None, return_ew=False,
+                        return_input_form=False, return_ew_signed=False):
     """Batched attn_crown_lb over B domains; returns lb (B,).
 
     sb_b: {L: (lo (B,n), hi (B,n))}; op_bounds_b mirrors op_bounds with a
@@ -479,6 +505,7 @@ def attn_crown_lb_batch(gg, xl, xh, sb_b, op_bounds_b, w_q, b_q, params_b,
                      w_t.unsqueeze(0).expand(B, -1).clone()}
     acc = torch.zeros(B, device=device, dtype=dtype) + float(b_q)
     ew_relu = {} if return_ew else None
+    ew_relu_s = {} if return_ew_signed else None
 
     def _push(inp, ew_b):
         ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_b)) + ew_b
@@ -508,6 +535,10 @@ def attn_crown_lb_batch(gg, xl, xh, sb_b, op_bounds_b, w_q, b_q, params_b,
                 # per-domain backward sensitivity at this relu's output
                 # (|lA|) — the BaBSR weight, replacing the static root ew_w.
                 ew_relu[L] = ew.detach().abs()
+            if ew_relu_s is not None:
+                # SIGNED ew at this relu's output — needed for the BBPS
+                # branch-improvement score (ep/en split + branch re-prop).
+                ew_relu_s[L] = ew.detach().clone()
             lo_t, hi_t = sb_b[L]
             lo_t = lo_t.to(dtype); hi_t = hi_t.to(dtype)
             ub_r = hi_t.clamp(min=0)
@@ -673,16 +704,212 @@ def attn_crown_lb_batch(gg, xl, xh, sb_b, op_bounds_b, w_q, b_q, params_b,
         raise NotImplementedError('attn_crown batch: no ew reached input')
     lb = acc + ew_inp.clamp(min=0) @ xl.to(dtype) \
         + ew_inp.clamp(max=0) @ xh.to(dtype)
+    if return_input_form:
+        # (acc (B,), ew_inp (B, n_in)): the input-space linear lower form
+        # lb(x) = acc + ew_inp·x. For an upper bound seed ew0=-eye and negate.
+        return lb, acc, ew_inp
+    if return_ew_signed:
+        return lb, ew_relu_s
     if return_ew:
         return lb, ew_relu
     return lb
+
+
+def _seed_input_forms(gg, xl, xh, sb, ob, params, start_name, ew0,
+                      chunk=512):
+    """Input-space linear forms (acc (B,), ew_inp (B, n_in)) for the backward
+    walk seeded with rows `ew0` at `start_name` — i.e. each row's CROWN bound is
+    `acc + ew_inp·x` over the input box. Batched + chunked, no-grad."""
+    device = xl.device; dtype = xl.dtype
+    B = ew0.shape[0]
+    accs = []; ews = []
+    for s0 in range(0, B, chunk):
+        rows = ew0[s0:s0 + chunk]; b = rows.shape[0]
+        sb_b = {L: (lo.unsqueeze(0).expand(b, -1), hi.unsqueeze(0).expand(b, -1))
+                for L, (lo, hi) in sb.items()}
+        ob_b = {}
+        for k, v in ob.items():
+            if isinstance(v[0], tuple):
+                ob_b[k] = ((v[0][0].unsqueeze(0).expand(b, -1),
+                            v[0][1].unsqueeze(0).expand(b, -1)),
+                           (v[1][0].unsqueeze(0).expand(b, -1),
+                            v[1][1].unsqueeze(0).expand(b, -1)))
+            else:
+                ob_b[k] = (v[0].unsqueeze(0).expand(b, -1),
+                           v[1].unsqueeze(0).expand(b, -1))
+        p_b = {k: v.unsqueeze(0).expand(b, *v.shape)
+               for k, v in params.items() if k[0] not in ('beta', 'rbeta')}
+        with torch.no_grad():
+            _lb, acc, ew = attn_crown_lb_batch(
+                gg, xl, xh, sb_b, ob_b, None, 0.0, p_b,
+                start_name=start_name, ew0=rows, return_input_form=True)
+        accs.append(acc); ews.append(ew)
+    return torch.cat(accs), torch.cat(ews)
+
+
+def bbps_root_scores(gg, xl, xh, sb, ob, params, w_q, b_q, chunk=256):
+    """BBPS branching score (ABC's nonlinear-branching heuristic, ported to VC).
+
+    ABC branches vit with NonlinearBranching/BBPS, NOT BaBSR: for each unstable
+    relu neuron it estimates the WORST-CHILD improvement in the spec lower bound
+    from splitting at 0, via a fast backward re-propagation (reuse the spec's input
+    linear form + each neuron's downstream-to-input map; re-concretize per branch).
+    This scores EVERY unstable neuron cheaply (unlike VC's FSB, which only evaluates
+    the BaBSR-top-k and so misses the spec-critical neurons BaBSR under-ranks).
+
+    Returns {layer_idx: score (n,)} (higher = more valuable split; 0 for stable).
+    Branching-only -> soundness-irrelevant. Uses the same linear-superposition
+    trick as ABC's A_after-A_before: with fixed earlier-layer relaxations the
+    downstream propagation is linear in layer L's coefficients, so replacing one
+    neuron's coefficient is a rank-1 update of the input form + a re-concretize."""
+    device = xl.device
+    dtype = xl.dtype
+    ops = gg['ops']
+    relu_in = {op['layer_idx']: op['inputs'][0] for op in ops
+               if op['type'] == 'relu' and op.get('layer_idx') in sb}
+    w_t = (w_q.to(device=device, dtype=dtype) if torch.is_tensor(w_q)
+           else torch.as_tensor(np.asarray(w_q, np.float64),
+                                device=device, dtype=dtype))
+    # spec input form: lb(x) = acc_spec + b_q + ewinp_full·x  (b_q cancels in Δ)
+    _acc_spec, ewinp_spec = _seed_input_forms(gg, xl, xh, sb, ob, params,
+                                              ops[-1]['name'], w_t.unsqueeze(0))
+    ewinp_full = ewinp_spec[0]                              # (n_in,)
+    base_conc = (ewinp_full.clamp(min=0) @ xl.to(dtype)
+                 + ewinp_full.clamp(max=0) @ xh.to(dtype))
+    # signed ew at every relu output (one batched B=1 walk)
+    sb_b = {L: (lo.unsqueeze(0), hi.unsqueeze(0)) for L, (lo, hi) in sb.items()}
+    ob_b = {}
+    for k, v in ob.items():
+        if isinstance(v[0], tuple):
+            ob_b[k] = ((v[0][0].unsqueeze(0), v[0][1].unsqueeze(0)),
+                       (v[1][0].unsqueeze(0), v[1][1].unsqueeze(0)))
+        else:
+            ob_b[k] = (v[0].unsqueeze(0), v[1].unsqueeze(0))
+    p_b = {k: v.unsqueeze(0) for k, v in params.items()
+           if k[0] not in ('beta', 'rbeta')}
+    with torch.no_grad():
+        _lb, ew_s = attn_crown_lb_batch(gg, xl, xh, sb_b, ob_b, w_t, float(b_q),
+                                        p_b, return_ew_signed=True)
+    out = {}
+    for L, (lo, hi) in sb.items():
+        if L not in relu_in or L not in ew_s:
+            continue
+        lo = lo.to(dtype); hi = hi.to(dtype)
+        n_L = lo.numel()
+        ew_out = ew_s[L][0]                                 # (n_L,) signed
+        ub_r = hi.clamp(min=0); lb_r = lo.clamp(max=0)
+        ub_r = torch.maximum(ub_r, lb_r + 1e-12)
+        up_s = ub_r / (ub_r - lb_r); up_t = -lb_r * up_s
+        active = (lo >= 0).to(dtype); dead = (hi <= 0).to(dtype)
+        unstable = (1 - active) * (1 - dead)
+        lam = params.get(('relu', L))
+        lam = (lam.clamp(0, 1) if lam is not None else (up_s > 0.5).to(dtype))
+        lo_slope = active + unstable * lam
+        up_slope = active + unstable * up_s
+        up_off = unstable * up_t
+        ep = ew_out.clamp(min=0); en = ew_out.clamp(max=0)
+        ewin_cur = ep * lo_slope + en * up_slope            # current ew^in_L
+        if not bool((unstable > 0).any()):
+            out[L] = torch.zeros(n_L, device=device, dtype=dtype); continue
+        # per-neuron downstream-to-input map (seed eye at the pre-activation op)
+        eye = torch.eye(n_L, device=device, dtype=dtype)
+        acc_seed, ewinp_seed = _seed_input_forms(gg, xl, xh, sb, ob, params,
+                                                 relu_in[L], eye, chunk=chunk)
+        dbounds = []
+        for ewin_new in (ew_out, torch.zeros_like(ew_out)):  # active, inactive
+            delta = ewin_new - ewin_cur                      # (n_L,)
+            dbound = torch.empty(n_L, device=device, dtype=dtype)
+            for s0 in range(0, n_L, chunk):
+                sl = slice(s0, min(s0 + chunk, n_L))
+                ew_new = (ewinp_full.unsqueeze(0)
+                          + delta[sl].unsqueeze(1) * ewinp_seed[sl])  # (c, n_in)
+                conc = (ew_new.clamp(min=0) @ xl.to(dtype)
+                        + ew_new.clamp(max=0) @ xh.to(dtype))
+                dacc = -en[sl] * up_off[sl] + delta[sl] * acc_seed[sl]
+                dbound[sl] = dacc + (conc - base_conc)
+            dbounds.append(dbound)
+        score = torch.minimum(dbounds[0], dbounds[1])        # worst-child gain
+        out[L] = torch.where(unstable > 0, score,
+                             torch.zeros_like(score))
+    return out
+
+
+def box_halfspace_branch_score(gg, xl, xh, sb, ob, params, w_q, b_q):
+    """Deterministic spec-aware branching weight (fix #2). For each unstable
+    relu neuron, bound its PRE-activation over `box ∩ {spec-halfspace}` using
+    CROWN backward linear forms (no generators / forward-zono) and the
+    closed-form `box_halfspace` LP; score = the gap that survives the spec
+    constraint (the neurons the spec can't pin down -> the spec-critical splits).
+    Returns {layer_idx: score (n,)}. Branching-only -> soundness-irrelevant."""
+    import numpy as _np
+    from . import box_halfspace as _bh
+    device = xl.device; dtype = xl.dtype
+    center = ((xl + xh) * 0.5).to(torch.float64).cpu().numpy()
+    radius = ((xh - xl) * 0.5).to(torch.float64).cpu().numpy()
+    # spec lower form m(x)=acc+a·x over the input -> halfspace a·x <= -acc
+    # (region where the spec lower bound is non-positive; superset of unsafe),
+    # rescaled to e in [-1,1]: x = center + radius*e.
+    w_t = (w_q.to(device=device, dtype=dtype) if torch.is_tensor(w_q)
+           else torch.as_tensor(_np.asarray(w_q, _np.float64),
+                                device=device, dtype=dtype))
+    acc_s, ew_s = _seed_input_forms(gg, xl, xh, sb, ob, params,
+                                    gg['ops'][-1]['name'], w_t.unsqueeze(0))
+    a_in = ew_s[0].to(torch.float64).cpu().numpy()
+    a_spec = a_in * radius
+    beta_spec = float(-acc_s[0].item() - float((a_in * center).sum()) - float(b_q))
+    # relu layer -> pre-activation op name
+    relu_in = {op['layer_idx']: op['inputs'][0] for op in gg['ops']
+               if op['type'] == 'relu' and op.get('layer_idx') in sb}
+    out = {}
+    for L, in_name in relu_in.items():
+        lo_t, hi_t = sb[L]
+        uns = ((lo_t < 0) & (hi_t > 0))
+        n = lo_t.numel()
+        score = torch.zeros(n, device=device, dtype=dtype)
+        if not bool(uns.any()):
+            out[L] = score; continue
+        eye = torch.eye(n, device=device, dtype=dtype)
+        acc_lo, ew_lo = _seed_input_forms(gg, xl, xh, sb, ob, params, in_name, eye)
+        acc_up, ew_up = _seed_input_forms(gg, xl, xh, sb, ob, params, in_name, -eye)
+        ew_lo = ew_lo.to(torch.float64).cpu().numpy(); acc_lo = acc_lo.to(torch.float64).cpu().numpy()
+        ew_up = ew_up.to(torch.float64).cpu().numpy(); acc_up = acc_up.to(torch.float64).cpu().numpy()
+        idx = torch.nonzero(uns).flatten().tolist()
+        sc = score.cpu().numpy()
+        for j in idx:
+            d_lo = ew_lo[j] * radius; c0_lo = acc_lo[j] + float((ew_lo[j] * center).sum())
+            d_hi = -ew_up[j] * radius; c0_hi = -acc_up[j] - float((ew_up[j] * center).sum())
+            tlo = _bh.lagrangian_min(d_lo, c0_lo, a_spec, beta_spec)
+            thi = _bh.lagrangian_max(d_hi, c0_hi, a_spec, beta_spec)
+            if _np.isfinite(tlo) and _np.isfinite(thi) and thi > tlo:
+                sc[j] = min(-tlo, thi)            # gap surviving the spec halfspace
+            else:                                  # infeasible/degenerate -> plain gap
+                sc[j] = min(-float(lo_t[j]), float(hi_t[j]))
+        if os.environ.get('VC_BH_DEBUG'):
+            # rank candidate formulas vs ABC's known-good neuron set for 2157
+            _abc = {0: {326, 328, 570, 584, 646, 678, 725, 1005, 1033, 1093,
+                        1513, 1558}, 1: {652, 1132, 1386, 1463},
+                    2: {983, 998, 1118, 1295}}.get(L, set())
+            a_arr = a_spec
+            proj = _np.array([abs(float((ew_lo[j] * radius * a_arr).sum()))
+                              for j in idx])  # |spec . g_lo| (sensitivity)
+            gap = sc[idx]                      # surviving spec-halfspace gap
+            base = _np.array([min(-float(lo_t[j]), float(hi_t[j])) for j in idx])
+            for nm_, val_ in (('bh_gap', gap), ('spec_proj', proj),
+                              ('gap*proj', base * proj), ('bh*proj', gap * proj)):
+                order = [idx[k] for k in _np.argsort(-val_)]
+                topk = set(order[:max(4, len(_abc))])
+                print(f'  [bh-dbg] L{L} {nm_}: top{len(topk)} ∩ ABC = '
+                      f'{len(topk & _abc)}/{len(_abc)}', flush=True)
+        out[L] = torch.as_tensor(sc, device=device, dtype=dtype).clamp(min=0)
+    return out
 
 
 def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
                   time_left, ew_w=None, batch=16, n_iters=12, lr=0.1,
                   max_domains=200000, print_progress=False,
                   gg_work=None, work_dtype=None, kfsb_k=4, perdom_ew=True,
-                  hot_warmup=0, hot_kfsb=16):
+                  hot_warmup=0, hot_kfsb=16, bh_score=False, perdom_la=False,
+                  bbps_score=False, bbps_topk=12):
     """Batched no-reforward beta-CROWN BaB on ONE open query.
 
     Returns (ok, n_domains, reason). The ABC vit recipe: each domain's
@@ -887,7 +1114,8 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
                 best = ('exp', nm, j, float(lo[j]), float(hi[j]))
         return best
 
-    def pick_candidates(clamps, kk, dom_ew=None, allow=None):
+    def pick_candidates(clamps, kk, dom_ew=None, allow=None, full_w=None,
+                        dom_la=None):
         """Top-kk relu split candidates by the BaBSR-style heuristic
         (global across layers); exp-input fallback when no unstable
         relu remains. Returns a list of split descriptors (possibly
@@ -895,19 +1123,33 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
 
         dom_ew: optional {L: (n,)} per-domain backward sensitivity |lA|
         (from batch_dom_ew) — the BaBSR weight ABC uses. Falls back to the
-        static root ew_w when not provided."""
+        static root ew_w when not provided.
+        full_w: optional {L: (n,)} that REPLACES the gap*weight score entirely
+        (the box-halfspace spec-aware score already encodes split value).
+        dom_la: optional {L: (n,)} per-domain BETA-INCLUSIVE |lA| (ABC's BaBSR);
+        when given, score = |lA| * triangle-intercept(-lo*hi/(hi-lo))."""
         cands = []
         sb_d = dom_sb(clamps)
         for L, (lo, hi) in sb_d.items():
             uns = (lo < 0) & (hi > 0)
             if not bool(uns.any()):
                 continue
-            score = torch.minimum(-lo, hi) * uns
-            _w = (dom_ew.get(L) if dom_ew is not None else None)
-            if _w is None and ew_w is not None and L in ew_w:
-                _w = ew_w[L]
-            if _w is not None and _w.numel() == score.numel():
-                score = score * (_w.to(score.dtype) + 1e-12)
+            if dom_la is not None and L in dom_la \
+                    and dom_la[L].numel() == lo.numel():
+                # proper BaBSR: |lA| * triangle intercept (-lo*hi/(hi-lo))
+                intercept = (-lo * hi) / (hi - lo).clamp(min=1e-12)
+                score = dom_la[L].to(device=lo.device, dtype=lo.dtype) \
+                    * intercept * uns
+            elif full_w is not None and L in full_w \
+                    and full_w[L].numel() == lo.numel():
+                score = full_w[L].to(lo.dtype).clone() * uns
+            else:
+                score = torch.minimum(-lo, hi) * uns
+                _w = (dom_ew.get(L) if dom_ew is not None else None)
+                if _w is None and ew_w is not None and L in ew_w:
+                    _w = ew_w[L]
+                if _w is not None and _w.numel() == score.numel():
+                    score = score * (_w.to(score.dtype) + 1e-12)
             for (L2, j2) in clamps:
                 if L2 == L:
                     score[j2] = -1.0
@@ -942,7 +1184,7 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
             c2[(nm, j)] = (l_, m_) if side == 0 else (m_, u_)
         return c2
 
-    def bound_batch(doms, eval_only=False):
+    def bound_batch(doms, eval_only=False, return_la=False):
         """doms: list of (clamps, warm_params). Returns best lb (B,)
         tensor (detached) and per-domain optimized params (detached);
         eval_only skips the Adam loop (one no-grad eval, params=warm —
@@ -1004,6 +1246,26 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
                         cl[i, j] = val[0]
                         ch[i, j] = val[1]
                 oc_b[nm] = (cl, ch)
+        if eval_only and _compile_walk:
+            # CONSTANT-STRUCTURE for torch.compile: give rc_b/oc_b the SAME keys
+            # every call (all relu layers + exp ops, ±inf where unclamped) so the
+            # compiled walk sees one fixed graph instead of re-tracing per
+            # clamp-key-set. ±inf clamp + the (zero) rbeta/beta that params_b then
+            # adds for these keys is a NO-OP (the _apply_beta_b mask is all-False
+            # at ±inf), so the bound is identical — only the dict structure is
+            # stabilized. Confined to the FSB eval_only path (Adam path unchanged).
+            for L in sb_root:
+                if L not in rc_b:
+                    n = sb_root[L][0].numel()
+                    rc_b[L] = (
+                        torch.full((B, n), -np.inf, device=device, dtype=dtype),
+                        torch.full((B, n), np.inf, device=device, dtype=dtype))
+            for nm in exp_names:
+                if nm not in oc_b:
+                    n = ob0[nm][0].numel()
+                    oc_b[nm] = (
+                        torch.full((B, n), -np.inf, device=device, dtype=dtype),
+                        torch.full((B, n), np.inf, device=device, dtype=dtype))
         # batched params: every key in base_params + betas for clamped
         # layers/ops; warm-start per domain where the parent carried one
         params_b = {}
@@ -1053,11 +1315,39 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
             oc_b = {nm: (cl.to(wdt), ch.to(wdt))
                     for nm, (cl, ch) in oc_b.items()}
         if eval_only:
+            if _dump_walk and not _walk_dumped[0] and B >= _dump_walk_minB:
+                import pickle
+                # wgg holds a torch.jit ScriptFunction (some cached kernel) that
+                # plain pickle rejects; the backward CROWN walk only reads DATA
+                # fields, so strip every non-data object (callables/ScriptFns).
+                def _san(o):
+                    if isinstance(o, torch.Tensor):
+                        return o.detach()
+                    if isinstance(o, (int, float, bool, str, bytes,
+                                      np.ndarray)) or o is None:
+                        return o
+                    if isinstance(o, dict):
+                        return {k: _san(v) for k, v in o.items()}
+                    if isinstance(o, (list, tuple)):
+                        return type(o)(_san(v) for v in o)
+                    return None  # callables / ScriptFunctions / etc.
+                _payload = dict(
+                    wgg=_san(wgg), xl_w=xl_w.detach(), xh_w=xh_w.detach(),
+                    sb_b=_san(sb_b), ob_b=_san(ob_b), w_w=_san(w_w),
+                    b_q=float(b_q), params_b=_san(params_b),
+                    oc_b=_san(oc_b or None), rc_b=_san(rc_b or None), B=B)
+                with open(_dump_walk, 'wb') as _df:
+                    pickle.dump(_payload, _df)
+                _walk_dumped[0] = True
+                print(f'[dump-walk] wrote eval_only batch B={B} -> '
+                      f'{_dump_walk}', flush=True)
+            _walk = (_compiled_walk() if _compile_walk
+                     else attn_crown_lb_batch)
             with torch.no_grad():
-                lb = attn_crown_lb_batch(wgg, xl_w, xh_w, sb_b, ob_b,
-                                         w_w, float(b_q), params_b,
-                                         op_clamps_b=oc_b or None,
-                                         relu_clamps_b=rc_b or None)
+                lb = _walk(wgg, xl_w, xh_w, sb_b, ob_b,
+                           w_w, float(b_q), params_b,
+                           op_clamps_b=oc_b or None,
+                           relu_clamps_b=rc_b or None)
             return lb, None
         opt = torch.optim.Adam(list(params_b.values()), lr=lr)
         best = torch.full((B,), -np.inf, device=device, dtype=wdt)
@@ -1087,6 +1377,18 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
             out_params.append({
                 k: v[i].detach().to('cpu', torch.float32)
                 for k, v in params_b.items()})
+        if return_la:
+            # (1b) per-domain beta-INCLUSIVE |lA| at each relu, captured from a
+            # final no-grad eval at the optimized {alpha,beta} — ABC's BaBSR
+            # weight. One extra walk per round (~1/12 of the Adam cost).
+            with torch.no_grad():
+                _lb2, ew_relu = attn_crown_lb_batch(
+                    wgg, xl_w, xh_w, sb_b, ob_b, w_w, float(b_q), params_b,
+                    op_clamps_b=oc_b or None, relu_clamps_b=rc_b or None,
+                    return_ew=True)
+            la_list = [{L: ew_relu[L][i].detach().to('cpu')
+                        for L in ew_relu} for i in range(B)]
+            return best, out_params, la_list
         return best, out_params
 
     heap = []
@@ -1094,7 +1396,7 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
     n_domains = 1
     if not pick_candidates({}, 1):
         return False, 1, 'no_split'
-    heapq.heappush(heap, (-0.0, cnt, {}, None))
+    heapq.heappush(heap, (-0.0, cnt, {}, None, None))
     # HOT-SET warmup: the first `hot_warmup` rounds use a WIDE FSB (hot_kfsb) to
     # DISCOVER the high-value split neurons (FSB ranks by actual child-bound
     # improvement); after warmup, restrict candidates to that discovered set at
@@ -1103,7 +1405,96 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
     # with restricted-set speed. Branching-only -> soundness-irrelevant.
     _hot = set(); _round = 0
     _prof = os.environ.get('VC_BAB_PROF')
+    _compile_walk = bool(os.environ.get('VC_COMPILE_WALK'))
+    _adapt_kfsb = float(os.environ.get('VC_ADAPT_KFSB', 0.0))
+    _adapt_near_kk = int(os.environ.get('VC_ADAPT_NEAR_KK', 4))
+    # (A) FSB-walk microbench dump: pickle the first steady-state eval_only
+    # batch (B >= VC_DUMP_WALK_MINB) so the walk can be timed in isolation.
+    _dump_walk = os.environ.get('VC_DUMP_WALK')
+    _dump_walk_minB = int(os.environ.get('VC_DUMP_WALK_MINB', 1000))
+    _walk_dumped = [False]
+    # (B) scoring-fidelity dump: per round/domain, each FSB candidate's raw
+    # score components (lo,hi,|lA|) + FSB ground-truth child-bounds, so any
+    # cheap-score formula can be ranked against FSB's pick OFFLINE (jsonl,
+    # incremental so a timeout-kill keeps what ran). Default off.
+    _dump_fsb = os.environ.get('VC_DUMP_FSB')
     _t_fsb = _t_bnd = _t_ew = 0.0
+    # (#2) deterministic spec-aware branching score, computed ONCE at the root
+    # via the box-halfspace LP over CROWN backward forms; replaces the gap*ew_w
+    # heuristic (which mis-ranks the spec-critical neurons -> kfsb chaos).
+    _bh_w = None
+    if bh_score:
+        _t_bh0 = time.perf_counter()
+        _bh_w = box_halfspace_branch_score(gg, xl, xh, sb_root, ob0,
+                                           base_params, w_q, b_q)
+        print(f'  [bh-score] computed root spec-halfspace scores for '
+              f'{len(_bh_w)} relu layers ({time.perf_counter()-_t_bh0:.1f}s)',
+              flush=True)
+    # BBPS branching (ABC's ACTUAL vit heuristic, ported): root bound-improvement
+    # score per neuron, used as the pick_candidates pre-filter weight (full_w).
+    # Reproduces ABC's neuron set 18/20 vs BaBSR's 8/20 -> kfsb FSB then refines
+    # the RIGHT candidates. Gated by attn_bab_bbps_score / VC_BBPS_BRANCH.
+    if bbps_score or os.environ.get('VC_BBPS_BRANCH'):
+        _t_bb0 = time.perf_counter()
+        _bh_w = bbps_root_scores(gg, xl, xh, sb_root, ob0, base_params,
+                                 w_q, b_q)
+        # RESTRICT candidates to the top-K BBPS neurons per layer (the discovered
+        # critical set) — mirrors the forced-20 experiment that closed in budget;
+        # _bh_w still orders within the set. K from VC_BBPS_TOPK / attn_bab_bbps_topk.
+        _topk = int(os.environ.get('VC_BBPS_TOPK', 0) or bbps_topk or 12)
+        _force_set = set()
+        for _L, _sc in _bh_w.items():
+            _ni = _sc.numel()
+            for _j in torch.topk(_sc, min(_topk, _ni)).indices.tolist():
+                if float(_sc[_j]) > 0:
+                    _force_set.add((_L, int(_j)))
+        print(f'  [bbps-score] computed root BBPS scores for {len(_bh_w)} relu '
+              f'layers, restricted to {len(_force_set)} neurons (top-{_topk}/layer) '
+              f'({time.perf_counter()-_t_bb0:.1f}s)', flush=True)
+    if os.environ.get('VC_BH_DEBUG'):
+        # Does ROOT scoring match ABC's dynamic neuron set? Compare proper BaBSR
+        # (|lA|*triangle-intercept) vs the default (|lA|*min(-lo,hi)) vs parts.
+        _abc = {0: {326, 328, 570, 584, 646, 678, 725, 1005, 1033, 1093, 1513,
+                    1558}, 1: {652, 1132, 1386, 1463}, 2: {983, 998, 1118, 1295}}
+        for L, (lo, hi) in sb_root.items():
+            uns = (lo < 0) & (hi > 0)
+            if not bool(uns.any()) or L not in _abc:
+                continue
+            la = (ew_w[L] if (ew_w is not None and L in ew_w
+                              and ew_w[L].numel() == lo.numel())
+                  else torch.ones_like(lo))
+            intercept = (-lo * hi) / (hi - lo).clamp(min=1e-12)
+            mn = torch.minimum(-lo, hi)
+            cands = {'babsr(|lA|*intercept)': la * intercept * uns,
+                     'default(|lA|*min)': la * mn * uns,
+                     '|lA|': la * uns, 'intercept': intercept * uns}
+            for nm_, sc in cands.items():
+                k = max(4, len(_abc[L]))
+                top = set(torch.topk(sc, min(k, sc.numel())).indices.tolist())
+                print(f'  [babsr-dbg] L{L} {nm_}: top{len(top)} ∩ ABC = '
+                      f'{len(top & _abc[L])}/{len(_abc[L])}', flush=True)
+    if os.environ.get('VC_BBPS_DEBUG'):
+        # Does the ported BBPS score (ABC's ACTUAL vit heuristic) match ABC's
+        # neuron set far better than BaBSR? Compare top-k ∩ ABC forced-20.
+        _abc = {0: {326, 328, 570, 584, 646, 678, 725, 1005, 1033, 1093, 1513,
+                    1558}, 1: {652, 1132, 1386, 1463}, 2: {983, 998, 1118, 1295}}
+        _t_b = time.perf_counter()
+        _bbps = bbps_root_scores(gg, xl, xh, sb_root, ob0, base_params, w_q, b_q)
+        print(f'  [bbps-dbg] computed BBPS root scores '
+              f'({time.perf_counter()-_t_b:.1f}s)', flush=True)
+        _tot = _hit = 0
+        for L in sorted(_abc):
+            if L not in _bbps:
+                continue
+            sc = _bbps[L]
+            k = len(_abc[L])
+            top = set(torch.topk(sc, min(k, sc.numel())).indices.tolist())
+            _hit += len(top & _abc[L]); _tot += len(_abc[L])
+            print(f'  [bbps-dbg] L{L} BBPS: top{len(top)} ∩ ABC = '
+                  f'{len(top & _abc[L])}/{len(_abc[L])}  (max={float(sc.max()):.4g})',
+                  flush=True)
+        print(f'  [bbps-dbg] TOTAL ∩ ABC = {_hit}/{_tot} '
+              f'(BaBSR baseline was 8/20)', flush=True)
     while heap:
         if time_left() <= 2.0:
             return False, n_domains, 'time'
@@ -1114,10 +1505,11 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
         _kk = hot_kfsb if _in_warmup else kfsb_k
         _allow = (_hot if (hot_warmup and not _in_warmup and _hot) else None)
         # pop up to batch//2 worst domains; kfsb-pick each one's split
-        popped = []
+        popped = []; popped_la = []; popped_lb = []
         while heap and (len(popped) + 1) * 2 <= batch:
-            lb_p, _, clamps, wp = heapq.heappop(heap)
-            popped.append((clamps, wp))
+            lb_p, _, clamps, wp, la = heapq.heappop(heap)
+            popped.append((clamps, wp)); popped_la.append(la)
+            popped_lb.append(lb_p)
         cand_lists = []
         # per-domain backward sensitivity for this round's popped domains
         # (one batched no-beta walk); the BaBSR weight (ABC-style), replacing
@@ -1129,7 +1521,19 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
         for _di, (clamps, wp) in enumerate(popped):
             _dew = ({L: _dom_ews[L][_di] for L in _dom_ews}
                     if _dom_ews is not None else None)
-            cands = pick_candidates(clamps, _kk, _dew, _allow)
+            # (1b) per-domain beta-inclusive |lA| stored when this domain was
+            # bounded (root domain has None -> falls back to ew_w).
+            _dla = popped_la[_di] if perdom_la else None
+            # ADAPTIVE kfsb: wide FSB only for domains still FAR from closing
+            # (lb < -thr); near-closing domains get a cheap kfsb (one more split
+            # usually closes them). Cuts the FSB cost in the convergence tail,
+            # where most domains live, without touching the far-domain branching
+            # quality that the wide FSB is load-bearing for. Branching-only ->
+            # soundness-irrelevant. Gated by VC_ADAPT_KFSB=<thr> (default off).
+            _kk_i = _kk
+            if _adapt_kfsb and not _in_warmup and popped_lb[_di] >= -_adapt_kfsb:
+                _kk_i = min(_kk, _adapt_near_kk)
+            cands = pick_candidates(clamps, _kk_i, _dew, _allow, _bh_w, _dla)
             if not cands:
                 return False, n_domains, 'exhausted'
             cand_lists.append(cands)
@@ -1148,14 +1552,44 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
             _t_fsb += time.perf_counter() - _tf
             chosen = []
             r = 0
-            for (clamps, wp), cands in zip(popped, cand_lists):
+            _fsb_recs = [] if _dump_fsb else None
+            for _di2, ((clamps, wp), cands) in enumerate(zip(popped,
+                                                             cand_lists)):
                 best_sp = None; best_m = -np.inf
+                _crec = [] if _dump_fsb else None
+                _sb_d = dom_sb(clamps) if _dump_fsb else None
+                _dew2 = ({L: _dom_ews[L][_di2] for L in _dom_ews}
+                         if (_dump_fsb and _dom_ews is not None) else None)
+                _dla2 = popped_la[_di2] if (_dump_fsb and perdom_la) else None
                 for sp in cands:
-                    m = min(float(lbs_c[r]), float(lbs_c[r + 1]))
+                    c0 = float(lbs_c[r]); c1 = float(lbs_c[r + 1])
+                    m = min(c0, c1)
                     r += 2
                     if m > best_m:
                         best_m = m; best_sp = sp
+                    if _dump_fsb and sp[0] == 'relu':
+                        _L, _j = sp[1], sp[2]
+                        _lo, _hi = _sb_d[_L]
+                        _ew = (float(_dew2[_L][_j])
+                               if (_dew2 is not None and _L in _dew2) else None)
+                        _la = (float(_dla2[_L][_j])
+                               if (_dla2 is not None and _L in _dla2
+                                   and _dla2[_L].numel() > _j) else None)
+                        # [L, j, lo, hi, |lA|_nobeta, |lA|_beta, fsb_c0, fsb_c1]
+                        _crec.append([int(_L), int(_j), float(_lo[_j]),
+                                      float(_hi[_j]), _ew, _la, c0, c1])
                 chosen.append(best_sp)
+                if _dump_fsb:
+                    _chosen_idx = next(
+                        (k for k, sp in enumerate(cands) if sp is best_sp), -1)
+                    _fsb_recs.append({'lb': float(popped_lb[_di2]),
+                                      'cands': _crec,
+                                      'chosen': _chosen_idx})
+            if _dump_fsb:
+                import json
+                with open(_dump_fsb, 'a') as _ff:
+                    _ff.write(json.dumps({'round': _round,
+                                          'doms': _fsb_recs}) + '\n')
         else:
             chosen = [c[0] for c in cand_lists]
         if _in_warmup:
@@ -1170,7 +1604,10 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
             for side in (0, 1):
                 children.append((child_clamps(clamps, sp, side), wp))
         _tb = time.perf_counter()
-        lbs, out_params = bound_batch(children)
+        if perdom_la:
+            lbs, out_params, la_list = bound_batch(children, return_la=True)
+        else:
+            lbs, out_params = bound_batch(children); la_list = None
         _t_bnd += time.perf_counter() - _tb
         if _prof and _round % 20 == 0:
             print(f'    [bab-prof] round {_round} dom {n_domains}: '
@@ -1185,7 +1622,8 @@ def attn_beta_bab(gg, xl, xh, sb0, ob0, w_q, b_q, root_params, *,
             if lb_i > 0:
                 continue
             cnt += 1
-            heapq.heappush(heap, (lb_i, cnt, c2, out_params[i]))
+            heapq.heappush(heap, (lb_i, cnt, c2, out_params[i],
+                                  la_list[i] if la_list is not None else None))
         if print_progress and n_domains % 256 < batch:
             worst = heap[0][0] if heap else 0.0
             print(f'    [beta-bab] {n_domains} domains, frontier '

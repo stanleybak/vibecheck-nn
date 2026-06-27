@@ -1149,6 +1149,27 @@ def default_settings(**overrides):
         # 0 = off. Branching-only -> soundness-irrelevant.
         attn_bab_hot_warmup=0,
         attn_bab_hot_kfsb=16,
+        # (#2) box-halfspace spec-aware branching score (deterministic): scores
+        # each unstable relu by its pre-activation gap surviving box ∩ spec-
+        # halfspace (CROWN backward forms + closed-form box_halfspace LP, no
+        # generators). Replaces the gap*ew_w heuristic that mis-ranks neurons.
+        # Branching-only -> soundness-irrelevant. Off by default.
+        attn_bab_bh_score=False,
+        # (1b) per-domain BETA-INCLUSIVE |lA| branching (ABC's BaBSR): capture
+        # |lA| at each relu from bound_batch's beta-optimized walk, store per
+        # child, score |lA|*intercept when popped. Cheap (one extra walk/round)
+        # + dynamic (per-domain, finds the deep-tree critical neurons root
+        # scores miss). Branching-only -> soundness-irrelevant. Off by default.
+        attn_bab_perdom_la=False,
+        # BBPS branching (ABC's ACTUAL nonlinear-branching heuristic for vit, ported
+        # — NOT BaBSR). Per neuron, estimates worst-child spec-bound improvement from
+        # splitting (fast backward re-prop), restricts candidates to the top-K BBPS
+        # neurons/layer (the discovered critical set), then kfsb FSB refines. Closes
+        # vit ibp_3_3_8 in budget (2157: 52s vs kfsb=16 timeout) where BaBSR can't —
+        # BaBSR captured only 8/20 of ABC's neurons, BBPS captures 18/20.
+        # Branching-only -> soundness-irrelevant.
+        attn_bab_bbps_score=False,
+        attn_bab_bbps_topk=12,                  # candidates kept per relu layer
         phase8_dual_ascent_max_iter=1,         # K — hard iter cap per node
         # Phase 8 minimum-budget floor as fraction of total_timeout. The
         # pipeline rebudgets so Phase 8 always gets at least this fraction
