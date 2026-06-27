@@ -121,9 +121,21 @@ def test_resolve_cex_io_meta(tmp_path):
         '(declare-network N (declare-input X1 float32 [1, 2]) '
         '(declare-input X2 real [1, 3]) (declare-output Y float32 [1, 1]))\n'
         '(assert (<= Y[0,0] 0.0))\n')
-    assert vbmain._resolve_cex_io_meta(p) == (
+    # Returns (inputs, outputs, order) — order is the DECLARATION order so a
+    # network PAIR's interleaved X_f,Y_f,X_g,Y_g cex follows the spec, not
+    # inputs-then-outputs (the v2 validator reads variables by order).
+    expected = (
         (('X1', 'float32', (1, 2), 2), ('X2', 'real', (1, 3), 3)),
-        (('Y', 'float32', (1, 1), 1),))
+        (('Y', 'float32', (1, 1), 1),),
+        (('in', 0), ('in', 1), ('out', 0)))
+    assert vbmain._resolve_cex_io_meta(p) == expected
+    # Same spec gzipped + referenced by the plain name -> still resolved
+    # (the resolver opens `<spec>.gz` transparently).
+    import gzip
+    with gzip.open(p + '.gz', 'wt') as f:
+        f.write(open(p).read())
+    os.remove(p)
+    assert vbmain._resolve_cex_io_meta(p) == expected
     # v1 spec (no declare-network) -> None: the cex keeps the ONNX node names.
     p1 = str(tmp_path / 'v1.vnnlib')
     open(p1, 'w').write('(declare-const X_0 Real)\n(assert (<= X_0 1.0))\n')

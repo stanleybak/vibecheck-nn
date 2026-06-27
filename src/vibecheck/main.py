@@ -534,9 +534,18 @@ def _maybe_network_pair(args):
     from . import network_pair as npair
     if not npair.is_network_pair_net_field(args.net):
         return
+    orig_field = args.net
     merged_onnx, merged_spec = npair.build_merged_instance(args.net, args.spec)
     print(f'Network-pair instance: merged {npair.detect_kind(npair._read_vnnlib_text(args.spec))} '
           f'pair -> {merged_onnx}')
+    # Capture per-network reconstruction info (from the ORIGINAL pair spec, before the rewrite)
+    # so the cex emits the pair's declared X_f,Y_f,X_g,Y_g, not the merged net's collapsed I/O.
+    # build_merged_instance already parsed/resolved these above, so this cannot fail here.
+    _lp = npair.resolve_pair_paths(orig_field, args.spec)   # {label: resolved abs onnx path}
+    _paths = list(_lp.values())
+    nf = _paths[0]
+    ng = _paths[1] if len(_paths) > 1 else _paths[0]
+    args.pair_cex_info = (nf, ng, npair.parse_multinet(npair._read_vnnlib_text(args.spec)))
     args.net = merged_onnx
     args.spec = merged_spec
 
@@ -795,17 +804,31 @@ def _onnx_io_meta(onnx_path):
     return ins, outs
 
 
-def _cex_v2(ins_meta, outs_meta, x_flat, y_flat, fmt):
+def _cex_v2(ins_meta, outs_meta, x_flat, y_flat, fmt, order=None):
     """Build the VNNLIB 2.0 counterexample: per-tensor `NAME dtype [d0,d1,...]` header then
-    the tensor's C-order values (one per line) — every input (the flat X split by input size)
-    then every output (the flat Y split by output size). Mirrors the VNN-COMP 2026 v2 format."""
+    the tensor's C-order values (one per line). Tensors are emitted in the spec's DECLARATION
+    order (`order` = list of ('in'|'out', index)) — for a single network that's inputs then
+    output, but for a network PAIR the spec interleaves per-network (X_f, Y_f, X_g, Y_g), and
+    the v2 validator reads variables BY ORDER, so grouping all inputs first is rejected
+    (malformed_ce: expected Y_f, found X_g). `order=None` falls back to inputs-then-outputs."""
+    if order is None:
+        order = ([('in', i) for i in range(len(ins_meta))]
+                 + [('out', j) for j in range(len(outs_meta))])
+    in_off, out_off = [0], [0]
+    for _, _, _, sz in ins_meta:
+        in_off.append(in_off[-1] + sz)
+    for _, _, _, sz in outs_meta:
+        out_off.append(out_off[-1] + sz)
     lines = []
-    for meta, flat in ((ins_meta, x_flat), (outs_meta, y_flat)):
-        off = 0
-        for name, dt, shape, size in meta:
-            lines.append(f"{name} {dt} [{','.join(str(d) for d in shape)}]")
-            lines.extend(f'{v:{fmt}}' for v in flat[off:off + size])
-            off += size
+    for kind, idx in order:
+        if kind == 'in':
+            name, dt, shape, size = ins_meta[idx]
+            flat, off = x_flat, in_off[idx]
+        else:
+            name, dt, shape, size = outs_meta[idx]
+            flat, off = y_flat, out_off[idx]
+        lines.append(f"{name} {dt} [{','.join(str(d) for d in shape)}]")
+        lines.extend(f'{v:{fmt}}' for v in flat[off:off + size])
     return '\n'.join(lines)
 
 
@@ -817,11 +840,13 @@ def _format_cex(version, onnx_path, x_flat, y_flat, fmt, io_meta=None):
     Only if the spec didn't declare them (`io_meta is None`) do we fall back to the ONNX node
     metadata. The values under each header are plain numbers regardless. Logs the source."""
     if version == '2.0':
-        ins, outs = io_meta if io_meta is not None else _onnx_io_meta(onnx_path)
+        meta = io_meta if io_meta is not None else _onnx_io_meta(onnx_path)
+        ins, outs = meta[0], meta[1]
+        order = meta[2] if len(meta) > 2 else None   # spec declaration order (pairs interleave)
         _src = 'spec-declared tensors' if io_meta is not None else 'ONNX node metadata'
         print(f'  [counterexample] format=v2.0 (per-tensor: "NAME dtype [shape]" + '
-              f'C-order values per input then output; using {_src})', flush=True)
-        return _cex_v2(ins, outs, x_flat, y_flat, fmt)
+              f'C-order values in spec-declaration order; using {_src})', flush=True)
+        return _cex_v2(ins, outs, x_flat, y_flat, fmt, order)
     print('  [counterexample] format=v1.0 (flat s-expr: ((X_i <v>) ... (Y_j <v>)))',
           flush=True)
     return _cex_sexpr(x_flat, y_flat, fmt)
@@ -875,15 +900,22 @@ def _resolve_cex_io_meta(spec_path):
         return None
     if 'declare-network' not in head:
         return None
-    ins, outs = [], []
+    ins, outs, order = [], [], []
     for kind, name, dt, shp in re.findall(
             r'\(declare-(input|output)\s+(\S+)\s+(\S+)\s+\[([^\]]*)\]', head):
         shape = tuple(int(s.strip()) for s in shp.split(',') if s.strip())
         size = 1
         for d in shape:
             size *= d
-        (ins if kind == 'input' else outs).append((name, dt, shape, size))
-    return (tuple(ins), tuple(outs)) if (ins or outs) else None
+        if kind == 'input':
+            order.append(('in', len(ins)))
+            ins.append((name, dt, shape, size))
+        else:
+            order.append(('out', len(outs)))
+            outs.append((name, dt, shape, size))
+    # order = the DECLARATION order (a network PAIR interleaves X_f,Y_f,X_g,Y_g; the v2
+    # validator reads variables by order, so the cex must follow it, not group inputs first).
+    return (tuple(ins), tuple(outs), tuple(order)) if (ins or outs) else None
 
 
 def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
@@ -989,7 +1021,15 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
         _ver = getattr(args, 'cex_version', '1.0')
         _io = getattr(args, 'cex_io_decls', None)   # spec-declared v2 names (resolved once)
         _orig = getattr(args, 'orig_net_for_cex', None)
-        if _orig is not None:
+        _pair = getattr(args, 'pair_cex_info', None)
+        if _pair is not None:
+            # Network-pair (iso/monotonic): the loaded net is the MERGED net; reconstruct the
+            # pair's declared per-network tensors (X_f,Y_f,X_g,Y_g) from the merged witness by
+            # running the original f, g nets, then emit in the spec's declaration order.
+            from . import network_pair as npair
+            _xf, _yf = npair.reconstruct_pair_cex(_pair[0], _pair[1], _pair[2], witness)
+            ce = _format_cex(_ver, args.net, _xf, _yf, cex_fmt, io_meta=_io)
+        elif _orig is not None:
             # Nonlinear-augmented instance: the loaded net's outputs are the
             # constraint polynomials, not the original net's output. Emit Y from
             # the ORIGINAL net so the cex has the benchmark's true output shape.

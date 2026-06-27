@@ -399,6 +399,40 @@ def oracle(nf_path, ng_path, ir, merged_path, out_dim, n_samples=120, seed=0):
     return worst
 
 
+def reconstruct_pair_cex(nf_path, ng_path, ir, merged_witness):
+    """Map a MERGED-net witness back to the per-network counterexample the pair spec declares.
+
+    The merged input is z = base[0..n-1] (= g's input x_g) followed by an optional relational
+    delta. The pair spec declares X_f, Y_f, X_g, Y_g, so we reconstruct x_f, x_g from z exactly
+    as the merge oracle does (x_g = base; x_f = base with the one relational coord clamped),
+    run the ORIGINAL f and g nets to get the true Y_f, Y_g, and return
+    (x_flat, y_flat) = (concat(x_f, x_g), concat(y_f, y_g)) in input/output groups (the v2
+    writer interleaves them into declaration order X_f,Y_f,X_g,Y_g). This makes the cex carry
+    the benchmark's real per-network tensors instead of the merged net's collapsed I/O."""
+    z = np.asarray(merged_witness, np.float64).flatten()
+    n = ir['n']
+    rel = ir['rel']
+    base = z[:n]
+    x_g = base.copy()
+    x_f = base.copy()
+    if rel:
+        k = rel['k']
+        delta = float(z[n]) if z.shape[0] > n else 0.0
+        x_f[k] = np.clip(base[k] + delta, ir['xf_box'][k][0], ir['xf_box'][k][1])
+    nf, ng = _load_onnx(nf_path), _load_onnx(ng_path)
+    fin, gin = _free_input(nf), _free_input(ng)
+    shp_f = [d.dim_value or 1 for d in fin.type.tensor_type.shape.dim]
+    shp_g = [d.dim_value or 1 for d in gin.type.tensor_type.shape.dim]
+    # _serialize handles the .gz-authoritative case (the loose .onnx may be absent).
+    sf = ort.InferenceSession(_serialize(nf_path), providers=['CPUExecutionProvider'])
+    sg = ort.InferenceSession(_serialize(ng_path), providers=['CPUExecutionProvider'])
+    y_f = sf.run(None, {fin.name: x_f.astype(np.float32).reshape(shp_f)})[0].flatten()
+    y_g = sg.run(None, {gin.name: x_g.astype(np.float32).reshape(shp_g)})[0].flatten()
+    x_flat = np.concatenate([x_f, x_g]).astype(np.float64)
+    y_flat = np.concatenate([y_f, y_g]).astype(np.float64)
+    return x_flat, y_flat
+
+
 # ----------------------------------------------------------------- entry point
 
 def _cache_paths(net_field, vnnlib_path):

@@ -148,6 +148,32 @@ def test_mono_merge_oracle(tmp_path):
     assert txt.count('(declare-const X_') == 6
 
 
+def test_reconstruct_pair_cex_mono(tmp_path):
+    # reconstruct_pair_cex maps a MERGED-net witness [base(5), delta] back to the
+    # pair's declared per-network tensors: x_g=base, x_f=base with coord 0 clamped,
+    # y_f/y_g from the ORIGINAL net. Returns (concat(x_f,x_g), concat(y_f,y_g)).
+    f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
+    _tiny_acasxu(f, seed=3); _mono_spec(spec)
+    field = f"[('f', '{f}'), ('g', '{f}')]"
+    npair.build_merged_instance(field, spec)
+    ir = npair.parse_multinet(open(spec).read())
+    rng = np.random.default_rng(2)
+    base = (rng.random(5).astype(np.float32) * 2 - 1)
+    delta = 0.7
+    z = np.concatenate([base, [delta]]).astype(np.float64)
+    x_flat, y_flat = npair.reconstruct_pair_cex(f, f, ir, z)
+    # expected x_f / x_g
+    x_f = base.copy().astype(np.float64); x_g = base.copy().astype(np.float64)
+    x_f[0] = np.clip(base[0] + delta, ir['xf_box'][0][0], ir['xf_box'][0][1])
+    sf = ort.InferenceSession(f)
+    y_f = sf.run(None, {'X': x_f.astype(np.float32).reshape(1, 1, 1, 5)})[0].flatten()
+    y_g = sf.run(None, {'X': x_g.astype(np.float32).reshape(1, 1, 1, 5)})[0].flatten()
+    assert np.allclose(x_flat, np.concatenate([x_f, x_g]))
+    assert np.allclose(y_flat, np.concatenate([y_f, y_g]), atol=1e-6)
+    # input group is 10 (5+5), output group is 10 (5+5)
+    assert x_flat.shape == (10,) and y_flat.shape == (10,)
+
+
 def test_mono_constpins_build(tmp_path):
     # constant-pinned coords (== X_f[i] <const>) -> degenerate box; oracle still exact
     f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
