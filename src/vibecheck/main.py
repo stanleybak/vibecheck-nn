@@ -173,17 +173,19 @@ def main():
             sp.build_fakequant_surrogate(args.net, fq)
             # Also parse the (large) box spec here (untimed) + pickle it, so the
             # timed run loads it instead of re-parsing ~8s of index constraints.
-            # Best-effort: a missing/odd spec here just means no cache (the timed
-            # run parses it) — prepare must not fail over an optimization.
+            # If a spec was given it MUST parse — a bad spec is a real error and
+            # raises LOUDLY (the crash handler records 'error'). Quantized prepare
+            # can also run net-only (no spec file, e.g. a surrogate-build-only
+            # test): then there is simply nothing to cache (explicit skip, logged).
             _bc = None
-            try:
+            if os.path.isfile(args.spec) or os.path.isfile(str(args.spec) + '.gz'):
                 import pickle
                 _bc = _box_cache_path(args.spec)
                 with open(_bc, 'wb') as _bf:
                     pickle.dump(sp.parse_box_and_output(args.spec), _bf)
-            except (FileNotFoundError, OSError, ValueError, NotImplementedError) as _e:
-                print(f'  [prepare] box cache skipped ({type(_e).__name__}: {_e})')
-                _bc = None
+            else:
+                print(f'  [prepare] no spec file at {args.spec!r}; box cache '
+                      f'skipped (timed run will parse the spec)')
             print(f'Quantized model: built surrogates (skipped graph pre-parse): '
                   f'{p}, {fq}' + (f', {_bc}' if _bc else ''))
             sys.exit(0)

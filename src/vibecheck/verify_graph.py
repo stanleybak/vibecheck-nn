@@ -9937,19 +9937,18 @@ def _try_clear_ce_upgrade(graph, spec, settings, t_start):
     if budget <= 0.1:
         return None
     from .onnx_torch_runner import pgd_via_onnx
-    try:
-        _sat, _w = pgd_via_onnx(
-            onnx_p, spec,
-            n_restarts=int(settings.pgd_phase0_restarts
-                           if 'pgd_phase0_restarts' in settings else 256),
-            n_iter=int(settings.pgd_phase0_iters
-                       if 'pgd_phase0_iters' in settings else 100),
-            accept_margin=-atol,
-            deadline=time.perf_counter() + budget)
-    except (RuntimeError, ImportError, OSError, ValueError):
-        # PGD-via-ONNX best-effort: torch/ORT runtime errors, missing optional
-        # deps, bad path, or shape mismatch. The boundary witness already stands.
-        return None
+    # No except-swallow: pgd_via_onnx already handles its own OOM and missing
+    # onnxsim internally, so anything it raises here (a bad onnx, a shape
+    # mismatch, a torch bug) is a REAL error — let it propagate to main's crash
+    # handler ('error' + traceback) rather than silently skipping the upgrade.
+    _sat, _w = pgd_via_onnx(
+        onnx_p, spec,
+        n_restarts=int(settings.pgd_phase0_restarts
+                       if 'pgd_phase0_restarts' in settings else 256),
+        n_iter=int(settings.pgd_phase0_iters
+                   if 'pgd_phase0_iters' in settings else 100),
+        accept_margin=-atol,
+        deadline=time.perf_counter() + budget)
     if not _sat or _w is None:
         return None
     w = np.asarray(_w).flatten()
@@ -9971,10 +9970,9 @@ def _orig_pair_or_self_margin(graph, spec, settings, witness, atol):
     pinfo = getattr(settings, 'pair_cex_info', None)
     if pinfo is not None:
         from . import network_pair as npair
-        try:
-            _oy = npair.pair_orig_atom_outputs(pinfo[0], pinfo[1], pinfo[2], witness)
-        except (RuntimeError, OSError, ValueError):
-            return None
+        # No swallow: reconstructing on the original f,g is set up from a verified
+        # pair instance, so a failure here is a real bug — let it raise.
+        _oy = npair.pair_orig_atom_outputs(pinfo[0], pinfo[1], pinfo[2], witness)
         _, _ci = spec.check(_oy, _oy)
         return _ci.get('worst_margin')
     onnx_p = getattr(graph, 'onnx_path', None)

@@ -85,9 +85,10 @@ def test_upgrade_no_budget_left_returns_none(tmp_path):
                                  time.perf_counter() - 5.0) is None
 
 
-def test_upgrade_swallows_pgd_error(tmp_path, monkeypatch):
-    """A torch/ORT runtime error from the PGD attempt must not crash the run —
-    the boundary witness already stands, so the upgrade returns None."""
+def test_upgrade_propagates_pgd_error(tmp_path, monkeypatch):
+    """A real error from the PGD attempt is NOT swallowed — it propagates (the
+    upgrade does not silently skip; main's crash handler records 'error')."""
+    import pytest
     import vibecheck.onnx_torch_runner as otr
 
     def _boom(*a, **k):
@@ -96,8 +97,8 @@ def test_upgrade_swallows_pgd_error(tmp_path, monkeypatch):
     monkeypatch.setattr(otr, 'pgd_via_onnx', _boom)
     g = _Graph(_identity_onnx(tmp_path))
     s = default_settings(total_timeout=30.0)
-    assert _try_clear_ce_upgrade(g, _spec(-1.0, 1.0), s,
-                                 time.perf_counter()) is None
+    with pytest.raises(RuntimeError, match='synthetic pgd failure'):
+        _try_clear_ce_upgrade(g, _spec(-1.0, 1.0), s, time.perf_counter())
 
 
 def test_chokepoint_keeps_boundary_when_no_clear_ce(tmp_path):
