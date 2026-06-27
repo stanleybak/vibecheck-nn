@@ -231,18 +231,17 @@ def _parse_output_atoms(text):
     atoms = []
 
     def add(lhs, raw_op, raw_rhs):
-        # NON-STRICT bound (sound): a strict `< 0` is encoded as its closure
-        # `<= 0` (a SUPERSET of the true unsafe set), NOT `<= -margin` (a strict
-        # SUBSET that would false-unsat a shallow real CE — e.g. monotonic_acasxu
-        # diff = -5e-5). The strict `<` semantics are enforced DOWNSTREAM in the
-        # SAT-detection: PGD + ORT confirmation only commit 'sat' on a CLEAR CE
-        # (margin <= -atol); the measure-zero boundary (diff = 0, e.g. an iso
-        # pair's trivial point or a monotone net's x1==x2 diagonal) validates only
-        # within tolerance, so it is persisted as a within-tol sat while the
-        # search keeps looking for a clear CE or an unsat proof. See
-        # `verify_graph._sat_disposition`.
+        # The VERIFIER bound uses the non-strict CLOSURE: a strict `< 0` is encoded
+        # as `<= 0` (a SUPERSET of the true unsafe set) — sound for UNSAT (proving
+        # no point in the closure ⟹ no strict counterexample). The original
+        # strictness is recorded per-atom so the CE-CHECK can be STRICT: an ORT
+        # witness is only a real counterexample if it violates the ORIGINAL strict
+        # `<`/`>` (margin < 0), so the measure-zero boundary (diff = 0, e.g. a
+        # monotone net's x_f==x_g diagonal) is REJECTED at validation, not emitted.
+        # (`verify_graph._try_clear_ce_upgrade` + the pair CE-check on the originals.)
         op = '<=' if raw_op in ('<', '<=') else '>='
-        atoms.append({'lhs': lhs, 'op': op, 'rhs': raw_rhs})
+        atoms.append({'lhs': lhs, 'op': op, 'rhs': raw_rhs,
+                      'strict': raw_op in ('<', '>')})
 
     # form 1: (OP Y_a[i] (SIGN Y_b[j] eps))  ->  Y_a[i] - Y_b[j] (OP) (±eps)
     seen = set()
@@ -431,6 +430,24 @@ def reconstruct_pair_cex(nf_path, ng_path, ir, merged_witness):
     x_flat = np.concatenate([x_f, x_g]).astype(np.float64)
     y_flat = np.concatenate([y_f, y_g]).astype(np.float64)
     return x_flat, y_flat
+
+
+def pair_orig_atom_outputs(nf_path, ng_path, ir, merged_witness):
+    """The merged net's BAKED atom outputs (`Y = A · [Y_f; Y_g]`) RECOMPUTED from the
+    ORIGINAL f, g nets for a merged witness. The merged net is only oracle-faithful to
+    f,g within ORACLE_TOL, and the scorer replays the ORIGINAL nets — so a counterexample
+    must be validated against THESE values (run `spec.check` on them), not the merged
+    net's own output. Shape = (num_distinct_atoms,) = the merged net's output width."""
+    _, y_flat = reconstruct_pair_cex(nf_path, ng_path, ir, merged_witness)
+    out_dim = y_flat.shape[0] // 2
+    A, _ = _atom_layout(ir, out_dim)            # [num_atoms, 2*out_dim]
+    return (A @ y_flat).astype(np.float64)
+
+
+def pair_is_strict(ir):
+    """True if ANY output atom came from a strict `<`/`>` (so the CE-check must require
+    a strict violation — margin < 0 — and reject the measure-zero boundary)."""
+    return any(at.get('strict') for at in ir['atoms'])
 
 
 # ----------------------------------------------------------------- entry point

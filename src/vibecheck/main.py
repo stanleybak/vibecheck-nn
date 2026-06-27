@@ -404,6 +404,11 @@ def _verify(args, sat_state=None):
         # returns immediately when it finds one — there is no within-output-tolerance
         # "emit early then keep searching" path any more, so no result_sink is needed.
         graph.optimize(settings)
+        # For a network PAIR the loaded net is the MERGED net; expose the original
+        # f,g + IR so the SAT chokepoint can CE-check witnesses against the ORIGINAL
+        # nets (what the scorer replays) and require a STRICT violation, not the
+        # merge-approximated closure (`verify_graph._try_clear_ce_upgrade`).
+        settings.pair_cex_info = getattr(args, 'pair_cex_info', None)
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
               f'timeout={args.timeout}s)...')

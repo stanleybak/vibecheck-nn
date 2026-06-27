@@ -9868,19 +9868,43 @@ def verify_graph(graph, spec, settings):
             details['phase'] = f'spurious_sat_{details.get("phase")}'
             result = 'unknown'
         elif (float(getattr(settings, 'clear_ce_upgrade_budget', 0.0)) > 0.0
-                and not bool(getattr(settings, 'disable_sat_finding', False))
-                and _info.get('worst_margin') is not None
-                and float(_info['worst_margin']) > -_atol):
-            # The witness is a valid but NEAR-BOUNDARY closure counterexample
-            # (worst output margin ~0 — e.g. a network-pair's trivial diagonal,
-            # x_f == x_g so the diff is exactly 0). It scores CORRECT, but isn't a
-            # strict violation. Try a bounded margin-minimizing PGD for a CLEAR CE
-            # (margin < -atol) and emit that instead when found; otherwise the
-            # already-valid boundary witness stands (no sat is ever lost).
-            _clear = _try_clear_ce_upgrade(graph, spec, settings, _vg_t_start)
-            if _clear is not None:
-                details['witness'] = _clear
-                details['phase'] = f'{details.get("phase")}+clear_ce_upgrade'
+                and not bool(getattr(settings, 'disable_sat_finding', False))):
+            _pair = getattr(settings, 'pair_cex_info', None)
+            if _pair is not None:
+                # NETWORK PAIR: `_validate_sat_witness` ran on the MERGED net (the
+                # CLOSURE `<=`), which accepts the measure-zero boundary (the trivial
+                # diagonal x_f==x_g -> output diff 0). CE-check on the ORIGINAL f,g
+                # (what the scorer replays) and require a STRICT violation. If the
+                # witness isn't strictly clear there, search for a clear CE; if none
+                # exists for a STRICT spec the witness is NOT a valid counterexample
+                # -> downgrade to 'unknown' rather than emit a non-strict sat.
+                from . import network_pair as _np
+                _strict = _np.pair_is_strict(_pair[2])
+                _om = _orig_pair_or_self_margin(
+                    graph, spec, settings, details['witness'], _atol)
+                if _om is None or float(_om) >= -_atol:
+                    _clear = _try_clear_ce_upgrade(
+                        graph, spec, settings, _vg_t_start)
+                    if _clear is not None:
+                        details['witness'] = _clear
+                        details['phase'] = f'{details.get("phase")}+clear_ce_upgrade'
+                    elif _strict:
+                        if getattr(settings, 'print_progress', False):
+                            print('  [validate-top] pair witness violates only the '
+                                  'closure boundary, not the strict spec, and no '
+                                  'clear CE found -> unknown', flush=True)
+                        details['original_phase'] = details.get('phase')
+                        details['phase'] = f'nonstrict_pair_ce_{details.get("phase")}'
+                        result = 'unknown'
+            elif (_info.get('worst_margin') is not None
+                    and float(_info['worst_margin']) > -_atol):
+                # Single net, NEAR-BOUNDARY closure CE (worst margin ~0): try a bounded
+                # margin-minimizing PGD for a CLEAR CE (margin < -atol) and emit that
+                # instead when found; otherwise the already-valid witness stands.
+                _clear = _try_clear_ce_upgrade(graph, spec, settings, _vg_t_start)
+                if _clear is not None:
+                    details['witness'] = _clear
+                    details['phase'] = f'{details.get("phase")}+clear_ce_upgrade'
     return result, details
 
 
@@ -9927,11 +9951,33 @@ def _try_clear_ce_upgrade(graph, spec, settings, t_start):
     if not _sat or _w is None:
         return None
     w = np.asarray(_w).flatten()
-    _ok, _vinfo = _validate_sat_witness(onnx_p, spec, w, atol=atol, out_atol=0.0)
-    _m = _vinfo.get('worst_margin')
-    if _ok and _m is not None and float(_m) < -atol:
+    _m = _orig_pair_or_self_margin(graph, spec, settings, w, atol)
+    # Require a CLEAR strict violation (margin < -atol) on the REAL nets the scorer
+    # replays — the original f,g for a pair, else the loaded net itself.
+    if _m is not None and float(_m) < -atol:
         return w
     return None
+
+
+def _orig_pair_or_self_margin(graph, spec, settings, witness, atol):
+    """Worst output-spec margin for `witness`, evaluated on the REAL net(s) the
+    scorer replays: for a network PAIR, recompute the atom outputs from the
+    ORIGINAL f,g (`network_pair.pair_orig_atom_outputs`) and run `spec.check` on
+    THEM (the merged net is only oracle-faithful to ORACLE_TOL); otherwise validate
+    on the loaded onnx via ORT. Returns the worst margin (< 0 ⟹ violated) or None
+    if it can't be computed. Margin convention matches `spec.check`."""
+    pinfo = getattr(settings, 'pair_cex_info', None)
+    if pinfo is not None:
+        from . import network_pair as npair
+        try:
+            _oy = npair.pair_orig_atom_outputs(pinfo[0], pinfo[1], pinfo[2], witness)
+        except (RuntimeError, OSError, ValueError):
+            return None
+        _, _ci = spec.check(_oy, _oy)
+        return _ci.get('worst_margin')
+    onnx_p = getattr(graph, 'onnx_path', None)
+    _ok, _vinfo = _validate_sat_witness(onnx_p, spec, witness, atol=atol, out_atol=0.0)
+    return _vinfo.get('worst_margin') if _ok else None
 
 
 def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):
