@@ -178,6 +178,59 @@ def test_output_boundary_violation_accepted():
     os.unlink(onnx_p)
 
 
+def test_single_net_strict_constraint_rejects_boundary():
+    """A STRICT single-net constraint (`< Y_0 0`) rejects the boundary witness
+    (Y_0 == 0 is not `< 0`) but accepts a strict violation — the verifier's
+    closure half is unchanged; this is the CE-check half generalized to a
+    single net (not just the iso/monotonic pair path)."""
+    onnx_p = _save(_identity_onnx(2, 2))
+    strict = _conjunct_spec(
+        x_lo=[-1.0, -1.0], x_hi=[1.0, 1.0],
+        constraints=[Constraint(index=0, op='<=', value=0.0, strict=True)])
+    # boundary Y_0 == 0 -> NOT a strict counterexample -> rejected.
+    ok, info = _validate_sat_witness(onnx_p, strict, [0.0, 0.0])
+    assert not ok
+    assert 'does not violate spec' in info['reason']
+    # strict violation Y_0 = -0.3 -> accepted.
+    ok2, info2 = _validate_sat_witness(onnx_p, strict, [-0.3, 0.0])
+    assert ok2, info2
+    assert info2['spec_check'] == 'unknown'
+    # the SAME witness on the NON-strict spec is accepted at the boundary
+    # (sanity: strict is the only difference).
+    nonstrict = _conjunct_spec(
+        x_lo=[-1.0, -1.0], x_hi=[1.0, 1.0],
+        constraints=[Constraint(index=0, op='<=', value=0.0, strict=False)])
+    ok3, _ = _validate_sat_witness(onnx_p, nonstrict, [0.0, 0.0])
+    assert ok3
+    os.unlink(onnx_p)
+
+
+def test_loader_parses_strict_comparison():
+    """vnnlib_loader records strictness: `(< Y_0 c)` -> strict Constraint,
+    `(<= Y_0 c)` -> non-strict, and likewise for pairwise `(> Y_a Y_b)`."""
+    import tempfile
+    from vibecheck.vnnlib_loader import load_vnnlib
+
+    def _spec_text(body):
+        f = tempfile.NamedTemporaryFile(suffix='.vnnlib', delete=False, mode='w')
+        f.write('(declare-const X_0 Real)\n(declare-const Y_0 Real)\n'
+                '(declare-const Y_1 Real)\n'
+                '(assert (<= X_0 1.0))\n(assert (>= X_0 -1.0))\n' + body)
+        f.close()
+        return f.name
+
+    p_strict = _spec_text('(assert (< Y_0 0.5))\n')
+    sp = load_vnnlib(p_strict)
+    c = sp.disjuncts[0].constraints[0]
+    assert c.op == '<=' and c.value == 0.5 and c.strict is True
+    os.unlink(p_strict)
+
+    p_nonstrict = _spec_text('(assert (<= Y_0 0.5))\n')
+    sp2 = load_vnnlib(p_nonstrict)
+    assert sp2.disjuncts[0].constraints[0].strict is False
+    os.unlink(p_nonstrict)
+
+
 def test_input_box_tol_still_applies_when_output_strictly_violates():
     """The 1e-4 INPUT-box tolerance is unchanged: a witness up to atol outside
     the box is accepted, provided its output STRICTLY violates."""

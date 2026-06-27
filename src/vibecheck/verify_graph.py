@@ -5433,22 +5433,23 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0,
     # Y-only `spec.check` with the output band `out_atol` (default 0.0 = strict,
     # boundary inclusive per the official `<=`/`>=` comparison).
     w = np.asarray(witness).flatten().astype(np.float64)
-    _disjunctive = any(getattr(c, 'input_lo', None) is not None
-                       for c in spec.disjuncts)
 
     def _output_violated(inbox, y):
-        if _disjunctive:
-            is_ce, _ = spec.check_witness(inbox[0].astype(np.float64), y)
-            return is_ce, ({} if is_ce else {
-                'reason': ('ORT output does not violate any disjunct whose '
-                           'X-subrange contains the witness (check_witness rejected)')})
-        check_res, check_info = spec.check(y - out_atol, y + out_atol)
+        # STRICT CE-check: a `<`/`>` constraint at the boundary (margin == 0) is
+        # NOT a counterexample (`is_strict_ce` honors per-constraint strictness;
+        # for non-strict specs it reduces to the closure `<=`/`>=`). The verifier
+        # bound keeps the closure (sound for UNSAT) — this is only the CE side.
+        _x = inbox[0].astype(np.float64)
+        is_ce = spec.is_strict_ce(_x, y, out_atol)
+        # worst_margin (closure, for diagnostics / the SAT disposition).
+        _, check_info = spec.check(y - out_atol, y + out_atol)
         upd = {'worst_margin': check_info.get('worst_margin')}
-        if check_res != 'unknown':
-            upd['reason'] = (f'ORT output does not violate spec '
-                             f'(worst_margin={check_info.get("worst_margin"):.4g}, '
-                             f'out_atol={out_atol})')
-        return (check_res == 'unknown'), upd
+        if not is_ce:
+            upd['reason'] = (
+                f'ORT output does not violate spec '
+                f'(worst_margin={check_info.get("worst_margin"):.4g}, '
+                f'out_atol={out_atol})')
+        return is_ce, upd
 
     return _validate_witness_ort(onnx_path, [w], [(spec.x_lo, spec.x_hi)],
                                  _output_violated, atol, emit_slack=emit_slack)
@@ -5534,8 +5535,9 @@ def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
                 return True, info
             out_flat = np.asarray(out).flatten().astype(np.float64)
             info['n_checked'] += 1
-            is_ce, _ = spec.check_witness(
-                x.flatten().astype(np.float64), out_flat)
+            # STRICT CE-check: a sample on the boundary of a strict `<`/`>` spec is
+            # NOT a counterexample, so it must NOT flip a sound VERIFIED to SAT.
+            is_ce = spec.is_strict_ce(x.flatten().astype(np.float64), out_flat)
             if is_ce:
                 info['ok'] = False
                 info['reason'] = ('sample is a real counterexample '

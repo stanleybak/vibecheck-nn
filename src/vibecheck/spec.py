@@ -11,10 +11,18 @@ from dataclasses import dataclass
 
 @dataclass
 class Constraint:
-    """Threshold constraint: Y[index] op value."""
+    """Threshold constraint: Y[index] op value.
+
+    `strict` records whether the source comparison was a STRICT `<`/`>` (vs the
+    non-strict `<=`/`>=`). The VERIFIER bound ignores it (treats every comparison
+    as the non-strict closure — sound for UNSAT: no point in the closed unsafe
+    region ⟹ no point in the strict one). The CE-CHECK uses it: a strict
+    constraint at the boundary (margin == 0) is NOT a counterexample (`is_ce_at`).
+    """
     index: int
     op: str       # '>=' or '<='
     value: float
+    strict: bool = False
 
     def margin(self, output_lo, output_hi):
         """Positive margin = verified safe."""
@@ -31,9 +39,10 @@ class Constraint:
 
 @dataclass
 class PairwiseConstraint:
-    """Pairwise constraint: unsafe if Y[comp] >= Y[pred]."""
+    """Pairwise constraint: unsafe if Y[comp] >= Y[pred] (strict: > )."""
     pred: int
     comp: int
+    strict: bool = False
 
     def margin(self, output_lo, output_hi):
         """Positive margin = pred provably beats comp."""
@@ -88,6 +97,22 @@ class Conjunct:
             return True
         return bool(np.all(x >= self.input_lo - 1e-9)
                     and np.all(x <= self.input_hi + 1e-9))
+
+    def is_ce_at(self, y, out_atol=0.0):
+        """True iff EVERY constraint is satisfied at the point output `y` under
+        STRICT semantics (conjunct = AND of constraints). A `strict` constraint
+        (`<`/`>`) requires `margin < out_atol` — the boundary `margin == 0` does
+        NOT count at the default `out_atol=0`; a non-strict constraint requires
+        `margin <= out_atol`. `out_atol` (default 0.0 = no output tolerance, the
+        2026 rule) optionally widens the accepted band. CE-check companion to
+        `margin` (which the verifier uses as the closure, ignoring strictness)."""
+        for c in self.constraints:
+            m = c.margin(y, y)
+            ok = ((m < out_atol) if getattr(c, 'strict', False)
+                  else (m <= out_atol))
+            if not ok:
+                return False
+        return True
 
     def __str__(self):
         return ' AND '.join(str(c) for c in self.constraints)
@@ -146,6 +171,19 @@ class VNNSpec:
             if x_ok and m is not None and m <= 0:
                 is_ce = True
         return is_ce, details
+
+    def is_strict_ce(self, x, y, out_atol=0.0):
+        """True iff (x, y) is a counterexample under STRICT output semantics: some
+        disjunct whose X-subrange contains `x` has ALL its constraints satisfied
+        at `y` with strict comparisons honored (a `<`/`>` constraint at the
+        boundary, margin == 0, is NOT a counterexample). `out_atol` (default 0.0)
+        optionally widens the output band. Reduces to the closure `check_witness`
+        when no constraint is strict and `out_atol=0`. The CE-CHECK uses this; the
+        VERIFIER bound (`check`) keeps the closure (sound for UNSAT)."""
+        for conj in self.disjuncts:
+            if conj.x_satisfied(x) and conj.is_ce_at(y, out_atol):
+                return True
+        return False
 
     def as_pairwise(self):
         """Extract (pred, comps_set) if all constraints are pairwise with same pred.

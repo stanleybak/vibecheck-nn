@@ -108,24 +108,25 @@ def _parse_output_constraints(text):
     """Parse output constraints from top-level assertions."""
     constraints = []
 
-    # Pairwise: (>= Y_comp Y_pred)
-    for m in re.finditer(r'>=\s+Y_(\d+)\s+Y_(\d+)', text):
+    # Pairwise: (>= Y_comp Y_pred) / strict (> Y_comp Y_pred) — `(=?)` captures
+    # strictness so the CE-check rejects the boundary on a strict `>`/`<`.
+    for m in re.finditer(r'>(=?)\s+Y_(\d+)\s+Y_(\d+)', text):
         constraints.append(PairwiseConstraint(
-            pred=int(m.group(2)), comp=int(m.group(1))))
+            pred=int(m.group(3)), comp=int(m.group(2)), strict=(m.group(1) == '')))
 
-    # Pairwise: (<= Y_pred Y_comp)
-    for m in re.finditer(r'<=\s+Y_(\d+)\s+Y_(\d+)', text):
+    # Pairwise: (<= Y_pred Y_comp) / strict (< Y_pred Y_comp)
+    for m in re.finditer(r'<(=?)\s+Y_(\d+)\s+Y_(\d+)', text):
         constraints.append(PairwiseConstraint(
-            pred=int(m.group(1)), comp=int(m.group(2))))
+            pred=int(m.group(2)), comp=int(m.group(3)), strict=(m.group(1) == '')))
 
     if not constraints:
-        # Threshold: (>= Y_i constant) or (<= Y_i constant)
-        for m in re.finditer(r'\(>=\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)', text):
+        # Threshold: (>= Y_i const) / (<= Y_i const), strict (> / <).
+        for m in re.finditer(r'\(>(=?)\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)', text):
             constraints.append(Constraint(
-                int(m.group(1)), '>=', float(m.group(2))))
-        for m in re.finditer(r'\(<=\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)', text):
+                int(m.group(2)), '>=', float(m.group(3)), strict=(m.group(1) == '')))
+        for m in re.finditer(r'\(<(=?)\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)', text):
             constraints.append(Constraint(
-                int(m.group(1)), '<=', float(m.group(2))))
+                int(m.group(2)), '<=', float(m.group(3)), strict=(m.group(1) == '')))
 
     if not constraints:
         raise ValueError("Cannot parse output constraints from VNNLIB")
@@ -137,21 +138,21 @@ def _parse_block_constraints(block):
     """Parse constraints from an (and ...) block."""
     constraints = []
 
-    # Y threshold
-    for m in re.finditer(r'\(>=\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)', block):
+    # Y threshold (strict `>`/`<` captured via `(=?)`)
+    for m in re.finditer(r'\(>(=?)\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)', block):
         constraints.append(Constraint(
-            int(m.group(1)), '>=', float(m.group(2))))
-    for m in re.finditer(r'\(<=\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)', block):
+            int(m.group(2)), '>=', float(m.group(3)), strict=(m.group(1) == '')))
+    for m in re.finditer(r'\(<(=?)\s+Y_(\d+)\s+([-\d.eE+]+)\s*\)', block):
         constraints.append(Constraint(
-            int(m.group(1)), '<=', float(m.group(2))))
+            int(m.group(2)), '<=', float(m.group(3)), strict=(m.group(1) == '')))
 
     # Y pairwise
-    for m in re.finditer(r'>=\s+Y_(\d+)\s+Y_(\d+)', block):
+    for m in re.finditer(r'>(=?)\s+Y_(\d+)\s+Y_(\d+)', block):
         constraints.append(PairwiseConstraint(
-            pred=int(m.group(2)), comp=int(m.group(1))))
-    for m in re.finditer(r'<=\s+Y_(\d+)\s+Y_(\d+)', block):
+            pred=int(m.group(3)), comp=int(m.group(2)), strict=(m.group(1) == '')))
+    for m in re.finditer(r'<(=?)\s+Y_(\d+)\s+Y_(\d+)', block):
         constraints.append(PairwiseConstraint(
-            pred=int(m.group(1)), comp=int(m.group(2))))
+            pred=int(m.group(2)), comp=int(m.group(3)), strict=(m.group(1) == '')))
 
     return constraints
 
