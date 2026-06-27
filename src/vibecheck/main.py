@@ -171,7 +171,21 @@ def main():
             sp.build_float_surrogate(args.net, p)
             fq = (p[:-5] if p.endswith('.onnx') else p) + '_fq.onnx'
             sp.build_fakequant_surrogate(args.net, fq)
-            print(f'Quantized model: built surrogates (skipped graph pre-parse): {p}, {fq}')
+            # Also parse the (large) box spec here (untimed) + pickle it, so the
+            # timed run loads it instead of re-parsing ~8s of index constraints.
+            # Best-effort: a missing/odd spec here just means no cache (the timed
+            # run parses it) — prepare must not fail over an optimization.
+            _bc = None
+            try:
+                import pickle
+                _bc = _box_cache_path(args.spec)
+                with open(_bc, 'wb') as _bf:
+                    pickle.dump(sp.parse_box_and_output(args.spec), _bf)
+            except (FileNotFoundError, OSError, ValueError, NotImplementedError) as _e:
+                print(f'  [prepare] box cache skipped ({type(_e).__name__}: {_e})')
+                _bc = None
+            print(f'Quantized model: built surrogates (skipped graph pre-parse): '
+                  f'{p}, {fq}' + (f', {_bc}' if _bc else ''))
             sys.exit(0)
         _require_input_file(args.spec, 'spec (--spec)')   # non-quant prepare needs the spec
         from .preparse import write_cache
@@ -658,13 +672,16 @@ def _maybe_surrogate_attack(args, sat_state):
     print(f'Surrogate-attack mode: quantized ONNX -> PGD via float surrogate '
           f'(restarts={settings.surrogate_attack_restarts}, '
           f'steps={settings.surrogate_attack_steps}, timeout={timeout}s)')
+    # The (121 MB) box spec ONCE, shared between the attack and the emit re-check:
+    # the prepare-pkl cache when present, else a single parse (~8s).
+    _box_spec = _load_or_parse_box(args)
     verdict, witness = sp.surrogate_attack(
         args.net, args.spec, settings, timeout,
         surrogate_path=_surrogate_path(args.net),
-        log=(print if args.verbose else (lambda _m: None)))
+        log=(print if args.verbose else (lambda _m: None)), spec=_box_spec)
     if args.results_file:
         _emit_surrogate_result(args, verdict, witness, sat_state,
-                               settings.counterexample_precision)
+                               settings.counterexample_precision, box_spec=_box_spec)
     print(f'\nResult (surrogate-attack): {verdict}')
     return 1  # never 'verified' in this incomplete mode
 
@@ -781,6 +798,31 @@ def _surrogate_path(onnx_path):
     import tempfile
     h = hashlib.md5(os.path.abspath(onnx_path).encode()).hexdigest()[:12]
     return os.path.join(tempfile.gettempdir(), f'vibecheck_surrogate_{h}.onnx')
+
+
+def _box_cache_path(spec_path):
+    """Deterministic path for the prepare-pkl-cached parsed box spec (shared by
+    prepare/run, keyed on the spec). smart_turn's box is 121 MB and the parse is
+    ~8s of Python index-splitting; prepare parses it once (untimed) and the timed
+    run loads the pickle instead."""
+    import hashlib
+    import tempfile
+    h = hashlib.md5(os.path.abspath(spec_path).encode()).hexdigest()[:12]
+    return os.path.join(tempfile.gettempdir(), f'vibecheck_sbox_{h}.pkl')
+
+
+def _load_or_parse_box(args):
+    """The surrogate box spec: load the prepare-pkl cache when present (and pkl
+    loading is allowed), else parse `args.spec`. One parse, shared attack+emit."""
+    from . import surrogate_pgd as sp
+    if getattr(args, 'allow_unsafe_pkl_loading', False):
+        cp = _box_cache_path(args.spec)
+        if os.path.exists(cp):
+            import pickle
+            with open(cp, 'rb') as f:
+                print(f'Loaded surrogate box cache: {cp}')
+                return pickle.load(f)
+    return sp.parse_box_and_output(args.spec)
 
 
 def _cex_sexpr(x_flat, y_flat, fmt='.17g'):
@@ -929,7 +971,8 @@ def _resolve_cex_io_meta(spec_path):
     return (tuple(ins), tuple(outs), tuple(order)) if (ins or outs) else None
 
 
-def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
+def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g',
+                           box_spec=None):
     """Write the surrogate verdict; for sat, a counterexample over the multi-input witness
     (ORIGINAL-model order) + the ORT-CPU output, in the format matching the input spec's
     vnnlib version (`args.cex_version`; smart_turn is v2 -> per-tensor blocks). Honors the
@@ -951,7 +994,10 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g'):
         _spec_path = getattr(args, 'spec', None)
         if _spec_path:
             try:
-                _sspec = sp.parse_box_and_output(_spec_path)
+                # Reuse the spec the attack already parsed (smart_turn's box is
+                # 121 MB / ~8s to parse) rather than re-parsing it here.
+                _sspec = box_spec if box_spec is not None else \
+                    sp.parse_box_and_output(_spec_path)
                 _boxes = [(lo, hi) for _, _, lo, hi in _sspec.inputs]
 
                 def _violated(inbox, yv):

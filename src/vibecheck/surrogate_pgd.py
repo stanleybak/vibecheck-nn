@@ -416,9 +416,15 @@ def _decompressed(path):
 
 # ------------------------------------------------------------------------------- PGD
 
-def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=None, log=print):
+def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=None,
+                     log=print, spec=None):
     """Run surrogate-PGD. Returns (verdict, witness) where verdict in {'sat','timeout',
     'unknown'} and witness is a list of per-input np.ndarrays (None unless sat).
+
+    `spec` (optional, a `parse_box_and_output` result): reuse an already-parsed spec
+    instead of re-parsing `vnnlib_path` — smart_turn's box spec is 121 MB and the
+    parse is ~8s, so the caller shares ONE parse between the attack and the emit
+    re-check rather than paying it twice.
 
     Candidates considered (all ORT-CPU-confirmed on the ORIGINAL quantized model, the
     authoritative oracle): the box CENTER, the box CORNERS, and each PGD restart's best
@@ -440,7 +446,8 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     torch.set_num_threads(_nthr)
 
     t0 = time.time()
-    spec = parse_box_and_output(vnnlib_path)
+    if spec is None:
+        spec = parse_box_and_output(vnnlib_path)
     # Use the MODEL's input shapes (spec only carries a flat per-index box); reconciles
     # v1 (flat X_i) and v2 (declared shape) with the real model. Fail fast on a mismatch.
     mshapes = _model_input_shapes(onnx_path)
