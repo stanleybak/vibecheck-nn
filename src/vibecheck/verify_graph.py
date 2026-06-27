@@ -9339,6 +9339,7 @@ def verify_graph(graph, spec, settings):
 
     Returns (result_str, details_dict).
     """
+    _vg_t_start = time.perf_counter()   # for the top-level clear-CE upgrade budget
     # Pre-pass: if conjuncts carry per-disjunct X subboxes (e.g., nn4sys
     # lindex, acasxu prop_6), split into per-subbox sub-verifications.
     # The vnnlib spec encodes the unsafe region as
@@ -9866,7 +9867,71 @@ def verify_graph(graph, spec, settings):
             details['original_phase'] = details.get('phase')
             details['phase'] = f'spurious_sat_{details.get("phase")}'
             result = 'unknown'
+        elif (float(getattr(settings, 'clear_ce_upgrade_budget', 0.0)) > 0.0
+                and not bool(getattr(settings, 'disable_sat_finding', False))
+                and _info.get('worst_margin') is not None
+                and float(_info['worst_margin']) > -_atol):
+            # The witness is a valid but NEAR-BOUNDARY closure counterexample
+            # (worst output margin ~0 — e.g. a network-pair's trivial diagonal,
+            # x_f == x_g so the diff is exactly 0). It scores CORRECT, but isn't a
+            # strict violation. Try a bounded margin-minimizing PGD for a CLEAR CE
+            # (margin < -atol) and emit that instead when found; otherwise the
+            # already-valid boundary witness stands (no sat is ever lost).
+            _clear = _try_clear_ce_upgrade(graph, spec, settings, _vg_t_start)
+            if _clear is not None:
+                details['witness'] = _clear
+                details['phase'] = f'{details.get("phase")}+clear_ce_upgrade'
     return result, details
+
+
+def _try_clear_ce_upgrade(graph, spec, settings, t_start):
+    """A sat witness ORT-validated but is only a NEAR-BOUNDARY closure CE (worst
+    output margin > -sat_validate_atol). Run a bounded margin-minimizing PGD on
+    the raw ONNX for a CLEAR counterexample (worst margin < -atol) so the emitted
+    sat is a genuine strict violation rather than a boundary point — the
+    network-pair benchmarks (monotonic/isomorphic acasxu) otherwise settle on a
+    trivial diagonal (x_f == x_g -> output diff exactly 0) even though clear
+    violations exist elsewhere in the box.
+
+    Returns a clear witness (np.ndarray, spec.x_lo shape) or None. Bounded by
+    `settings.clear_ce_upgrade_budget` and the remaining total-timeout budget;
+    every returned witness is ORT-confirmed to violate with margin < -atol."""
+    onnx_p = getattr(graph, 'onnx_path', None)
+    if onnx_p is None:
+        return None
+    atol = float(settings.sat_validate_atol
+                 if 'sat_validate_atol' in settings else 1e-4)
+    cap = float(getattr(settings, 'clear_ce_upgrade_budget', 0.0))
+    if cap <= 0.0:
+        return None
+    tot = float(getattr(settings, 'total_timeout', 0.0)) or cap
+    # Leave ~1 s of headroom against the global deadline so the upgrade can't
+    # push the instance into a hard timeout.
+    budget = min(cap, tot - (time.perf_counter() - t_start) - 1.0)
+    if budget <= 0.1:
+        return None
+    from .onnx_torch_runner import pgd_via_onnx
+    try:
+        _sat, _w = pgd_via_onnx(
+            onnx_p, spec,
+            n_restarts=int(settings.pgd_phase0_restarts
+                           if 'pgd_phase0_restarts' in settings else 256),
+            n_iter=int(settings.pgd_phase0_iters
+                       if 'pgd_phase0_iters' in settings else 100),
+            accept_margin=-atol,
+            deadline=time.perf_counter() + budget)
+    except (RuntimeError, ImportError, OSError, ValueError):
+        # PGD-via-ONNX best-effort: torch/ORT runtime errors, missing optional
+        # deps, bad path, or shape mismatch. The boundary witness already stands.
+        return None
+    if not _sat or _w is None:
+        return None
+    w = np.asarray(_w).flatten()
+    _ok, _vinfo = _validate_sat_witness(onnx_p, spec, w, atol=atol, out_atol=0.0)
+    _m = _vinfo.get('worst_margin')
+    if _ok and _m is not None and float(_m) < -atol:
+        return w
+    return None
 
 
 def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):

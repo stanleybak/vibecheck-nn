@@ -1426,6 +1426,15 @@ def default_settings(**overrides):
         # (The old `keep_searching_within_tol` setting was removed: under the 2026
         # output-strict rule there is no within-output-tolerance sat to keep searching
         # past — VC emits `sat` only for a genuine violation and returns immediately.)
+        # When an emitted sat witness is a NEAR-BOUNDARY closure counterexample
+        # (worst output margin > -sat_validate_atol — e.g. a network-pair's trivial
+        # diagonal where x_f == x_g so the output diff is exactly 0: a valid `<=`
+        # CE the scorer accepts, but NOT a strict violation), spend up to this many
+        # seconds on a margin-minimizing PGD for a CLEAR counterexample
+        # (margin < -atol) and emit that instead when found. Purely additive: the
+        # already-valid boundary witness stands if no clearer CE exists, so it never
+        # loses a sat (e.g. ml4acopf 14_ieee prop3 keeps its boundary CE). 0 = off.
+        clear_ce_upgrade_budget=8.0,
         # Per-value precision for the counterexample written to the results file
         # (used by BOTH the graph and surrogate-attack emit paths). '.17g'
         # round-trips float64 losslessly, so the scorer replays the exact witness
