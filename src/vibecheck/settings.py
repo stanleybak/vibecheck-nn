@@ -149,6 +149,24 @@ def default_settings(**overrides):
         # ORT-CPU confirm. Validated to track ORT exactly on cell interiors (off only by
         # one cell at exact rounding-tie boundaries). False -> rank by surrogate loss.
         surrogate_quant_eval=True,
+        # Threads for the surrogate-attack forward (the verifier otherwise pins BLAS to 1
+        # thread for sound bounding; the attack is an approximate search where multi-thread is
+        # safe and ~4x faster on the slow saturating forward). 0 -> min(12, cpu_count).
+        surrogate_attack_threads=0,
+        # Cap the surrogate-attack GPU memory (set_per_process_memory_fraction) so it never
+        # hogs the card; the saturating surrogate gradient-checkpoints and needs only ~3GB.
+        surrogate_gpu_mem_gb=6.0,
+        # surrogate-attack: whether the surrogate's quantized matmuls reproduce the
+        # NON-VNNI int16-pair SATURATION that ORT's MLAS u8xs8 GEMM applies on CPUs without
+        # AVX-VNNI (e.g. AMD Zen2). That saturation makes the SAME QDQ graph compute a
+        # different function on VNNI (Intel, exact int32) vs non-VNNI (saturating) hardware,
+        # so a counterexample valid on one CPU can flip on the other (measured on smart_turn:
+        # 0.918 Intel vs 0.500 AMD for one witness). 'auto' => probe the local ORT once
+        # (detect_quant_oracle) and saturate iff the local oracle saturates, keeping the
+        # surrogate gradient and the ORT validation in the SAME regime on whatever box we run.
+        # 'on'/'off' force it (develop on Intel while targeting a non-VNNI scorer, or vice
+        # versa). See surrogate_pgd.detect_quant_oracle / saturating_qmatmul.
+        surrogate_saturation='auto',
         # PGD L-inf step sizes (fractions of the input-box width) cycled across restarts.
         # All < 1 so each restart takes SEVERAL gradual clamped steps rather than a single
         # FGSM jump straight to a box vertex; the spread (0.02..0.2) covers fine-to-coarse

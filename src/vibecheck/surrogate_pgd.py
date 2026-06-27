@@ -33,6 +33,68 @@ def has_quantized_ops(onnx_path):
     return any(n.op_type in ('DequantizeLinear', 'QuantizeLinear') for n in model.graph.node)
 
 
+_QUANT_ORACLE_PROBE = None
+
+
+def detect_quant_oracle():
+    """Detect which u8xs8 quantized-GEMM regime the LOCAL onnxruntime uses, by replaying a
+    tiny known-saturating QLinearMatMul and reading the answer back. Returns 'exact'
+    (VNNI/int32 accumulation, e.g. Intel AVX-VNNI) or 'saturating' (non-VNNI MLAS emulation
+    via VPMADDUBSW: adjacent u8xs8 product pairs summed into int16 WITH SATURATION, e.g. AMD
+    Zen2). This characterizes the validation oracle on THIS machine directly — what ORT
+    actually computes, not a CPUID heuristic — at ~3ms. The probe: a=255 (x64), w=127, so the
+    exact int32 dot is 64*255*127 and the requant scale maps exact->~250, int16-saturated->~126.
+
+    Why it matters: the same QDQ graph computes a DIFFERENT function on VNNI vs non-VNNI
+    hardware (measured on smart_turn: one witness gives 0.918 on Intel, 0.500 on AMD), so a
+    counterexample is only meaningful against an oracle matching the scorer's CPU. The
+    surrogate is set to saturate iff this returns 'saturating' (settings.surrogate_saturation
+    == 'auto'), keeping the surrogate gradient and the ORT validation in the same regime."""
+    global _QUANT_ORACLE_PROBE
+    import onnxruntime as ort
+    if _QUANT_ORACLE_PROBE is None:
+        K = 64
+        scale = np.float32(K * 255 * 127 * 0.1 * 0.1 / 250.0)
+        g = helper.make_graph(
+            [helper.make_node('QLinearMatMul',
+                              ['a', 'a_s', 'a_z', 'B', 'b_s', 'b_z', 'y_s', 'y_z'], ['y'])],
+            'quant_oracle_probe',
+            [helper.make_tensor_value_info('a', TensorProto.UINT8, [1, K])],
+            [helper.make_tensor_value_info('y', TensorProto.UINT8, [1, 1])],
+            [numpy_helper.from_array(np.float32(0.1), 'a_s'),
+             numpy_helper.from_array(np.uint8(0), 'a_z'),
+             numpy_helper.from_array(np.full((K, 1), 127, np.int8), 'B'),
+             numpy_helper.from_array(np.float32(0.1), 'b_s'),
+             numpy_helper.from_array(np.int8(0), 'b_z'),
+             numpy_helper.from_array(scale, 'y_s'),
+             numpy_helper.from_array(np.uint8(0), 'y_z')])
+        m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 19)])
+        m.ir_version = 9
+        _QUANT_ORACLE_PROBE = m.SerializeToString()
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 1
+    sess = ort.InferenceSession(_QUANT_ORACLE_PROBE, so, providers=['CPUExecutionProvider'])
+    y = int(sess.run(None, {'a': np.full((1, 64), 255, np.uint8)})[0].ravel()[0])
+    return 'exact' if y >= 200 else 'saturating'
+
+
+def resolve_saturation(settings, log=print):
+    """Resolve settings.surrogate_saturation ('auto'/'on'/'off') to a bool for the surrogate.
+    'auto' probes the local ORT (detect_quant_oracle) so the surrogate matches whatever the
+    validation oracle on this box does. Logs the decision."""
+    mode = str(getattr(settings, 'surrogate_saturation', 'auto')).lower()
+    if mode in ('on', 'true'):
+        log('[surrogate] saturation: ON (forced)')
+        return True
+    if mode in ('off', 'false'):
+        log('[surrogate] saturation: OFF (forced)')
+        return False
+    oracle = detect_quant_oracle()
+    sat = (oracle == 'saturating')
+    log(f'[surrogate] saturation: {"ON" if sat else "OFF"} (auto; local ORT oracle is {oracle!r})')
+    return sat
+
+
 def _load_onnx_model(path):
     if path.endswith('.gz'):
         with gzip.open(path) as fh:
@@ -369,6 +431,14 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     import torch
     from onnx2torch import convert
 
+    # The verifier pins single-threaded BLAS (OMP/MKL_NUM_THREADS=1 in __init__) for sound,
+    # deterministic bounding. The surrogate ATTACK is an approximate gradient search (ORT
+    # decides the verdict), and its forward — especially the saturating GEMM's [M,K/2,N]
+    # materialization — is the bottleneck, so we let it use multiple threads. Single-threaded
+    # the saturating step is ~65s (only ~2 steps fit a 100s timeout); ~12 threads -> ~15s.
+    _nthr = int(getattr(settings, 'surrogate_attack_threads', 0)) or min(12, os.cpu_count() or 1)
+    torch.set_num_threads(_nthr)
+
     t0 = time.time()
     spec = parse_box_and_output(vnnlib_path)
     # Use the MODEL's input shapes (spec only carries a flat per-index box); reconciles
@@ -391,6 +461,7 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     # (A bare next-float shift is invisible in float32 and gave false sats.)
     strict_buffer = float(getattr(settings, 'sat_strict_buffer', 1e-9))
     use_quant_eval = bool(getattr(settings, 'surrogate_quant_eval', True))
+    saturate = resolve_saturation(settings, log=log)
 
     if surrogate_path is None or not os.path.exists(surrogate_path):
         surrogate_path = (surrogate_path or '/tmp/_vibecheck_surrogate.onnx')
@@ -404,16 +475,51 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     # and the authoritative ORT-CPU replay of the ORIGINAL model decides 'sat'.
     _want_gpu = (getattr(settings, 'device', 'gpu') == 'gpu')
     dev = 'cuda' if (_want_gpu and torch.cuda.is_available()) else 'cpu'
-    model = convert(surrogate_path).eval().to(dev)
-    eval_model = None
-    if use_quant_eval:
-        fq_path = (surrogate_path[:-5] if surrogate_path.endswith('.onnx') else surrogate_path) + '_fq.onnx'
+    if dev == 'cuda':
+        # MEMORY PROTECTION: cap this process so it can't grab the whole card (the saturating
+        # surrogate gradient-checkpoints, so it only needs ~3GB). On GPU the saturating step is
+        # ~1s (vs ~13s CPU, ~13x); ORT validation stays on CPU (the scorer's oracle). Hybrid by
+        # design: gradient on GPU, oracle on CPU.
+        _gpu_gb = float(getattr(settings, 'surrogate_gpu_mem_gb', 6.0))
+        _tot = torch.cuda.get_device_properties(0).total_memory / 1e9
+        torch.cuda.set_per_process_memory_fraction(min(0.95, _gpu_gb / _tot), 0)
+        log(f'[surrogate] GPU mem capped ~{_gpu_gb:.0f}GB of {_tot:.0f}GB')
+    fq_path = (surrogate_path[:-5] if surrogate_path.endswith('.onnx') else surrogate_path) + '_fq.onnx'
+    if saturate:
+        # NON-VNNI scorer: the float/fakequant surrogates track the VNNI (exact int32) output,
+        # so their gradient steers PGD to CEs that FLIP on the saturating scorer (the float
+        # search finds nothing on a non-VNNI box). Build the SATURATING surrogate instead — a
+        # differentiable fakequant (STE round/clip) with int16-pair saturation grafted into its
+        # matmuls + audio Conv1d. It reproduces the non-VNNI ORT output exactly (validated:
+        # 0.9176 VNNI / 0.5000 non-VNNI at the smart_turn inst_7 witness), so its gradient
+        # cracks the pinned instances the float surrogate cannot (the video Conv3d are skipped —
+        # their saturating im2col OOMs and they don't affect the flip). Used for BOTH gradient
+        # and ranking; the authoritative ORT-CPU replay still decides 'sat'.
+        from .saturating_quant import (make_fakequant_differentiable,
+                                        graft_saturating_matmuls, graft_saturating_convs)
         if not os.path.exists(fq_path):
             build_fakequant_surrogate(onnx_path, fq_path)
-        eval_model = convert(fq_path).eval().to(dev)
+        model = convert(fq_path).eval().to(dev)
+        make_fakequant_differentiable(model, log=log)
+        graft_saturating_matmuls(model, onnx_path, log=log)
+        graft_saturating_convs(model, onnx_path, log=log, only_types=('Conv1d',))
+        # The saturating surrogate is only PARTIALLY faithful (video Conv3d + act×act matmuls
+        # are left exact), so its output UNDER-predicts the real flip during search (it can
+        # read 0.5 at a point where ORT already cracked to 0.86). So it's a bad RANKER — don't
+        # gate ORT on it. Instead the PGD loop validates every stepped point on the authoritative
+        # ORT directly (saturate branch below); its GRADIENT is what steers toward the flip.
+        eval_model = None
+    else:
+        model = convert(surrogate_path).eval().to(dev)
+        eval_model = None
+        if use_quant_eval:
+            if not os.path.exists(fq_path):
+                build_fakequant_surrogate(onnx_path, fq_path)
+            eval_model = convert(fq_path).eval().to(dev)
     log(f'[surrogate] loaded on {dev} in {time.time()-t0:.1f}s; '
         f'inputs={[(n, s) for n, s, _, _ in spec.inputs]} restarts={restarts} steps={steps} '
-        f'quant_eval={"on" if eval_model is not None else "off"}')
+        f'quant_eval={"on" if eval_model is not None else "off"} '
+        f'saturation={"on" if saturate else "off"}')
 
     def to_t(a, shp):
         return torch.tensor(a.astype(np.float32).reshape(tuple(shp)), device=dev)
@@ -495,24 +601,35 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
     _bs = getattr(settings, 'pgd_seed', None)
     base_seed = int(_bs) if isinstance(_bs, (int, float)) else None
     alphas = list(getattr(settings, 'surrogate_alphas', None) or [0.05, 0.1, 0.2, 0.02])
+    if saturate:
+        # The saturating surrogate's forward is ~10-20x slower (the int16-pair materialization),
+        # so PGD must crack in a FEW steps within the timeout. Large sign-steps from the center
+        # do (validated: pinned smart_turn instances flip in 2-3 steps at alpha~0.5); the default
+        # small alphas would exhaust the budget first. Overridable via surrogate_saturation_alphas.
+        # Cycled PER STEP (not per restart) in saturate mode — the saturating forward is slow
+        # (~18s/step), so only ~5 steps fit the timeout and a single fixed alpha can't both reach
+        # far cells (big alpha) AND land in a narrow CE cell (small alpha). A spread spanning
+        # large->small WITHIN one center restart cracks every smart_turn instance: e.g. inst 10
+        # needs ~0.75 at step 4, inst 24/28/39 need ~0.15 (a big step overshoots their thin cell).
+        alphas = list(getattr(settings, 'surrogate_saturation_alphas', None)
+                      or [0.5, 0.2, 0.75, 0.15, 0.35, 0.1, 0.6, 0.9])
 
-    # 1) CENTER. For a quantized model whose output is constant over the box (the box sits
-    #    inside one quantization cell, so PGD can't move the output), the center value IS
-    #    the verdict — clear SAT (e.g. Y=0.918 > 0.5) or within-tol (e.g. Y pinned at 0.5).
+    # 1) CENTER. Returns 'sat' only if the center is a CLEAR CE (Y strictly > rhs, e.g. 0.918);
+    #    a center pinned at the boundary (Y=0.5) is NOT a CE — fall through to the PGD search.
     res = ort_consider(cens, 'center')
     if res is not None:
         return 'sat', res[1][0]
 
-    # 2) PGD restarts on the float surrogate (gradient). The first restart is seeded from
-    #    the CENTER, the rest from seeded RANDOM in-box points (`pgd_seed + r`). Each step is
-    #    a GRADUAL L-inf step `alpha*(h-l)*sign(grad)` (alpha < 1, several steps — NOT a
-    #    single jump to a box vertex) CLAMPED back into [lo,hi]. No box-corner enumeration
-    #    (1.27 M dims). When the center is only within-tol, this is exactly the "keep
-    #    searching for a clear CE" pass; the within-tol witness stays stashed as the fallback.
+    # 2) PGD restarts (gradient from the surrogate). The first restart is seeded from the
+    #    CENTER, the rest from seeded RANDOM in-box points (`pgd_seed + r`). Each step is a
+    #    GRADUAL L-inf step `alpha*(h-l)*sign(grad)` (alpha < 1, several steps — NOT a single
+    #    jump to a box vertex) CLAMPED back into [lo,hi]. No box-corner enumeration (1.27 M
+    #    dims). When the center is pinned at the boundary, this search is how a clear CE is
+    #    found (it cracks the pinned smart_turn instances in a few steps).
     for r in range(restarts):
         if time.time() - t0 > timeout:
             break
-        alpha = alphas[r % len(alphas)]
+        base_alpha = alphas[r % len(alphas)]   # per-restart alpha (non-saturate path)
         if r == 0:
             pts = [c.clone() for c in cens]
         else:
@@ -526,6 +643,8 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
             if time.time() - t0 > timeout:
                 break
             _f0 = time.time()
+            # saturate mode: cycle alpha PER STEP so one center restart spans large->small steps
+            alpha = alphas[it % len(alphas)] if saturate else base_alpha
             for p in pts:
                 p.requires_grad_(True)
             y = model(*pts)
@@ -554,6 +673,14 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
                        for p, g, l, h in zip(pts, grads, los, his)]
             _t_fwd += time.time() - _f0
             _n_steps += 1
+            if saturate:
+                # The saturating surrogate's margin under-predicts (it skips video conv3d /
+                # act×act), so it can't gate ORT — validate the just-stepped point directly on
+                # the authoritative ORT (cheap: ~0.3s) every step. The saturating GRADIENT is the
+                # lever; ORT decides. This is what cracks the pinned instances (2-3 steps).
+                res = ort_consider([p.detach() for p in pts], f'restart{r} step{it} (sat,a={alpha})')
+                if res is not None:
+                    return 'sat', res[1][0]
         # End of restart: confirm the best candidate. Prefer the best fake-quant point (the
         # ≈ORT proxy) over the best surrogate point; gate the (slower) ORT replay so we only
         # confirm when fake-quant says it at least reaches within-tol (skip when clearly safe).
@@ -561,7 +688,7 @@ def surrogate_attack(onnx_path, vnnlib_path, settings, timeout, surrogate_path=N
         cand = best_fq_pts if best_fq_pts is not None else best_pts
         fqm = best_fq if best_fq_pts is not None else fq_margin(best_pts)
         if fqm is None or fqm >= -atol:
-            res = ort_consider(cand, f'restart{r}(a={alpha}'
+            res = ort_consider(cand, f'restart{r}(a={base_alpha}'
                                + (f',fq={fqm:.3e})' if fqm is not None else ')'))
             if res is not None:
                 return 'sat', res[1][0]
