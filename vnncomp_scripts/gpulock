@@ -13,6 +13,15 @@
 # SWEEPS: wrap EACH instance in its own `gpulock run`, not the whole sweep, so it
 # releases between instances and others interleave one-by-one (FIFO-fair).
 set -u
+
+# Sanity guard: this is the SHARED AWS GPU lock (box user `ubuntu`), NOT for local.
+# Refuse to run anywhere else so it can't be invoked by mistake on a dev machine.
+if [ "$(id -un)" != "ubuntu" ]; then
+  echo "gpulock: refusing to run as '$(id -un)' on '$(hostname)'." >&2
+  echo "         This is the shared AWS GPU lock (box user 'ubuntu') — not for local use." >&2
+  exit 2
+fi
+
 ROOT="$HOME/gpu_lock"; HELD="$ROOT/held"; Q="$ROOT/queue"
 mkdir -p "$Q"
 WHO="${GPULOCK_WHO:-$(whoami)}"
