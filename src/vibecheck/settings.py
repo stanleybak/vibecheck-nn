@@ -201,6 +201,13 @@ def default_settings(**overrides):
         # the enumeration (a larger free grid => not a discrete-patch instance => raise).
         cctsdb_yolo=False,
         cctsdb_max_positions=1_000_000,
+        # Nonlinear v2 spec support (nonlinear_augment.py + input_feasibility.py): the
+        # empty-input + transpile-to-augmented-ONNX pre-checks. They `parse_vnnlib_v2`
+        # the WHOLE spec to detect a degree>=2 monomial — O(spec size), ~37s on a 121 MB
+        # box spec (smart_turn). Only ONE 2026 benchmark has a nonlinear INPUT constraint
+        # (adaptive_cruise_control_non_linear, `200*X0 >= X1^2`), so this is OFF by default
+        # and that benchmark's config turns it on; every other benchmark skips both checks.
+        nonlinear_v2_augment=False,
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded

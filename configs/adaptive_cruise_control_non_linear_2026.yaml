@@ -20,6 +20,10 @@
 # the narrow basin's step size). pgd_sat_min_time refills the otherwise-unused sat
 # budget with fresh deterministic-seeded batches until a CE is found. Tuned so seeds
 # 0..9 all crack the hardest instances (see docs/benchmarks/adaptive_cruise_control_2026.md).
+# Enable the nonlinear v2 spec handling (empty-input + transpile-to-augmented).
+# OFF by default (it parses the whole spec to detect degree>=2 terms); this is
+# the ONE 2026 benchmark with a nonlinear INPUT constraint (200*X0 >= X1^2).
+nonlinear_v2_augment: true
 pgd_per_restart_disjunct: true
 pgd_alpha_multi: true
 pgd_restarts: 512

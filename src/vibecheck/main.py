@@ -283,18 +283,21 @@ def _verify(args, sat_state=None):
     if _cct is not None:
         sys.exit(_cct)
 
-    # Empty-input check (nonlinear specs, e.g. adaptive_cruise_control): if the
-    # input constraints are jointly infeasible the input region is EMPTY, the
-    # property is vacuously true, and the verdict is `unsat` with no verification.
-    # Sound; runs on the ORIGINAL v2 spec BEFORE the augment. See input_feasibility.py.
-    _empty = _maybe_empty_input(args)
-    if _empty is not None:
-        sys.exit(_empty)
-
-    # Nonlinear v2 specs (adaptive_cruise_control): transpile to an augmented
-    # ONNX + linear v1 spec up front, then verify normally. Must run BEFORE the
-    # graph load. See nonlinear_augment.py (transpile is ORT-oracle-gated).
-    _maybe_nonlinear_augment(args)
+    # Nonlinear v2 spec handling (empty-input + transpile-to-augmented) — gated
+    # OFF by default (config `nonlinear_v2_augment: true`). Both pre-checks
+    # `parse_vnnlib_v2` the whole spec, which is ~37s on smart_turn's 121 MB box.
+    # Only adaptive_cruise_control_non_linear has a nonlinear INPUT constraint, so
+    # only its config enables this; everything else skips both. See settings.py.
+    if _config_flag(args, 'nonlinear_v2_augment'):
+        # Empty-input check: if the input constraints are jointly INFEASIBLE the
+        # input region is EMPTY, the property is vacuously true -> `unsat` (sound).
+        # Runs on the ORIGINAL v2 spec BEFORE the augment. See input_feasibility.py.
+        _empty = _maybe_empty_input(args)
+        if _empty is not None:
+            sys.exit(_empty)
+        # Transpile the nonlinear v2 spec to an augmented ONNX + linear v1 spec up
+        # front, then verify normally. See nonlinear_augment.py (ORT-oracle-gated).
+        _maybe_nonlinear_augment(args)
 
     # Fast path: load the pre-parsed graph and/or spec from prepare_instance.sh's
     # per-source caches, skipping the (potentially multi-second) ONNX parse. The
@@ -546,6 +549,16 @@ def _maybe_network_pair(args):
     args.pair_cex_info = (nf, ng, npair.parse_multinet(npair._read_vnnlib_text(args.spec)))
     args.net = merged_onnx
     args.spec = merged_spec
+
+
+def _config_flag(args, key, default=False):
+    """Read a boolean flag from the --config YAML (the same source the attack
+    modes gate on). Returns `default` when there is no --config or the key is
+    absent. Cheap: the config is small (per-benchmark knobs), unlike the spec."""
+    if getattr(args, 'config', None) is None:
+        return default
+    from .config_loader import load_config
+    return bool(load_config(args.config).get(key, default))
 
 
 def _maybe_empty_input(args):

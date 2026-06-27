@@ -70,6 +70,21 @@ def test_emit_surrogate_unknown_and_never_downgrade(tmp_path):
     assert open(rf).read().strip() == 'unknown'
 
 
+def test_config_flag_gates_nonlinear_augment(tmp_path):
+    # The nonlinear v2 pre-checks (empty-input + augment) are OFF unless the
+    # --config sets `nonlinear_v2_augment: true`. _config_flag is the gate.
+    assert vbmain._config_flag(_args(config=None), 'nonlinear_v2_augment') is False
+    c0 = tmp_path / 'c0.yaml'; c0.write_text('pgd_restarts: 4\n')   # key absent
+    assert vbmain._config_flag(_args(config=str(c0)), 'nonlinear_v2_augment') is False
+    c1 = tmp_path / 'c1.yaml'; c1.write_text('nonlinear_v2_augment: true\n')
+    assert vbmain._config_flag(_args(config=str(c1)), 'nonlinear_v2_augment') is True
+    # the ONE benchmark that needs it has it enabled in its shipped config
+    import yaml
+    acc = yaml.safe_load(
+        open('configs/adaptive_cruise_control_non_linear_2026.yaml'))
+    assert acc.get('nonlinear_v2_augment') is True
+
+
 def test_resolve_cex_version(tmp_path):
     assert vbmain._resolve_cex_version('1', 'x') == '1.0'
     assert vbmain._resolve_cex_version('v2', 'x') == '2.0'
