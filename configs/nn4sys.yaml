@@ -14,4 +14,12 @@
 #   2. vnnlib parser dropped per-disjunct X constraints + overwrote
 #      X bounds across (and ...) blocks (22 of 194 lindex_* cases
 #      returned false-SAT pre-fix).
+#
+# mscn_*: the per-disjunct subbox backward needs the mul/div_bilinear McCormick
+# input boxes threaded in (the forward-LiRPA path doesn't match the global
+# stash). per_disjunct_bilinear_boxes fixes the NotImplementedError and lets the
+# per-q CROWN + BAB close the cardinality subboxes (verified: dual cases up to
+# ~6670 subboxes unsat within budget). Gated because it touches the shared
+# bilinear backward; enabled here after nn4sys validation.
+per_disjunct_bilinear_boxes: true
 

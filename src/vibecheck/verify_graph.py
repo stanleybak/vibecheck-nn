@@ -8732,27 +8732,35 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
             # stale box from an unrelated earlier forward can never leak in (a
             # stale/narrow box would make the envelope under-cover -> unsound).
             # `bil_b` stays None for graphs with no bilinear op (e.g. non-mscn).
+            # GATED on `per_disjunct_bilinear_boxes` (default OFF): when off, the
+            # per-disjunct backward falls back to its prior behavior (global
+            # stash / raise), so OTHER bilinear benchmarks (lsnc_relu, ml4acopf,
+            # cgan, vit, adaptive_cc) are unchanged until each is re-validated.
+            _pdb = bool(getattr(settings, 'per_disjunct_bilinear_boxes', False))
             bil_b = None
             while _chunk >= 1:
                 try:
                     if _chunk >= _bs_full:
-                        if hasattr(_fwd_fn, 'last_bilinear_op_bounds'):
+                        if _pdb and hasattr(_fwd_fn, 'last_bilinear_op_bounds'):
                             _fwd_fn.last_bilinear_op_bounds = None
                         sb_b, (c_b, G_b) = _fwd_fn(
                             xl_t, xh_t, gg_fast, dev, dt)
-                        bil_b = getattr(
-                            _fwd_fn, 'last_bilinear_op_bounds', None)
+                        if _pdb:
+                            bil_b = getattr(
+                                _fwd_fn, 'last_bilinear_op_bounds', None)
                     else:
                         sb_parts = None; c_parts = []; G_parts = []
                         bil_parts = None
                         for ci0 in range(0, _bs_full, _chunk):
                             ci1 = min(ci0 + _chunk, _bs_full)
-                            if hasattr(_fwd_fn, 'last_bilinear_op_bounds'):
+                            if _pdb and hasattr(
+                                    _fwd_fn, 'last_bilinear_op_bounds'):
                                 _fwd_fn.last_bilinear_op_bounds = None
                             sb_c, (cc, GG) = _fwd_fn(
                                 xl_t[ci0:ci1], xh_t[ci0:ci1], gg_fast, dev, dt)
-                            _bil_c = getattr(
+                            _bil_c = (getattr(
                                 _fwd_fn, 'last_bilinear_op_bounds', None)
+                                if _pdb else None)
                             if sb_parts is None:
                                 sb_parts = {L: ([sb_c[L][0]], [sb_c[L][1]])
                                              for L in sb_c}

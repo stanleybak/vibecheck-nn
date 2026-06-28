@@ -1299,6 +1299,16 @@ def default_settings(**overrides):
         # all three). Same caller signature via
         # `forward_lirpa_compat_zono_batched` adapter.
         use_forward_lirpa_subboxes=True,
+        # In `_verify_per_disjunct_subboxes`, capture the mul/div_bilinear
+        # McCormick input boxes from the actual subbox forward and pass them
+        # (index-selected) to `_spec_backward_graph_batched`, instead of relying
+        # on the global `_forward_zonotope_graph_batched.last_bilinear_op_bounds`
+        # stash — which the forward-LiRPA path never matches, so the backward
+        # raised `NotImplementedError: mul_bilinear ...` and fell to slow BAB.
+        # Default OFF: it touches the SHARED bilinear backward used by every
+        # bilinear benchmark (lsnc_relu, ml4acopf, cgan, vit, adaptive_cc), so
+        # enable per-benchmark only after re-validating soundness on each.
+        per_disjunct_bilinear_boxes=False,
         # Mini-group size for `_multi_sub_input_split_bab`. 60 is the safe
         # default; `default_settings_for` overrides to 120/200 for instances
         # with many disjuncts (see `_adapt_per_disjunct`). Env MINI_GROUP_SIZE
