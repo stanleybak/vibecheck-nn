@@ -24,3 +24,8 @@ raise_on_oom: true     # default, explicit: OOM raises (no slow/misleading CPU f
 # overhead net-negative. So pin CPU.
 device: cpu
 
+
+# Linear-surrogate variants encode sigmoid/sin/cos as ReLU lookup tables;
+# merge them to tightly-bounded 1-D PWL nodes (else the expanded ReLU stack
+# blows the bound up: 118-linear-residual nl_alpha margin -38.69).
+merge_relu_lookup_table: true

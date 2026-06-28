@@ -518,6 +518,23 @@ def default_settings(**overrides):
         print_progress=True,
         fuse_gemm_conv=True,
         optimize_relu_relation=True,
+        # Merge ReLU-based piecewise-linear lookup tables (Unsqueeze->Sub->ReLU->
+        # MatMul->Add = bias + sum_i w_i*ReLU(x-o_i)) into one tightly-bounded 1-D
+        # PWL node (nl_pwl.PWLRelax), port of ABC/GenBaB merge_relu_lookup_table.
+        # The ml4acopf linear-surrogate nets encode sigmoid/sin/cos this way;
+        # propagating the expanded ReLU stack loses input correlation and blows
+        # the bound up (118-linear-residual nl_alpha margin -38.69). Exact rewrite;
+        # off by default (only the linear-surrogate ml4acopf variants need it).
+        merge_relu_lookup_table=False,
+        # Per-intermediate-node α-CROWN bound refinement (alpha_crown.
+        # refine_intermediate_bounds_per_node). Tightens each nonlinear layer's
+        # OWN pre-activation bound with a separate α per neuron (ABC's
+        # get_alpha_crown_start_nodes mechanism), vs the shared spec-objective α.
+        # On deep ReLU MLPs this is ~2x tighter (validated ml4acopf /137:
+        # -13.6 -> -6.985 == ABC). Off by default (the ml4acopf linear-residual
+        # variants need it; other benchmarks unaffected). Pairs with the no-
+        # reforward β BnB for the per-spec close.
+        opt_intermediate_bounds_per_node=False,
         # Exact MaxPool -> ReLU decomposition (max(a,b)=a+ReLU(b-a)) at load
         # time, so conv nets with pooling (vggnet16) verify via the ReLU
         # machinery (no backend has a real MaxPool handler). No-op without

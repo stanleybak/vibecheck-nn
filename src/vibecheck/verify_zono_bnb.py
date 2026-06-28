@@ -551,8 +551,13 @@ def _point_bcast_bias(a, bias, op, sign):
     return (a_nd + sign * const_nd).expand(B, *out_sh).reshape(B, -1)
 
 
-def _forward_batch_graph(x, gg):
-    """Batched forward pass for PGD on graph networks (supports skip connections)."""
+def _forward_batch_graph(x, gg, capture=None):
+    """Batched forward pass for PGD on graph networks (supports skip connections).
+
+    capture: optional node name; if given, return that node's activation
+    (an intermediate pre-activation) instead of the network output — used to
+    PGD the true range of a single intermediate neuron.
+    """
     batch = x.shape[0]
     act = {gg['input_name']: x}
     forks = gg['fork_points']
@@ -694,6 +699,15 @@ def _forward_batch_graph(x, gg):
         elif t == 'floor':
             act[name] = torch.floor(act[op['inputs'][0]])
 
+        elif t == 'pwl':
+            # Merged 1-D PWL lookup table: bias + sum_i w_i*ReLU(x - o_i).
+            x = act[op['inputs'][0]]
+            off = torch.as_tensor(op['offsets'], device=x.device, dtype=x.dtype)
+            w = torch.as_tensor(op['weights'], device=x.device, dtype=x.dtype)
+            act[name] = (float(op['bias'])
+                         + (torch.clamp(x.unsqueeze(-1) - off, min=0.0)
+                            * w).sum(-1))
+
         elif t in ('avg_pool', 'max_pool'):
             a = act[op['inputs'][0]]
             in_shape = op['in_shape']
@@ -745,6 +759,14 @@ def _forward_batch_graph(x, gg):
             raise NotImplementedError(
                 f'_forward_batch_graph: unknown op type {t!r} at {name!r}')
 
+        # Early-stop once the captured node is computed — avoids building the
+        # rest of the (expensive bilinear) graph + autograd tape when PGD only
+        # needs an early intermediate pre-activation.
+        if capture is not None and capture in act:
+            return act[capture]
+
+    if capture is not None:
+        return act[capture]
     return act[gg['ops'][-1]['name']]
 
 
@@ -1896,6 +1918,47 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
             layer_idx = op.get('layer_idx')
             if layer_idx is not None:
                 sb[layer_idx] = (lo_pre.clone(), hi_pre.clone())
+            # Stash the (clamped) pre-activation input bounds on the op so the
+            # backward-CROWN floor handler can read them without a layer_idx
+            # (floor/sin/cos are not ReLU-indexed nonlinear layers).
+            _ib_lo = (torch.maximum(lo_pre, _tl.to(lo_pre.dtype))
+                      if _tl is not None else lo_pre)
+            _ib_hi = (torch.minimum(hi_pre, _th.to(hi_pre.dtype))
+                      if _th is not None else hi_pre)
+            op['_nl_in_lo'] = _ib_lo.detach().clone()
+            op['_nl_in_hi'] = _ib_hi.detach().clone()
+
+        elif t == 'pwl':
+            # Merged 1-D piecewise-linear lookup table (nl_pwl.PWLRelax). Sound
+            # affine band over [lo, hi] (exact for a PWL: extrema at endpoints +
+            # breakpoints), applied via the same DeepZ transformer as sin/cos —
+            # scales existing gens by lam (preserves input correlation) + one
+            # fresh delta generator. Avoids the expanded-ReLU-stack blow-up.
+            from .nonlinear_relax import zono_affine_transform
+            from .nl_pwl import PWLRelax
+            z = _get(op['inputs'][0])
+            lo_pre, hi_pre = z.bounds()
+            relax = PWLRelax(op['offsets'], op['weights'], op.get('bias', 0.0))
+            _tl = _th = None
+            if op_clamps is not None and name in op_clamps:
+                _tl, _th = op_clamps[name]
+            _alpha = (relu_lambdas[name] if relu_lambdas is not None
+                      and name in relu_lambdas else None)
+            new_c, new_g = zono_affine_transform(
+                relax, z.center, z.generators, tight_lo=_tl, tight_hi=_th,
+                alpha=_alpha)
+            zono_state[name] = TorchZonotope(new_c, new_g)
+            if op_bounds is not None:
+                _ol = (torch.maximum(lo_pre, _tl.to(lo_pre.dtype))
+                       if _tl is not None else lo_pre)
+                _oh = (torch.minimum(hi_pre, _th.to(hi_pre.dtype))
+                       if _th is not None else hi_pre)
+                op_bounds[name] = (_ol.detach().clone(), _oh.detach().clone())
+            # Store the INPUT range in sb[layer_idx] (like sigmoid/tanh) so the
+            # backward-CROWN can read it from bbr_tensors[L].
+            _li = op.get('layer_idx')
+            if _li is not None:
+                sb[_li] = (lo_pre.clone(), hi_pre.clone())
 
         elif t == 'mul':
             # Constant scalar / per-channel multiply: y = scale * x.
@@ -1945,6 +2008,14 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                 op_bounds[name] = (
                     (_al.detach().clone(), _ah.detach().clone()),
                     (_bl.detach().clone(), _bh.detach().clone()))
+            # Stash per-operand bounds on the op so the backward-CROWN handler
+            # can (a) assert the no-slack center-linearization is only used when
+            # one operand is a point, and (b) build the sound McCormick envelope
+            # when both operands vary (ml4acopf V*V power-flow products).
+            op['_mul_a_lo'] = _al.detach().clone()
+            op['_mul_a_hi'] = _ah.detach().clone()
+            op['_mul_b_lo'] = _bl.detach().clone()
+            op['_mul_b_hi'] = _bh.detach().clone()
             in_shapes = op.get('in_shapes_nd', [None, None])
             out_shape = op.get('out_shape_nd')
             if (in_shapes[0] is not None and in_shapes[1] is not None
@@ -2626,6 +2697,29 @@ def _spec_backward_graph(tight, xl, xh, gg, spec_ew,
                 ep = ew.clamp(min=0); en = ew.clamp(max=0)
                 acc += float((ep * b_lo + en * b_up).sum())
                 ew_back = ep * k_lo + en * k_up
+                inp = op['inputs'][0]
+                ew_at[inp] = ew_at.get(
+                    inp, torch.zeros_like(ew_back)) + ew_back
+
+            elif (t == 'pwl' and op_bounds is not None
+                  and name in op_bounds):
+                # 1-D PWL lookup-table backward (nl_pwl.PWLRelax): the affine
+                # band f(x) in [lam*x + (mu-delta), lam*x + (mu+delta)] gives the
+                # lower/upper lines. Positive ew takes the lower line, negative ew
+                # the upper — sound by the band guarantee (same scheme as exp).
+                from .nl_pwl import PWLRelax
+                l_in, u_in = op_bounds[name]
+                l_in = l_in.to(device=ew.device, dtype=torch.float64)
+                u_in = u_in.to(device=ew.device, dtype=torch.float64)
+                _relax = PWLRelax(op['offsets'], op['weights'],
+                                  op.get('bias', 0.0))
+                lam, mu, delta = _relax.affine_band(l_in, u_in)
+                lam = lam.to(ew.dtype); mu = mu.to(ew.dtype)
+                delta = delta.to(ew.dtype)
+                b_lo = mu - delta; b_up = mu + delta
+                ep = ew.clamp(min=0); en = ew.clamp(max=0)
+                acc += float((ep * b_lo + en * b_up).sum())
+                ew_back = (ep + en) * lam            # both lines share slope lam
                 inp = op['inputs'][0]
                 ew_at[inp] = ew_at.get(
                     inp, torch.zeros_like(ew_back)) + ew_back

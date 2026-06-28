@@ -385,6 +385,28 @@ class TrigNode(GraphNode):
         zono_state[self.name] = _point_zono(fn(z.center))
 
 
+class PWLNode(GraphNode):
+    """Merged 1-D piecewise-linear lookup table:
+        f(x) = bias + sum_i weights_i * ReLU(x - offsets_i),  applied elementwise.
+
+    Created by ``onnx_optimizer.merge_relu_lookup_table`` from the expanded
+    Unsqueeze->Sub->ReLU->MatMul->Add ReLU-sum encoding (sigmoid/sin/cos PWL
+    approximations in the ml4acopf linear-surrogate nets). The basic-zono path
+    only point-evaluates (like Sin/Cos); the tight forward-zonotope bound lives in
+    ``verify_zono_bnb`` via ``nl_pwl.PWLRelax`` (sound affine band)."""
+
+    def zonotope_propagate(self, zono_state, gen_count, get_input,
+                           relu_type, graph):
+        z = get_input(self.inputs[0])
+        _require_point(self, z)
+        off = np.asarray(self.params['offsets'])
+        w = np.asarray(self.params['weights'])
+        b = float(self.params['bias'])
+        x = z.center
+        fx = b + (np.clip(x[..., None] - off, 0.0, None) * w).sum(-1)
+        zono_state[self.name] = _point_zono(fx)
+
+
 class PowNode(GraphNode):
     def zonotope_propagate(self, zono_state, gen_count, get_input,
                            relu_type, graph):
@@ -1339,6 +1361,7 @@ OP_REGISTRY = {
     'Cos': TrigNode,
     'Pow': PowNode,
     'Floor': FloorNode,
+    'PWLLookup': PWLNode,
     # Arithmetic
     'Neg': NegNode,
     'Add': AddNode,
@@ -1428,6 +1451,9 @@ class ComputeGraph:
         # monotonic_acasxu clamp) need this. Exact, on by default, no-op without Min/Max.
         if getattr(settings, 'min_max_to_relu', True):
             min_max_to_relu(self)
+        if getattr(settings, 'merge_relu_lookup_table', False):
+            from .onnx_optimizer import merge_relu_lookup_table
+            merge_relu_lookup_table(self)
         if settings.optimize_relu_relation:
             fold_conv(self)
             fold_gemm(self)
@@ -1789,6 +1815,28 @@ class ComputeGraph:
                     'name': name,
                     'type': 'sigmoid' if node.op_type == 'Sigmoid' else 'tanh',
                     'inputs': inp_names,
+                    'layer_idx': relu_idx,
+                })
+                relu_names.append(name)
+                relu_idx += 1
+                computed.add(name)
+
+            elif node.op_type == 'PWLLookup':
+                # Merged 1-D piecewise-linear lookup table (see
+                # onnx_optimizer.merge_relu_lookup_table): bounded tightly via
+                # nl_pwl.PWLRelax instead of the expanded, correlation-losing
+                # ReLU stack. Carries offsets/weights/bias for the relaxation.
+                inp_names = [node.inputs[0]
+                             if node.inputs[0] in computed else '__input__']
+                ops.append({
+                    'name': name, 'type': 'pwl', 'inputs': inp_names,
+                    'offsets': np.asarray(node.params['offsets']),
+                    'weights': np.asarray(node.params['weights']),
+                    'bias': float(node.params['bias']),
+                    # Layer-indexed like sigmoid/tanh: its INPUT range is stored
+                    # in sb[layer_idx] by the forward zono, so the backward-CROWN
+                    # (_crown_backward_matrix / _spec_backward_graph) can read it
+                    # from bbr_tensors[L]. Fixed relaxation (no α), like sigmoid.
                     'layer_idx': relu_idx,
                 })
                 relu_names.append(name)

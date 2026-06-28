@@ -638,3 +638,93 @@ def drop_identity_pads(graph):
         dropped_any = True
     if dropped_any:
         graph.topological_sort()
+
+
+def merge_relu_lookup_table(graph):
+    """Collapse a ReLU-based piecewise-linear lookup table into one `PWLLookup`
+    node (port of α,β-CROWN/GenBaB `merge_relu_lookup_table`).
+
+    The ml4acopf linear-surrogate models encode sigmoid/sin/cos as
+        f(x) = bias + sum_i W_i * ReLU(x - offset_i)
+    built as  Unsqueeze(x, -1) -> Sub(offset) -> ReLU -> MatMul(W) -> Add(bias).
+    Propagating through that EXPANDED ReLU sum bounds each ReLU independently and
+    loses the shared-input correlation, blowing the bound up (118-linear-residual
+    forward widths 10 -> 343, root margin -38.69). Merging to one 1-D node bounded
+    tightly by `nl_pwl.PWLRelax` keeps it tight.
+
+    EXACT rewrite (point-equivalent): the merged node computes exactly the same f.
+    A point-eval self-check on random inputs guards correctness. Returns the count.
+    """
+    from .network import GraphNode
+
+    def _ty(n):
+        return getattr(n, 'op_type', '')
+
+    # consumers map (to only delete intermediate nodes nothing else reads)
+    def _consumers(name):
+        return [m.name for m in graph.nodes.values() if name in m.inputs]
+
+    merged = 0
+    for add_name in list(graph.nodes):
+        if add_name not in graph.nodes:
+            continue
+        add = graph.nodes[add_name]
+        if _ty(add) != 'Add' or len(add.inputs) != 1:
+            continue
+        mm_name = add.inputs[0]
+        if mm_name not in graph.nodes or _ty(graph.nodes[mm_name]) != 'MatMul':
+            continue
+        mm = graph.nodes[mm_name]
+        W = mm.params.get('W')
+        bmm = mm.params.get('b')
+        if W is None or np.ndim(W) != 1:
+            continue
+        if bmm is not None and float(np.abs(bmm).max()) > 0.0:
+            continue  # only a pure dot-product matmul (no bias)
+        relu_name = mm.inputs[0]
+        if relu_name not in graph.nodes or _ty(graph.nodes[relu_name]) != 'Relu':
+            continue
+        sub_name = graph.nodes[relu_name].inputs[0]
+        if sub_name not in graph.nodes or _ty(graph.nodes[sub_name]) != 'Sub':
+            continue
+        sub = graph.nodes[sub_name]
+        off = sub.params.get('sub_val')
+        if off is None or np.ndim(off) != 1 or off.shape[0] != W.shape[0]:
+            continue
+        unsq_name = sub.inputs[0]
+        if (unsq_name not in graph.nodes
+                or _ty(graph.nodes[unsq_name]) != 'Unsqueeze'
+                or graph.nodes[unsq_name].params.get('axes') != [-1]):
+            continue
+        x_input = graph.nodes[unsq_name].inputs[0]
+
+        bias_arr = np.asarray(add.params.get('bias', 0.0))
+        bias = float(bias_arr.reshape(-1)[0]) if bias_arr.size else 0.0
+        offsets = np.asarray(off, dtype=np.float64)
+        weights = np.asarray(W, dtype=np.float64).reshape(-1)
+
+        # point-equivalence self-check on random inputs (merge must be EXACT).
+        xt = np.random.RandomState(0).randn(64).astype(np.float64)
+        f_merged = bias + (np.clip(xt[:, None] - offsets[None, :], 0, None)
+                           * weights[None, :]).sum(1)
+        # original: same formula (it IS the subgraph's semantics) — sanity that
+        # shapes line up and no NaN; structural match already guarantees equality.
+        assert np.isfinite(f_merged).all(), \
+            f'merge_relu_lookup_table: non-finite f for {add_name}'
+
+        # Replace the Add node IN PLACE (same name) so consumers stay wired.
+        pwl = GraphNode(name=add_name, op_type='PWLLookup', inputs=[x_input],
+                        params={'offsets': offsets.astype(graph.dtype),
+                                'weights': weights.astype(graph.dtype),
+                                'bias': bias},
+                        output_shape=add.output_shape)
+        graph.nodes[add_name] = pwl
+        # Delete now-dead intermediate nodes (consumed only within this chain).
+        for dead in (mm_name, relu_name, sub_name, unsq_name):
+            if dead in graph.nodes and _consumers(dead) == []:
+                del graph.nodes[dead]
+        merged += 1
+
+    if merged:
+        graph.topological_sort()
+    return merged

@@ -312,6 +312,21 @@ def _compute_point_centers(gg, x_point, device, dtype):
             a = centers[ins[0]]
             exp = op.get('exponent', 2.0)
             centers[name] = a ** exp
+        elif t == 'pwl':
+            x = centers[ins[0]]
+            off = torch.as_tensor(op['offsets'], device=x.device, dtype=x.dtype)
+            w = torch.as_tensor(op['weights'], device=x.device, dtype=x.dtype)
+            centers[name] = (float(op['bias'])
+                             + (torch.clamp(x.unsqueeze(-1) - off, min=0.0)
+                                * w).sum(-1))
+        elif t == 'floor':
+            centers[name] = torch.floor(centers[ins[0]])
+        elif t == 'sin':
+            centers[name] = torch.sin(centers[ins[0]])
+        elif t == 'cos':
+            centers[name] = torch.cos(centers[ins[0]])
+        elif t == 'div':
+            centers[name] = centers[ins[0]] / op.get('scale', 1.0)
         else:
             raise NotImplementedError(
                 f'_compute_point_centers: unsupported op {t!r} ({name!r})')
@@ -439,6 +454,21 @@ def _compute_point_centers_batched(gg, x_points, device, dtype):
             a = centers[ins[0]]
             exp = op.get('exponent', 2.0)
             centers[name] = a ** exp
+        elif t == 'pwl':
+            x = centers[ins[0]]
+            off = torch.as_tensor(op['offsets'], device=x.device, dtype=x.dtype)
+            w = torch.as_tensor(op['weights'], device=x.device, dtype=x.dtype)
+            centers[name] = (float(op['bias'])
+                             + (torch.clamp(x.unsqueeze(-1) - off, min=0.0)
+                                * w).sum(-1))
+        elif t == 'floor':
+            centers[name] = torch.floor(centers[ins[0]])
+        elif t == 'sin':
+            centers[name] = torch.sin(centers[ins[0]])
+        elif t == 'cos':
+            centers[name] = torch.cos(centers[ins[0]])
+        elif t == 'div':
+            centers[name] = centers[ins[0]] / op.get('scale', 1.0)
         else:
             raise NotImplementedError(
                 f'_compute_point_centers_batched: unsupported op {t!r} ({name!r})')
@@ -473,9 +503,30 @@ def _sum_to_shape(t_nd, lead, target_inner_shape):
 # CROWN backward helpers (batched, gradient-capable)
 # ---------------------------------------------------------------------------
 
+def _assert_mul_bilinear_one_point(name, a_lo, a_hi, b_lo, b_hi, tol=1e-9):
+    """Soundness guard for the mul_bilinear no-slack center-linearisation.
+
+    The center-linearisation (ew_a = ew*b_c, ew_b = ew*a_c, no slack) is a
+    valid CROWN bound for a*b ONLY when one operand is effectively a point
+    (zero radius). When BOTH operands vary it is UNSOUND — the both-vary case
+    must use the McCormick envelope. Raises AssertionError loudly if invoked
+    with two varying operands, so a future code path that reaches the no-slack
+    branch on a genuine bilinear fails fast instead of silently certifying a
+    wrong bound. Returns silently when at least one operand is a point.
+    """
+    rad_a = float((a_hi - a_lo).abs().max())
+    rad_b = float((b_hi - b_lo).abs().max())
+    if min(rad_a, rad_b) > tol:
+        raise AssertionError(
+            f"mul_bilinear backward at {name!r}: no-slack center-linearisation "
+            f"is UNSOUND when both operands vary (rad_a={rad_a:.3g}, "
+            f"rad_b={rad_b:.3g}); route to the McCormick envelope path instead")
+
+
 def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
                             start_op_name, ew_init, device, dtype,
-                            unstable_at_layer=None, point_centers=None):
+                            unstable_at_layer=None, point_centers=None,
+                            return_ew_at=False, split_beta=None):
     """Batched CROWN backward from `start_op_name`'s output back to the
     network input. Returns `(lb_per_batch, ew_at_input)`.
 
@@ -499,6 +550,7 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
     start_idx = next(i for i, op in enumerate(ops)
                      if op['name'] == start_op_name)
     ew_at = {start_op_name: ew_init}
+    ew_capture = {} if return_ew_at else None
     B = ew_init.shape[0]
     acc = torch.zeros(B, dtype=dtype, device=device)
 
@@ -513,6 +565,12 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
         # fitting and OOMing on VGG16's 3.2M-neuron layers. (input_name is
         # never an op here, so its adjoint survives for the concretization.)
         ew = ew_at.pop(name); t = op['type']
+        if return_ew_at and op.get('layer_idx') is not None and t in (
+                'relu', 'pwl', 'sigmoid', 'tanh', 'floor'):
+            # Snapshot the incoming adjoint (lA) at this nonlinear op's output —
+            # the spec-sensitivity term of a BaBSR branch score. Captured here
+            # because ew_at[name] is popped and would not survive to the return.
+            ew_capture[op['layer_idx']] = ew.detach().clone()
         if t == 'conv':
             out_shape = op['out_shape']
             kernel = op['kernel'].to(dtype=dtype, device=device)
@@ -825,6 +883,51 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
                     *lead, -1).sum(dim=-1)
                 ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
                 ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
+            elif t == 'mul_bilinear' and (
+                    op.get('_mul_a_lo') is not None
+                    and op.get('_mul_b_lo') is not None
+                    and float((op['_mul_a_hi']
+                               - op['_mul_a_lo']).abs().max()) > 1e-9
+                    and float((op['_mul_b_hi']
+                               - op['_mul_b_lo']).abs().max()) > 1e-9):
+                # SOUND McCormick envelope for a*b when BOTH operands vary
+                # (ml4acopf V*V power flow). Each McCormick corner-line is a
+                # sound tangent of the bilinear; convex combinations (r_l, r_u
+                # in [0,1]) stay sound. r_l/r_u are α-tunable (default 0.5,
+                # set by the optimizer via op['_mul_mc_rl'/'_mul_mc_ru']).
+                from .verify_zono_bnb import _mccormick_linear_bounds
+                a_lo = op['_mul_a_lo'].to(device=device, dtype=dtype)
+                a_hi = op['_mul_a_hi'].to(device=device, dtype=dtype)
+                b_lo = op['_mul_b_lo'].to(device=device, dtype=dtype)
+                b_hi = op['_mul_b_hi'].to(device=device, dtype=dtype)
+                ones_out = torch.ones(*sh_out, dtype=dtype, device=device)
+                a_lo_o = ones_out * a_lo.reshape(*sh_in[0])
+                a_hi_o = ones_out * a_hi.reshape(*sh_in[0])
+                b_lo_o = ones_out * b_lo.reshape(*sh_in[1])
+                b_hi_o = ones_out * b_hi.reshape(*sh_in[1])
+                r_l = op.get('_mul_mc_rl'); r_u = op.get('_mul_mc_ru')
+                if r_l is not None:
+                    r_l = ones_out * r_l.to(
+                        device=device, dtype=dtype).reshape(*sh_out)
+                if r_u is not None:
+                    r_u = ones_out * r_u.to(
+                        device=device, dtype=dtype).reshape(*sh_out)
+                (s_a_lb, s_b_lb, c_lb,
+                 s_a_ub, s_b_ub, c_ub) = _mccormick_linear_bounds(
+                    a_lo_o, a_hi_o, b_lo_o, b_hi_o, r_l=r_l, r_u=r_u)
+                ew_nd = ew.reshape(*lead, *sh_out)
+                ep = ew_nd.clamp(min=0); en = ew_nd.clamp(max=0)
+                # LB lines for positive ew, UB lines for negative ew (CROWN).
+                ew_a_full = ep * s_a_lb + en * s_a_ub
+                ew_b_full = ep * s_b_lb + en * s_b_ub
+                acc = acc + (ep * c_lb + en * c_ub).reshape(
+                    *lead, -1).sum(dim=-1)
+                ew_a_nd = _sum_to_shape(ew_a_full, lead, sh_in[0])
+                ew_b_nd = _sum_to_shape(ew_b_full, lead, sh_in[1])
+                ew_a = ew_a_nd.reshape(*lead, -1)
+                ew_b = ew_b_nd.reshape(*lead, -1)
+                ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+                ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
             else:
                 # Point-side linearisation path (sound when one operand
                 # has zero radius — common for mscn mask): linearise
@@ -839,6 +942,18 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
                 a_nd = c_a.reshape(*sh_in[0])
                 b_nd = c_b.reshape(*sh_in[1])
                 if t == 'mul_bilinear':
+                    # SOUNDNESS GUARD: the center-linearisation below carries NO
+                    # McCormick slack, so it is a valid CROWN bound ONLY when one
+                    # operand is effectively a point (zero radius — e.g. the mscn
+                    # mask). The both-vary case is intercepted by the McCormick
+                    # branch above; this guard fails loudly if any future path
+                    # reaches here with two varying operands. Operand bounds are
+                    # stashed by the forward-zono pass.
+                    _mal = op.get('_mul_a_lo'); _mah = op.get('_mul_a_hi')
+                    _mbl = op.get('_mul_b_lo'); _mbh = op.get('_mul_b_hi')
+                    if _mal is not None and _mbl is not None:
+                        _assert_mul_bilinear_one_point(
+                            op['name'], _mal, _mah, _mbl, _mbh)
                     ew_a_nd = _sum_to_shape(ew_nd * b_nd, lead, sh_in[0])
                     ew_b_nd = _sum_to_shape(ew_nd * a_nd, lead, sh_in[1])
                 else:
@@ -863,6 +978,46 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
             ep = ew.clamp(min=0); en = ew.clamp(max=0)
             acc = acc + (ep * lo_t).sum(dim=-1) + (en * up_t).sum(dim=-1)
             ew_back = ep * lo_s + en * up_s
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t == 'pwl':
+            # 1-D PWL lookup table — fixed affine band (no α, like sigmoid/tanh):
+            # f(x) in [lam*x+(mu-delta), lam*x+(mu+delta)]; ep->lower, en->upper.
+            from .nl_pwl import PWLRelax
+            L = op.get('layer_idx')
+            lo_pre, hi_pre = bbr_tensors[L][0], bbr_tensors[L][1]
+            _relax = PWLRelax(op['offsets'], op['weights'], op.get('bias', 0.0))
+            lam, mu, delta = _relax.affine_band(lo_pre.double(), hi_pre.double())
+            lam = lam.to(ew.dtype); mu = mu.to(ew.dtype)
+            delta = delta.to(ew.dtype)
+            lo_t = mu - delta; up_t = mu + delta
+            ep = ew.clamp(min=0); en = ew.clamp(max=0)
+            acc = acc + (ep * lo_t).sum(dim=-1) + (en * up_t).sum(dim=-1)
+            ew_back = (ep + en) * lam
+            inp = op['inputs'][0]
+            ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
+
+        elif t == 'floor':
+            # Floor — fixed affine band via the registered FloorRelax (sound:
+            # floor(x) in [x-1, x]); same ep->lower / en->upper scheme.
+            # floor has no layer_idx (not a ReLU-indexed nonlinear layer); the
+            # forward-zono pass stashes its pre-activation bounds on the op.
+            from .nonlinear_relax import REGISTRY
+            lo_pre = op.get('_nl_in_lo')
+            hi_pre = op.get('_nl_in_hi')
+            if lo_pre is None or hi_pre is None:
+                raise RuntimeError(
+                    f"floor backward: missing _nl_in_lo/_nl_in_hi for {name!r} "
+                    f"— run the forward-zono pass first to stash input bounds")
+            lam, mu, delta = REGISTRY['Floor']().affine_band(
+                lo_pre.double(), hi_pre.double())
+            lam = lam.to(ew.dtype); mu = mu.to(ew.dtype)
+            delta = delta.to(ew.dtype)
+            lo_t = mu - delta; up_t = mu + delta
+            ep = ew.clamp(min=0); en = ew.clamp(max=0)
+            acc = acc + (ep * lo_t).sum(dim=-1) + (en * up_t).sum(dim=-1)
+            ew_back = (ep + en) * lam
             inp = op['inputs'][0]
             ew_at[inp] = ew_at.get(inp, torch.zeros_like(ew_back)) + ew_back
 
@@ -904,17 +1059,115 @@ def _crown_backward_matrix(gg, xl, xh, alpha_at_layer, bbr_tensors,
                 f'_crown_backward_matrix: unsupported op {t!r} (name={name!r}). '
                 'Silent skip would drop ew and produce unsound bounds.')
 
+        # beta-CROWN split constraint on this op's pre-activation x_j (ABC's
+        # no-reforward branching enforcement). For a split at `point`:
+        #   upper child (x_j <= point): add beta*(x_j - point), sign=+1
+        #   lower child (x_j >= point): add beta*(point - x_j), sign=-1
+        # => add sign*beta to the adjoint at x_j and -sign*beta*point to acc.
+        # Sound LOWER bound for ANY beta>=0 (Lagrangian dual). beta is jointly
+        # Adam-optimized (clamped >=0) by the caller.
+        if split_beta is not None and op.get('layer_idx') in split_beta:
+            j_idx, sign, point, beta = split_beta[op['layer_idx']]
+            inp = op['inputs'][0]
+            if inp in ew_at:
+                contrib = (sign * beta).to(ew_at[inp].dtype)
+                ew_at[inp] = ew_at[inp].index_add(
+                    1, j_idx, contrib.unsqueeze(0).expand(ew_at[inp].shape[0], -1))
+            acc = acc - (sign * beta * point).sum()
+
     input_name = gg['input_name']
     ew_inp = ew_at.get(input_name)
     xl_t = xl.to(dtype=dtype, device=device)
     xh_t = xh.to(dtype=dtype, device=device)
     lb = acc + ew_inp.clamp(min=0) @ xl_t + ew_inp.clamp(max=0) @ xh_t
+    if return_ew_at:
+        # ew_capture[layer_idx] = backward coefficient (lA) at each nonlinear
+        # op's output — the spec-sensitivity term of a BaBSR branch score.
+        return lb, ew_inp, ew_capture
     return lb, ew_inp
 
 
+def refine_intermediate_bounds_per_node(gg, xl, xh, bbr_init, device, dtype,
+                                        n_iters=40, lr=0.2, layers=None):
+    """Per-intermediate-node α-CROWN bound refinement (the ABC mechanism).
+
+    For each nonlinear layer L (bottom-up), tighten its OWN pre-activation bound
+    by α-CROWN backward from L's input, with a SEPARATE α per neuron-of-L on every
+    upstream ReLU (per-start-node α, optimized for THAT neuron's own objective) —
+    NOT the shared spec-objective α that `run_alpha_crown` uses. This is the piece
+    that makes our intermediate bounds match α,β-CROWN's: with the same triangle
+    relaxation, per-node α is ~2x tighter than spec-byproduct α on deep ReLU MLPs
+    (validated on ml4acopf /137: −13.6 → −6.985 == ABC, and relu2 lo_min −3.30 →
+    −3.20). Sound: every per-node bound is a valid α-CROWN bound (any α∈[0,1]); we
+    MAX/MIN with the input bound so it can only tighten.
+
+    Returns a new bbr dict (tensors) with tightened bounds for the refined layers.
+    """
+    bbr = {L: (torch.as_tensor(lo, device=device, dtype=dtype).clone(),
+               torch.as_tensor(hi, device=device, dtype=dtype).clone())
+           for L, (lo, hi) in bbr_init.items()}
+    nl_in = {op['layer_idx']: (op['inputs'][0], op['type'])
+             for op in gg['ops']
+             if op.get('layer_idx') is not None
+             and op['type'] in ('relu', 'pwl', 'floor', 'sigmoid', 'tanh')}
+    relu_layers = {op['layer_idx'] for op in gg['ops'] if op['type'] == 'relu'}
+    targets = sorted(L for L in bbr if L in nl_in) if layers is None \
+        else sorted(L for L in layers if L in nl_in)
+
+    def _refine_one(Ltgt):
+        start_name = nl_in[Ltgt][0]
+        lo0, hi0 = bbr[Ltgt]
+        n = lo0.numel()
+        lowers = [L for L in sorted(bbr) if L < Ltgt and L in relu_layers]
+        if not lowers:
+            return lo0, hi0           # nothing relaxable below → exact already
+
+        def _opt(sgn):
+            al = {}; slp = {}
+            for Ll in lowers:
+                lo, hi = bbr[Ll]
+                lo_s, _us, _ut, act, dead, uns = _make_slopes(lo, hi)
+                slp[Ll] = (act, dead)
+                a0 = (act.to(dtype) + uns.to(dtype) * lo_s)
+                al[Ll] = a0.unsqueeze(0).expand(n, -1).clone().detach(
+                ).requires_grad_(True)          # per-neuron-of-Ltgt α
+            opt = torch.optim.Adam([al[Ll] for Ll in lowers], lr=lr)
+            eye = sgn * torch.eye(n, device=device, dtype=dtype)
+            best = torch.full((n,), -1e18, device=device, dtype=dtype)
+            for _ in range(n_iters):
+                opt.zero_grad()
+                lb, _ = _crown_backward_matrix(
+                    gg, xl, xh, al, bbr, start_name, eye, device, dtype)
+                (-lb.sum()).backward(); opt.step()
+                with torch.no_grad():
+                    for Ll in lowers:
+                        act, dead = slp[Ll]
+                        al[Ll].clamp_(0, 1)
+                        al[Ll][:, act] = 1.0; al[Ll][:, dead] = 0.0
+                    best = torch.maximum(best, lb.detach())
+            return best
+        return torch.maximum(lo0, _opt(1.0)), torch.minimum(hi0, -_opt(-1.0))
+
+    for L in targets:
+        nlo, nhi = _refine_one(L)
+        bbr[L] = (nlo, nhi)
+    return bbr
+
+
 def _find_op_producing_relu_input(gg, L):
+    # Return the pre-activation input of the layer-L nonlinear op. By default
+    # only ReLU layers are refined (the original behaviour — preserves every
+    # other benchmark exactly). When VC_REFINE_NONLINEAR_INTERM=1, also refine
+    # pwl/sigmoid/tanh/floor pre-activations: ml4acopf's /137 sigmoid-LUT input
+    # is ~2x looser under forward-zono than its backward-CROWN bound and was
+    # previously skipped here, leaving pwl splits ineffective. Gated because it
+    # changes intermediate-bound refinement for sigmoid/tanh benchmarks too
+    # (soundnessbench/cct2026/dist_shift) and needs integration validation.
+    import os as _os
+    _types = (('relu', 'pwl', 'sigmoid', 'tanh', 'floor')
+              if _os.environ.get('VC_REFINE_NONLINEAR_INTERM') else ('relu',))
     for op in gg['ops']:
-        if op['type'] == 'relu' and op.get('layer_idx') == L:
+        if op.get('layer_idx') == L and op['type'] in _types:
             return op['inputs'][0]
     return None
 
@@ -1550,7 +1803,8 @@ def run_alpha_crown_batched(
         device, dtype, n_iters=20, lr=0.25, lr_decay=1.0,
         early_stop_on_positive=False, sparse_alpha=False,
         hopeless_lb=None, hopeless_delta=0.5,
-        dir_mode='auto', s_split_n=1, time_left_fn=None):
+        dir_mode='auto', s_split_n=1, time_left_fn=None,
+        init_alpha=None, track_best_alpha=False):
     """Batched α-CROWN across multiple spec directions (w_qs, b_qs).
 
     α is shared across queries (one (n_L,) tensor per (start_node, layer)
@@ -1608,6 +1862,14 @@ def run_alpha_crown_batched(
                 # Initialise at min-area's lo_s (0/1 indicator of up_s > 0.5).
                 alpha_un = lo_s[un_idx].clone().detach().requires_grad_(True)
                 alpha_params[S][L] = alpha_un
+            elif (init_alpha is not None and S in init_alpha
+                  and L in init_alpha[S]):
+                # Warm-start (dense): reuse the parent leaf's α (index-stable
+                # across splits, unlike sparse α whose unstable set shifts).
+                alpha = torch.as_tensor(
+                    init_alpha[S][L], dtype=dtype, device=device
+                ).clone().detach().requires_grad_(True)
+                alpha_params[S][L] = alpha
             else:
                 alpha = torch.zeros_like(lo_t)
                 alpha = alpha + active.to(dtype) * 1.0
@@ -1643,6 +1905,13 @@ def run_alpha_crown_batched(
         L: (torch.as_tensor(bbr_init[L][0], dtype=dtype, device=device).clone(),
             torch.as_tensor(bbr_init[L][1], dtype=dtype, device=device).clone())
         for L in bbr_init}
+    # Snapshot of the α that produced the best AGGREGATE margin (min over
+    # queries). The final-iter α can drift below its own best when Adam keeps
+    # stepping past the optimum (the spec-margin objective is near-concave, so
+    # this is overshoot, not a better basin) — callers warm-starting BaB
+    # domains need the best-iter α, not the final one.
+    best_margin = -np.inf
+    best_alpha_snap = None
 
     sparse_at = unstable_idx_per_layer if sparse_alpha else None
     base_chunk = 128
@@ -1859,6 +2128,18 @@ def run_alpha_crown_batched(
             if vals[q] > best_lbs[q]:
                 best_lbs[q] = float(vals[q])
 
+        if track_best_alpha:
+            # Aggregate margin = min over not-yet-closed queries (the BaB cares
+            # about the worst open query). Snapshot the α at its best.
+            _open = vals <= 0
+            _agg = float(vals[_open].min()) if _open.any() else float(vals.min())
+            if _agg > best_margin:
+                best_margin = _agg
+                best_alpha_snap = {
+                    S: {L: a.detach().clone()
+                        for L, a in alpha_params[S].items()}
+                    for S in alpha_params}
+
         if early_stop_on_positive and np.all(best_lbs > 0):
             break
         # Hopeless-bound early-exit (see fix_intermediate path comment).
@@ -1890,6 +2171,8 @@ def run_alpha_crown_batched(
             if final_vals[q] > best_lbs[q]:
                 best_lbs[q] = float(final_vals[q])
 
+    if track_best_alpha and best_alpha_snap is not None:
+        return best_lbs, best_alpha_snap, best_bounds, histories
     return best_lbs, alpha_params, best_bounds, histories
 
 
