@@ -17,9 +17,9 @@
 #
 # mscn_*: the per-disjunct subbox backward needs the mul/div_bilinear McCormick
 # input boxes threaded in (the forward-LiRPA path doesn't match the global
-# stash). per_disjunct_bilinear_boxes fixes the NotImplementedError and lets the
-# per-q CROWN + BAB close the cardinality subboxes (verified: dual cases up to
-# ~6670 subboxes unsat within budget). Gated because it touches the shared
-# bilinear backward; enabled here after nn4sys validation.
-per_disjunct_bilinear_boxes: true
+# stash). `per_disjunct_bilinear_boxes` fixes the NotImplementedError and lets
+# the per-q CROWN + BAB close the cardinality subboxes (verified: dual cases up
+# to ~6670 subboxes unsat within budget). It is now ON by default (a sound
+# correctness fix, validated inert on the other bilinear benchmarks), so no
+# override is needed here.
 

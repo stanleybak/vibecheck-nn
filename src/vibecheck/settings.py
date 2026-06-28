@@ -1305,10 +1305,13 @@ def default_settings(**overrides):
         # on the global `_forward_zonotope_graph_batched.last_bilinear_op_bounds`
         # stash — which the forward-LiRPA path never matches, so the backward
         # raised `NotImplementedError: mul_bilinear ...` and fell to slow BAB.
-        # Default OFF: it touches the SHARED bilinear backward used by every
-        # bilinear benchmark (lsnc_relu, ml4acopf, cgan, vit, adaptive_cc), so
-        # enable per-benchmark only after re-validating soundness on each.
-        per_disjunct_bilinear_boxes=False,
+        # Default ON: it's a CORRECTNESS fix (sound McCormick boxes from the
+        # actual forward). Validated INERT (ON==OFF) on every other bilinear
+        # benchmark — lsnc_relu, ml4acopf, cgan, vit, adaptive_cc (~36 instances,
+        # zero diff/regress; soundness on SAT cases unchanged) — so in practice
+        # it only affects nn4sys's per-disjunct bilinear path. None for graphs
+        # with no bilinear op -> backward unchanged.
+        per_disjunct_bilinear_boxes=True,
         # Mini-group size for `_multi_sub_input_split_bab`. 60 is the safe
         # default; `default_settings_for` overrides to 120/200 for instances
         # with many disjuncts (see `_adapt_per_disjunct`). Env MINI_GROUP_SIZE
