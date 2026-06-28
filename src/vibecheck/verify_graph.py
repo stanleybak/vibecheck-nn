@@ -8712,17 +8712,34 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
             # only halve when actually needed.
             _bs_full = xl_t.shape[0]
             _chunk = _bs_full
+            # Per-sub bilinear (mul_bilinear) input boxes for the McCormick
+            # envelope, captured from the SAME forward that builds sb_b and
+            # batch-aligned with it. The forward stashes them on its own
+            # `.last_bilinear_op_bounds`; we reset-before / capture-after so a
+            # stale box from an unrelated earlier forward can never leak in (a
+            # stale/narrow box would make the envelope under-cover -> unsound).
+            # `bil_b` stays None for graphs with no bilinear op (e.g. non-mscn).
+            bil_b = None
             while _chunk >= 1:
                 try:
                     if _chunk >= _bs_full:
+                        if hasattr(_fwd_fn, 'last_bilinear_op_bounds'):
+                            _fwd_fn.last_bilinear_op_bounds = None
                         sb_b, (c_b, G_b) = _fwd_fn(
                             xl_t, xh_t, gg_fast, dev, dt)
+                        bil_b = getattr(
+                            _fwd_fn, 'last_bilinear_op_bounds', None)
                     else:
                         sb_parts = None; c_parts = []; G_parts = []
+                        bil_parts = None
                         for ci0 in range(0, _bs_full, _chunk):
                             ci1 = min(ci0 + _chunk, _bs_full)
+                            if hasattr(_fwd_fn, 'last_bilinear_op_bounds'):
+                                _fwd_fn.last_bilinear_op_bounds = None
                             sb_c, (cc, GG) = _fwd_fn(
                                 xl_t[ci0:ci1], xh_t[ci0:ci1], gg_fast, dev, dt)
+                            _bil_c = getattr(
+                                _fwd_fn, 'last_bilinear_op_bounds', None)
                             if sb_parts is None:
                                 sb_parts = {L: ([sb_c[L][0]], [sb_c[L][1]])
                                              for L in sb_c}
@@ -8730,10 +8747,22 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                                 for L in sb_c:
                                     sb_parts[L][0].append(sb_c[L][0])
                                     sb_parts[L][1].append(sb_c[L][1])
+                            if _bil_c:
+                                if bil_parts is None:
+                                    bil_parts = {nm: ([lo], [hi]) for nm, (lo, hi)
+                                                 in _bil_c.items()}
+                                else:
+                                    for nm, (lo, hi) in _bil_c.items():
+                                        bil_parts[nm][0].append(lo)
+                                        bil_parts[nm][1].append(hi)
                             c_parts.append(cc); G_parts.append(GG)
                         sb_b = {L: (torch.cat(sb_parts[L][0], dim=0),
                                      torch.cat(sb_parts[L][1], dim=0))
                                  for L in sb_parts}
+                        bil_b = (
+                            {nm: (torch.cat(los, dim=0), torch.cat(his, dim=0))
+                             for nm, (los, his) in bil_parts.items()}
+                            if bil_parts is not None else None)
                         # G shape: (B, n, K). K may differ per chunk
                         # (Sigmoid/Tanh/Pow add new gens proportional to
                         # the unstable count, which varies per batch).
@@ -8758,6 +8787,18 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                     _chunk = max(1, _chunk // 2)
             # Stash chunk size for downstream chunked CROWN calls.
             _fb_chunk = _chunk
+
+            def _sel_bil(idx_t):
+                """Slice the per-sub bilinear input boxes the SAME way as sb_b
+                so the batched spec backward gets the McCormick envelope boxes
+                for EXACTLY its sub-batch (not the global, possibly-mismatched
+                forward stash). None when the graph has no bilinear op."""
+                if bil_b is None:
+                    return None
+                return {nm: (lo.index_select(0, idx_t),
+                             hi.index_select(0, idx_t))
+                        for nm, (lo, hi) in bil_b.items()}
+
             n_out = c_b.shape[1]
             # For each sub-box index b, check all its Y conjuncts.
             for ki, key in enumerate(order):
@@ -8836,7 +8877,8 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                             import os as _osd0
                             spec_lbs_all = _spec_backward_graph_batched(
                                 tight_all, xl_unc, xh_unc, gg_fast,
-                                spec_ew_shared, dev, dt)
+                                spec_ew_shared, dev, dt,
+                                bilinear_op_bounds=_sel_bil(_unc_t))
                             lbs_np_all = spec_lbs_all[:, 0].detach().cpu().numpy()
                             biases = np.array([float(sub_queries[idx][0][2])
                                                 if sub_queries[idx] else -1e9
@@ -8944,7 +8986,8 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                                     spec_ew_q = {0: (w_q, 0.0)}
                                     lbs_basic_q = _spec_backward_graph_batched(
                                         sb_unc, xl_unc, xh_unc, gg_fast,
-                                        spec_ew_q, dev, dt)
+                                        spec_ew_q, dev, dt,
+                                        bilinear_op_bounds=_sel_bil(ki_t))
                                     lbs_np_q = (
                                         lbs_basic_q[:, 0].detach().cpu().numpy())
                                     margins_basic_q = (lbs_np_q
@@ -9035,7 +9078,10 @@ def _verify_per_disjunct_subboxes(graph, spec, settings):
                             try:
                                 spec_lbs = _spec_backward_graph_batched(
                                     tight_sub, xl_sub, xh_sub, gg_fast,
-                                    spec_ew_sub, dev, dt)
+                                    spec_ew_sub, dev, dt,
+                                    bilinear_op_bounds=_sel_bil(
+                                        torch.as_tensor([ki], dtype=torch.long,
+                                                        device=dev)))
                                 lbs_np = spec_lbs[0].detach().cpu().numpy()
                                 import os as _os_dump
                                 if _os_dump.environ.get('VIB_DUMP_INIT_LB', '') == '1':
