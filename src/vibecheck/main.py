@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -43,6 +44,58 @@ def _require_net(net_field, spec_path):
         sys.exit(1)
     for lbl, p in label_paths.items():
         _require_input_file(p, f'network {lbl!r} (--net pair)')
+
+
+# Backstop watchdog grace: how long past the cooperative --timeout to wait
+# before forcing a self-exit. The cooperative deadline checks should land the
+# run at <= --timeout; this only fires for a phase that ignores the deadline
+# (e.g. a long Gurobi build or a heavy forward), so it stays well inside the
+# competition harness's hard-kill margin while letting a legit near-deadline
+# emit win the race first. Env-overridable for tuning/tests.
+_HARD_TIMEOUT_GRACE_S = float(os.environ.get('VC_HARD_TIMEOUT_GRACE_S', '8'))
+
+
+def _hard_timeout_fire(timeout_s, grace_s):
+    """Force an immediate process exit (called by the backstop Timer thread).
+
+    A phase overran the cooperative ``--timeout``. The results file is already
+    pre-seeded with ``timeout`` (or holds an earlier-emitted sat/verdict), so we
+    just exit — no write, no race with the atomic emit. Using ``os._exit`` (not
+    ``sys.exit``) is deliberate: it terminates from this thread even while the
+    main thread is blocked in a C extension (Gurobi/torch/BLAS), which a Python
+    exception could not interrupt. Self-exiting here makes the harness record
+    our ``timeout`` verdict instead of having to SIGKILL us — which it logs as a
+    penalized ``run_instance_timeout``.
+    """
+    sys.stderr.write(
+        f'\n[hard-timeout] cooperative --timeout={timeout_s}s exceeded by '
+        f'{grace_s}s — forcing clean process exit with the pre-seeded verdict\n')
+    sys.stderr.flush()
+    os._exit(1)
+
+
+def _arm_hard_timeout(timeout_s, grace_s):
+    """Arm the backstop watchdog; returns the started daemon Timer.
+
+    Cancel it on a clean finish so it never fires for a well-behaved run.
+    """
+    t = threading.Timer(float(timeout_s) + float(grace_s),
+                        _hard_timeout_fire, args=(timeout_s, grace_s))
+    t.daemon = True
+    t.start()
+    return t
+
+
+def _is_oom_exception(exc):
+    """True iff `exc` is an out-of-memory condition.
+
+    A host MemoryError, or a CUDA OOM — which torch raises as
+    ``torch.cuda.OutOfMemoryError`` (a RuntimeError subclass) or occasionally a
+    bare RuntimeError whose message says so. Matching on type + message (not a
+    broad ``except RuntimeError``) keeps real bugs surfacing as ``error``.
+    """
+    return isinstance(exc, MemoryError) or (
+        isinstance(exc, RuntimeError) and 'out of memory' in str(exc).lower())
 
 
 def main():
@@ -229,6 +282,11 @@ def main():
     if args.results_file:
         with open(args.results_file, 'w') as f:
             f.write('timeout\n')
+    # Backstop watchdog: guarantee a clean self-exit by the budget even if a
+    # phase ignores the cooperative deadline, so the harness never has to
+    # SIGKILL us (a penalized run_instance_timeout). Cancelled on clean finish.
+    _watchdog = (_arm_hard_timeout(args.timeout, _HARD_TIMEOUT_GRACE_S)
+                 if (args.results_file and args.timeout) else None)
     try:
         _verify(args, sat_state)
     except SystemExit:
@@ -258,6 +316,11 @@ def main():
                 f.write('error\n')
                 f.write(f'{type(_exc).__name__}: {str(_exc)[:500]}\n')
         sys.exit(2)
+    finally:
+        # Clean finish (or handled crash) — disarm the backstop so it never
+        # fires for a well-behaved run.
+        if _watchdog is not None:
+            _watchdog.cancel()
 
 
 def _verify(args, sat_state=None):
@@ -424,7 +487,25 @@ def _verify(args, sat_state=None):
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
               f'timeout={args.timeout}s)...')
-        result, details = verify_graph(graph, spec, settings)
+        try:
+            result, details = verify_graph(graph, spec, settings)
+        except (MemoryError, RuntimeError) as _oom:
+            # Gated, opt-in graceful OOM: a sound verifier that exhausted memory
+            # could not decide -> 'unknown' (an undecided run), NOT a crash
+            # 'error'. Default raise_on_oom=True re-raises (never silently
+            # swallow OOM — per CLAUDE.md it once hid a real bug). Enabled only
+            # per-benchmark where an OOM is an expected, both-tools-fail outcome
+            # (vggnet spec17: forward-zono OOM at 100x eps). A non-OOM
+            # RuntimeError always re-raises so real bugs still surface.
+            if getattr(settings, 'raise_on_oom', True) \
+                    or not _is_oom_exception(_oom):
+                raise
+            print(f'\n[OOM] graph verification ran out of memory '
+                  f'({type(_oom).__name__}); raise_on_oom=False -> recording '
+                  f'"unknown" (out-of-memory, undecided), not "error"',
+                  flush=True)
+            result, details = 'unknown', {'phase': 'oom',
+                                          'oom': str(_oom)[:200]}
     else:
         print('Running zonotope analysis...')
         result, details = zonotope_verify(graph, spec)

@@ -828,6 +828,16 @@ def default_settings(**overrides):
         # (for nets routed here by the perturbation gate whose α-CROWN root
         # is tighter on IBP than the zonotope forward).
         milp_force_ibp_phase1=False,
+        # RISKY, default OFF: when a per-neuron tighten solve trips a Gurobi
+        # numeric-trouble warning, retry it ONCE at NumericFocus=3 (+ScaleFlag
+        # 2) instead of letting it propagate. The retry still runs through
+        # optimize_checked, so a bound is trusted only if the retry solves
+        # CLEANLY; a still-dirty retry is skipped (looser pre-tightening bound
+        # kept — sound) and logged loudly + into details['numeric_trouble'].
+        # `_risky` because a high NumericFocus changes solver behavior — ONLY
+        # enable per-benchmark for a known-fragile instance (metaroom
+        # 6cnn_ry_39_6). Default OFF preserves "never mask numeric trouble".
+        milp_numeric_focus_retry_risky=False,
         # Structural routing gate (verify_graph): conv nets with mean input
         # box width > this go to milp_verify (IBP + α + ReLU-split BaB); the
         # rest stay on the graph pipeline (zono + dual-ascent), tighter on

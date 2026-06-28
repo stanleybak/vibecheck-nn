@@ -6442,7 +6442,22 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 _round += 1
-                if pgd_sat or not _persist:
+                if pgd_sat:
+                    # Validate the witness NOW, inside the loop. PGD's internal
+                    # screen can accept a near-boundary point (a spurious
+                    # near-miss, or a within-tol point) that the strict ORT
+                    # check then rejects — that must NOT end a persist search.
+                    # Only a VALIDATED witness stops; otherwise keep attacking
+                    # with fresh inits until the budget is spent. (soundnessbench
+                    # property_013: the seed-0 round-1 witness is a +3.8e-7
+                    # near-miss; a later round finds the real CEX — exactly as
+                    # seeds 1/2/7 do in a single round. Previously the spurious
+                    # `pgd_sat=True` broke the loop after round 1.)
+                    _r = _sat_or_fallthrough('pgd', pgd_witness)
+                    if _r is not None:
+                        return _r
+                    pgd_sat = False
+                if not _persist:
                     break
         finally:
             settings.pgd_iter = _orig_iter
@@ -6452,10 +6467,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             print(f'Phase 0 (PGD before cascade): '
                   f'{timing["phase0_pgd"]:.2f}s  sat={pgd_sat}'
                   + (f' ({_round} round(s))' if _persist else ''), flush=True)
-        if pgd_sat:
-            _r = _sat_or_fallthrough('pgd', pgd_witness)
-            if _r is not None:
-                return _r
         if _persist:
             # Spent the full attack budget without a valid witness. The cascade
             # is useless here (all-SAT) or would OOM, so skip it and report

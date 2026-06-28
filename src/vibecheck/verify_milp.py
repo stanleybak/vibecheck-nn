@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .settings import default_settings, resolve_torch
-from .gurobi_util import optimize_checked
+from .gurobi_util import optimize_checked, GurobiNumericTrouble
 
 
 class VerifyStats:
@@ -133,6 +133,17 @@ _shared_sparse_args = None
 # Sliding-window depth for the sparse per-neuron conv MILP (None = exact/all
 # binarized). Inherited by Pool workers at fork, like `_shared_sparse_args`.
 _shared_window = None
+# RISKY, gated (settings.milp_numeric_focus_retry_risky, default False — ONLY
+# metaroom 6cnn_ry_39_6 needs it): when True, a per-neuron solve that trips a
+# Gurobi numeric-trouble warning is retried once at NumericFocus=3. Inherited
+# by Pool workers at fork. Set at the milp_verify entry. RISKY because a high
+# NumericFocus changes solver behavior — but the retry still goes through
+# optimize_checked, so a bound is trusted ONLY if the retry solves cleanly.
+_shared_nf_retry_risky = False
+# Numeric-trouble events surfaced into the verbose `details` object. Recorded
+# in the PARENT process (the GurobiNumericTrouble re-raises at it.next()).
+# Cleared per milp_verify call by its wrapper.
+_numeric_trouble_events = []
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +942,37 @@ def _pick_milp_direction(cur_lo, cur_hi, z_w_min, z_w_max):
     return grb.GRB.MAXIMIZE, grb.GRB.MINIMIZE
 
 
+def _optimize_nf_retry(model):
+    """`optimize_checked`, with a gated, RISKY NumericFocus=3 retry.
+
+    Default (`_shared_nf_retry_risky` False): plain optimize_checked — a
+    numeric-trouble warning PROPAGATES, so we never silently mask it.
+
+    Enabled: a first solve that trips a numeric-trouble warning is retried
+    ONCE at NumericFocus=3 + aggressive scaling. The retry STILL runs through
+    optimize_checked, so the resulting bound is trusted only if the retry
+    solves CLEANLY (no trouble tokens); a still-dirty retry re-raises (handled
+    + logged upstream, never trusted). The prior gen-LP wrong-bound case at
+    NumericFocus=2 still emitted the warning tokens, so optimize_checked would
+    reject it too — that is what makes this sound despite being `_risky`.
+
+    Returns True iff a clean NumericFocus=3 retry was used.
+    """
+    if not _shared_nf_retry_risky:
+        optimize_checked(model)
+        return False
+    try:
+        optimize_checked(model)
+        return False
+    except GurobiNumericTrouble:
+        model.setParam('NumericFocus', 3)
+        model.setParam('ScaleFlag', 2)
+        optimize_checked(model)   # re-validates; raises again if still dirty
+        print('  [tighten] numeric trouble RESOLVED by NumericFocus=3 retry '
+              '(risky flag)', flush=True)
+        return True
+
+
 def _solve_neuron_both(args):
     """Worker: solve BOTH min and max for a neuron on the same model.
 
@@ -1027,7 +1069,7 @@ def _solve_neuron_both(args):
         model.setParam('BestBdStop', 1e-6)  # stop if lb > 0 (proven active)
     else:
         model.setParam('BestBdStop', -1e-6)  # stop if ub < 0 (proven dead)
-    optimize_checked(model)
+    _optimize_nf_retry(model)
     if model.status == 9:
         any_timeout = True
     try:
@@ -1053,7 +1095,7 @@ def _solve_neuron_both(args):
         model.setParam('BestBdStop', 1e-6)
     else:
         model.setParam('BestBdStop', -1e-6)
-    optimize_checked(model)
+    _optimize_nf_retry(model)
     if model.status == 9:
         any_timeout = True
     try:
@@ -1155,10 +1197,29 @@ def _tighten_layer_parallel(layers_np, x_lo, x_hi, bounds, l,
                  for idx in unstable]
     chunksize = max(1, len(tasks) // (n_cores * 4))
 
+    # A worker LP/MILP can raise GurobiNumericTrouble (optimize_checked saw
+    # numeric-trouble warnings — see gurobi_util). By DEFAULT we do NOT mask
+    # it: it re-raises and surfaces (main records `error`) so a numeric
+    # problem is never hidden. ONLY under the gated, RISKY
+    # `milp_numeric_focus_retry_risky` flag (metaroom 6cnn_ry_39_6 — a
+    # relaxation-bound dead-end) does the worker first retry at NumericFocus=3
+    # (see _optimize_nf_retry); if that retry ALSO trips numeric trouble we
+    # then skip this neuron's tightening (keeping its looser pre-tightening
+    # bound, which is sound) and log it loudly + into the `details` object,
+    # rather than crashing the whole instance.
+    n_numeric_trouble = 0
     with multiprocessing.Pool(n_cores) as pool:
         if deadline is None:
-            results = pool.map(_solve_neuron_both, tasks,
-                               chunksize=chunksize)
+            try:
+                results = pool.map(_solve_neuron_both, tasks,
+                                   chunksize=chunksize)
+            except GurobiNumericTrouble:
+                if not _shared_nf_retry_risky:
+                    raise                      # default: never mask
+                # No per-task isolation in pool.map — drop this layer's
+                # tightening wholesale (keeps the looser incoming bounds).
+                n_numeric_trouble += 1
+                results = []
         else:
             # Hard wall-clock cap: the per-neuron `timeout` bounds ONE
             # solve, but a 250-neuron layer is 500 solves - without
@@ -1187,12 +1248,35 @@ def _tighten_layer_parallel(layers_np, x_lo, x_hi, bounds, l,
                     any_timeout = True
                     pool.terminate()
                     break
+                except GurobiNumericTrouble:
+                    if not _shared_nf_retry_risky:
+                        pool.terminate()
+                        raise                  # default: never mask
+                    # Worker already retried at NumericFocus=3 and STILL hit
+                    # numeric trouble; skip its result (keep the looser
+                    # pre-tightening bound) and keep pulling the remaining
+                    # workers. The pool stays alive — an exception captured by
+                    # the worker does not kill it.
+                    n_numeric_trouble += 1
+                    continue
 
     for idx, lb, ub, _, timed_out in results:
         if timed_out:
             any_timeout = True
         new_lo[idx] = max(new_lo[idx], lb)
         new_hi[idx] = min(new_hi[idx], ub)
+
+    if n_numeric_trouble:
+        # Loud log + record into the verbose `details` object (via the
+        # parent-process accumulator the milp_verify wrapper drains).
+        msg = (f'layer {l}: NumericFocus=3 retry did NOT resolve '
+               f'{n_numeric_trouble} neuron solve(s) — SKIPPED their '
+               f'tightening, kept the looser (sound) pre-tightening bound')
+        print(f'  [tighten] !! NUMERIC TROUBLE (risky flag): {msg}',
+              flush=True)
+        _numeric_trouble_events.append(
+            {'layer': int(l), 'skipped_neurons': int(n_numeric_trouble),
+             'phase': 'tighten', 'resolution': 'skipped_after_nf3_retry'})
 
     _shared_model = None
     _shared_sparse_args = None
@@ -4345,6 +4429,27 @@ def _milp_verify_graph(graph, spec, settings, device, dtype,
 
 def milp_verify(graph, spec, settings=None):
     """MILP verification pipeline.
+
+    Returns ('verified'|'unknown'|'sat', details_dict).
+
+    Thin wrapper that (a) arms the gated, RISKY NumericFocus=3 retry for the
+    Pool workers and (b) drains the numeric-trouble event accumulator into the
+    returned `details` object so any masked-then-skipped solves are visible in
+    the verbose output. The heavy lifting is in `_milp_verify_impl`.
+    """
+    global _shared_nf_retry_risky, _numeric_trouble_events
+    _numeric_trouble_events = []
+    _shared_nf_retry_risky = bool(
+        getattr(settings, 'milp_numeric_focus_retry_risky', False)
+        if settings is not None else False)
+    verdict, details = _milp_verify_impl(graph, spec, settings)
+    if _numeric_trouble_events:
+        details['numeric_trouble'] = list(_numeric_trouble_events)
+    return verdict, details
+
+
+def _milp_verify_impl(graph, spec, settings=None):
+    """MILP verification pipeline (see `milp_verify` wrapper).
 
     Returns ('verified'|'unknown'|'sat', details_dict).
     """
