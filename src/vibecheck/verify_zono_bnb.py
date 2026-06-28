@@ -4516,10 +4516,11 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
         elif t == 'sub_bilinear':
             # ew flows + to inp[0], - to inp[1]; no const.
             ia, ib = op['inputs'][0], op['inputs'][1]
-            ea = ew_at.get(ia)
-            eb = ew_at.get(ib)
-            ew_at[ia] = ew.clone() if ea is None else ea + ew
-            ew_at[ib] = (-ew).clone() if eb is None else eb + (-ew)
+            # Re-fetch inline: for a self-product (ia == ib) the up-front
+            # ea/eb-then-overwrite pattern dropped one side's gradient -> an
+            # unsound bound (e.g. -X^2's backward LB came out -20 vs true -25).
+            ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew)) + ew
+            ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew)) + (-ew)
 
         elif t == 'reshape':
             inp = op['inputs'][0]
@@ -4787,10 +4788,10 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
             ew_b_in_nd = _sum_to_shape(ew_b_nd, (B, Q), sh_in[1])
             ew_a = ew_a_in_nd.reshape(B, Q, -1)
             ew_b = ew_b_in_nd.reshape(B, Q, -1)
-            ea = ew_at.get(ia)
-            eb = ew_at.get(ib)
-            ew_at[ia] = ew_a if ea is None else ea + ew_a
-            ew_at[ib] = ew_b if eb is None else eb + ew_b
+            # Re-fetch inline so a self-product (ia == ib) accumulates BOTH
+            # sides (see the unsound -X^2 case below).
+            ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+            ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
 
         elif t == 'div_bilinear' and not op.get('_div_decoupled'):
             # Point-side linearization: b is point per-sub. Use exact
@@ -4921,10 +4922,12 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                 ew_b_nd = _sum_to_shape(ew_b_nd_full, (B, Q), sh_in[1])
                 ew_a = ew_a_nd.reshape(B, Q, -1)
                 ew_b = ew_b_nd.reshape(B, Q, -1)
-            ea = ew_at.get(ia)
-            eb = ew_at.get(ib)
-            ew_at[ia] = ew_a.clone() if ea is None else ea + ew_a
-            ew_at[ib] = ew_b.clone() if eb is None else eb + ew_b
+            # Re-fetch inline so a self-product (ia == ib) accumulates BOTH
+            # sides. The up-front ea/eb-then-overwrite pattern dropped one side's
+            # gradient for squares (X^2, Y^2) -> unsound backward LB that
+            # false-verified SAT adaptive_cc nonlinear-augment cases.
+            ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+            ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
 
         elif t == 'mul_bilinear' and t != 'mul_bilinear_box_relax':
             # Will fall through to box-relax below if needed.
@@ -5003,10 +5006,12 @@ def _spec_backward_graph_batched(tight, xl, xh, gg, spec_ew, device, dtype,
                     f'(tangent, not a bound). Ensure the forward zono ran on '
                     f'this box so .last_bilinear_op_bounds is populated, or '
                     f'pass bilinear_op_bounds explicitly.')
-            ea = ew_at.get(ia)
-            eb = ew_at.get(ib)
-            ew_at[ia] = ew_a.clone() if ea is None else ea + ew_a
-            ew_at[ib] = ew_b.clone() if eb is None else eb + ew_b
+            # Re-fetch inline so a self-product (ia == ib) accumulates BOTH
+            # sides. The up-front ea/eb-then-overwrite pattern dropped one side's
+            # gradient for squares (X^2, Y^2) -> unsound backward LB that
+            # false-verified SAT adaptive_cc nonlinear-augment cases.
+            ew_at[ia] = ew_at.get(ia, torch.zeros_like(ew_a)) + ew_a
+            ew_at[ib] = ew_at.get(ib, torch.zeros_like(ew_b)) + ew_b
 
         elif t == 'pow':
             # Pow batched backward — two-line (LB tangent, UB chord)
