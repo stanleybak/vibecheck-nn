@@ -5433,22 +5433,23 @@ def _validate_sat_witness(onnx_path, spec, witness, atol=1e-4, out_atol=0.0,
     # Y-only `spec.check` with the output band `out_atol` (default 0.0 = strict,
     # boundary inclusive per the official `<=`/`>=` comparison).
     w = np.asarray(witness).flatten().astype(np.float64)
-    _disjunctive = any(getattr(c, 'input_lo', None) is not None
-                       for c in spec.disjuncts)
 
     def _output_violated(inbox, y):
-        if _disjunctive:
-            is_ce, _ = spec.check_witness(inbox[0].astype(np.float64), y)
-            return is_ce, ({} if is_ce else {
-                'reason': ('ORT output does not violate any disjunct whose '
-                           'X-subrange contains the witness (check_witness rejected)')})
-        check_res, check_info = spec.check(y - out_atol, y + out_atol)
+        # STRICT CE-check: a `<`/`>` constraint at the boundary (margin == 0) is
+        # NOT a counterexample (`is_strict_ce` honors per-constraint strictness;
+        # for non-strict specs it reduces to the closure `<=`/`>=`). The verifier
+        # bound keeps the closure (sound for UNSAT) — this is only the CE side.
+        _x = inbox[0].astype(np.float64)
+        is_ce = spec.is_strict_ce(_x, y, out_atol)
+        # worst_margin (closure, for diagnostics / the SAT disposition).
+        _, check_info = spec.check(y - out_atol, y + out_atol)
         upd = {'worst_margin': check_info.get('worst_margin')}
-        if check_res != 'unknown':
-            upd['reason'] = (f'ORT output does not violate spec '
-                             f'(worst_margin={check_info.get("worst_margin"):.4g}, '
-                             f'out_atol={out_atol})')
-        return (check_res == 'unknown'), upd
+        if not is_ce:
+            upd['reason'] = (
+                f'ORT output does not violate spec '
+                f'(worst_margin={check_info.get("worst_margin"):.4g}, '
+                f'out_atol={out_atol})')
+        return is_ce, upd
 
     return _validate_witness_ort(onnx_path, [w], [(spec.x_lo, spec.x_hi)],
                                  _output_violated, atol, emit_slack=emit_slack)
@@ -5534,8 +5535,9 @@ def _validate_verified_with_samples(onnx_path, spec, n_samples=32,
                 return True, info
             out_flat = np.asarray(out).flatten().astype(np.float64)
             info['n_checked'] += 1
-            is_ce, _ = spec.check_witness(
-                x.flatten().astype(np.float64), out_flat)
+            # STRICT CE-check: a sample on the boundary of a strict `<`/`>` spec is
+            # NOT a counterexample, so it must NOT flip a sound VERIFIED to SAT.
+            is_ce = spec.is_strict_ce(x.flatten().astype(np.float64), out_flat)
             if is_ce:
                 info['ok'] = False
                 info['reason'] = ('sample is a real counterexample '
@@ -6440,7 +6442,22 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 _round += 1
-                if pgd_sat or not _persist:
+                if pgd_sat:
+                    # Validate the witness NOW, inside the loop. PGD's internal
+                    # screen can accept a near-boundary point (a spurious
+                    # near-miss, or a within-tol point) that the strict ORT
+                    # check then rejects — that must NOT end a persist search.
+                    # Only a VALIDATED witness stops; otherwise keep attacking
+                    # with fresh inits until the budget is spent. (soundnessbench
+                    # property_013: the seed-0 round-1 witness is a +3.8e-7
+                    # near-miss; a later round finds the real CEX — exactly as
+                    # seeds 1/2/7 do in a single round. Previously the spurious
+                    # `pgd_sat=True` broke the loop after round 1.)
+                    _r = _sat_or_fallthrough('pgd', pgd_witness)
+                    if _r is not None:
+                        return _r
+                    pgd_sat = False
+                if not _persist:
                     break
         finally:
             settings.pgd_iter = _orig_iter
@@ -6450,10 +6467,6 @@ def _run_pipeline(graph, spec, settings, build_fn, impl):
             print(f'Phase 0 (PGD before cascade): '
                   f'{timing["phase0_pgd"]:.2f}s  sat={pgd_sat}'
                   + (f' ({_round} round(s))' if _persist else ''), flush=True)
-        if pgd_sat:
-            _r = _sat_or_fallthrough('pgd', pgd_witness)
-            if _r is not None:
-                return _r
         if _persist:
             # Spent the full attack budget without a valid witness. The cascade
             # is useless here (all-SAT) or would OOM, so skip it and report
@@ -9403,6 +9416,7 @@ def verify_graph(graph, spec, settings):
 
     Returns (result_str, details_dict).
     """
+    _vg_t_start = time.perf_counter()   # for the top-level clear-CE upgrade budget
     # Pre-pass: if conjuncts carry per-disjunct X subboxes (e.g., nn4sys
     # lindex, acasxu prop_6), split into per-subbox sub-verifications.
     # The vnnlib spec encodes the unsafe region as
@@ -9930,7 +9944,115 @@ def verify_graph(graph, spec, settings):
             details['original_phase'] = details.get('phase')
             details['phase'] = f'spurious_sat_{details.get("phase")}'
             result = 'unknown'
+        elif (float(getattr(settings, 'clear_ce_upgrade_budget', 0.0)) > 0.0
+                and not bool(getattr(settings, 'disable_sat_finding', False))):
+            _pair = getattr(settings, 'pair_cex_info', None)
+            if _pair is not None:
+                # NETWORK PAIR: `_validate_sat_witness` ran on the MERGED net (the
+                # CLOSURE `<=`), which accepts the measure-zero boundary (the trivial
+                # diagonal x_f==x_g -> output diff 0). CE-check on the ORIGINAL f,g
+                # (what the scorer replays) and require a STRICT violation. If the
+                # witness isn't strictly clear there, search for a clear CE; if none
+                # exists for a STRICT spec the witness is NOT a valid counterexample
+                # -> downgrade to 'unknown' rather than emit a non-strict sat.
+                from . import network_pair as _np
+                _strict = _np.pair_is_strict(_pair[2])
+                _om = _orig_pair_or_self_margin(
+                    graph, spec, settings, details['witness'], _atol)
+                if _om is None or float(_om) >= -_atol:
+                    _clear = _try_clear_ce_upgrade(
+                        graph, spec, settings, _vg_t_start)
+                    if _clear is not None:
+                        details['witness'] = _clear
+                        details['phase'] = f'{details.get("phase")}+clear_ce_upgrade'
+                    elif _strict:
+                        if getattr(settings, 'print_progress', False):
+                            print('  [validate-top] pair witness violates only the '
+                                  'closure boundary, not the strict spec, and no '
+                                  'clear CE found -> unknown', flush=True)
+                        details['original_phase'] = details.get('phase')
+                        details['phase'] = f'nonstrict_pair_ce_{details.get("phase")}'
+                        result = 'unknown'
+            elif (_info.get('worst_margin') is not None
+                    and float(_info['worst_margin']) > -_atol):
+                # Single net, NEAR-BOUNDARY closure CE (worst margin ~0): try a bounded
+                # margin-minimizing PGD for a CLEAR CE (margin < -atol) and emit that
+                # instead when found; otherwise the already-valid witness stands.
+                _clear = _try_clear_ce_upgrade(graph, spec, settings, _vg_t_start)
+                if _clear is not None:
+                    details['witness'] = _clear
+                    details['phase'] = f'{details.get("phase")}+clear_ce_upgrade'
     return result, details
+
+
+def _try_clear_ce_upgrade(graph, spec, settings, t_start):
+    """A sat witness ORT-validated but is only a NEAR-BOUNDARY closure CE (worst
+    output margin > -sat_validate_atol). Run a bounded margin-minimizing PGD on
+    the raw ONNX for a CLEAR counterexample (worst margin < -atol) so the emitted
+    sat is a genuine strict violation rather than a boundary point — the
+    network-pair benchmarks (monotonic/isomorphic acasxu) otherwise settle on a
+    trivial diagonal (x_f == x_g -> output diff exactly 0) even though clear
+    violations exist elsewhere in the box.
+
+    Returns a clear witness (np.ndarray, spec.x_lo shape) or None. Bounded by
+    `settings.clear_ce_upgrade_budget` and the remaining total-timeout budget;
+    every returned witness is ORT-confirmed to violate with margin < -atol."""
+    onnx_p = getattr(graph, 'onnx_path', None)
+    if onnx_p is None:
+        return None
+    atol = float(settings.sat_validate_atol
+                 if 'sat_validate_atol' in settings else 1e-4)
+    cap = float(getattr(settings, 'clear_ce_upgrade_budget', 0.0))
+    if cap <= 0.0:
+        return None
+    tot = float(getattr(settings, 'total_timeout', 0.0)) or cap
+    # Leave ~1 s of headroom against the global deadline so the upgrade can't
+    # push the instance into a hard timeout.
+    budget = min(cap, tot - (time.perf_counter() - t_start) - 1.0)
+    if budget <= 0.1:
+        return None
+    from .onnx_torch_runner import pgd_via_onnx
+    # No except-swallow: pgd_via_onnx already handles its own OOM and missing
+    # onnxsim internally, so anything it raises here (a bad onnx, a shape
+    # mismatch, a torch bug) is a REAL error — let it propagate to main's crash
+    # handler ('error' + traceback) rather than silently skipping the upgrade.
+    _sat, _w = pgd_via_onnx(
+        onnx_p, spec,
+        n_restarts=int(settings.pgd_phase0_restarts
+                       if 'pgd_phase0_restarts' in settings else 256),
+        n_iter=int(settings.pgd_phase0_iters
+                   if 'pgd_phase0_iters' in settings else 100),
+        accept_margin=-atol,
+        deadline=time.perf_counter() + budget)
+    if not _sat or _w is None:
+        return None
+    w = np.asarray(_w).flatten()
+    _m = _orig_pair_or_self_margin(graph, spec, settings, w, atol)
+    # Require a CLEAR strict violation (margin < -atol) on the REAL nets the scorer
+    # replays — the original f,g for a pair, else the loaded net itself.
+    if _m is not None and float(_m) < -atol:
+        return w
+    return None
+
+
+def _orig_pair_or_self_margin(graph, spec, settings, witness, atol):
+    """Worst output-spec margin for `witness`, evaluated on the REAL net(s) the
+    scorer replays: for a network PAIR, recompute the atom outputs from the
+    ORIGINAL f,g (`network_pair.pair_orig_atom_outputs`) and run `spec.check` on
+    THEM (the merged net is only oracle-faithful to ORACLE_TOL); otherwise validate
+    on the loaded onnx via ORT. Returns the worst margin (< 0 ⟹ violated) or None
+    if it can't be computed. Margin convention matches `spec.check`."""
+    pinfo = getattr(settings, 'pair_cex_info', None)
+    if pinfo is not None:
+        from . import network_pair as npair
+        # No swallow: reconstructing on the original f,g is set up from a verified
+        # pair instance, so a failure here is a real bug — let it raise.
+        _oy = npair.pair_orig_atom_outputs(pinfo[0], pinfo[1], pinfo[2], witness)
+        _, _ci = spec.check(_oy, _oy)
+        return _ci.get('worst_margin')
+    onnx_p = getattr(graph, 'onnx_path', None)
+    _ok, _vinfo = _validate_sat_witness(onnx_p, spec, witness, atol=atol, out_atol=0.0)
+    return _vinfo.get('worst_margin') if _ok else None
 
 
 def _score_input_axes(graph, spec, gg=None, device=None, dtype=None):
@@ -12564,6 +12686,12 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
 
     import os as _os_isb_dbg
     _dbg_isb = (_os_isb_dbg.environ.get('DEBUG_INPUT_SPLIT_BATCHED', '') == '1')
+    # Branch-method trace: record (once) WHICH input-split heuristic is in
+    # effect and why — sb-sensitivity vs the widest-axis fallback. Emitted
+    # under standard --verbose (`print_progress`) so a silently-disabled `sb`
+    # is visible in the trace instead of needing a hand-added probe.
+    _pp_isb = bool(getattr(settings, 'print_progress', False))
+    _branch_logged = False
     # Per-phase profiler (bound / clip / split timing + closure counts).
     # Gated by `settings.input_split_batched_phase_timing` (env
     # VC_PHASE_TIMING forces it on for ad-hoc profiling). Every timing site
@@ -12727,6 +12855,13 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 all_disj_closed = torch.stack(
                     disj_closed_masks, dim=1).all(dim=1)
 
+        if _dbg_isb and n_iters == 0:
+            _bpd_root = []
+            for _di, _qix in disj_q_idx.items():
+                _bpd_root.append(spec_lbs_b[:, _qix].max(dim=1).values)
+            _wdb_root = torch.stack(_bpd_root, dim=1).min(dim=1).values
+            print(f'[is-batched ROOT] closure_lb={float(_wdb_root.min()):.4f} '
+                  f'crown_intermediate={crown_intermediate}', flush=True)
         if _phase_timing:
             _pt_ts = _pt_mark('bound', _pt_tb)
         unclosed = (~all_disj_closed).nonzero(as_tuple=True)[0]
@@ -12994,8 +13129,10 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 # of that; xl_split lines up with feasible_idx.
                 if clip_enabled and unclosed.numel() > 0 and A_lin is not None:
                     A_split = A_u[feasible_idx]
+                    _lb_split = spec_lbs_b[unclosed][feasible_idx]  # (B, Q)
                 else:
                     A_split = A_lin[unclosed]
+                    _lb_split = spec_lbs_b[unclosed]                # (B, Q)
                 # Per-leaf sensitivity: sum_q |A_q[i]| × width_i.
                 # Optional branch_boost (computed at init): boosts dims
                 # feeding the most-unstable shallow ReLU branch. Without
@@ -13003,13 +13140,54 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 # underestimate L2-branch lA on pensieve_big_parallel and
                 # pick all 4 splits in less-unstable L0/L1/L3 branches,
                 # missing the bound improvement (mean -7.42 vs +0.16).
-                sens = A_split.abs().sum(dim=1)  # (B, n_in)
-                scores = widths * sens
+                # `input_split_sb_margin_score`: margin-augmented, worst-query
+                # sb score (mirrors AB-CROWN's `input_split_heuristic_sb`,
+                # sb_sum=False). Per dim i: score_i = max_q[ |A_q[i]|.clamp(thr)
+                # × width_i/2 + lb_q·margin_w ], then argmax. The MAX over
+                # queries (vs the legacy SUM below) keeps the BINDING query's
+                # split dim from being diluted on multi-disjunct OR specs (cgan
+                # prop_2: 383 leaves / 23 s vs widest-axis timeout); the coeff
+                # clamp lets width break ties among tiny-coeff dims; the margin
+                # biases toward the closest-to-verified spec.
+                _sb_margin = bool(getattr(
+                    settings, 'input_split_sb_margin_score', False))
+                if _sb_margin:
+                    _thr = float(getattr(
+                        settings, 'input_split_sb_coeff_thresh', 0.01))
+                    _mw = float(getattr(
+                        settings, 'input_split_sb_margin_weight', 1.0))
+                    _base = (A_split.abs().clamp(min=_thr)
+                             * widths.unsqueeze(1) / 2)            # (B, Q, n_in)
+                    _base = _base + _lb_split.unsqueeze(-1) * _mw
+                    scores = _base.amax(dim=1)                     # (B, n_in)
+                else:
+                    sens = A_split.abs().sum(dim=1)  # (B, n_in)
+                    scores = widths * sens
                 if _branch_boost is not None:
                     scores = scores * _branch_boost.to(scores.device).unsqueeze(0)
                 ax = scores.argmax(dim=1)
+                _branch_method = 'sb-margin' if _sb_margin else 'sb-sum'
+                _branch_why = ''
             else:
                 ax = widths.argmax(dim=1)
+                _branch_method = 'widest-axis'
+                _branch_why = (
+                    'sb disabled (input_split_batched_branch_sb=False)'
+                    if not sb_enabled else 'A_lin unavailable')
+            # One-time branch-method trace (standard verbose) — makes the active
+            # heuristic and any silent-disable visible without a probe.
+            if (_pp_isb or _dbg_isb) and not _branch_logged:
+                _branch_logged = True
+                print(f'[branch] input-split heuristic={_branch_method}'
+                      + (f' ({_branch_why})' if _branch_why else '')
+                      + f'  free_dims={int((widths[0] > 0).sum())}'
+                      + f'  boost={_branch_boost is not None}', flush=True)
+            # Per-iteration split-dim trace (rate-limited) under verbose.
+            if (_pp_isb or _dbg_isb) and (n_iters < 8 or n_iters % 50 == 0):
+                _ax0 = int(ax[0].item())
+                print(f'[branch] iter={n_iters} split X_{_ax0} '
+                      f'(width={float(widths[0, _ax0]):.4f}) '
+                      f'leaves={xl_split.shape[0]}', flush=True)
             import os as _os_split_dbg
             if _os_split_dbg.environ.get('DEBUG_BAB_SPLIT', '') == '1':
                 for _i in range(min(xl_split.shape[0], 5)):

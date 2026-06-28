@@ -231,18 +231,17 @@ def _parse_output_atoms(text):
     atoms = []
 
     def add(lhs, raw_op, raw_rhs):
-        # NON-STRICT bound (sound): a strict `< 0` is encoded as its closure
-        # `<= 0` (a SUPERSET of the true unsafe set), NOT `<= -margin` (a strict
-        # SUBSET that would false-unsat a shallow real CE — e.g. monotonic_acasxu
-        # diff = -5e-5). The strict `<` semantics are enforced DOWNSTREAM in the
-        # SAT-detection: PGD + ORT confirmation only commit 'sat' on a CLEAR CE
-        # (margin <= -atol); the measure-zero boundary (diff = 0, e.g. an iso
-        # pair's trivial point or a monotone net's x1==x2 diagonal) validates only
-        # within tolerance, so it is persisted as a within-tol sat while the
-        # search keeps looking for a clear CE or an unsat proof. See
-        # `verify_graph._sat_disposition`.
+        # The VERIFIER bound uses the non-strict CLOSURE: a strict `< 0` is encoded
+        # as `<= 0` (a SUPERSET of the true unsafe set) — sound for UNSAT (proving
+        # no point in the closure ⟹ no strict counterexample). The original
+        # strictness is recorded per-atom so the CE-CHECK can be STRICT: an ORT
+        # witness is only a real counterexample if it violates the ORIGINAL strict
+        # `<`/`>` (margin < 0), so the measure-zero boundary (diff = 0, e.g. a
+        # monotone net's x_f==x_g diagonal) is REJECTED at validation, not emitted.
+        # (`verify_graph._try_clear_ce_upgrade` + the pair CE-check on the originals.)
         op = '<=' if raw_op in ('<', '<=') else '>='
-        atoms.append({'lhs': lhs, 'op': op, 'rhs': raw_rhs})
+        atoms.append({'lhs': lhs, 'op': op, 'rhs': raw_rhs,
+                      'strict': raw_op in ('<', '>')})
 
     # form 1: (OP Y_a[i] (SIGN Y_b[j] eps))  ->  Y_a[i] - Y_b[j] (OP) (±eps)
     seen = set()
@@ -399,11 +398,70 @@ def oracle(nf_path, ng_path, ir, merged_path, out_dim, n_samples=120, seed=0):
     return worst
 
 
+def reconstruct_pair_cex(nf_path, ng_path, ir, merged_witness):
+    """Map a MERGED-net witness back to the per-network counterexample the pair spec declares.
+
+    The merged input is z = base[0..n-1] (= g's input x_g) followed by an optional relational
+    delta. The pair spec declares X_f, Y_f, X_g, Y_g, so we reconstruct x_f, x_g from z exactly
+    as the merge oracle does (x_g = base; x_f = base with the one relational coord clamped),
+    run the ORIGINAL f and g nets to get the true Y_f, Y_g, and return
+    (x_flat, y_flat) = (concat(x_f, x_g), concat(y_f, y_g)) in input/output groups (the v2
+    writer interleaves them into declaration order X_f,Y_f,X_g,Y_g). This makes the cex carry
+    the benchmark's real per-network tensors instead of the merged net's collapsed I/O."""
+    z = np.asarray(merged_witness, np.float64).flatten()
+    n = ir['n']
+    rel = ir['rel']
+    base = z[:n]
+    x_g = base.copy()
+    x_f = base.copy()
+    if rel:
+        k = rel['k']
+        delta = float(z[n]) if z.shape[0] > n else 0.0
+        x_f[k] = np.clip(base[k] + delta, ir['xf_box'][k][0], ir['xf_box'][k][1])
+    nf, ng = _load_onnx(nf_path), _load_onnx(ng_path)
+    fin, gin = _free_input(nf), _free_input(ng)
+    shp_f = [d.dim_value or 1 for d in fin.type.tensor_type.shape.dim]
+    shp_g = [d.dim_value or 1 for d in gin.type.tensor_type.shape.dim]
+    # _serialize handles the .gz-authoritative case (the loose .onnx may be absent).
+    sf = ort.InferenceSession(_serialize(nf_path), providers=['CPUExecutionProvider'])
+    sg = ort.InferenceSession(_serialize(ng_path), providers=['CPUExecutionProvider'])
+    y_f = sf.run(None, {fin.name: x_f.astype(np.float32).reshape(shp_f)})[0].flatten()
+    y_g = sg.run(None, {gin.name: x_g.astype(np.float32).reshape(shp_g)})[0].flatten()
+    x_flat = np.concatenate([x_f, x_g]).astype(np.float64)
+    y_flat = np.concatenate([y_f, y_g]).astype(np.float64)
+    return x_flat, y_flat
+
+
+def pair_orig_atom_outputs(nf_path, ng_path, ir, merged_witness):
+    """The merged net's BAKED atom outputs (`Y = A · [Y_f; Y_g]`) RECOMPUTED from the
+    ORIGINAL f, g nets for a merged witness. The merged net is only oracle-faithful to
+    f,g within ORACLE_TOL, and the scorer replays the ORIGINAL nets — so a counterexample
+    must be validated against THESE values (run `spec.check` on them), not the merged
+    net's own output. Shape = (num_distinct_atoms,) = the merged net's output width."""
+    _, y_flat = reconstruct_pair_cex(nf_path, ng_path, ir, merged_witness)
+    out_dim = y_flat.shape[0] // 2
+    A, _ = _atom_layout(ir, out_dim)            # [num_atoms, 2*out_dim]
+    return (A @ y_flat).astype(np.float64)
+
+
+def pair_is_strict(ir):
+    """True if ANY output atom came from a strict `<`/`>` (so the CE-check must require
+    a strict violation — margin < 0 — and reject the measure-zero boundary)."""
+    return any(at.get('strict') for at in ir['atoms'])
+
+
 # ----------------------------------------------------------------- entry point
 
 def _cache_paths(net_field, vnnlib_path):
-    """Deterministic temp paths keyed on the instance (onnx field + spec)."""
-    h = hashlib.md5((net_field + '|' + os.path.abspath(vnnlib_path)).encode()).hexdigest()[:12]
+    """Where to write the merged-pair onnx + v1 spec. Prefer NEXT TO THE SPEC with a clear,
+    instance-named suffix (`instance_33.vnnlib.pair.onnx` / `.pair.vnnlib`) so the artifacts
+    are obvious and co-located instead of hash-named files buried in /tmp; fall back to a
+    hashed /tmp path only when the spec's directory is read-only (e.g. a packaged benchmark)."""
+    spec_abs = os.path.abspath(vnnlib_path)
+    base = spec_abs[:-3] if spec_abs.endswith('.gz') else spec_abs   # strip a trailing .gz
+    if os.access(os.path.dirname(base), os.W_OK):
+        return base + '.pair.onnx', base + '.pair.vnnlib'
+    h = hashlib.md5((net_field + '|' + spec_abs).encode()).hexdigest()[:12]
     d = tempfile.gettempdir()
     return (os.path.join(d, f'vibecheck_pair_{h}.onnx'),
             os.path.join(d, f'vibecheck_pair_{h}.vnnlib'))

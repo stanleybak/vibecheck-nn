@@ -148,6 +148,95 @@ def test_mono_merge_oracle(tmp_path):
     assert txt.count('(declare-const X_') == 6
 
 
+def test_reconstruct_pair_cex_mono(tmp_path):
+    # reconstruct_pair_cex maps a MERGED-net witness [base(5), delta] back to the
+    # pair's declared per-network tensors: x_g=base, x_f=base with coord 0 clamped,
+    # y_f/y_g from the ORIGINAL net. Returns (concat(x_f,x_g), concat(y_f,y_g)).
+    f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
+    _tiny_acasxu(f, seed=3); _mono_spec(spec)
+    field = f"[('f', '{f}'), ('g', '{f}')]"
+    npair.build_merged_instance(field, spec)
+    ir = npair.parse_multinet(open(spec).read())
+    rng = np.random.default_rng(2)
+    base = (rng.random(5).astype(np.float32) * 2 - 1)
+    delta = 0.7
+    z = np.concatenate([base, [delta]]).astype(np.float64)
+    x_flat, y_flat = npair.reconstruct_pair_cex(f, f, ir, z)
+    # expected x_f / x_g
+    x_f = base.copy().astype(np.float64); x_g = base.copy().astype(np.float64)
+    x_f[0] = np.clip(base[0] + delta, ir['xf_box'][0][0], ir['xf_box'][0][1])
+    sf = ort.InferenceSession(f)
+    y_f = sf.run(None, {'X': x_f.astype(np.float32).reshape(1, 1, 1, 5)})[0].flatten()
+    y_g = sf.run(None, {'X': x_g.astype(np.float32).reshape(1, 1, 1, 5)})[0].flatten()
+    assert np.allclose(x_flat, np.concatenate([x_f, x_g]))
+    assert np.allclose(y_flat, np.concatenate([y_f, y_g]), atol=1e-6)
+    # input group is 10 (5+5), output group is 10 (5+5)
+    assert x_flat.shape == (10,) and y_flat.shape == (10,)
+
+
+def test_pair_is_strict():
+    # mono `(< Y_f[3] Y_g[3])` and iso `(> ... )(< ...)` are STRICT -> CE-check must
+    # require a strict violation; a fabricated non-strict atom flips it off.
+    strict_ir = {'atoms': [{'op': '<=', 'rhs': 0.0, 'strict': True}]}
+    nonstrict_ir = {'atoms': [{'op': '<=', 'rhs': 0.0, 'strict': False}]}
+    assert npair.pair_is_strict(strict_ir) is True
+    assert npair.pair_is_strict(nonstrict_ir) is False
+
+
+def test_pair_orig_atom_outputs_matches_merged(tmp_path):
+    # pair_orig_atom_outputs recomputes the merged net's BAKED atom outputs from the
+    # ORIGINAL f,g — must equal the merged net's own output (within the merge oracle
+    # tolerance) at the same witness.
+    f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
+    _tiny_acasxu(f, seed=3); _mono_spec(spec)
+    field = f"[('f', '{f}'), ('g', '{f}')]"
+    mo, _ = npair.build_merged_instance(field, spec)
+    ir = npair.parse_multinet(open(spec).read())
+    assert npair.pair_is_strict(ir) is True
+    rng = np.random.default_rng(4)
+    base = (rng.random(5).astype(np.float32) * 2 - 1)
+    z = np.concatenate([base, [0.6]]).astype(np.float64)
+    orig = npair.pair_orig_atom_outputs(f, f, ir, z)
+    merged_out = ort.InferenceSession(mo).run(
+        None, {'X': np.array([z], np.float32)})[0].flatten()
+    assert orig.shape == merged_out.shape
+    assert np.allclose(orig, merged_out, atol=npair.ORACLE_TOL)
+
+
+def test_orig_pair_margin_strict_vs_boundary(tmp_path):
+    # verify_graph._orig_pair_or_self_margin CE-checks a merged witness on the
+    # ORIGINAL f,g: a clear CE has margin < 0, the trivial diagonal (delta=0,
+    # x_f==x_g -> Y_f==Y_g) has margin == 0 (the boundary the strict spec rejects).
+    from vibecheck.verify_graph import _orig_pair_or_self_margin
+    from vibecheck.vnnlib_loader import load_vnnlib
+    f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
+    _tiny_acasxu(f, seed=3); _mono_spec(spec)
+    mo, mv = npair.build_merged_instance(f"[('f', '{f}'), ('g', '{f}')]", spec)
+    ir = npair.parse_multinet(open(spec).read())
+    merged_spec = load_vnnlib(mv)
+
+    class _G:
+        onnx_path = mo
+
+    class _S(dict):
+        __getattr__ = dict.get
+    s = _S(pair_cex_info=(f, f, ir))
+    # diagonal: delta = 0 -> x_f == x_g -> Y_f[3]-Y_g[3] == 0 (boundary)
+    rng = np.random.default_rng(7)
+    base = (rng.random(5).astype(np.float32) * 2 - 1)
+    z_diag = np.concatenate([base, [0.0]]).astype(np.float64)
+    m_diag = _orig_pair_or_self_margin(_G(), merged_spec, s, z_diag, 1e-4)
+    assert abs(m_diag) < 1e-6, m_diag                    # exactly on the boundary
+    # a delta that actually breaks monotonicity -> margin < 0 (strict violation)
+    best = None
+    for d in np.linspace(0.1, 1.9, 30):
+        z = np.concatenate([base, [d]]).astype(np.float64)
+        m = _orig_pair_or_self_margin(_G(), merged_spec, s, z, 1e-4)
+        if best is None or m < best:
+            best = m
+    assert best is not None and best < 0.0               # a strict CE exists
+
+
 def test_mono_constpins_build(tmp_path):
     # constant-pinned coords (== X_f[i] <const>) -> degenerate box; oracle still exact
     f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')

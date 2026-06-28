@@ -6,3 +6,16 @@
 # crash (fixed in zonotope.py) and (b) the FeasibilityTol=1e-6 vs
 # float32-zono ulp-mismatch unsoundness (fixed in verify_milp.py).
 # Both root causes are now patched; defaults handle the benchmark.
+#
+# EXCEPTION: 6cnn_ry_39_6 / spec_idx_119_eps_0.00000436 is a numerically
+# fragile MILP-tighten case — a per-neuron LP trips Gurobi numeric-trouble
+# warnings ("variables dropped from basis", "switch to quad precision"),
+# which by default propagate to an `error` verdict. This is a confirmed
+# relaxation-bound DEAD-END (ABC also times out; see
+# docs/benchmarks/metaroom_2023.md), so the goal is a graceful `timeout`,
+# not a crash. The flag below retries those solves once at NumericFocus=3
+# (sound: the retry is re-validated by optimize_checked; a still-dirty
+# result is skipped, keeping the looser pre-tightening bound, and logged
+# loudly + into details['numeric_trouble']). RISKY/opt-in — only this
+# benchmark exhibits the issue.
+milp_numeric_focus_retry_risky: true

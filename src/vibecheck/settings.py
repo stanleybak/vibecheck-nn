@@ -149,6 +149,24 @@ def default_settings(**overrides):
         # ORT-CPU confirm. Validated to track ORT exactly on cell interiors (off only by
         # one cell at exact rounding-tie boundaries). False -> rank by surrogate loss.
         surrogate_quant_eval=True,
+        # Threads for the surrogate-attack forward (the verifier otherwise pins BLAS to 1
+        # thread for sound bounding; the attack is an approximate search where multi-thread is
+        # safe and ~4x faster on the slow saturating forward). 0 -> min(12, cpu_count).
+        surrogate_attack_threads=0,
+        # Cap the surrogate-attack GPU memory (set_per_process_memory_fraction) so it never
+        # hogs the card; the saturating surrogate gradient-checkpoints and needs only ~3GB.
+        surrogate_gpu_mem_gb=6.0,
+        # surrogate-attack: whether the surrogate's quantized matmuls reproduce the
+        # NON-VNNI int16-pair SATURATION that ORT's MLAS u8xs8 GEMM applies on CPUs without
+        # AVX-VNNI (e.g. AMD Zen2). That saturation makes the SAME QDQ graph compute a
+        # different function on VNNI (Intel, exact int32) vs non-VNNI (saturating) hardware,
+        # so a counterexample valid on one CPU can flip on the other (measured on smart_turn:
+        # 0.918 Intel vs 0.500 AMD for one witness). 'auto' => probe the local ORT once
+        # (detect_quant_oracle) and saturate iff the local oracle saturates, keeping the
+        # surrogate gradient and the ORT validation in the SAME regime on whatever box we run.
+        # 'on'/'off' force it (develop on Intel while targeting a non-VNNI scorer, or vice
+        # versa). See surrogate_pgd.detect_quant_oracle / saturating_qmatmul.
+        surrogate_saturation='auto',
         # PGD L-inf step sizes (fractions of the input-box width) cycled across restarts.
         # All < 1 so each restart takes SEVERAL gradual clamped steps rather than a single
         # FGSM jump straight to a box vertex; the spread (0.02..0.2) covers fine-to-coarse
@@ -183,6 +201,13 @@ def default_settings(**overrides):
         # the enumeration (a larger free grid => not a discrete-patch instance => raise).
         cctsdb_yolo=False,
         cctsdb_max_positions=1_000_000,
+        # Nonlinear v2 spec support (nonlinear_augment.py + input_feasibility.py): the
+        # empty-input + transpile-to-augmented-ONNX pre-checks. They `parse_vnnlib_v2`
+        # the WHOLE spec to detect a degree>=2 monomial — O(spec size), ~37s on a 121 MB
+        # box spec (smart_turn). Only ONE 2026 benchmark has a nonlinear INPUT constraint
+        # (adaptive_cruise_control_non_linear, `200*X0 >= X1^2`), so this is OFF by default
+        # and that benchmark's config turns it on; every other benchmark skips both checks.
+        nonlinear_v2_augment=False,
         pgd_phase0_enabled=True,
         pgd_time_budget_phase0=10.0,
         # Deterministic Phase-0 PGD: when not None, the torch RNG is seeded
@@ -332,6 +357,15 @@ def default_settings(**overrides):
         # input box is approximately isotropic after splits). Default
         # off; AB-CROWN's `naive` (= widest) is the empirical winner.
         input_split_batched_branch_sb=False,
+        # When sb branching is on, use the margin-augmented WORST-QUERY sb score
+        # (max_q[|A_q[i]|.clamp(thr)·width/2 + lb_q·margin]) instead of the legacy
+        # sum-over-queries form. Mirrors AB-CROWN's `input_split_heuristic_sb`;
+        # the max (vs sum) avoids diluting the binding query's split dim on
+        # multi-disjunct OR specs — cgan prop_2: 383 leaves vs widest-axis
+        # timeout. Default off (legacy sum unchanged for existing sb users).
+        input_split_sb_margin_score=False,
+        input_split_sb_coeff_thresh=0.01,   # AB-CROWN sb_coeff_thresh
+        input_split_sb_margin_weight=1.0,    # AB-CROWN sb_margin_weight
         # Route input-split-eligible nets to the freeze-replay α-CROWN verifier
         # (verify_hybrid_acasxu) with TIGHTENED intermediate bounds. The batched
         # input-split BaB's forward-zono intermediate bounds are ~1000x too
@@ -794,6 +828,16 @@ def default_settings(**overrides):
         # (for nets routed here by the perturbation gate whose α-CROWN root
         # is tighter on IBP than the zonotope forward).
         milp_force_ibp_phase1=False,
+        # RISKY, default OFF: when a per-neuron tighten solve trips a Gurobi
+        # numeric-trouble warning, retry it ONCE at NumericFocus=3 (+ScaleFlag
+        # 2) instead of letting it propagate. The retry still runs through
+        # optimize_checked, so a bound is trusted only if the retry solves
+        # CLEANLY; a still-dirty retry is skipped (looser pre-tightening bound
+        # kept — sound) and logged loudly + into details['numeric_trouble'].
+        # `_risky` because a high NumericFocus changes solver behavior — ONLY
+        # enable per-benchmark for a known-fragile instance (metaroom
+        # 6cnn_ry_39_6). Default OFF preserves "never mask numeric trouble".
+        milp_numeric_focus_retry_risky=False,
         # Structural routing gate (verify_graph): conv nets with mean input
         # box width > this go to milp_verify (IBP + α + ReLU-split BaB); the
         # rest stay on the graph pipeline (zono + dual-ascent), tighter on
@@ -1470,6 +1514,15 @@ def default_settings(**overrides):
         # (The old `keep_searching_within_tol` setting was removed: under the 2026
         # output-strict rule there is no within-output-tolerance sat to keep searching
         # past — VC emits `sat` only for a genuine violation and returns immediately.)
+        # When an emitted sat witness is a NEAR-BOUNDARY closure counterexample
+        # (worst output margin > -sat_validate_atol — e.g. a network-pair's trivial
+        # diagonal where x_f == x_g so the output diff is exactly 0: a valid `<=`
+        # CE the scorer accepts, but NOT a strict violation), spend up to this many
+        # seconds on a margin-minimizing PGD for a CLEAR counterexample
+        # (margin < -atol) and emit that instead when found. Purely additive: the
+        # already-valid boundary witness stands if no clearer CE exists, so it never
+        # loses a sat (e.g. ml4acopf 14_ieee prop3 keeps its boundary CE). 0 = off.
+        clear_ce_upgrade_budget=8.0,
         # Per-value precision for the counterexample written to the results file
         # (used by BOTH the graph and surrogate-attack emit paths). '.17g'
         # round-trips float64 losslessly, so the scorer replays the exact witness

@@ -107,6 +107,42 @@ def test_pgd_no_false_sat_on_near_miss(tmp_path):
     assert sat2 is True and wit2 is not None, 'real violation must be sat'
 
 
+def test_pgd_accept_margin_demands_clear_ce(tmp_path):
+    """`accept_margin` controls how deep into the unsafe region PGD must reach.
+    Identity net Y=X, unsafe Y_0 <= 0 (closure). The default (0.0) accepts any
+    point in the closure (incl. the Y_0=0 boundary); a NEGATIVE accept_margin
+    forces PGD to keep pushing until it finds a CLEAR violation (Y_0 <= margin).
+    This is the network-pair diagonal-upgrade lever."""
+    import onnx
+    from onnx import helper, TensorProto
+    from vibecheck.onnx_torch_runner import pgd_via_onnx
+    from vibecheck.spec import VNNSpec, Conjunct, Constraint
+
+    W = helper.make_tensor('W', TensorProto.FLOAT, [1, 1], [1.0])
+    b = helper.make_tensor('b', TensorProto.FLOAT, [1], [0.0])
+    node = helper.make_node('Gemm', ['X', 'W', 'b'], ['Y'])
+    graph = helper.make_graph(
+        [node], 'identity',
+        [helper.make_tensor_value_info('X', TensorProto.FLOAT, [1, 1])],
+        [helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 1])],
+        [W, b])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 13)])
+    p = tmp_path / 'identity.onnx'
+    onnx.save(model, str(p))
+    dev = torch.device('cpu')
+    # Box [-1, 1] -> clear CEs (Y_0 down to -1) exist for unsafe Y_0 <= 0.
+    spec = VNNSpec(np.array([-1.0], np.float32), np.array([1.0], np.float32),
+                   [Conjunct([Constraint(0, '<=', 0.0)])])
+    sat, wit = pgd_via_onnx(str(p), spec, n_restarts=16, n_iter=80,
+                            device=dev, dtype=torch.float32, simplify=False)
+    assert sat is True and wit is not None
+    # Demand a CLEAR CE strictly inside the unsafe region.
+    sat2, wit2 = pgd_via_onnx(str(p), spec, n_restarts=16, n_iter=80,
+                              accept_margin=-0.5, device=dev,
+                              dtype=torch.float32, simplify=False)
+    assert sat2 is True and float(wit2.flatten()[0]) <= -0.5 + 1e-5
+
+
 def test_runner_slice_negative_axis_and_attr_form():
     data = torch.arange(12).reshape(3, 4).float()
     # negative axis (-1), default steps

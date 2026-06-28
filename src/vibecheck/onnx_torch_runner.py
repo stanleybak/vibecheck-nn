@@ -273,12 +273,20 @@ def onnx_forward(model, x, device=None, dtype=None):
 
 def pgd_via_onnx(onnx_path, spec, n_restarts=256, n_iter=100, lr=0.1,
                  device=None, dtype=None, simplify=True, min_restarts=8,
-                 seeds=None, deadline=None):
+                 seeds=None, deadline=None, accept_margin=0.0):
     """Run PGD against the raw ONNX model. Returns (sat: bool, witness or None).
 
     Used as a last-resort SAT-finder when gpu_graph can't run forward
     (e.g., transformer attention with shape-sensitive ops). OOM-halves
     n_restarts down to min_restarts before giving up.
+
+    ``accept_margin`` (default 0.0): only commit a witness whose worst disjunct
+    margin is ``<= accept_margin``. The default 0.0 accepts any point in the
+    (closure) unsafe region. Pass a NEGATIVE value (e.g. ``-COUNTEREXAMPLE_ATOL``)
+    to demand a CLEAR counterexample strictly inside the unsafe region — used to
+    upgrade a near-boundary witness (a network-pair's trivial diagonal) to a
+    genuine strict violation. The loss always minimizes the margin, so a
+    more-negative target just makes PGD keep pushing past the boundary.
 
     ``seeds`` (optional, [S, n_in] array/tensor): extra starting points
     prepended to the random restarts — e.g. the dual-ascent BaB's primal
@@ -375,7 +383,7 @@ def pgd_via_onnx(onnx_path, spec, n_restarts=256, n_iter=100, lr=0.1,
                     # min_m <= 0; if PGD only reaches a positive near-miss it
                     # keeps searching and ultimately returns no-sat (-> unknown),
                     # never a false-sat.
-                    sat_mask = min_m <= 0.0
+                    sat_mask = min_m <= accept_margin
                     if sat_mask.any():
                         idx = int(sat_mask.nonzero()[0].item())
                         return True, x[idx].detach().cpu().numpy().reshape(spec.x_lo.shape)

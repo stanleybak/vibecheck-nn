@@ -20,6 +20,12 @@
 # path requires; capping crown_retighten_max_neurons does NOT help (un-retightened
 # neurons keep exploded box bounds → bound explodes, cap=10000 → -1.5e8).
 auto_route_milp_for_conv: false
+# spec17 (100x eps, all 150528 px) OOMs the forward zono — an expected,
+# both-tools-fail outcome (ABC also exceeds budget on spec16/17). Record it as a
+# graceful 'unknown' (sound: out-of-memory, undecided) instead of a crash
+# 'error'. raise_on_oom=False is the documented opt-in; the main.py OOM gate
+# logs it loudly and catches only genuine OOMs (a non-OOM bug still surfaces).
+raise_on_oom: false
 crown_retighten_forward: true
 crown_retighten_patches: true
 box_reduce_patch_budget: 6.0e+9

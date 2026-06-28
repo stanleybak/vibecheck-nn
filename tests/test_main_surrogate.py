@@ -70,6 +70,21 @@ def test_emit_surrogate_unknown_and_never_downgrade(tmp_path):
     assert open(rf).read().strip() == 'unknown'
 
 
+def test_config_flag_gates_nonlinear_augment(tmp_path):
+    # The nonlinear v2 pre-checks (empty-input + augment) are OFF unless the
+    # --config sets `nonlinear_v2_augment: true`. _config_flag is the gate.
+    assert vbmain._config_flag(_args(config=None), 'nonlinear_v2_augment') is False
+    c0 = tmp_path / 'c0.yaml'; c0.write_text('pgd_restarts: 4\n')   # key absent
+    assert vbmain._config_flag(_args(config=str(c0)), 'nonlinear_v2_augment') is False
+    c1 = tmp_path / 'c1.yaml'; c1.write_text('nonlinear_v2_augment: true\n')
+    assert vbmain._config_flag(_args(config=str(c1)), 'nonlinear_v2_augment') is True
+    # the ONE benchmark that needs it has it enabled in its shipped config
+    import yaml
+    acc = yaml.safe_load(
+        open('configs/adaptive_cruise_control_non_linear_2026.yaml'))
+    assert acc.get('nonlinear_v2_augment') is True
+
+
 def test_resolve_cex_version(tmp_path):
     assert vbmain._resolve_cex_version('1', 'x') == '1.0'
     assert vbmain._resolve_cex_version('v2', 'x') == '2.0'
@@ -121,9 +136,21 @@ def test_resolve_cex_io_meta(tmp_path):
         '(declare-network N (declare-input X1 float32 [1, 2]) '
         '(declare-input X2 real [1, 3]) (declare-output Y float32 [1, 1]))\n'
         '(assert (<= Y[0,0] 0.0))\n')
-    assert vbmain._resolve_cex_io_meta(p) == (
+    # Returns (inputs, outputs, order) — order is the DECLARATION order so a
+    # network PAIR's interleaved X_f,Y_f,X_g,Y_g cex follows the spec, not
+    # inputs-then-outputs (the v2 validator reads variables by order).
+    expected = (
         (('X1', 'float32', (1, 2), 2), ('X2', 'real', (1, 3), 3)),
-        (('Y', 'float32', (1, 1), 1),))
+        (('Y', 'float32', (1, 1), 1),),
+        (('in', 0), ('in', 1), ('out', 0)))
+    assert vbmain._resolve_cex_io_meta(p) == expected
+    # Same spec gzipped + referenced by the plain name -> still resolved
+    # (the resolver opens `<spec>.gz` transparently).
+    import gzip
+    with gzip.open(p + '.gz', 'wt') as f:
+        f.write(open(p).read())
+    os.remove(p)
+    assert vbmain._resolve_cex_io_meta(p) == expected
     # v1 spec (no declare-network) -> None: the cex keeps the ONNX node names.
     p1 = str(tmp_path / 'v1.vnnlib')
     open(p1, 'w').write('(declare-const X_0 Real)\n(assert (<= X_0 1.0))\n')
