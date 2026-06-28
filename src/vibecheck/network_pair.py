@@ -411,13 +411,33 @@ def reconstruct_pair_cex(nf_path, ng_path, ir, merged_witness):
     z = np.asarray(merged_witness, np.float64).flatten()
     n = ir['n']
     rel = ir['rel']
-    base = z[:n]
+    base = z[:n].copy()
+    # Snap the emitted witness to the ORIGINAL float64 box (xf_box / base_box,
+    # both parsed `float(...)` in _parse_ir, so exact). The merged net's clamp
+    # constants are float32 (the ACAS Xu net is float32), so a witness coord at an
+    # equality PIN (box (c,c)) or sitting on a box BOUND carries float32(c), off
+    # by ~1e-8 -> the official scorer's strict input check (tol 0) fails, scoring
+    # the witness CORRECT_UP_TO_TOLERANCE instead of CORRECT. Clamping to the
+    # float64 box restores the exact constant ("if the input is a point or on a
+    # bound, emit that exact value"). Sound: such a coord MUST satisfy the
+    # pin/bound, so emitting the exact value only strengthens the witness; interior
+    # coords are unchanged. Pair/merged emit ONLY (this function runs only for
+    # network pairs), so no other benchmark is affected.
+    # Clamp `base` (= x_g) to its box FIRST, then derive x_f from the snapped base,
+    # so the monotone relation x_f[k] = base[k] + delta (delta >= 0) >= x_g[k] is
+    # preserved even when a relational coord sits on its bound.
+    _bg_lo = np.array([a for a, _ in ir['base_box']])
+    _bg_hi = np.array([b for _, b in ir['base_box']])
+    base = np.clip(base, _bg_lo, _bg_hi)
     x_g = base.copy()
     x_f = base.copy()
     if rel:
         k = rel['k']
         delta = float(z[n]) if z.shape[0] > n else 0.0
         x_f[k] = np.clip(base[k] + delta, ir['xf_box'][k][0], ir['xf_box'][k][1])
+    _xf_lo = np.array([a for a, _ in ir['xf_box']])
+    _xf_hi = np.array([b for _, b in ir['xf_box']])
+    x_f = np.clip(x_f, _xf_lo, _xf_hi)
     nf, ng = _load_onnx(nf_path), _load_onnx(ng_path)
     fin, gin = _free_input(nf), _free_input(ng)
     shp_f = [d.dim_value or 1 for d in fin.type.tensor_type.shape.dim]

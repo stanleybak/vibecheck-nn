@@ -72,6 +72,27 @@ Two emit-side fixes make the sat verdicts robust:
 
 Integration pin: `tests/integration/test_monotonic_acasxu_2026.py`.
 
+## Scoring: float32-pinned inputs (fixed)
+
+The output margins are clear (above), but the *input* side initially scored all
+50 as `CORRECT_UP_TO_TOLERANCE`, not `CORRECT`. Cause: the merged net is float32
+(the ACAS Xu net is), so an input coord the spec FIXES by equality
+(`X_f[3] == 0.227272727` ≈ 5/22) — or one sitting on a non-float32-exact box
+bound (`X_g[0] >= -0.16247807`) — was emitted as its **float32** value, off by
+~5–7e-9. The official scorer's strict (tol-0) input check then needs 1e-4
+tolerance → TOL. (VC's own validation never flagged it: `sat_validate_atol`=1e-4
+≫ 7e-9, and the pair is validated against the *merged* float32 net where the
+witness is exactly in-box — so it's a valid within-tol sat by VC's criteria, just
+not strict-CORRECT.)
+
+Fix: `network_pair.reconstruct_pair_cex` clamps each net's emitted witness to its
+ORIGINAL float64 box (`base_box` for g, `xf_box` for f — both parsed `float(...)`,
+so exact), snapping equality pins and bound-sitting coords to the exact constant.
+`base` is clamped to `base_box` first, then `x_f` is derived, so the monotone
+`x_f[k] >= x_g[k]` (delta ≥ 0) is preserved. Verified with the official VNN-COMP
+scorer: **50/50 now `CORRECT`** (was 0). Regression guard:
+`tests/test_network_pair.py::test_reconstruct_pair_cex_snaps_to_exact_float64_box`.
+
 ## Key unresolved issues
 
-- None — VC matches ABC at 50/50.
+- None — VC matches ABC at 50/50 (all `CORRECT` after the float32-pin snap above).

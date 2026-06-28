@@ -174,6 +174,54 @@ def test_reconstruct_pair_cex_mono(tmp_path):
     assert x_flat.shape == (10,) and y_flat.shape == (10,)
 
 
+def test_reconstruct_pair_cex_snaps_to_exact_float64_box(tmp_path):
+    """A pinned / bound-sitting input coord must be emitted as the EXACT float64
+    box constant, not its float32-rounded search value.
+
+    The merged net is float32, so a coord the spec FIXES by equality to a
+    non-float32-exact constant (here 5/22) — or one sitting on a non-exact box
+    bound — comes out of the search as float32(c), off by ~1e-8. The official
+    VNN-COMP scorer's strict (tol-0) input check then needs tolerance, scoring
+    the witness CORRECT_UP_TO_TOLERANCE instead of CORRECT. reconstruct_pair_cex
+    clamps each net's witness to its ORIGINAL float64 box, restoring the exact
+    constant. Regression guard for the monotonic_acasxu 50/50 TOL->CORRECT fix.
+    """
+    f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
+    _tiny_acasxu(f, seed=5)
+    PIN = 0.227272727       # ~5/22, NOT representable in float32
+    LO = -0.16247807        # relational lower bound, NOT float32-exact
+    assert np.float64(np.float32(PIN)) != PIN and np.float64(np.float32(LO)) != LO
+    L = ['(vnnlib-version <2.0>)',
+         '(declare-network f (declare-input X_f float32 [1,1,1,5]) '
+         '(declare-output Y_f float32 [1,5]))',
+         '(declare-network g (equal-to f))']
+    for i in range(5):
+        L.append(f'(assert (and (<= X_f[{i}] 1.0) (>= X_f[{i}] -1.0)))')
+    for i in range(1, 5):
+        L.append(f'(assert (== X_f[{i}] X_g[{i}]))')
+    L.append(f'(assert (== X_f[3] {PIN!r}))')      # non-f32-exact equality pin
+    L.append('(assert (>= X_f[0] X_g[0]))')        # monotone relational coord 0
+    L.append(f'(assert (>= X_g[0] {LO!r}))')       # non-f32-exact lower bound
+    L.append('(assert (< Y_f[3] Y_g[3]))')
+    open(spec, 'w').write('\n'.join(L) + '\n')
+    ir = npair.parse_multinet(open(spec).read())
+    # merged witness as the FLOAT32 net produces it: pin + relational coord both
+    # carry float32-rounded values (the pin off, the relational coord below LO).
+    base = np.zeros(5, np.float64)
+    base[3] = np.float64(np.float32(PIN))          # float32(5/22) != PIN
+    base[0] = np.float64(np.float32(LO))           # x_g[0] just below LO in f32
+    z = np.concatenate([base, [0.6]]).astype(np.float64)   # delta = 0.6 > 0
+    x_flat, _ = npair.reconstruct_pair_cex(f, f, ir, z)
+    x_f, x_g = x_flat[:5], x_flat[5:]
+    # pinned coord 3: EXACT float64 constant on both nets (not the float32 value)
+    assert x_f[3] == PIN and x_g[3] == PIN
+    assert x_f[3] != np.float64(np.float32(PIN))   # the bug would leave float32(PIN)
+    # relational coord 0: x_g snapped UP to the exact lower bound (>= LO holds)
+    assert x_g[0] == LO and x_g[0] >= LO
+    # monotonicity preserved: x_f[0] = clip(base[0]+delta) >= x_g[0]
+    assert x_f[0] >= x_g[0]
+
+
 def test_pair_is_strict():
     # mono `(< Y_f[3] Y_g[3])` and iso `(> ... )(< ...)` are STRICT -> CE-check must
     # require a strict violation; a fabricated non-strict atom flips it off.
