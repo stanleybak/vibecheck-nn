@@ -357,6 +357,15 @@ def default_settings(**overrides):
         # input box is approximately isotropic after splits). Default
         # off; AB-CROWN's `naive` (= widest) is the empirical winner.
         input_split_batched_branch_sb=False,
+        # When sb branching is on, use the margin-augmented WORST-QUERY sb score
+        # (max_q[|A_q[i]|.clamp(thr)·width/2 + lb_q·margin]) instead of the legacy
+        # sum-over-queries form. Mirrors AB-CROWN's `input_split_heuristic_sb`;
+        # the max (vs sum) avoids diluting the binding query's split dim on
+        # multi-disjunct OR specs — cgan prop_2: 383 leaves vs widest-axis
+        # timeout. Default off (legacy sum unchanged for existing sb users).
+        input_split_sb_margin_score=False,
+        input_split_sb_coeff_thresh=0.01,   # AB-CROWN sb_coeff_thresh
+        input_split_sb_margin_weight=1.0,    # AB-CROWN sb_margin_weight
         # Route input-split-eligible nets to the freeze-replay α-CROWN verifier
         # (verify_hybrid_acasxu) with TIGHTENED intermediate bounds. The batched
         # input-split BaB's forward-zono intermediate bounds are ~1000x too

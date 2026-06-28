@@ -3971,7 +3971,7 @@ def _forward_zonotope_graph_batched(xl, xh, gg, device, dtype):
     return sb, state[last_name]
 
 
-def _crown_intermediate_batched(gg, xl, xh, device, dtype):
+def _crown_intermediate_batched(gg, xl, xh, device, dtype, chunk=2048):
     """Backward-CROWN intermediate pre-ReLU bounds (min-area slopes, no α).
 
     This is what AB-CROWN uses for ACAS Xu (`bound_prop_method: crown`) and it
@@ -4001,23 +4001,46 @@ def _crown_intermediate_batched(gg, xl, xh, device, dtype):
     # `tight` also holds string-keyed bilinear/pool boxes (kept for the
     # backward McCormick pass); iterate ONLY the int ReLU-layer keys so
     # sorted() doesn't choke on mixed str/int (lsnc_relu quadratic forms).
+    # Seed only UNSTABLE neurons (sparse) in TILES of `chunk` (chunked): the
+    # full `[+I, -I]` seed over all n neurons materializes a (B, 2n, n) backward
+    # coefficient (~21 GiB on a 28.8k-neuron conv layer -> OOM even at B=1). A
+    # stable neuron's ReLU relaxation is EXACT regardless of its bound width, so
+    # its forward-zono bound already suffices and needs no backward tightening
+    # (AB-CROWN's `sparse_interm`). Tiling caps peak memory at O(chunk),
+    # independent of n (AB-CROWN's `crown.batch_size`).
+    _chunk = max(1, int(chunk))
     for L in sorted(L for L in tight if isinstance(L, int)):
         if L not in relu_op_by_L:
             continue
         feed = relu_op_by_L[L]['inputs'][0]
-        n = tight[L][0].shape[1]
-        eye = torch.eye(n, dtype=dtype, device=device)
-        seed = {feed: torch.cat([eye, -eye], dim=0)
-                .unsqueeze(0).expand(B, -1, -1)}
-        sl = _spec_backward_graph_batched(
-            tight, xl, xh, gg, None, device, dtype,
-            seed_ew_at=seed,
-            seed_acc=torch.zeros(B, 2 * n, dtype=dtype, device=device))
-        # Intersect the backward-CROWN bound with the running (forward-zono)
-        # bound; both sound, so the tighter one stays sound.
-        lo_t = torch.maximum(tight[L][0], sl[:, :n])
-        hi_t = torch.maximum(torch.minimum(tight[L][1], -sl[:, n:]), lo_t)
-        tight[L] = (lo_t, hi_t)
+        lo_L, hi_L = tight[L]
+        n = lo_L.shape[1]
+        # Union of unstable across the batch: one seed set; domains where the
+        # neuron is stable just re-derive a sound bound the intersection keeps.
+        idx = (((lo_L < 0) & (hi_L > 0)).any(dim=0)).nonzero(as_tuple=True)[0]
+        m = int(idx.numel())
+        if m == 0:
+            continue
+        new_lo = lo_L.clone()
+        new_hi = hi_L.clone()
+        for c0 in range(0, m, _chunk):
+            cidx = idx[c0:c0 + _chunk]
+            k = int(cidx.numel())
+            eye_k = torch.zeros(k, n, dtype=dtype, device=device)
+            eye_k[torch.arange(k, device=device), cidx] = 1.0
+            seed = {feed: torch.cat([eye_k, -eye_k], dim=0)
+                    .unsqueeze(0).expand(B, -1, -1)}
+            sl = _spec_backward_graph_batched(
+                tight, xl, xh, gg, None, device, dtype,
+                seed_ew_at=seed,
+                seed_acc=torch.zeros(B, 2 * k, dtype=dtype, device=device))
+            # Intersect the backward-CROWN bound with the running (forward-zono)
+            # bound; both sound, so the tighter one stays sound.
+            lo_c = torch.maximum(lo_L[:, cidx], sl[:, :k])
+            hi_c = torch.maximum(torch.minimum(hi_L[:, cidx], -sl[:, k:]), lo_c)
+            new_lo[:, cidx] = lo_c
+            new_hi[:, cidx] = hi_c
+        tight[L] = (new_lo, new_hi)
     return tight
 
 

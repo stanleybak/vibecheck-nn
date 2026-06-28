@@ -27,3 +27,9 @@ input_split_batch_size: 16
 pgd_restarts: 128
 pgd_time_budget_phase0: 2.0
 
+# Sensitivity-based input-split branching. The default widest-axis round-robin
+# splits dims by width alone and cannot converge the eps-0.10 img32 instances
+# (prop_2: 4795 leaves, timeout). Enabling sb with the margin-augmented
+# worst-query score (AB-CROWN's sb) cracks prop_2 in 383 leaves / 23 s.
+input_split_batched_branch_sb: true
+input_split_sb_margin_score: true

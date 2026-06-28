@@ -12611,6 +12611,12 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
 
     import os as _os_isb_dbg
     _dbg_isb = (_os_isb_dbg.environ.get('DEBUG_INPUT_SPLIT_BATCHED', '') == '1')
+    # Branch-method trace: record (once) WHICH input-split heuristic is in
+    # effect and why — sb-sensitivity vs the widest-axis fallback. Emitted
+    # under standard --verbose (`print_progress`) so a silently-disabled `sb`
+    # is visible in the trace instead of needing a hand-added probe.
+    _pp_isb = bool(getattr(settings, 'print_progress', False))
+    _branch_logged = False
     # Per-phase profiler (bound / clip / split timing + closure counts).
     # Gated by `settings.input_split_batched_phase_timing` (env
     # VC_PHASE_TIMING forces it on for ad-hoc profiling). Every timing site
@@ -12774,6 +12780,13 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 all_disj_closed = torch.stack(
                     disj_closed_masks, dim=1).all(dim=1)
 
+        if _dbg_isb and n_iters == 0:
+            _bpd_root = []
+            for _di, _qix in disj_q_idx.items():
+                _bpd_root.append(spec_lbs_b[:, _qix].max(dim=1).values)
+            _wdb_root = torch.stack(_bpd_root, dim=1).min(dim=1).values
+            print(f'[is-batched ROOT] closure_lb={float(_wdb_root.min()):.4f} '
+                  f'crown_intermediate={crown_intermediate}', flush=True)
         if _phase_timing:
             _pt_ts = _pt_mark('bound', _pt_tb)
         unclosed = (~all_disj_closed).nonzero(as_tuple=True)[0]
@@ -13041,8 +13054,10 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 # of that; xl_split lines up with feasible_idx.
                 if clip_enabled and unclosed.numel() > 0 and A_lin is not None:
                     A_split = A_u[feasible_idx]
+                    _lb_split = spec_lbs_b[unclosed][feasible_idx]  # (B, Q)
                 else:
                     A_split = A_lin[unclosed]
+                    _lb_split = spec_lbs_b[unclosed]                # (B, Q)
                 # Per-leaf sensitivity: sum_q |A_q[i]| × width_i.
                 # Optional branch_boost (computed at init): boosts dims
                 # feeding the most-unstable shallow ReLU branch. Without
@@ -13050,13 +13065,54 @@ def _input_split_batched_inner(graph, spec, settings, gg, device, dtype,
                 # underestimate L2-branch lA on pensieve_big_parallel and
                 # pick all 4 splits in less-unstable L0/L1/L3 branches,
                 # missing the bound improvement (mean -7.42 vs +0.16).
-                sens = A_split.abs().sum(dim=1)  # (B, n_in)
-                scores = widths * sens
+                # `input_split_sb_margin_score`: margin-augmented, worst-query
+                # sb score (mirrors AB-CROWN's `input_split_heuristic_sb`,
+                # sb_sum=False). Per dim i: score_i = max_q[ |A_q[i]|.clamp(thr)
+                # × width_i/2 + lb_q·margin_w ], then argmax. The MAX over
+                # queries (vs the legacy SUM below) keeps the BINDING query's
+                # split dim from being diluted on multi-disjunct OR specs (cgan
+                # prop_2: 383 leaves / 23 s vs widest-axis timeout); the coeff
+                # clamp lets width break ties among tiny-coeff dims; the margin
+                # biases toward the closest-to-verified spec.
+                _sb_margin = bool(getattr(
+                    settings, 'input_split_sb_margin_score', False))
+                if _sb_margin:
+                    _thr = float(getattr(
+                        settings, 'input_split_sb_coeff_thresh', 0.01))
+                    _mw = float(getattr(
+                        settings, 'input_split_sb_margin_weight', 1.0))
+                    _base = (A_split.abs().clamp(min=_thr)
+                             * widths.unsqueeze(1) / 2)            # (B, Q, n_in)
+                    _base = _base + _lb_split.unsqueeze(-1) * _mw
+                    scores = _base.amax(dim=1)                     # (B, n_in)
+                else:
+                    sens = A_split.abs().sum(dim=1)  # (B, n_in)
+                    scores = widths * sens
                 if _branch_boost is not None:
                     scores = scores * _branch_boost.to(scores.device).unsqueeze(0)
                 ax = scores.argmax(dim=1)
+                _branch_method = 'sb-margin' if _sb_margin else 'sb-sum'
+                _branch_why = ''
             else:
                 ax = widths.argmax(dim=1)
+                _branch_method = 'widest-axis'
+                _branch_why = (
+                    'sb disabled (input_split_batched_branch_sb=False)'
+                    if not sb_enabled else 'A_lin unavailable')
+            # One-time branch-method trace (standard verbose) — makes the active
+            # heuristic and any silent-disable visible without a probe.
+            if (_pp_isb or _dbg_isb) and not _branch_logged:
+                _branch_logged = True
+                print(f'[branch] input-split heuristic={_branch_method}'
+                      + (f' ({_branch_why})' if _branch_why else '')
+                      + f'  free_dims={int((widths[0] > 0).sum())}'
+                      + f'  boost={_branch_boost is not None}', flush=True)
+            # Per-iteration split-dim trace (rate-limited) under verbose.
+            if (_pp_isb or _dbg_isb) and (n_iters < 8 or n_iters % 50 == 0):
+                _ax0 = int(ax[0].item())
+                print(f'[branch] iter={n_iters} split X_{_ax0} '
+                      f'(width={float(widths[0, _ax0]):.4f}) '
+                      f'leaves={xl_split.shape[0]}', flush=True)
             import os as _os_split_dbg
             if _os_split_dbg.environ.get('DEBUG_BAB_SPLIT', '') == '1':
                 for _i in range(min(xl_split.shape[0], 5)):
