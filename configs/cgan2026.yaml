@@ -1,0 +1,35 @@
+# cgan_2023 — conditional GAN regular-track benchmark. Sub-models:
+#   * 8 baseline cGAN nets (img32/64 × nCh1/3 × 4 props) — ConvTranspose+
+#     ReLU. The img64 ones are easy SAT in ~0.3s; img32 UNSAT bowls take
+#     ~13s each.
+#   * nonlinear_activations — Tanh + Sigmoid intermediate layers. Closed-
+#     form α-CROWN linear bounds derived per `_sigmoid_tanh_linear_bounds`
+#     (binary-search Newton tangent; NOT sampling — see CLAUDE.md).
+#   * transposedConvPadding_1 — ConvTranspose with output_padding.
+#   * upsample — nearest-neighbour Upsample-9 (linear-exact).
+#   * small_transformer — bilinear-MatMul attention + Softmax. Our gpu_graph
+#     can't fully represent attention; SAT cases route through the raw-
+#     ONNX PGD fallback (`onnx_torch_runner.pgd_via_onnx`). UNSAT cases
+#     on the transformer return 'unknown' (out of scope).
+#
+# Batch=16 keeps the imgSz64 forward inside 10 GB; the imgSz32 nets fit
+# comfortably. 120 s/case beats AB-CROWN's ~9-15 s on UNSAT-heavy cases
+# easily on SAT (sub-second) but is comparable on UNSAT.
+input_split_batched_enabled: true
+input_split_batched_clip_enabled: true
+input_split_batched_alpha_boundary_eps: 0.0
+input_split_batched_alpha_iters: 0
+input_split_batched_milp_escalate: false
+input_split_batch_size: 16
+# 10K PGD restarts on cgan = ~10 s phase-0 wasted on UNSAT cases.
+# 128 restarts × 2 s budget catches every SAT case we'd find with 10K
+# and cuts UNSAT-bowl wall by ~2.8×. Profile: scratch/cgan_pgd_sweep.py.
+pgd_restarts: 128
+pgd_time_budget_phase0: 2.0
+
+# Sensitivity-based input-split branching. The default widest-axis round-robin
+# splits dims by width alone and cannot converge the eps-0.10 img32 instances
+# (prop_2: 4795 leaves, timeout). Enabling sb with the margin-augmented
+# worst-query score (AB-CROWN's sb) cracks prop_2 in 383 leaves / 23 s.
+input_split_batched_branch_sb: true
+input_split_sb_margin_score: true

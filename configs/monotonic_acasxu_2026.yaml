@@ -1,0 +1,15 @@
+# monotonic_acasxu_2026 — network-PAIR acasxu (original f vs a monotone-perturbed
+# g), merged at runtime; small input (5 dims). It is ALREADY solved 50/50 sat by
+# the auto-selected `input_split_small` profile (input_dim <= 20 -> input-split
+# fast-leaf BaB), so no tuning is strictly required.
+#
+# This is an INTENTIONAL shell, not a no-op: passing --config disables the
+# auto-profile selection (config_profiles.default_settings_for only runs when
+# there is NO --config), so we replicate exactly what `_profile_input_split_small`
+# sets — otherwise the run would fall back to bare default_settings and could
+# regress. With this file present the verbose log shows
+# `profile=config:.../monotonic_acasxu_2026.yaml` instead of a silently-chosen
+# default, making the benchmark's settings explicit and auditable.
+input_split_enabled: true
+input_split_fast_leaf: true
+input_split_alpha_iters: 3

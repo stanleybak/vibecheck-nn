@@ -1,0 +1,18 @@
+# relusplitter_2026 (regular track, 120 instances, 180s timeout).
+#
+# MNIST 784-in MLPs (Gemm+ReLU only): 4 base nets (model_0_0..3_3) x 5 ReLU-split
+# variants (pct0.2..1.0). The split rewrites z -> ReLU(z)-ReLU(-z) inside each
+# layer (a passthrough + a +/-1 split-pair), widening the Gemms but computing the
+# SAME function. vibecheck's `fold_gemm` (onnx_optimizer, auto-applied via the
+# default optimize_relu_relation=True) collapses the split back to the base layer
+# sizes, so a pct1.0 split verifies as fast as its base net.
+#
+# No special machinery needed — the default profile + fold_gemm + bab_refine
+# already handle the whole family (confirmed locally: base / pct0.4 / pct1.0 all
+# verify in ~1s; the known SAT instance reproduces). This config exists only so the
+# benchmark is picked up by the sweep (configs are matched by name); the few keys
+# below are the defaults made explicit. Notably vibecheck has no analogue of ABC's
+# pct0.4 indexing bug (which gave ABC 20 errors), so we expect to beat ABC here.
+
+# fold the ReLU-split back to base width (default; the load-bearing rewrite here)
+optimize_relu_relation: true
