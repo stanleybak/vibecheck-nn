@@ -1558,6 +1558,18 @@ def default_settings(**overrides):
         # round-trips float64 losslessly, so the scorer replays the exact witness
         # vibecheck found (maximizes strict-CORRECT vs within-tolerance).
         counterexample_precision='.17g',
+        # Extra safe-margin (in output units) demanded before the bound declares
+        # `verified`. Default 0.0 = the exact rule `worst_margin > 0`. Applied to
+        # the loaded spec ONLY for the nonlinear-augment category (when
+        # `nonlinear_v2_augment` is on), to absorb the float32/float64 gap: those
+        # instances are verified in float64 but SCORED in float32, where rounding
+        # noise (~5e-4 at the adaptive_cruise_control output scale) can flip a
+        # razor-thin f64 `unsat` into a float32 counterexample. Bloating the
+        # margin makes such cases defer to the PGD sat-search (which finds the
+        # scorer-valid CE) instead of false-unsatting under --disable-sat-finding.
+        # Purely conservative: it only ever WITHHOLDS `verified`, never the
+        # reverse, so it cannot create a false `unsat`. See spec.VNNSpec.check.
+        unsat_margin_bloat=0.0,
         # Counterexample on-disk FORMAT, matching the VNNCOMP rules per spec version:
         #   '1' / '1.0' -> flat s-expression `((X_0 v)... (Y_0 v)...)`
         #   '2' / '2.0' -> per-tensor `NAME float32 [shape]\n<C-order values>` blocks

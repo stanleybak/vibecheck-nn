@@ -24,6 +24,17 @@
 # OFF by default (it parses the whole spec to detect degree>=2 terms); this is
 # the ONE 2026 benchmark with a nonlinear INPUT constraint (200*X0 >= X1^2).
 nonlinear_v2_augment: true
+# Float64-bound vs float32-scoring guard. These instances are tolerance-boundary:
+# the true f64 min of the constraint poly p_c is ~0 (measured: f64 output margin
+# +5.5e-7), so the f64 bound CAN prove `unsat` — but the official scorer replays
+# the net in float32, where rounding noise (~4.7e-4 at this output scale) yields a
+# clear CE. So a float64 `unsat` here is contradicted by the scorer; the correct
+# verdict is the PGD-found `sat`. Demand >1e-3 of safe margin before declaring
+# `unsat`, so these razor-thin cases DEFER to the sat-search (and, under
+# --disable-sat-finding soundness probes, time out) instead of false-unsatting.
+# Purely conservative — only ever withholds `verified`. Only affects this
+# benchmark (gated on nonlinear_v2_augment in main._verify).
+unsat_margin_bloat: 1.0e-3
 pgd_per_restart_disjunct: true
 pgd_alpha_multi: true
 pgd_restarts: 512

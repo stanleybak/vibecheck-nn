@@ -474,6 +474,15 @@ def _verify(args, sat_state=None):
         settings.update(args.set_overrides)   # --set wins over config/profile
         if args.verbose:
             settings.print_progress = True
+        # Nonlinear-augment category ONLY: the bound runs in float64 but the
+        # official scorer replays the net in float32, so a razor-thin f64 `unsat`
+        # can be contradicted by a float32 CE. Demand the configured extra
+        # safe-margin before the bound declares `verified` (purely conservative —
+        # see spec.VNNSpec.check). Double-gated: non-zero only when the run is an
+        # augmented instance AND the config sets `unsat_margin_bloat`.
+        spec.unsat_margin_bloat = (
+            float(settings.unsat_margin_bloat)
+            if _config_flag(args, 'nonlinear_v2_augment') else 0.0)
         # SAT policy (VNN-COMP 2026 output-strict): VC only ever emits a `sat` for a
         # GENUINE counterexample (output strictly violates, input in-box), and it
         # returns immediately when it finds one — there is no within-output-tolerance

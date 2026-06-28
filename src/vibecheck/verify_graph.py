@@ -10193,7 +10193,12 @@ def _nonlinear_backward_crown_root(gg, spec, sb, op_bounds, xl, xh, zf,
     # (a disjunct is verified iff this is > 0).
     margins = {di: max(spec_lbs.get(qi, -1.0) for qi, _, _ in ql)
                for di, ql in disj_queries.items()}
-    verified_disj = {di for di, m in margins.items() if m > 0}
+    # Nonlinear-augment float32 guard: a disjunct counts as proven only if its
+    # margin clears `spec.unsat_margin_bloat` (default 0.0 = the exact `m > 0`).
+    # Set > 0 only for adaptive_cruise_control, where the f64 bound and the
+    # float32 scorer disagree at a razor-thin margin (see spec.VNNSpec.check).
+    _bloat = float(getattr(spec, 'unsat_margin_bloat', 0.0))
+    verified_disj = {di for di, m in margins.items() if m > _bloat}
     worst = min(margins.values()) if margins else -1.0
     det = {'method': 'nonlinear_bwd_crown', 'worst_margin': worst,
            'margins': margins, 'verified_disj': len(verified_disj),
@@ -10293,7 +10298,9 @@ def _nonlinear_alpha_opt(graph, spec, settings, t_start, total_timeout,
         spec_margin = dmar.min()
         _smf = float(spec_margin.detach())   # scalar for logging/checks
         best = max(best, _smf)
-        if _smf > 0:
+        # Nonlinear-augment float32 guard (see spec.VNNSpec.check): require the
+        # spec margin to clear `unsat_margin_bloat` before declaring verified.
+        if _smf > float(getattr(spec, 'unsat_margin_bloat', 0.0)):
             _restore()
             if print_progress:
                 print(f'[nl_alpha] verified at iter {it}, '

@@ -128,6 +128,18 @@ class VNNSpec:
     x_lo: np.ndarray
     x_hi: np.ndarray
     disjuncts: list  # list of Conjunct
+    # Extra safe-margin demanded before declaring `verified` (default 0.0 = the
+    # exact rule `worst > 0`). Set > 0 ONLY for the nonlinear-augment category,
+    # where the verifier bounds in float64 but the official scorer replays the
+    # net in float32: when the f64 worst margin is below the float32 evaluation
+    # noise (~5e-4 at the adaptive_cruise_control output magnitude), an f64
+    # `unsat` proof can be contradicted by a float32 counterexample. Requiring
+    # `worst > unsat_margin_bloat` makes those razor-thin cases defer (→ the PGD
+    # sat-search finds the scorer-valid CE) instead of false-unsatting. The
+    # bloat is purely conservative: it only ever WITHHOLDS `verified`, so it can
+    # never turn a real `sat` into a false `unsat`. See main._verify (set only
+    # when `nonlinear_v2_augment`) and configs/adaptive_cruise_control_*.yaml.
+    unsat_margin_bloat: float = 0.0
 
     def check(self, output_lo, output_hi):
         """Check spec against output bounds.
@@ -141,9 +153,10 @@ class VNNSpec:
             margins[i] = conj.margin(output_lo, output_hi)
 
         worst = min(margins.values()) if margins else 0.0
-        return ('verified' if worst > 0 else 'unknown'), {
+        return ('verified' if worst > self.unsat_margin_bloat else 'unknown'), {
             'margins': margins,
             'worst_margin': float(worst),
+            'unsat_margin_bloat': float(self.unsat_margin_bloat),
         }
 
     def check_witness(self, x, y):

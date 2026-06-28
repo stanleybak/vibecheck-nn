@@ -83,6 +83,32 @@ def test_vnnspec_check_unknown():
     assert result == 'unknown'
     assert details['worst_margin'] == -2.0
 
+def test_vnnspec_check_margin_bloat_withholds_verified():
+    """A razor-thin positive margin (0 < worst <= bloat) must NOT verify when
+    `unsat_margin_bloat` is set — the nonlinear-augment float32/float64 guard.
+    The constraint `Y_0 >= 10` over output [0, 9.9995] has worst_margin
+    +5e-4; the default rule verifies, but a 1e-3 bloat defers to 'unknown'."""
+    spec = VNNSpec(
+        x_lo=np.array([0.0]),
+        x_hi=np.array([1.0]),
+        disjuncts=[Conjunct([Constraint(0, '>=', 10.0)])])
+    lo, hi = np.array([0.0]), np.array([9.9995])
+    # default (bloat 0.0): the thin +5e-4 margin verifies
+    res0, det0 = spec.check(lo, hi)
+    assert res0 == 'verified'
+    assert det0['worst_margin'] == pytest.approx(5e-4)
+    assert det0['unsat_margin_bloat'] == 0.0
+    # with the bloat: worst_margin 5e-4 <= 1e-3 -> withheld
+    spec.unsat_margin_bloat = 1e-3
+    res1, det1 = spec.check(lo, hi)
+    assert res1 == 'unknown'
+    assert det1['worst_margin'] == pytest.approx(5e-4)
+    assert det1['unsat_margin_bloat'] == 1e-3
+    # a comfortably-safe margin (1.0 > bloat) still verifies under the bloat
+    res2, _ = spec.check(np.array([0.0]), np.array([9.0]))
+    assert res2 == 'verified'
+
+
 def test_vnnspec_n_constraints():
     spec = VNNSpec(np.zeros(1), np.ones(1), [
         Conjunct([Constraint(0, '>=', 1.0), Constraint(0, '<=', 0.0)]),
