@@ -51,9 +51,8 @@ written to `--results-file` when set).
 ```
 
 The unit tests build synthetic ONNX/VNNLIB inline and need no external data, so
-they run on a fresh clone. Only the **integration** and **vnncomp
-point-propagation** tests read benchmark paths from `tests/paths.yaml`
-(gitignored).
+they run on a fresh clone. Only the **integration** tests read benchmark paths
+from `tests/paths.yaml` (gitignored).
 
 Run a single unit test by node id, or a single integration case by its
 parametrized `desc` (the `-k` terms are AND-ed):
@@ -84,7 +83,7 @@ cd vnncomp2025_benchmarks
 > changes the seed) and re-run. This is an upstream benchmark-repo quirk, not a
 > vibecheck issue.
 
-To enable the integration/point-prop tests, point `tests/paths.yaml` at the clone:
+To enable the integration tests, point `tests/paths.yaml` at the clone:
 
 ```bash
 cp tests/paths.yaml.template tests/paths.yaml
