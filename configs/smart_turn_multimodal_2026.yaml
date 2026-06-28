@@ -13,8 +13,15 @@
 surrogate_attack: true
 surrogate_attack_restarts: 4
 surrogate_attack_steps: 30
-# Witness is float32, so %.9g is float32-exact and ~halves the counterexample file size.
-counterexample_precision: '.9g'
+# Precision MUST round-trip float64 losslessly ('.17g', the default). The emitted
+# witness is `witness_inbox` — the float32 candidate CLAMPED to the float64 input
+# box (np.clip to the vnnlib lo/hi). For the ~388k/1.27M dims that sit exactly on a
+# box bound, the clamped value is the float64 bound; writing it at '.9g' (9 sig-figs)
+# rounds ~half of them a few ulps BELOW lb, so the competition scorer's strict
+# input_tol=0 check (x<lb) fails and downgrades CORRECT -> correct_up_to_tolerance.
+# '.17g' writes the in-box value exactly -> strict in-box -> CORRECT. (The old '.9g'
+# "float32-exact" rationale was wrong: the clamp introduces float64 bound values.)
+counterexample_precision: '.17g'
 # GPU (default): the fake-quant eval oracle + center/corner checks make the attack robust
 # to the GPU-architecture trajectory divergence that the old per-step-ORT path suffered.
 device: gpu
