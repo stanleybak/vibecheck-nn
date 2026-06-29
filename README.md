@@ -105,3 +105,9 @@ cat /tmp/r.txt   # -> unsat (verified)
 
 Each benchmark's `instances.csv` lists its `(onnx, vnnlib, timeout)` triples; pick
 any row to reproduce a specific case.
+
+## Contributors
+
+[Stanley Bak](https://stanleybak.com) (lead)
+
+Doug Wehbe (testing)
