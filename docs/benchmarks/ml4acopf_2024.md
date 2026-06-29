@@ -102,3 +102,54 @@ scatter-ADD gather adjoint.
 118_ieee / 300_ieee hard props (prop2/3/4 etc.) — both VC and α,β-CROWN time
 out (deeply nested power-flow bilinears; the per-node refinement is grossly
 insufficient at 1696/3804 output dims). No ABC-only misses.
+
+## 14_ieee linear-residual / prop3 — investigation (open gap)
+
+`14_ieee_ml4acopf-linear-residual.onnx` / `14_ieee_prop3.vnnlib`: **VC timeout (600s)
+vs α,β-CROWN unsat (~9s)**. (The old "VC 1.0 unsat 11s" baseline was a previous VC
+version; current VC times out on both 1.0 and 2.0 — same spec logically; format is
+irrelevant.) 20-disjunct output OR; 22 input dims, all varying. Net is a ReLU MLP
+(L0–L3) + a sin/cos "trig tail" (L4–L11) + 12 genuine bilinear `Mul`s.
+
+**Where the time goes** (verbose, AWS): nonlinear backward-CROWN root closes 17/20
+disjuncts, `worst_margin = −2.54e-2`; forward-α (`nl_alpha`) plateaus at −2.33e-2;
+then the 22-dim **input-split BaB** (`_verify_nonlinear_graph`) churns to depth 26 /
+2366 leaves without closing → timeout. (Added a `[trig_bab]` heartbeat so this phase
+is no longer silent; `VC_DUMP_IBOUNDS=1` dumps per-layer pre-act bounds + gg op
+histogram.)
+
+**Ruled out by measurement (vs α,β-CROWN, agent-traced):**
+- Intermediate ReLU bounds **match ABC** on the 4 comparable layers (VC even tighter
+  on L1); trig input `/137 ≈ VC L3` — *not* the gap.
+- **Per-disjunct α: tested, no help** — BUT only in the FORWARD zono (`nl_alpha`):
+  a fresh α per disjunct still plateaus disjunct 11 at −2.327e-2. So per-disjunct-vs-
+  shared is **not** the lever; the forward-zono bound is the limiter.
+- Brancher choice (input-split vs nonlinear-op split): both timeout.
+- PWL `merge_relu_lookup_table`: fires (9 relu + 3 pwl), **identical** −2.54e-2 here.
+- Interval tightening ceiling (shrink refined backward bounds → points):
+  ReLU→ −1.09e-2 (~57% of gap), bilinear/op inputs→ −1.95e-2, **BOTH→ −7.3e-3
+  (~71%) — still negative.** Even perfect interval tightening can't cross zero.
+
+**The actual gap = forward-α vs backward-α on the trig relaxation, NOT α granularity
+and NOT intervals.** α,β-CROWN keeps each sin/cos as ONE exact PWL table (54 pieces)
+and α-optimizes its per-piece ReLU slopes *inside the single backward pass to the
+spec* (intermediates frozen, `enable_opt_interm_bounds: false`), closing
+−2.68e-5 → +4.68e-4 in 5 iters, **zero BaB**. VC unrolls the same sin/cos into 8
+explicit ReLU layers, concretizes each, and uses *forward* α — compounding triangle
+relaxations.
+
+**MISSING ON THIS PATH: per-disjunct / per-piece α in the BACKWARD pass.** VC's
+nonlinear path uses one shared FORWARD α vs min-over-disjuncts. The backward per-query
+α machinery (`alpha_crown.run_alpha_crown`, which handles relu/fc/pwl/mul_bilinear)
+exists but is **not wired here** and **cannot traverse this net's `slice`/`gather`**
+in the trig tail. This backward per-piece α — applied per surviving disjunct — is the
+untested, promising lever; it was never exercised on this path.
+
+**Promising fix path (neither piece alone closes it):**
+1. Wire backward per-(piece, disjunct) α into the nonlinear path (reuse `run_alpha_crown`
+   + the `pwl` backward handler; needs `slice`/`gather` backward, or fold the sin/cos
+   8-ReLU stacks into single PWL tables like ABC's `MultiPiecewiseNonlinear`).
+2. LP/MILP intermediate tightening + cascade (recovers ~71% of the gap per the ceiling
+   above) — VC's MILP tightener is ReLU-only today (no McCormick/trig), so it'd apply
+   to the early MLP only.
+Combined they cross zero; separately they don't.

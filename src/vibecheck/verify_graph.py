@@ -10194,6 +10194,23 @@ def _nonlinear_backward_crown_root(gg, spec, sb, op_bounds, xl, xh, zf,
     _crown_refine_intermediate_graph(
         gg, xl, xh, sb_r, ob_r, device, dtype, deadline=deadline,
         print_progress=bool(getattr(settings, 'print_progress', False)))
+    import os as _os_ib
+    if _os_ib.environ.get('VC_DUMP_IBOUNDS'):
+        from collections import Counter as _Ctr
+        _hist = _Ctr(op['type'] for op in gg['ops'])
+        print(f'[ibounds] gg op histogram: relu={_hist.get("relu",0)} '
+              f'pwl={_hist.get("pwl",0)} mul_bilinear={_hist.get("mul_bilinear",0)} '
+              f'(full={dict(_hist)})', flush=True)
+        # Diagnostic (env-gated): per-ReLU-layer pre-activation bounds + unstable
+        # counts, forward-zono vs CROWN-refined, BEFORE any α — to compare against
+        # α,β-CROWN's intermediate bounds.
+        for L in sorted(sb_r.keys(), key=lambda x: str(x)):
+            _l0, _h0 = sb[L]; _l1, _h1 = sb_r[L]
+            _u0 = int(((_l0 < 0) & (_h0 > 0)).sum())
+            _u1 = int(((_l1 < 0) & (_h1 > 0)).sum())
+            print(f'[ibounds] L={L} n={_l0.numel()} unstable: fwd={_u0} refined={_u1} '
+                  f'| fwd[{float(_l0.min()):.3e},{float(_h0.max()):.3e}] '
+                  f'refined[{float(_l1.min()):.3e},{float(_h1.max()):.3e}]', flush=True)
     spec_lbs, _ = _spec_backward_graph(
         sb_r, xl, xh, gg, spec_ew, list(range(len(queries))), len(sb_r),
         device, dtype, op_bounds=ob_r)
@@ -10314,6 +10331,13 @@ def _nonlinear_alpha_opt(graph, spec, settings, t_start, total_timeout,
         dmar = torch.stack([qm[idx].max() for idx in grp_idx])
         spec_margin = dmar.min()
         _smf = float(spec_margin.detach())   # scalar for logging/checks
+        if print_progress and (it == 0 or _smf > best):
+            _dm = dmar.detach().cpu().numpy()
+            _nclosed = int((_dm > 0).sum())
+            _worst = sorted(float(x) for x in _dm)[:6]
+            print(f'[nl_alpha] iter={it}: spec_margin={_smf:.3e} '
+                  f'closed={_nclosed}/{len(_dm)} worst6='
+                  f'{[f"{x:.3e}" for x in _worst]}', flush=True)
         best = max(best, _smf)
         # Nonlinear-augment float32 guard (see spec.VNNSpec.check): require the
         # spec margin to clear `unsat_margin_bloat` before declaring verified.
@@ -10489,7 +10513,7 @@ def _verify_nonlinear_graph(graph, spec, settings, t_start, total_timeout):
     # those, branch on NONLINEAR-OP PRE-ACTIVATIONS instead (α,β-CROWN's
     # nonlinear_split): splitting a Sqr/Sigmoid/Sin/Cos input range tightens
     # that op's relaxation AND every downstream bilinear Mul that consumes it.
-    max_var = int(getattr(settings, 'trig_bab_max_var', 28))
+    max_var = int(getattr(settings, 'nonlinear_input_split_max_var', 28))
     if n_var > max_var:
         return _verify_trig_nonlinear_split(
             graph, spec, settings, gg, xl0, xh0, dt, device, deadline,
@@ -10533,17 +10557,41 @@ def _verify_nonlinear_graph(graph, spec, settings, t_start, total_timeout):
     closed = 0
     opened = 0
     abandoned = 0
+    _hb_t = _time.perf_counter()          # heartbeat timer
+    _max_depth_seen = 0
+    _best_margin = None                    # best (largest) worst-disjunct margin seen
     try:
         while queue:
-            if _time.perf_counter() >= deadline:
+            _now = _time.perf_counter()
+            if _now >= deadline:
+                if print_progress:
+                    print(f'[trig_bab] input-split TIMEOUT: opened={opened} '
+                          f'closed={closed} queue={len(queue)} '
+                          f'max_depth={_max_depth_seen} best_margin='
+                          f'{"n/a" if _best_margin is None else f"{_best_margin:.3e}"}',
+                          flush=True)
                 _restore()
                 return 'unknown', {'method': 'trig_input_split',
                                    'reason': 'timeout', 'leaves_closed': closed}
+            if print_progress and _now - _hb_t >= 5.0:
+                print(f'[trig_bab] input-split heartbeat: opened={opened} '
+                      f'closed={closed} queue={len(queue)} depth={_max_depth_seen} '
+                      f'best_margin='
+                      f'{"n/a" if _best_margin is None else f"{_best_margin:.3e}"} '
+                      f'elapsed={_now - t_start:.0f}s', flush=True)
+                _hb_t = _now
             xl, xh, depth = queue.pop()
+            _max_depth_seen = max(_max_depth_seen, depth)
             v, d, zf = _leaf(xl, xh)
             if v == 'verified':
                 closed += 1
                 continue
+            try:
+                _wm = float(np.max(d)) if d is not None else None
+                if _wm is not None and (_best_margin is None or _wm > _best_margin):
+                    _best_margin = _wm
+            except (TypeError, ValueError):
+                pass
             opened += 1
             di = _split_dim(xl, xh, zf)
             # Can't split a (near-)degenerate box, or hit an optional cap:

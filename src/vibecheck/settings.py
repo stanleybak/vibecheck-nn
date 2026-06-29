@@ -526,6 +526,13 @@ def default_settings(**overrides):
         # the bound up (118-linear-residual nl_alpha margin -38.69). Exact rewrite;
         # off by default (only the linear-surrogate ml4acopf variants need it).
         merge_relu_lookup_table=False,
+        # Max number of VARYING input dims for which the nonlinear-physics BaB
+        # (_verify_nonlinear_graph) uses INPUT-split branch-and-bound. Above this,
+        # it switches to nonlinear-OP-clamp split (_verify_trig_nonlinear_split),
+        # which branches the few nonlinear ops instead of the (here 22-dim) input
+        # box — better when the net is mostly stable and input-split would be
+        # near-exponential. (Was the hardcoded `trig_bab_max_var=28`.)
+        nonlinear_input_split_max_var=28,
         # Per-intermediate-node α-CROWN bound refinement (alpha_crown.
         # refine_intermediate_bounds_per_node). Tightens each nonlinear layer's
         # OWN pre-activation bound with a separate α per neuron (ABC's
