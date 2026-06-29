@@ -161,8 +161,18 @@ def _torch_op(op_type, inputs, attrs):
     if op_type == 'Shape':
         return torch.tensor(list(inputs[0].shape))
     if op_type == 'Gather':
+        # ONNX Gather (= numpy.take along `axis`): output rank = data.rank +
+        # indices.rank - 1. A 0-d (scalar) index DROPS the gathered axis; an N-d
+        # index inserts its shape at the axis. index_select (1-d index only, axis
+        # always kept) was wrong for both, diverging the rank in shape subgraphs
+        # (Shape->Gather->Unsqueeze->Concat). Negative indices wrap (ONNX-legal).
+        data = inputs[0]
+        idx = inputs[1].long()
         axis = int(attrs.get('axis', 0))
-        return inputs[0].index_select(axis, inputs[1].long())
+        axis = axis if axis >= 0 else axis + data.ndim
+        flat = data.index_select(axis, (idx % data.shape[axis]).reshape(-1))
+        new_shape = list(data.shape[:axis]) + list(idx.shape) + list(data.shape[axis + 1:])
+        return flat.reshape(new_shape)
     if op_type == 'Sin':
         return torch.sin(inputs[0])
     if op_type == 'Cos':
@@ -224,6 +234,52 @@ def _torch_op(op_type, inputs, attrs):
                 return inputs[0]
             axes = list(range(inputs[0].ndim))
         return torch.sum(inputs[0], dim=tuple(axes), keepdim=keepdims)
+    if op_type == 'ReduceMean':
+        # Mean over `axes` — same axes/keepdims/empty handling as ReduceSum
+        # (vit_2023 axes=[1] keepdims=0; smart_turn layernorm axes=[-1] keepdims=1).
+        keepdims = bool(attrs.get('keepdims', 1))
+        noop_empty = bool(attrs.get('noop_with_empty_axes', 0))
+        if len(inputs) > 1 and inputs[1] is not None:
+            axes = [int(a) for a in inputs[1].reshape(-1).tolist()]
+        else:
+            axes = [int(a) for a in attrs.get('axes', [])]
+        if not axes:
+            if noop_empty:
+                return inputs[0]
+            axes = list(range(inputs[0].ndim))
+        return torch.mean(inputs[0], dim=tuple(axes), keepdim=keepdims)
+    if op_type == 'LeakyRelu':
+        return F.leaky_relu(inputs[0], negative_slope=float(attrs.get('alpha', 0.01)))
+    if op_type == 'Sign':
+        return torch.sign(inputs[0])
+    if op_type == 'Erf':
+        return torch.erf(inputs[0])
+    if op_type == 'Sqrt':
+        return torch.sqrt(inputs[0])
+    if op_type == 'Dropout':
+        # Inference: identity (drop is a no-op at test time). The benchmark nets
+        # declare a single output (no mask).
+        return inputs[0]
+    if op_type == 'GlobalAveragePool':
+        # Average over all spatial dims (everything after N, C), keepdims.
+        x = inputs[0]
+        return x.mean(dim=tuple(range(2, x.ndim)), keepdim=True)
+    if op_type == 'Split':
+        # axis + EXPLICIT split sizes ('split' input opset>=13, else attribute) —
+        # the only form in the benchmarks (collins_aero axis=4 split=[2,2,7];
+        # nn4sys axis=-1 split=[6,1]). Returns a tuple -> onnx_forward maps it to
+        # the node's multiple outputs. Equal-split (no sizes) needs the output
+        # count, which _torch_op can't see, so it raises rather than guess.
+        axis = int(attrs.get('axis', 0))
+        if len(inputs) > 1 and inputs[1] is not None:
+            sizes = [int(s) for s in inputs[1].reshape(-1).tolist()]
+        elif 'split' in attrs:
+            sizes = [int(s) for s in attrs['split']]
+        else:
+            raise NotImplementedError(
+                'onnx_torch_runner: Split without explicit split sizes '
+                '(equal-split needs the output count, unavailable here)')
+        return torch.split(inputs[0], sizes, dim=axis)
     raise NotImplementedError(f'onnx_torch_runner: unsupported op {op_type!r}')
 
 

@@ -174,6 +174,98 @@ def test_runner_reducesum_attr_and_empty_axes():
     assert torch.allclose(out_none, x.sum(dim=1))
 
 
+def test_runner_gather_scalar_index_drops_axis():
+    """ONNX Gather output rank = data.rank + indices.rank - 1, so a 0-d (scalar)
+    index REMOVES the gathered axis (matches numpy.take / onnxruntime). The old
+    index_select kept the axis (and can't take a 0-d index at all) -> rank
+    divergence that broke shape subgraphs Shape->Gather->Unsqueeze->Concat
+    ->Reshape (vit_2023 /0/Concat_1: Unsqueeze gave (1,1) vs ORT's (1,))."""
+    data = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    # scalar index on axis 0 -> shape (4,)  (numpy: data[2])
+    out = _torch_op('Gather', [data, torch.tensor(2)], {'axis': 0})
+    assert out.shape == (4,) and torch.equal(out, data[2])
+    # scalar index on axis 1 -> shape (3,)
+    out1 = _torch_op('Gather', [data, torch.tensor(1)], {'axis': 1})
+    assert out1.shape == (3,) and torch.equal(out1, data[:, 1])
+    # 1-D index: axis KEPT at len(idx) (unchanged behaviour)
+    out2 = _torch_op('Gather', [data, torch.tensor([0, 2])], {'axis': 0})
+    assert out2.shape == (2, 4) and torch.equal(out2, data[[0, 2]])
+    # negative axis
+    out3 = _torch_op('Gather', [data, torch.tensor([1, 3])], {'axis': -1})
+    assert out3.shape == (3, 2) and torch.equal(out3, data[:, [1, 3]])
+    # N-D index inserts the index shape at the axis
+    out4 = _torch_op('Gather', [data, torch.tensor([[0, 1], [2, 0]])], {'axis': 0})
+    assert out4.shape == (2, 2, 4)
+
+
+def test_runner_leakyrelu_sign_erf_sqrt():
+    """Elementwise ops added to clear the CE-search NotImplementedError surface:
+    LeakyRelu (collins_aerospace yolov5, alpha=0.1), Sign (traffic_signs),
+    Erf/Sqrt (smart_turn encoder)."""
+    import torch.nn.functional as _F
+    x = torch.tensor([-2.0, -0.5, 0.0, 0.5, 2.0])
+    assert torch.allclose(_torch_op('LeakyRelu', [x], {'alpha': 0.1}),
+                          _F.leaky_relu(x, 0.1))
+    assert torch.allclose(_torch_op('LeakyRelu', [x], {}),     # default alpha 0.01
+                          _F.leaky_relu(x, 0.01))
+    assert torch.equal(_torch_op('Sign', [x], {}), torch.sign(x))
+    assert torch.allclose(_torch_op('Erf', [x], {}), torch.erf(x))
+    xp = x.abs()
+    assert torch.allclose(_torch_op('Sqrt', [xp], {}), torch.sqrt(xp))
+
+
+def test_runner_dropout_identity():
+    """Dropout is a no-op at inference (vggnet16, collins_rul declare nout=1)."""
+    x = torch.randn(3, 4)
+    assert torch.equal(_torch_op('Dropout', [x], {'ratio': 0.5}), x)
+
+
+def test_runner_global_average_pool():
+    """GlobalAveragePool: mean over all spatial dims, keepdims (smart_turn video
+    backbone)."""
+    x = torch.randn(1, 3, 5, 7)
+    out = _torch_op('GlobalAveragePool', [x], {})
+    assert out.shape == (1, 3, 1, 1)
+    assert torch.allclose(out, x.mean(dim=(2, 3), keepdim=True))
+
+
+def test_runner_reducemean():
+    """ReduceMean mirrors ReduceSum (vit_2023 axes=[1] keepdims=0; smart_turn
+    layernorm axes=[-1] keepdims=1)."""
+    x = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    assert torch.allclose(_torch_op('ReduceMean', [x], {'axes': [1], 'keepdims': 0}),
+                          x.mean(dim=1))
+    assert torch.allclose(_torch_op('ReduceMean', [x], {'axes': [-1], 'keepdims': 1}),
+                          x.mean(dim=-1, keepdim=True))
+    # axes as tensor input (opset>=18)
+    assert torch.allclose(_torch_op('ReduceMean', [x, torch.tensor([0])], {'keepdims': 0}),
+                          x.mean(dim=0))
+    # empty axes -> reduce all (keepdims=1 default)
+    assert torch.allclose(_torch_op('ReduceMean', [x], {}), x.mean().reshape(1, 1))
+    # noop_with_empty_axes=1 -> identity
+    assert torch.equal(_torch_op('ReduceMean', [x], {'noop_with_empty_axes': 1}), x)
+    # axes input present but None -> attribute fallback
+    assert torch.allclose(_torch_op('ReduceMean', [x, None], {'axes': [1], 'keepdims': 0}),
+                          x.mean(dim=1))
+
+
+def test_runner_split():
+    """Split with explicit sizes — the only form in the benchmarks (collins_aero
+    axis=4 split=[2,2,7]; nn4sys axis=-1 split=[6,1]). Returns a tuple that
+    onnx_forward maps to the node's multiple outputs."""
+    import pytest
+    x = torch.arange(22, dtype=torch.float32).reshape(2, 11)
+    parts = _torch_op('Split', [x], {'axis': 1, 'split': [2, 2, 7]})
+    assert len(parts) == 3 and [p.shape[1] for p in parts] == [2, 2, 7]
+    assert torch.equal(torch.cat(parts, dim=1), x)
+    # sizes via tensor input (opset>=13)
+    parts2 = _torch_op('Split', [x, torch.tensor([6, 5])], {'axis': 1})
+    assert len(parts2) == 2 and parts2[0].shape[1] == 6
+    # no sizes -> clear NotImplementedError (output count unknowable in _torch_op)
+    with pytest.raises(NotImplementedError):
+        _torch_op('Split', [x], {'axis': 1})
+
+
 def test_runner_slice_negative_axis_and_attr_form():
     data = torch.arange(12).reshape(3, 4).float()
     # negative axis (-1), default steps
