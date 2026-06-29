@@ -493,6 +493,18 @@ def _verify(args, sat_state=None):
         # nets (what the scorer replays) and require a STRICT violation, not the
         # merge-approximated closure (`verify_graph._try_clear_ce_upgrade`).
         settings.pair_cex_info = getattr(args, 'pair_cex_info', None)
+        # Nonlinear-AUGMENT analogue of pair_cex_info: the SAT chokepoint validated
+        # the witness on the AUGMENTED net (constraint polynomials in float32,
+        # CLOSURE `<=`), which accepts a measure-zero boundary point (e.g. Y lands
+        # exactly on a strict `>` threshold). Expose a validator that CE-checks the
+        # witness against the ORIGINAL v2 net+spec the way the official scorer does
+        # (float32 ORT replay, output-strict), so verify_graph's clear-CE upgrade can
+        # require a STRICT violation and search deeper for one (it exists when the
+        # net's true extremum strictly exceeds the threshold). Augment runs only.
+        if getattr(args, 'orig_net_for_cex', None) is not None:
+            settings.augment_cex_validator = (
+                lambda w: _validate_cex_v2_competition(
+                    args, spec, w, cex_fmt=settings.counterexample_precision)[0])
         print(f'Running graph verification (device={args.device}, '
               f'impl={settings.graph_impl}, profile={settings._profile}, '
               f'timeout={args.timeout}s)...')
@@ -625,6 +637,30 @@ def _verify(args, sat_state=None):
             # verdict is bit-identical to the competition checker (see
             # tests/test_competition_cex_equiv.py), so we get the competition's
             # exact semantics without paying its per-assertion cost in the sweep.
+            #
+            # AUGMENT-ONLY backstop: a nonlinear-v2 augmented `sat` is primarily
+            # gated INSIDE verify_graph — the shared `_sat_disposition` classifier
+            # only commits `sat` when the witness STRICTLY violates the ORIGINAL v2
+            # spec (output-strict), so every graph sat path (Phase-0 PGD, trig_bab,
+            # the nominal probe, MILP) keeps searching past a boundary CE instead of
+            # emitting it. This terminal re-check only fires for an augment `sat` that
+            # reaches emit WITHOUT going through that classifier (e.g. a non-graph
+            # route), so it can never emit a witness the official scorer would reject.
+            if line == 'sat' and getattr(args, 'orig_net_for_cex', None) is not None:
+                # Validation-only BACKSTOP. The augment SAT search itself
+                # (verify_graph `_sat_disposition`) already requires a STRICT violation
+                # of the ORIGINAL v2 spec before committing `sat`, so a witness reaching
+                # here is normally already valid. This re-check only guards an augment
+                # `sat` that arrived via some other path; if it's only a boundary on
+                # the original spec, downgrade rather than emit a scorer-penalty.
+                _acc, _res, _msg = _validate_cex_v2_competition(
+                    args, spec, _w_final,
+                    cex_fmt=settings.counterexample_precision)
+                if not _acc:
+                    print('  [validate] augment SAT witness rejected on the ORIGINAL '
+                          f'v2 spec ({_res}: {_msg}) — downgrading, not emitting SAT')
+                    line = 'timeout' if timed_out else 'unknown'
+                    _w_final = None
         if line == 'unknown' and (
                 timed_out or (args.timeout is not None and t_total >= args.timeout - 2.0)):
             line = 'timeout'

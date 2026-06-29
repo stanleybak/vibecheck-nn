@@ -5232,13 +5232,30 @@ def _compute_avg_layer_width(gg, bounds_by_relu):
 def _sat_disposition(graph, spec, settings, witness, info):
     """Classify an ORT-VALIDATED sat witness (from `_validate_sat_witness`, ok=True).
 
-    Always returns 'real'. Under the VNN-COMP 2026 output-strict rule the validation
-    gate runs with out_atol=0 and only admits a genuine violation (worst margin
-    <= 0 for the spec's `<=`/`>=` comparison), so any witness reaching here IS a real
-    counterexample — commit 'sat' and stop. There is no within-output-tolerance
-    near-miss any more (that emit-early-then-keep-searching path is removed); the
-    return value is kept for the call sites that branch on it.
-    """
+    Returns 'real' (commit 'sat') or 'within_tol' (a non-committal CE — every caller
+    treats a non-'real' value as "keep searching"). This is the SINGLE shared
+    classifier all the graph sat paths funnel through (`_finalize`, the nonlinear
+    nominal probe, trig_bab's `_try_witness`), so the augment rule below applies to
+    every one of them at once.
+
+    Standard runs: any witness reaching here passed the out_atol=0 gate, so it IS a
+    genuine violation -> 'real'.
+
+    NONLINEAR-AUGMENT runs: the gate ran on the AUGMENTED net+spec (constraint
+    polynomials, float32, CLOSURE `<=`), which a measure-zero boundary point (output
+    landing exactly on a strict `>`/`<` threshold) satisfies but the official scorer
+    (output-STRICT on the ORIGINAL v2 spec) does NOT award. Require a STRICT
+    violation of the ORIGINAL spec (`augment_cex_validator`, float32 ORT = the
+    scorer's exact check); a boundary hit -> 'within_tol' so the search keeps going
+    (the strict CE lives in a thin-but-nonempty region PGD is drawn toward)."""
+    _augval = getattr(settings, 'augment_cex_validator', None)
+    if _augval is not None:
+        if _augval(witness):
+            return 'real'
+        if getattr(settings, 'print_progress', False):
+            print('  [augment] CE meets the closure but not the STRICT original v2 '
+                  'spec; not committing, continuing the search', flush=True)
+        return 'within_tol'
     return 'real'
 
 
@@ -10415,8 +10432,9 @@ def _verify_nonlinear_graph(graph, spec, settings, t_start, total_timeout):
             def _try_witness(_w):
                 """ORT-validate + dispose a candidate witness. Returns the
                 ('sat', details) tuple for a CLEAR CE (commit now); None for a
-                within-tol CE (persisted by `_sat_disposition`, keep searching)
-                or a witness ORT rejects."""
+                within-tol CE (keep searching) or a witness ORT rejects. The augment
+                STRICT-original rule lives in the shared `_sat_disposition`, so a
+                boundary hit returns None here and the PGD loop keeps attacking."""
                 _w = np.asarray(_w).flatten()
                 _ok, _vinfo = _validate_sat_witness(_onnx_p, spec, _w,
                                                     atol=_atol,
