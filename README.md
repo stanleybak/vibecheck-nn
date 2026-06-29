@@ -108,6 +108,5 @@ any row to reproduce a specific case.
 
 ## Contributors
 
-[Stanley Bak](https://stanleybak.com) (lead)
-
-Doug Wehbe (testing)
+* [Stanley Bak](https://stanleybak.com) (lead)
+* Doug Wehbe (testing)
