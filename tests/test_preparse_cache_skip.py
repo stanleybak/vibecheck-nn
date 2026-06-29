@@ -14,9 +14,26 @@ the same parse at verify time, so a genuine loader bug still surfaces loudly the
 only the optional cache is skipped. This test also pins that we DON'T swallow
 unexpected exception types (no broad `except Exception`).
 """
+import gzip
+import hashlib
+
 import pytest
 
 import vibecheck.preparse as pp
+
+
+def test_file_sha1_resolves_gz_sibling(tmp_path):
+    """Benchmarks ship gzipped; instances.csv names the un-gz file. `_file_sha1`
+    must key on the `.gz` bytes when only the `.gz` exists (else the whole
+    pre-parse cache silently FileNotFoundError'd for every gzipped benchmark).
+    Regression for the cgan/nn4sys prepare-cache crash masked as status=ok."""
+    payload = b'fake onnx/vnnlib bytes'
+    gz = tmp_path / 'model.onnx.gz'
+    with gzip.open(gz, 'wb') as f:
+        f.write(payload)
+    bare = str(tmp_path / 'model.onnx')          # does NOT exist; only the .gz does
+    expect = hashlib.sha1(gz.read_bytes()).hexdigest()   # sha1 of the .gz bytes
+    assert pp._file_sha1(bare) == expect          # resolves the .gz sibling, no crash
 
 
 def test_skips_uncacheable_vnnlib_keeps_onnx(monkeypatch, capsys):

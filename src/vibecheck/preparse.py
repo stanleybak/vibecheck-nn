@@ -57,7 +57,17 @@ def cache_dir():
 
 def _file_sha1(path):
     """Streaming sha1 of a file's raw bytes (chunked so a 500 MB ONNX doesn't
-    land in memory all at once)."""
+    land in memory all at once).
+
+    Resolves a `.gz` sibling when the literal path is absent: the benchmarks ship
+    gzipped and instances.csv names the UN-gz file (`foo.onnx`), while only
+    `foo.onnx.gz` exists on disk. The graph/spec loaders already decompress
+    transparently — only this content-key did not, so the whole pre-parse cache
+    silently failed (FileNotFoundError, masked by run_instance.sh's `|| WARNING`)
+    for every gzipped benchmark. Keying on the `.gz` bytes is consistent across
+    prepare (write) and the timed run (load), so the cache now actually hits."""
+    if not os.path.isfile(path) and os.path.isfile(str(path) + '.gz'):
+        path = str(path) + '.gz'
     h = hashlib.sha1()
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(1 << 20), b''):

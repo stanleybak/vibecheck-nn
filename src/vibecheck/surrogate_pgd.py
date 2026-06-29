@@ -96,6 +96,11 @@ def resolve_saturation(settings, log=print):
 
 
 def _load_onnx_model(path):
+    # Benchmarks ship gzipped and instances.csv names the UN-gz file (`foo.onnx`)
+    # while only `foo.onnx.gz` exists; resolve the .gz sibling so the quantized-op
+    # probe (the first thing prepare does) doesn't crash on every gzipped net.
+    if not os.path.isfile(path) and os.path.isfile(path + '.gz'):
+        path = path + '.gz'
     if path.endswith('.gz'):
         with gzip.open(path) as fh:
             return onnx.load_model_from_string(fh.read())
