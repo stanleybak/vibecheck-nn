@@ -143,6 +143,37 @@ def test_pgd_accept_margin_demands_clear_ce(tmp_path):
     assert sat2 is True and float(wit2.flatten()[0]) <= -0.5 + 1e-5
 
 
+def test_runner_reducesum_axes_input():
+    """ReduceSum with axes as a tensor input (ONNX opset>=13) — the form used by
+    lsnc_relu's relu_quadrotor2d_state net (/lyapunov/ReduceSum etc.; axes=[1] or
+    [-1], keepdims=1). ReduceSum was the SOLE unsupported op in that net, so the
+    clear-CE upgrade's pgd_via_onnx raised NotImplementedError and turned 3 valid
+    sat (quadrotor2d_state 26/45/74) into `error`."""
+    x = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    out = _torch_op('ReduceSum', [x, torch.tensor([1])], {'keepdims': 1})
+    assert torch.allclose(out, x.sum(dim=1, keepdim=True)) and out.shape == (3, 1)
+    # negative axis + keepdims=0
+    out0 = _torch_op('ReduceSum', [x, torch.tensor([-1])], {'keepdims': 0})
+    assert torch.allclose(out0, x.sum(dim=-1)) and out0.shape == (3,)
+
+
+def test_runner_reducesum_attr_and_empty_axes():
+    """ReduceSum opset<13 attribute form + the empty-axes cases."""
+    x = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    # opset<13: axes is an attribute, no tensor input
+    out = _torch_op('ReduceSum', [x], {'axes': [0], 'keepdims': 0})
+    assert torch.allclose(out, x.sum(dim=0))
+    # empty axes + default noop_with_empty_axes=0 -> reduce ALL dims (keepdims=1)
+    allsum = _torch_op('ReduceSum', [x], {'keepdims': 1})
+    assert torch.allclose(allsum, x.sum().reshape(1, 1))
+    # empty axes + noop_with_empty_axes=1 -> identity (no reduction)
+    noop = _torch_op('ReduceSum', [x], {'noop_with_empty_axes': 1})
+    assert torch.equal(noop, x)
+    # axes input present but None -> falls back to the attribute form
+    out_none = _torch_op('ReduceSum', [x, None], {'axes': [1], 'keepdims': 0})
+    assert torch.allclose(out_none, x.sum(dim=1))
+
+
 def test_runner_slice_negative_axis_and_attr_form():
     data = torch.arange(12).reshape(3, 4).float()
     # negative axis (-1), default steps

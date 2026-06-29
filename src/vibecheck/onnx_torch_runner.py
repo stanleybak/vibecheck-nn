@@ -207,6 +207,23 @@ def _torch_op(op_type, inputs, attrs):
             ax = ax if ax >= 0 else ax + data.ndim
             sl[ax] = slice(s, e, st)
         return data[tuple(sl)]
+    if op_type == 'ReduceSum':
+        # Sum over `axes`. opset>=13 passes axes as input[1] (a tensor); opset<13
+        # as the `axes` attribute. keepdims (default 1) retains reduced dims as
+        # size 1. noop_with_empty_axes (default 0): when axes is empty, 0 => reduce
+        # ALL axes, 1 => identity. (lsnc_relu relu_quadrotor2d_state: axes-input
+        # [1]/[-1], keepdims=1.)
+        keepdims = bool(attrs.get('keepdims', 1))
+        noop_empty = bool(attrs.get('noop_with_empty_axes', 0))
+        if len(inputs) > 1 and inputs[1] is not None:
+            axes = [int(a) for a in inputs[1].reshape(-1).tolist()]
+        else:
+            axes = [int(a) for a in attrs.get('axes', [])]
+        if not axes:
+            if noop_empty:
+                return inputs[0]
+            axes = list(range(inputs[0].ndim))
+        return torch.sum(inputs[0], dim=tuple(axes), keepdim=keepdims)
     raise NotImplementedError(f'onnx_torch_runner: unsupported op {op_type!r}')
 
 
