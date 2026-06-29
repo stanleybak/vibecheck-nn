@@ -243,9 +243,27 @@ def main():
                   f'{p}, {fq}' + (f', {_bc}' if _bc else ''))
             sys.exit(0)
         _require_input_file(args.spec, 'spec (--spec)')   # non-quant prepare needs the spec
+        # Mirror the RUN's routing (STRUCTURALLY, no config needed — prepare gets no
+        # --config) so the cache holds what the timed run actually loads. Just like
+        # the network-pair merge above self-gates on the net-field shape,
+        # `_maybe_nonlinear_augment` self-gates on `is_nonlinear_v2_spec(spec)` — a
+        # property of the PROBLEM (a degree>=2 / X*Y atom in the spec), which only a
+        # nonlinear-v2 augment instance (adaptive_cruise) has. For such an instance it
+        # builds the augment (untimed, incl. its ORT oracle) and rewrites
+        # args.net/args.spec to the AUGMENTED net + linear v1 spec; the augment is a
+        # pure function of (net, spec) with deterministic paths and
+        # `build_augmented_instance` is idempotent, so the timed run reuses these
+        # artifacts (no rebuild) and load-cache-hits the augmented graph + spec below.
+        # No-op for every linear spec.
+        _maybe_nonlinear_augment(args)
         from .preparse import write_cache
         onnx_pkl, vnnlib_pkl = write_cache(args.net, args.spec, _DTYPES[args.dtype])
-        print(f'Wrote pre-parse caches:\n  graph: {onnx_pkl}\n  spec:  {vnnlib_pkl}')
+        # Either may be None = that part was logged + skipped (uncacheable net/spec);
+        # the timed run parses it from source. Report honestly so the prepare log
+        # doesn't imply a cache was written when it wasn't.
+        print('Pre-parse caches:\n'
+              f'  graph: {onnx_pkl if onnx_pkl else "(skipped — parsed at run time)"}\n'
+              f'  spec:  {vnnlib_pkl if vnnlib_pkl else "(skipped — parsed at run time)"}')
         sys.exit(0)
 
     # Resolve the counterexample on-disk FORMAT version once, from the original spec

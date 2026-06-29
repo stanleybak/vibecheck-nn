@@ -178,10 +178,41 @@ def load_vnnlib_cache(vnnlib_path):
         return None
 
 
+# A net/spec the pre-parse cache cannot build. NOT a bug and NOT swallowed-silently:
+# the cache is a pure PERF optimization, and the timed run re-parses from source
+# (the authoritative path) — nonlinear-v2 specs go through the augment, cctsdb_yolo
+# nets through the custom YOLO handler, neither of which uses these caches. So we
+# LOG the skip explicitly and continue. This catch is safe vs the no-swallow rule:
+# for any benchmark whose RUN does use load_onnx/load_vnnlib, the same parse runs at
+# verify time too, so a genuine loader bug still surfaces LOUDLY there (recorded as
+# 'error') — it is never hidden, only the (optional) cache for it is skipped.
+#   NotImplementedError: vnnlib_loader rejects a degree>=2 (nonlinear) spec atom.
+#   ValueError / IndexError: onnx_loader shape inference on an unsupported net.
+_UNCACHEABLE = (NotImplementedError, ValueError, IndexError)
+
+
 # ------------------------------------------------------------------- combined API
 def write_cache(onnx_path, vnnlib_path, dtype):
-    """Cache both the ONNX graph and the VNNLIB spec. Returns (onnx_pkl, vnnlib_pkl)."""
-    return write_onnx_cache(onnx_path, dtype), write_vnnlib_cache(vnnlib_path)
+    """Cache both the ONNX graph and the VNNLIB spec. Returns (onnx_pkl, vnnlib_pkl);
+    either element is None when that part could not be pre-parsed (logged + skipped —
+    the timed run parses it from source). A failure to cache one never aborts the
+    other."""
+    try:
+        onnx_pkl = write_onnx_cache(onnx_path, dtype)
+    except _UNCACHEABLE as e:
+        print(f'  [prepare] onnx pre-parse cache SKIPPED for '
+              f'{os.path.basename(onnx_path)} ({type(e).__name__}: {e}); the timed '
+              f'run will parse this net from source.', flush=True)
+        onnx_pkl = None
+    try:
+        vnnlib_pkl = write_vnnlib_cache(vnnlib_path)
+    except _UNCACHEABLE as e:
+        print(f'  [prepare] vnnlib pre-parse cache SKIPPED for '
+              f'{os.path.basename(vnnlib_path)} ({type(e).__name__}: {e}); the timed '
+              f'run will parse this spec from source (e.g. nonlinear-v2 -> augment).',
+              flush=True)
+        vnnlib_pkl = None
+    return onnx_pkl, vnnlib_pkl
 
 
 def load_cache(onnx_path, vnnlib_path, dtype):
