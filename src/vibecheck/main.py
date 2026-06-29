@@ -234,8 +234,18 @@ def main():
             if os.path.isfile(args.spec) or os.path.isfile(str(args.spec) + '.gz'):
                 import pickle
                 _bc = _box_cache_path(args.spec)
-                with open(_bc, 'wb') as _bf:
+                # ATOMIC write (temp + fsync + os.replace): a prepare interrupted
+                # mid-write (e.g. killed by a concurrent prepare's zombie-cleanup)
+                # must never leave a torn/0-byte cache for the timed run to choke on.
+                _bctmp = _bc + '.tmp'
+                with open(_bctmp, 'wb') as _bf:
                     pickle.dump(sp.parse_box_and_output(args.spec), _bf)
+                    _bf.flush()
+                    os.fsync(_bf.fileno())
+                os.replace(_bctmp, _bc)
+                # Size log so a truncated/empty cache is visible in the prepare log.
+                print(f'  [prepare] wrote box cache {_bc} '
+                      f'({os.path.getsize(_bc)} bytes)')
             else:
                 print(f'  [prepare] no spec file at {args.spec!r}; box cache '
                       f'skipped (timed run will parse the spec)')
@@ -403,12 +413,14 @@ def _verify(args, sat_state=None):
     # the explicit unsafe-pkl flag.
     graph = spec = None
     if args.allow_unsafe_pkl_loading:
-        from .preparse import load_cache
+        from .preparse import load_cache, onnx_pkl_path, vnnlib_pkl_path
         graph, spec = load_cache(args.net, args.spec, dtype)
         if graph is not None:
-            print(f'Loaded pre-parse graph cache for {os.path.basename(args.net)}')
+            _gp = onnx_pkl_path(args.net)
+            print(f'Loaded pre-parse graph cache {_gp} ({os.path.getsize(_gp)} bytes)')
         if spec is not None:
-            print(f'Loaded pre-parse spec cache for {os.path.basename(args.spec)}')
+            _sp = vnnlib_pkl_path(args.spec)
+            print(f'Loaded pre-parse spec cache {_sp} ({os.path.getsize(_sp)} bytes)')
 
     if graph is None:
         print(f'Loading network: {args.net}')
@@ -959,15 +971,27 @@ def _box_cache_path(spec_path):
 
 def _load_or_parse_box(args):
     """The surrogate box spec: load the prepare-pkl cache when present (and pkl
-    loading is allowed), else parse `args.spec`. One parse, shared attack+emit."""
+    loading is allowed), else parse `args.spec`. One parse, shared attack+emit.
+
+    SELF-HEALING: a corrupt/empty box cache (e.g. a prepare interrupted mid-write
+    leaves a 0-byte pkl -> pickle.load raises EOFError) must NOT crash the timed run.
+    We catch the load failure, LOG it, and fall back to parsing the spec ourselves —
+    the cache is a pure optimization, the parse is the source of truth. (Mirrors the
+    graph/spec load_cache, which already returns None -> re-parse on a bad cache.)"""
     from . import surrogate_pgd as sp
+    import pickle
     if getattr(args, 'allow_unsafe_pkl_loading', False):
         cp = _box_cache_path(args.spec)
         if os.path.exists(cp):
-            import pickle
-            with open(cp, 'rb') as f:
-                print(f'Loaded surrogate box cache: {cp}')
-                return pickle.load(f)
+            try:
+                with open(cp, 'rb') as f:
+                    box = pickle.load(f)
+                print(f'Loaded surrogate box cache {cp} ({os.path.getsize(cp)} bytes)')
+                return box
+            except (EOFError, pickle.UnpicklingError, OSError, ValueError,
+                    AttributeError, ImportError) as e:
+                print(f'  [warn] surrogate box cache {cp} unreadable '
+                      f'({type(e).__name__}: {e}); re-parsing the spec instead')
     return sp.parse_box_and_output(args.spec)
 
 

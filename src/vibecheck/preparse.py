@@ -107,7 +107,11 @@ def _write(path, meta, obj):
     with open(tmp, 'wb') as f:
         pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    # Size log so a truncated/empty cache is visible in the prepare log.
+    print(f'  [prepare] wrote {path} ({os.path.getsize(path)} bytes)', flush=True)
 
 
 # --------------------------------------------------------------------- ONNX graph

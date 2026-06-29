@@ -25,6 +25,16 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 
+def _atomic_onnx_save(model, out_path):
+    """Save an ONNX model ATOMICALLY (temp + os.replace): a surrogate build
+    interrupted mid-write (e.g. a concurrent prepare's zombie-cleanup) must never
+    leave a corrupt/0-byte .onnx that the timed run would then fail to load. (The
+    surrogate is rebuilt only when MISSING, not when corrupt — so prevent corrupt.)"""
+    tmp = out_path + '.tmp'
+    onnx.save(model, tmp)
+    os.replace(tmp, out_path)
+
+
 # --------------------------------------------------------------------------- detect
 
 def has_quantized_ops(onnx_path):
@@ -180,7 +190,7 @@ def build_float_surrogate(onnx_path, out_path):
     del m.opset_import[:]
     m.opset_import.extend(keep)
     m.ir_version = 8
-    onnx.save(m, out_path)
+    _atomic_onnx_save(m, out_path)
     return out_path
 
 
@@ -275,7 +285,7 @@ def build_fakequant_surrogate(onnx_path, out_path):
     del m.opset_import[:]
     m.opset_import.extend(keep)
     m.ir_version = 8
-    onnx.save(m, out_path)
+    _atomic_onnx_save(m, out_path)
     return out_path
 
 

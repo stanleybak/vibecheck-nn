@@ -72,3 +72,26 @@ def test_does_not_swallow_unexpected_exception(monkeypatch):
     monkeypatch.setattr(pp, 'write_vnnlib_cache', lambda p: '/cache/spec.vnnlib.pkl')
     with pytest.raises(KeyError):
         pp.write_cache('net.onnx', 'spec.vnnlib', 'float32')
+
+
+def test_load_or_parse_box_selfheals_on_corrupt_cache(monkeypatch, capsys, tmp_path):
+    """A 0-byte/corrupt surrogate box cache (e.g. a prepare interrupted mid-write)
+    must self-heal: log a warning and re-parse the spec, not crash with EOFError.
+    Regression for smart_turn instance_41 (run errored `EOFError: Ran out of input`
+    loading a truncated box pkl)."""
+    import os
+    import types
+    import vibecheck.main as m
+    import vibecheck.surrogate_pgd as sp
+
+    spec = str(tmp_path / 'x.vnnlib')
+    open(spec, 'w').write('(declare-const X_0 Real)')
+    cp = m._box_cache_path(spec)
+    os.makedirs(os.path.dirname(cp), exist_ok=True)
+    open(cp, 'wb').close()                                   # 0-byte cache
+    monkeypatch.setattr(sp, 'parse_box_and_output', lambda p: 'REPARSED_BOX')
+
+    args = types.SimpleNamespace(allow_unsafe_pkl_loading=True, spec=spec)
+    out = m._load_or_parse_box(args)
+    assert out == 'REPARSED_BOX'                             # fell back to parse
+    assert 'unreadable' in capsys.readouterr().out          # logged the anomaly
