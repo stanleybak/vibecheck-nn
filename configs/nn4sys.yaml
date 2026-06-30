@@ -22,4 +22,13 @@
 # to ~6670 subboxes unsat within budget). It is now ON by default (a sound
 # correctness fix, validated inert on the other bilinear benchmarks), so no
 # override is needed here.
+#
+# mscn_* ROUTING: these nets have both-vary bilinear Muls, so verify_graph's
+# nonlinear auto-router (_route_nonlinear, added in 762cc34) hijacks them into the
+# forward-zono nl_alpha path, which plateaus and times out (mscn_2048d
+# cardinality_0_1 regressed 20s -> timeout; +9 more mscn cases). Declaring the
+# batched input-split BaB as the intended strategy makes the router DEFER (the
+# same opt-out lsnc_relu got in fcb71d0), routing mscn back to the input-split
+# path that closes them (cardinality_0_1 -> unsat ~50s on AWS).
+input_split_batched_enabled: true
 
