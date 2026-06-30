@@ -1452,8 +1452,19 @@ class ComputeGraph:
         if getattr(settings, 'min_max_to_relu', True):
             min_max_to_relu(self)
         if getattr(settings, 'merge_relu_lookup_table', False):
-            from .onnx_optimizer import merge_relu_lookup_table
-            merge_relu_lookup_table(self)
+            # Size gate: the merged PWL band is looser than the expanded ReLU on
+            # SMALL nets (14_ieee ~6.5K params: merge loosens the root -> timeout)
+            # but needed on LARGE nets (118/300 ~292K-1.3M: expanded stack blows
+            # up). Only merge above the param threshold.
+            _min_params = int(getattr(settings,
+                                      'merge_relu_lookup_table_min_params', 0))
+            _nparams = sum(
+                v.size for n in self.nodes.values()
+                for v in (n.params.values() if getattr(n, 'params', None) else [])
+                if isinstance(v, np.ndarray))
+            if _nparams >= _min_params:
+                from .onnx_optimizer import merge_relu_lookup_table
+                merge_relu_lookup_table(self)
         if settings.optimize_relu_relation:
             fold_conv(self)
             fold_gemm(self)

@@ -133,6 +133,35 @@ def test_merge_creates_pwl_and_is_exact(tmp_path):
         torch.testing.assert_close(out, ref, atol=1e-6, rtol=0)
 
 
+def test_optimize_merge_gate_by_param_count(tmp_path):
+    """optimize() gates merge_relu_lookup_table on the net's parameter count
+    (merge_relu_lookup_table_min_params): large nets fold the lookup table to a
+    PWL node (the expanded ReLU stack blows the bound up), small nets keep the
+    expanded ReLU (its triangle relaxation is tighter). See ml4acopf 14_ieee
+    (~6.5K params, merge OFF) vs 118/300 (~292K-1.3M, merge ON)."""
+    from vibecheck.settings import default_settings
+    n = 5
+    off = [-1.5, 0.0, 0.8, 2.0]
+    w = [1.0, -2.0, 0.5, 1.5]
+    bias = 0.3
+    p = str(tmp_path / 'lut.onnx')
+    _lookup_table_onnx(p, n, off, w, bias)
+
+    # threshold 0 -> param count clears it -> merge runs -> PWL, ReLU gone.
+    g = ComputeGraph.from_onnx(p, dtype=np.float64)
+    g.optimize(default_settings(merge_relu_lookup_table=True,
+                                merge_relu_lookup_table_min_params=0))
+    assert sum(nd.op_type == 'PWLLookup' for nd in g.nodes.values()) == 1
+    assert not any(nd.op_type == 'Relu' for nd in g.nodes.values())
+
+    # threshold above this tiny net's param count -> merge skipped -> ReLU kept.
+    g2 = ComputeGraph.from_onnx(p, dtype=np.float64)
+    g2.optimize(default_settings(merge_relu_lookup_table=True,
+                                 merge_relu_lookup_table_min_params=10 ** 9))
+    assert not any(nd.op_type == 'PWLLookup' for nd in g2.nodes.values())
+    assert any(nd.op_type == 'Relu' for nd in g2.nodes.values())
+
+
 def test_merge_skips_nonmatching_graph(tmp_path):
     """A plain Gemm->Relu net has no lookup table -> merge is a no-op."""
     nodes = [helper.make_node('MatMul', ['X', 'W'], ['z']),

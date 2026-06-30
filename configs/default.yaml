@@ -138,6 +138,7 @@ max_tighten_layer: 3
 max_tighten_layer_lp: 2
 maxpool_to_relu: true
 merge_relu_lookup_table: false
+merge_relu_lookup_table_min_params: 50000
 milp_alpha_tighten: true
 milp_alpha_tighten_iters: 10
 milp_bound_inflation_atol: 1.0e-05

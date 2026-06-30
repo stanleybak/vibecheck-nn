@@ -526,6 +526,14 @@ def default_settings(**overrides):
         # the bound up (118-linear-residual nl_alpha margin -38.69). Exact rewrite;
         # off by default (only the linear-surrogate ml4acopf variants need it).
         merge_relu_lookup_table=False,
+        # Only apply merge_relu_lookup_table to nets with at least this many
+        # parameter elements. The PWL band the merge produces is LOOSER than the
+        # expanded ReLU stack on SMALL nets (14_ieee, ~6.5K params: merge ON ->
+        # backward-CROWN root 17/20 @ -2.54e-2 -> timeout; merge OFF -> 19/20 @
+        # -1.95e-2 -> unsat 11s), but TIGHTER on large nets where the expanded
+        # stack loses correlation (118/300, ~292K-1.3M params: merge needed,
+        # -38.69 -> -4.589). Threshold cleanly separates the two (45x gap).
+        merge_relu_lookup_table_min_params=50000,
         # Max number of VARYING input dims for which the nonlinear-physics BaB
         # (_verify_nonlinear_graph) uses INPUT-split branch-and-bound. Above this,
         # it switches to nonlinear-OP-clamp split (_verify_trig_nonlinear_split),
