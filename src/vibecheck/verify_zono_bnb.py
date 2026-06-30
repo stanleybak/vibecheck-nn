@@ -1203,7 +1203,8 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
                              relu_lambdas=None, op_bounds=None,
                              op_clamps=None, col_ids_out=None,
-                             op_fresh_ids=None, op_geom_out=None):
+                             op_fresh_ids=None, op_geom_out=None,
+                             all_bounds=None):
     if relu_lambdas is None:
         # plain (non-differentiable) use: keep the historical no-grad
         # fast path; the alpha-zono caller passes relu_lambdas and needs
@@ -1214,20 +1215,21 @@ def _forward_zonotope_graph(xl, xh, gg, device, dtype, settings=None,
                 rec_zono=rec_zono, tight_bounds=tight_bounds,
                 op_bounds=op_bounds, op_clamps=op_clamps,
                 col_ids_out=col_ids_out, op_fresh_ids=op_fresh_ids,
-                op_geom_out=op_geom_out)
+                op_geom_out=op_geom_out, all_bounds=all_bounds)
     return _forward_zonotope_graph_impl(
         xl, xh, gg, device, dtype, settings=settings, rec_zono=rec_zono,
         tight_bounds=tight_bounds, relu_lambdas=relu_lambdas,
         op_bounds=op_bounds, op_clamps=op_clamps,
         col_ids_out=col_ids_out, op_fresh_ids=op_fresh_ids,
-        op_geom_out=op_geom_out)
+        op_geom_out=op_geom_out, all_bounds=all_bounds)
 
 
 def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
                              rec_zono=None, tight_bounds=None,
                              relu_lambdas=None, op_bounds=None,
                              op_clamps=None, col_ids_out=None,
-                             op_fresh_ids=None, op_geom_out=None):
+                             op_fresh_ids=None, op_geom_out=None,
+                             all_bounds=None):
     """Graph-aware zonotope forward pass (supports skip connections).
 
     ``op_geom_out`` (optional dict): for each elementwise splittable nonlinear
@@ -2358,6 +2360,13 @@ def _forward_zonotope_graph_impl(xl, xh, gg, device, dtype, settings=None,
         # output margin-slack back to each op (bbps-style scoring).
         if op_fresh_ids is not None and _id_counter[0] > _pre_fresh_id:
             op_fresh_ids[name] = (_pre_fresh_id, _id_counter[0])
+
+        # Optional: record every op's output [lo,hi]. The Gurobi-MILP nonlinear
+        # route uses these for stable-neuron / single-PWL-piece detection (skip
+        # exact encoding of trivial neurons). Inert unless a dict is supplied.
+        if all_bounds is not None:
+            _abl, _abh = zono_state[name].bounds()
+            all_bounds[name] = (_abl.detach().clone(), _abh.detach().clone())
 
         # Free zonotopes (and their col IDs) that are no longer needed
         for inp in op['inputs']:

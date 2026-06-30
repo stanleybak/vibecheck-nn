@@ -29,3 +29,8 @@ device: cpu
 # merge them to tightly-bounded 1-D PWL nodes (else the expanded ReLU stack
 # blows the bound up: 118-linear-residual nl_alpha margin -38.69).
 merge_relu_lookup_table: true
+
+# Monotone-output inversion: exact+fp32-validated certification of the
+# scale*sigmoid(z)+bias head (closes the linearized 118/300 prop3/prop4 the
+# relaxation path times out on). Gated; inert on non-matching nets.
+monotone_output_inversion: true

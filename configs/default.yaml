@@ -182,6 +182,8 @@ milp_route_pert_threshold: null
 milp_sample_timeout: 5.0
 milp_scoring: ew_frac
 mini_group_size: 60
+monotone_inversion_buffer: 0.0
+monotone_output_inversion: false
 nonlin_div_fallback: box
 nonlin_mul_fallback: box
 nonlinear_input_split_max_var: 28

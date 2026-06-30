@@ -541,6 +541,14 @@ def default_settings(**overrides):
         # box — better when the net is mostly stable and input-split would be
         # near-exponential. (Was the hardcoded `trig_bab_max_var=28`.)
         nonlinear_input_split_max_var=28,
+        # Monotone-output inversion route (src/vibecheck/monotone_invert.py).
+        # GATED, default OFF. When a spec output factors as scale*g(z)+bias with g
+        # a monotone 1-D op (merged pwl/sigmoid/tanh) and z from a bilinear-free
+        # cone, bound it EXACTLY via scale*g.interval(z_box)+bias and certify with
+        # an fp32 forward-validation. Inert unless on AND the structure matches;
+        # used for the ml4acopf linearized surrogates (118/300 prop3/prop4).
+        monotone_output_inversion=False,
+        monotone_inversion_buffer=0.0,   # fp32 forward must clear this (0 = side-check only)
         # Per-intermediate-node α-CROWN bound refinement (alpha_crown.
         # refine_intermediate_bounds_per_node). Tightens each nonlinear layer's
         # OWN pre-activation bound with a separate α per neuron (ABC's

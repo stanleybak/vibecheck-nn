@@ -9510,6 +9510,20 @@ def verify_graph(graph, spec, settings):
             getattr(settings, 'input_split_batched_enabled', False))
         if (_route_nonlinear and hasattr(spec, 'x_lo')
                 and getattr(spec, 'x_lo', None) is not None):
+            # GATED monotone-output inversion pre-pass (default OFF). Exact + fp32-
+            # forward-validated certification for spec outputs of the form
+            # scale*g(z)+bias (ml4acopf linearized prop3/prop4). INERT unless the
+            # setting is on AND the structure matches; returns None otherwise so
+            # the existing pipeline below runs unchanged.
+            if getattr(settings, 'monotone_output_inversion', False):
+                from . import monotone_invert as _moninv
+                _milog = (print if getattr(settings, 'print_progress', False)
+                          else None)
+                _mi = _moninv.try_verify(graph, spec, settings,
+                                         device=str(_resolve_device(settings)),
+                                         log=_milog)
+                if _mi is not None:
+                    return _mi[0], {**_mi[1], 'method': 'monotone_invert'}
             import torch as _t
             _prev_sig = (settings.get('sigmoid_relaxation', 'box')
                          if settings is not None else 'box')
