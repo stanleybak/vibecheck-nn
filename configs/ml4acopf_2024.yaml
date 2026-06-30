@@ -34,3 +34,9 @@ merge_relu_lookup_table: true
 # scale*sigmoid(z)+bias head (closes the linearized 118/300 prop3/prop4 the
 # relaxation path times out on). Gated; inert on non-matching nets.
 monotone_output_inversion: true
+
+# PGD pre-phase before the nonlinear bound work. On the 300-bus net α-CROWN
+# iter 0 alone exceeds the budget and starves the CE search; attacking first
+# lands the SAT (e.g. 300 linear-residual prop2) in <2s. Gated; UNSAT/other
+# benchmarks unaffected (the witness is ORT-revalidated before any 'sat').
+nonlinear_pre_pgd: true

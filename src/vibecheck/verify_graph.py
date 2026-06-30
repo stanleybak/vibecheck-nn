@@ -9565,6 +9565,30 @@ def verify_graph(graph, spec, settings):
             _t0 = _time_tg.perf_counter()
             _tot = float(getattr(settings, 'total_timeout', 60.0))
             _deadline = _t0 + _tot
+            # GATED PGD pre-phase (default OFF). The backward-CROWN / α-CROWN
+            # bound work below can eat the WHOLE budget on big nets (300-bus
+            # ml4acopf: α-CROWN iter 0 alone > timeout), starving the CE search
+            # that otherwise runs only inside _verify_nonlinear_graph AFTER them.
+            # Attack FIRST so short-budget SAT cases (300 linear-residual prop2)
+            # are found in <2s. Only fires on `nonlinear_pre_pgd`; returns 'sat'
+            # solely on a _pgd_attack_general-confirmed witness (re-validated via
+            # ORT-CPU in main._verify). Inert for UNSAT / other benchmarks.
+            if (bool(getattr(settings, 'nonlinear_pre_pgd', False))
+                    and not bool(getattr(settings, 'disable_sat_finding', False))):
+                _pp_budget = min(
+                    float(getattr(settings, 'nonlinear_pre_pgd_secs', 5.0)),
+                    max(0.0, _deadline - _time_tg.perf_counter()))
+                if _pp_budget > 0.0:
+                    _gg32 = graph.gpu_graph(device=_bcdev, dtype=_t.float32)
+                    _pp_sat, _pp_wit = _pgd_attack_general(
+                        _xl.to(_t.float32), _xh.to(_t.float32), spec, _gg32,
+                        settings, time_budget=_pp_budget)
+                    if getattr(settings, 'print_progress', False):
+                        print(f'[nonlinear_pre_pgd] sat={_pp_sat} '
+                              f'budget={_pp_budget:.1f}s', flush=True)
+                    if _pp_sat:
+                        return 'sat', {'witness': _pp_wit,
+                                       'phase': 'nonlinear_pre_pgd'}
             # Backward-CROWN root with topo-order intermediate-bound refinement
             # (ABC's tight-intermediate init-CROWN analog). Closes the ml4acopf
             # linear nets the forward box + α-CROWN miss (e.g. 14_ieee-linear

@@ -549,6 +549,18 @@ def default_settings(**overrides):
         # used for the ml4acopf linearized surrogates (118/300 prop3/prop4).
         monotone_output_inversion=False,
         monotone_inversion_buffer=0.0,   # fp32 forward must clear this (0 = side-check only)
+        # GATED PGD pre-phase for the nonlinear route (default OFF). On big
+        # nonlinear nets the slow nl_alpha (α-CROWN iter 0 on the 300-bus
+        # ml4acopf net exceeds the whole budget) STARVES the CE search that
+        # otherwise only runs inside _verify_nonlinear_graph AFTER it, so short-
+        # budget SAT cases (ml4acopf 300 linear-residual prop2) time out even
+        # though plain 30-restart PGD cracks them in <2s (10/10 seeds). When on,
+        # run a brief attack FIRST (ABC's pgd_order='before'), before backward-
+        # CROWN / α-CROWN. Returns 'sat' only on a _pgd_attack_general-confirmed
+        # witness (re-validated via ORT-CPU in main._verify). Inert unless on, so
+        # UNSAT cases and other benchmarks are unaffected. Used for ml4acopf_2024.
+        nonlinear_pre_pgd=False,
+        nonlinear_pre_pgd_secs=5.0,      # wall-time cap for the pre-phase attack
         # Per-intermediate-node α-CROWN bound refinement (alpha_crown.
         # refine_intermediate_bounds_per_node). Tightens each nonlinear layer's
         # OWN pre-activation bound with a separate α per neuron (ABC's
