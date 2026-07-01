@@ -1,3 +1,4 @@
+description: "Vision transformer (attention/softmax): plain phase-1 bounds plus a PGD attack for SAT."
 # vit_2023 — ViT attention nets (extended track). Stack: softmax
 # decomposition (exp/reduce_sum/reciprocal/mul_bilinear) with exact
 # max-shift, attention-aware backward CROWN (exp/recip planes + McCormick

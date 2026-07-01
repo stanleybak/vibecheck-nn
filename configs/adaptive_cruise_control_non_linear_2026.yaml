@@ -1,3 +1,4 @@
+description: "Nonlinear-constraint spec (var*var products): augment the net with the constraint polynomials (nonlinear-v2 augment), then verify."
 # adaptive_cruise_control_non_linear_2026 (extended track, 50 instances, v2 spec).
 #
 # 2-input ACC nets with NONLINEAR v2 specs: the DNF atoms are polynomials in X and

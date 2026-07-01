@@ -1,3 +1,4 @@
+description: "IBP-trained CNN7 (Conv+Gemm, pure ReLU): conv->MILP route with zonotope-lift off, gated on input uncertainty."
 # challenging_certified_training_2026 — IBP-trained CNN7s (5 Conv + 2 Gemm,
 # pure ReLU, linear chain), cifar10 eps2/eps8 + tinyimagenet eps1, each in a
 # normal and a wide variant. 60 instances, timeouts 30/120/550 s.

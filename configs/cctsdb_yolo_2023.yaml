@@ -1,3 +1,4 @@
+description: "YOLO patch-robustness: a dedicated handler enumerates a finite grid of patch placements, complete ONLY under this network's assumption that patch positions are integer-valued (architecture-specific, not a general method)."
 # cctsdb_yolo_2023 (extended track, 39 instances, 350s timeout): CCTSDB YOLO traffic-sign
 # patch robustness. The ONNX bakes patch-placement (ScatterND/Range/Where) + a YOLO detector +
 # post-processing (ArgMax/dynamic-Min/Max) that neither vibecheck's graph loader nor onnx2torch

@@ -1,3 +1,4 @@
+description: "Deep 4-input AllInOne MLPs (ReLU + skip Concat): batched input-split BaB over the tiny input dim."
 # linearizenn_2024 — VNNCOMP regular track. 60 instances on 11 AllInOne
 # MLPs (4-input, deep ReLU + Slice/MatMul skip branch + Concat → output).
 #

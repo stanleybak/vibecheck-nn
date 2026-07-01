@@ -1,3 +1,4 @@
+description: "YOLOv5-nano object detection: INCOMPLETE onnx2torch PGD attack over the perturbed patch, witness ORT-validated -- never returns unsat."
 # collins_aerospace_benchmark (extended track, 6 instances, 3600s timeout): YOLOv5-nano
 # (640x640, 60 Conv + LeakyRelu + Sigmoid) object-detection robustness. All 6 instances are
 # sat (ABC ~95s each). vibecheck CAN load/convert the net (no control-flow ops), so we run the

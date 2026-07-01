@@ -126,9 +126,15 @@ def main():
     parser.add_argument('--config', default=None,
                         help='Per-benchmark YAML overrides on top of '
                              'default_settings(). When set, overrides take '
-                             'precedence over CLI knobs; when omitted, '
-                             'default_settings_for(graph, spec) auto-detects '
-                             'a profile.')
+                             'precedence over CLI knobs; when omitted, auto mode '
+                             '(config_detect) picks the closest bundled config from '
+                             'the network/spec structure. See --detect-only.')
+    parser.add_argument('--detect-only', action='store_true', dest='detect_only',
+                        help='Auto-config detection dry-run: print which '
+                             'configs/*.yaml the auto mode would pick for this '
+                             '--net/--spec (and the rule that fired), then exit '
+                             'WITHOUT verifying. Used to validate routing across '
+                             'benchmarks. See config_detect.detect_config.')
     parser.add_argument('--set', action='append', default=[], dest='set_kv',
                         metavar='KEY=VALUE',
                         help='Override any single setting by name (repeatable). '
@@ -185,6 +191,20 @@ def main():
     # The spec is checked later — the quantized prepare path doesn't use it.
     _require_net(args.net, args.spec)
 
+    if args.detect_only:
+        # Auto-config detection dry-run: print the yaml the auto mode would pick
+        # (from network/spec structure, NOT the specific net) + its description, then
+        # exit. Runs on the ORIGINAL --net/--spec, before any pair-merge/augment rewrite.
+        from .config_detect import detect_from_field
+        from .config_loader import config_description, config_path
+        _fp, _yaml, _rule = detect_from_field(args.net, args.spec)
+        _desc = config_description(config_path(_yaml))
+        print(f'AUTO-DETECT {_yaml} | rule {_rule}')
+        if _desc:
+            print(f'  description: {_desc}')
+        print(f'  fingerprint: {_fp}')
+        return 0
+
     if args.verbose:
         # Line-buffer stdout so per-phase progress flushes on every newline.
         # Without this, a redirected stdout is block-buffered and a hung/
@@ -207,6 +227,14 @@ def main():
         print(f'[verbose] gurobi license file: {_found}' if _found
               else '[verbose] gurobi license file: none found '
                    '(gurobipy bundled size-limited license)', flush=True)
+
+    # AUTO mode: with no --config, pick the closest category config from the network/spec
+    # STRUCTURE (config_detect) and set args.config to it, so EVERY config-gated path
+    # downstream (nonlinear-v2 augment, quantized surrogate-attack, cex format, the graph
+    # settings load) behaves exactly as if the user had passed that --config. Runs on the
+    # ORIGINAL net/spec before any pair-merge/augment rewrite. Logged with the rule +
+    # one-line description; --set still wins last; an explicit --config skips this.
+    _auto_select_config(args)
 
     if args.prepare_pkl_unsafe:
         # Untimed prepare step: parse + cache, no verification. For a QUANTIZED model the
@@ -475,32 +503,30 @@ def _verify(args, sat_state=None):
         result, details = milp_verify(graph, spec, settings)
     elif args.mode == 'graph':
         from .verify_graph import verify_graph
-        if args.config is not None:
-            # Explicit per-benchmark YAML: load → use as overrides on top of
-            # default_settings(). CLI knobs (device/bits/timeout/...) apply
-            # too, but YAML overrides win when there's a conflict.
-            from .settings import default_settings
-            from .config_loader import load_config
-            yaml_overrides = load_config(args.config)
-            cli_overrides = dict(
-                device=args.device, bits=args.bits,
-                total_timeout=args.timeout, pgd_restarts=args.pgd_restarts)
-            cli_overrides.update(yaml_overrides)
-            if args.disable_sat_finding:  # CLI soundness probe wins over YAML
-                cli_overrides['disable_sat_finding'] = True
-            settings = default_settings(**cli_overrides)
-            settings._profile = f'config:{args.config}'
-        else:
-            from .config_profiles import default_settings_for
-            settings = default_settings_for(
-                graph, spec,
-                device=args.device,
-                bits=args.bits,
-                total_timeout=args.timeout,
-                pgd_restarts=args.pgd_restarts,
-            )
-            if args.disable_sat_finding:
-                settings.disable_sat_finding = True
+        # In graph mode args.config is ALWAYS set here: an explicit --config, or the config
+        # `_auto_select_config` resolved from network/spec structure (graph mode requires the
+        # spec, so auto-detection always runs before this point). Load it as overrides on top
+        # of default_settings(); CLI knobs (device/bits/timeout/...) apply too, but YAML
+        # overrides win. The auto-selection already printed its rule + description at select
+        # time, so here we only note an explicit --config.
+        assert args.config is not None, 'graph mode reached with no config (auto-detect skipped?)'
+        from .settings import default_settings
+        from .config_loader import load_config, config_description
+        yaml_overrides = load_config(args.config)
+        cli_overrides = dict(
+            device=args.device, bits=args.bits,
+            total_timeout=args.timeout, pgd_restarts=args.pgd_restarts)
+        cli_overrides.update(yaml_overrides)
+        if args.disable_sat_finding:  # CLI soundness probe wins over YAML
+            cli_overrides['disable_sat_finding'] = True
+        settings = default_settings(**cli_overrides)
+        _auto = getattr(args, 'auto_selected', None)
+        settings._profile = (f'auto:{os.path.basename(args.config)}(rule {_auto[0]})'
+                             if _auto else f'config:{args.config}')
+        if not _auto:   # auto already printed its line; avoid duplicate
+            _desc = config_description(args.config)
+            print(f'Config {os.path.basename(args.config)}: {_desc}' if _desc
+                  else f'Config {os.path.basename(args.config)}')
         settings.update(args.set_overrides)   # --set wins over config/profile
         if args.verbose:
             settings.print_progress = True
@@ -763,6 +789,33 @@ def _maybe_empty_input(args):
         os.replace(tmp, args.results_file)
     print('\nResult: unsat')
     return 0
+
+
+def _auto_select_config(args):
+    """No --config (graph mode): pick the closest bundled config from network/spec
+    STRUCTURE (config_detect) and set args.config to it, so every config-gated path runs
+    exactly as if the user had passed that --config. Records
+    args.auto_selected=(rule, yaml, fingerprint, description) and logs the choice.
+
+    No-op when: --config is explicit, the mode isn't graph (other modes are legacy/explicit),
+    or the spec file is absent (e.g. a quantized prepare step). Graph-mode verification
+    requires the spec (_verify asserts it), so when the graph verifier builds its settings
+    args.config is always resolved. Runs on the ORIGINAL net/spec, before any pair-merge or
+    nonlinear-augment rewrite of args.net/args.spec."""
+    if args.config is not None or args.mode != 'graph':
+        return
+    if not (os.path.exists(args.spec) or os.path.exists(str(args.spec) + '.gz')):
+        return
+    from .config_detect import detect_from_field
+    from .config_loader import config_description, config_path
+    fp, yaml_name, rule = detect_from_field(args.net, args.spec)
+    desc = config_description(config_path(yaml_name))
+    args.config = config_path(yaml_name)
+    args.auto_selected = (rule, yaml_name, fp, desc)
+    print(f'Auto-config: {yaml_name} | rule {rule}' + (f' | {desc}' if desc else ''),
+          flush=True)
+    if args.verbose:
+        print(f'[verbose] auto-detect fingerprint: {fp}', flush=True)
 
 
 def _maybe_nonlinear_augment(args):

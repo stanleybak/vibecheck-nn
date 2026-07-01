@@ -1,3 +1,4 @@
+description: "TinyImageNet ResNet (image conv): CROWN/BaB with patches-zonotope, zonotope-lift off (same strategy as cifar100)."
 # tinyimagenet_2024 — TinyImageNet ResNet, VNNCOMP regular track.
 # Same config as cifar100_2024 — both ran under runner_p25off.py in v6
 # side-by-side. PatchesZonotope is auto-engaged via settings.zono_impl when

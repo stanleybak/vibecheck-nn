@@ -1,3 +1,4 @@
+description: "Low-dimensional ReLU FC (ACAS-Xu family): batched input-split BaB, hybrid ACAS-Xu path off."
 # acasxu_2023 — small FC controller (5-D input, 6×50 ReLU layers).
 # VNNCOMP regular track, 186 cases (prop_1..10 across 45 nets).
 #

@@ -1,3 +1,4 @@
+description: "MNIST 784-in ReLU MLPs (plus ReLU-split variants): batched input-split BaB."
 # relusplitter_2026 (regular track, 120 instances, 180s timeout).
 #
 # MNIST 784-in MLPs (Gemm+ReLU only): 4 base nets (model_0_0..3_3) x 5 ReLU-split

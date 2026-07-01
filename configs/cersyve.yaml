@@ -1,3 +1,4 @@
+description: "Small 2D/4D ReLU controllers: batched input-split BaB with CROWN input-space clipping."
 # cersyve — small (2D/4D input) controller verification benchmarks,
 # VNNCOMP regular track. Pendulum/lane_keep/point_mass × pretrain/finetune
 # × con/inv = 12 instances. Networks: ~10 ReLU layers, ~200 neurons.

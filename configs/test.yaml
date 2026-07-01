@@ -1,3 +1,4 @@
+description: "VNNCOMP smoke-test category: tiny ReLU nets + ACAS-Xu, a correctness/pipeline check only (not scored)."
 # test — VNNCOMP "test" smoke category (toolchain check, not scored).
 #
 # Five instances (v1 / 1.0 specs): three tiny 1-D ReLU nets (nano/tiny/small)

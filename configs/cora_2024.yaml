@@ -1,3 +1,4 @@
+description: "Higher-dimensional ReLU FC classifier: batched input-split BaB, zonotope-lift off."
 # cora_2024 — VNNCOMP regular track. 180 instances across 9 MLPs.
 #
 # Borrows the cifar100 Phase-8 dual-ascent config to crack hard cifar10-set

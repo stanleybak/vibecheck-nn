@@ -1,3 +1,4 @@
+description: "Network-pair monotonicity (equal-to): merge f,g into one net and search for a relational counterexample."
 # monotonic_acasxu_2026 — network-PAIR acasxu (original f vs a monotone-perturbed
 # g), merged at runtime; small input (5 dims). It is ALREADY solved 50/50 sat by
 # the auto-selected `input_split_small` profile (input_dim <= 20 -> input-split

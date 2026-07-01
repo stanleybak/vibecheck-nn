@@ -1,3 +1,4 @@
+description: "TinyYOLO ReLU CNN (skip-Adds, avgpool->conv): CROWN/BaB with zonotope-lift on."
 # yolo_2023 — TinyYOLO (extended track). ResNet-style ReLU CNN: 14 Conv, 7 ReLU
 # layers, skip-Adds, identity Pads (dropped by drop_identity_pads) and 2x2/2
 # AveragePools (emitted as equivalent depthwise-uniform convs by gpu_graph).

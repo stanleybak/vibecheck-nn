@@ -1,3 +1,4 @@
+description: "Two-level-lattice nets (2-D input, deep ternary-sparse chains): zono+CROWN with batched input-split BaB."
 # tllverifybench_2023: two-level-lattice nets (2-D input, ~8 ReLU layers, deep
 # TERNARY-SPARSE MatMul/Add chains — weights are {-1,0,1}, 2-8 nonzeros/row).
 #

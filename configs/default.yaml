@@ -1,3 +1,4 @@
+description: "Default production pipeline: bab_refine phase-1, conv->MILP auto-route, zonotope-lift on."
 # Generated from default_settings() in src/vibecheck/settings.py
 # Per-benchmark YAMLs in this dir only need to list OVERRIDES.
 # Regenerate with: .venv/bin/python tools/dump_default_yaml.py > configs/default.yaml

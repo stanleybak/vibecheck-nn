@@ -1,3 +1,4 @@
+description: "Small MNIST MLPs with Sigmoid: phase-2.5 zonotope-lift tightens the sigmoid pre-ReLU bounds; input-split BaB."
 # dist_shift_2023 — VNNCOMP regular track. 72 instances across 3 small
 # MLPs (mnist_concat with Sigmoid, mnist_generator, mnist_prior).
 #

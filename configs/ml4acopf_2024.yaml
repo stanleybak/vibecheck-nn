@@ -1,3 +1,4 @@
+description: "Nonlinear network/spec (sin/cos/pow ops or var*var constraints): nonlinear route on CPU."
 # ml4acopf_2024 (regular track, 69 instances, 600s timeout).
 #
 # AC optimal-power-flow surrogate nets ending in non-linear physics (Concat of

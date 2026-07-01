@@ -1,3 +1,4 @@
+description: "SAT-as-ReLU nets with integer weights: conjunctive joint-feasibility MILP; FP bound inflation disabled (weights are exact)."
 # sat_relu (extended/regular): SAT problems encoded as integer-weighted ReLU nets.
 # The unsafe spec is a CONJUNCTION (Y_0>=1 AND Y_1<=0); proven via the joint
 # feasibility MILP (see verify_milp conjunctive-disjunct path). The nets have

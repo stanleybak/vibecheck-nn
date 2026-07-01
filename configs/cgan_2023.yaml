@@ -1,3 +1,4 @@
+description: "Conditional-GAN generator (ConvTranspose+ReLU, some Tanh/Sigmoid): batched input-split BaB over the latent input."
 # cgan_2023 — conditional GAN regular-track benchmark. Sub-models:
 #   * 8 baseline cGAN nets (img32/64 × nCh1/3 × 4 props) — ConvTranspose+
 #     ReLU. The img64 ones are easy SAT in ~0.3s; img32 UNSAT bowls take

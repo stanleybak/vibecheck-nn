@@ -1,3 +1,4 @@
+description: "Lyapunov stable-control ReLU nets with a convex-quadratic value: input-split BaB over the box-violation + level-set disjunction."
 # lsnc_relu — Lyapunov stable neural control (quadrotor2d_state).
 # VNNCOMP 2026 (extended track). 80 instances, ONE net (6-in / 8-out):
 # a ReLU controller + ReLU residual dynamics, plus a CONVEX quadratic

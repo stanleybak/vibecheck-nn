@@ -1,3 +1,4 @@
+description: "Conv image classifier: CROWN/BaB with zonotope-lift off and a bounded PGD attack budget."
 # cifar100_2024 — CIFAR100 ResNet (medium/large), VNNCOMP regular track.
 # Sister benchmark to tinyimagenet_2024 (same CIFAR/TinyImageNet ResNet family,
 # same base pipeline). This config ports the validated tinyimagenet "lean"

@@ -1,3 +1,4 @@
+description: "Network-pair isomorphism (isomorphic-to): merge f,g and check the +/-eps output relation."
 # isomorphic_acasxu_2026 — network-PAIR (original f vs perturbed g) merged into one
 # acasxu-sized net; the property is an OR of |Y_g - Y_f| >= eps atoms. Reuses the
 # acasxu_2023 input-split + backward-CROWN profile (the merged net is acasxu-shaped):

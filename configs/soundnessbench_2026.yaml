@@ -1,3 +1,4 @@
+description: "Adversarially-hidden-CEX SAT soundness trap: high-restart PGD to FIND the hidden counterexample; conv->MILP off."
 # soundnessbench: all 50 instances are SAT with an adversarially-hidden
 # counterexample; the benchmark exists to catch UNSOUND verifiers (a
 # verified/unsat on a SAT case = unsound). vibecheck is already SOUND on it

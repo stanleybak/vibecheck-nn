@@ -1,3 +1,4 @@
+description: "Binarized (Sign-activation) GTSRB nets: INCOMPLETE sign-attack (PGD on a clipped-STE Sign surrogate) -- never returns unsat."
 # traffic_signs_recognition_2023 (regular track, 45 instances, 480s timeout): GTSRB Binary
 # Neural Networks — the "QConv" layers use `Sign` activations (binarized weights/acts).
 # Neither vibecheck nor ABC can bound `Sign` soundly through onnx2pytorch, so we run the

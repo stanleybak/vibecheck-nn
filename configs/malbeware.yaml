@@ -1,3 +1,4 @@
+description: "Small malware-classifier conv nets: disable the conv->MILP shortcut (it fails to converge here); default CROWN/BaB."
 # malbeware — VNNCOMP regular track. 150 instances across 3 small
 # malware-classifier models: linear (Gemm only), 4-25 (1 Conv + 1 Gemm),
 # 16-25 (1 Conv + 1 Gemm, wider). 4096-input 64×64 images, 25 classes.

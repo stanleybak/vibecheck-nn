@@ -1,3 +1,4 @@
+description: "INT8-quantized multimodal transformer: INCOMPLETE surrogate-attack (PGD) only -- never returns unsat."
 # smart_turn_multimodal_2026: a 41.6M-param INT8-quantized multimodal (audio+video)
 # transformer. vibecheck (and ABC) cannot build a sound graph for the quantized ops
 # (DequantizeLinear/QuantizeLinear), so we run the INCOMPLETE surrogate-attack mode

@@ -1,3 +1,4 @@
+description: "Database-learning nets (lindex/mscn/pensieve): batched input-split BaB with per-disjunct handling for many-disjunct specs."
 # nn4sys — VNNCOMP regular track. 194 instances across 12 models
 # (lindex, lindex_deep, mscn_*, pensieve_*).
 #
