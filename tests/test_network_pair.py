@@ -110,6 +110,46 @@ def test_parse_mono_ir(tmp_path):
     assert at['lhs'][('f', 3)] == 1.0 and at['lhs'][('g', 3)] == -1.0
 
 
+def test_flatten_nd_indices_rowmajor_and_passthrough():
+    # Declared shapes drive ROW-MAJOR flattening. A last-component heuristic would be
+    # WRONG when the leading dims aren't all 1 (shape [2,3]: `A[1,2]` is flat 5, not 2);
+    # strides are correct for any shape.
+    txt = ('(declare-input A real [2, 3])\n'
+           '(declare-output B real [4])\n'
+           'A[1,2] A[0,0] A[7] B[3] C[1,1]')
+    out = npair._flatten_nd_indices(txt)
+    assert 'A[5]' in out             # row-major 1*3+2 = 5 (last-component would give 2)
+    assert 'A[0]' in out             # 0*3+0 = 0
+    assert 'A[7]' in out             # rank 1 != shape rank 2 -> untouched
+    assert 'B[3]' in out             # rank matches [4] -> flat 3 (single-dim, unchanged)
+    assert 'C[1,1]' in out           # C undeclared (shape None) -> untouched
+
+
+def test_parse_nd_shaped_refs_matches_flat():
+    # Real 2026 pair specs index ND (`X_f[0,0,0,i]`, `Y_g[0,i]`); the flattener must
+    # yield the SAME IR as the equivalent flat 1-D spec. Direct equivalence check on the
+    # monotonic shape (the 100 shipped instances are covered by the integration pins).
+    decls = ('(declare-input X_f real [1, 1, 1, 5])\n'
+             '(declare-output Y_f real [1, 5])\n'
+             '(declare-input X_g real [1, 1, 1, 5])\n'
+             '(declare-output Y_g real [1, 5])\n')
+
+    def body(xf, xg, yf, yg):
+        L = [f'(assert (and (<= {xf(i)} 1.0) (>= {xf(i)} -1.0)))' for i in range(5)]
+        L += [f'(assert (== {xf(i)} {xg(i)}))' for i in range(1, 5)]
+        L += [f'(assert (>= {xf(0)} {xg(0)}))', f'(assert (>= {xg(0)} -1.0))',
+              f'(assert (< {yf(3)} {yg(3)}))']
+        return '\n'.join(L)
+
+    nd = decls + body(lambda i: f'X_f[0,0,0,{i}]', lambda i: f'X_g[0,0,0,{i}]',
+                      lambda i: f'Y_f[0,{i}]', lambda i: f'Y_g[0,{i}]')
+    flat = body(lambda i: f'X_f[{i}]', lambda i: f'X_g[{i}]',
+                lambda i: f'Y_f[{i}]', lambda i: f'Y_g[{i}]')
+    assert npair.parse_multinet(nd) == npair.parse_multinet(flat)
+    ir = npair.parse_multinet(nd)
+    assert ir['n'] == 5 and ir['rel']['k'] == 0 and ir['atoms'][0]['lhs'][('f', 3)] == 1.0
+
+
 def test_iso_merge_oracle(tmp_path):
     f = str(tmp_path / 'f.onnx'); g = str(tmp_path / 'g.onnx'); spec = str(tmp_path / 's.vnnlib')
     _tiny_acasxu(f, seed=1); _tiny_acasxu(g, seed=2); _iso_spec(spec, eps=0.05)

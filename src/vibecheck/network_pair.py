@@ -178,6 +178,32 @@ def _const(name, arr, dtype=TensorProto.FLOAT):
 
 # ------------------------------------------------------------------ parse -> IR
 
+def _flatten_nd_indices(text):
+    """Rewrite ND variable indices `X_f[0,0,0,4]` -> flat `X_f[4]` using the declared shapes,
+    so the 1D-index parsers below work on ND-shaped specs (e.g. monotonic_acasxu declares
+    X_f shape [1,1,1,5] and writes X_f[0,0,0,j]; isomorphic uses 1D and is left unchanged).
+    Only rewrites `Name[idx,...]` whose index rank matches its declared shape rank; anything
+    else (incl. the `[1,1,1,5]` shape literals, which have a space before `[`) is untouched.
+    Row-major strides, so it is correct for any shape (not just the leading-dims-all-1 case a
+    last-component heuristic assumed)."""
+    shapes = {}
+    for name, shp in re.findall(
+            r'\(declare-(?:input|output)\s+(\S+)\s+\S+\s+\[([^\]]*)\]', text):
+        shapes[name] = [int(s) for s in shp.split(',') if s.strip()]
+
+    def repl(m):
+        name, idx_s = m.group(1), m.group(2)
+        idxs = [int(x) for x in idx_s.split(',')]
+        shape = shapes.get(name)
+        if shape is None or len(idxs) != len(shape):
+            return m.group(0)
+        flat = 0
+        for i, dim in zip(idxs, shape):
+            flat = flat * dim + i
+        return f'{name}[{flat}]'
+    return re.sub(r'([A-Za-z_]\w*)\[([\d,\s]+)\]', repl, text)
+
+
 def parse_multinet(text):
     """Parse a 2-network v2 spec into the canonical IR (see module docstring).
 
@@ -193,12 +219,10 @@ def parse_multinet(text):
     # Normalize multi-dim batch-indexed refs to the flat `X_f[i]` form every regex
     # below expects. The 2026 benchmarks were updated to VNN-LIB 2.0 shaped refs —
     # 4-D inputs `X_f[0,0,0,i]` (shape [1,1,1,5]) and 2-D outputs `Y_g[0,i]` (shape
-    # [1,5]). Every leading dim is size 1 (index 0), so the flat index is the LAST
-    # comma-separated component; take it. Plain 1-D refs `X_f[i]` are left untouched,
-    # so both spec versions parse. (Does not touch `declare-input X_f real [..]` —
-    # that has a space before `[`, so the `X_f[` pattern doesn't match it.)
-    text = re.sub(r'([XY]_[fg])\[([\d\s,]+)\]',
-                  lambda m: f"{m.group(1)}[{m.group(2).split(',')[-1].strip()}]", text)
+    # [1,5]). `_flatten_nd_indices` maps each ND ref to its row-major flat index using
+    # the declared shape; plain 1-D refs `X_f[i]` are left untouched, so both spec
+    # versions parse.
+    text = _flatten_nd_indices(text)
     n = max(int(i) for i in re.findall(r'X_[fg]\[(\d+)\]', text)) + 1
     f_lo = [None] * n; f_hi = [None] * n
     # f input box: (<= X_f[i] HI) ... (>= X_f[i] LO)
