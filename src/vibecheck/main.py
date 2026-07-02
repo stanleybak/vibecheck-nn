@@ -99,6 +99,38 @@ def _is_oom_exception(exc):
 
 
 def main():
+    """Console entry point: dispatch between the VNN-LIB standard CLI (Ch. 5:
+    `--name`/`--version`, `verify <query> ...`, `supports <capability>`) and the
+    legacy flat `--net/--spec` CLI (what the VNNCOMP harness invokes). A bare
+    positional first argument is a query filepath -> implicit `verify`, so
+    `vibecheck query.vnnlib --network f=m.onnx` works without spelling it out."""
+    argv = sys.argv[1:]
+    if argv and (argv[0] in ('--name', '--version', 'supports', 'verify')
+                 or not argv[0].startswith('-')):
+        from .cli_standard import dispatch
+        return dispatch(argv)
+    return _legacy_main(argv)
+
+
+def _verdict_str(kind, style):
+    """Spell an internal verdict token ('unsat'/'sat'/'unknown'/'timeout'/'error')
+    for emission. The single point where the two CLI dialects diverge: the
+    VNN-LIB standard (Ch. 5) writes `timed-out` where VNNCOMP scripts parse
+    `timeout`; every other token is identical. All internal logic keeps the
+    canonical 'timeout' token — translate only when writing."""
+    if kind == 'timeout' and style == 'standard':
+        return 'timed-out'
+    return kind
+
+
+def _emit_style(args):
+    """The verdict spelling style for this run ('vnncomp' default; 'standard' when
+    driven through the VNN-LIB standard `verify` CLI). getattr-guarded so tests
+    that build a bare namespace keep the legacy spelling."""
+    return getattr(args, 'verdict_style', 'vnncomp')
+
+
+def _legacy_main(argv=None):
     parser = argparse.ArgumentParser(
         description='VibeCheck — Neural Network Verification via Zonotope Analysis')
     parser.add_argument('--net', required=True, help='Path to ONNX network')
@@ -179,7 +211,14 @@ def main():
                              'is loaded via pickle (arbitrary code exec) — only use in a '
                              'trusted directory you control. -unsafe is in the name to '
                              'make that explicit.')
-    args = parser.parse_args()
+    parser.add_argument('--verdict-style', default='vnncomp', dest='verdict_style',
+                        choices=['vnncomp', 'standard'],
+                        help="Verdict spelling for stdout/--results-file: 'vnncomp' "
+                             "(default, the competition scripts' 'timeout') or "
+                             "'standard' (the VNN-LIB standard's 'timed-out'). The "
+                             "`vibecheck verify` CLI passes 'standard'; only the "
+                             'timeout word differs.')
+    args = parser.parse_args(argv)
 
     # Parse --set KEY=VALUE overrides once (validated against default_settings());
     # applied to the built settings at every construction site below + in the
@@ -337,7 +376,7 @@ def main():
     # with 'error'; an early within-tol counterexample overwrites it with 'sat'.
     if args.results_file:
         with open(args.results_file, 'w') as f:
-            f.write('timeout\n')
+            f.write(_verdict_str('timeout', _emit_style(args)) + '\n')
     # Backstop watchdog: guarantee a clean self-exit by the budget even if a
     # phase ignores the cooperative deadline, so the harness never has to
     # SIGKILL us (a penalized run_instance_timeout). Cancelled on clean finish.
@@ -369,7 +408,7 @@ def main():
             # readers that take only content[0] are unaffected.
             _exc = sys.exc_info()[1]
             with open(args.results_file, 'w') as f:
-                f.write('error\n')
+                f.write(_verdict_str('error', _emit_style(args)) + '\n')
                 f.write(f'{type(_exc).__name__}: {str(_exc)[:500]}\n')
         sys.exit(2)
     finally:
@@ -785,7 +824,7 @@ def _maybe_empty_input(args):
     if args.results_file:
         tmp = f'{args.results_file}.tmp'
         with open(tmp, 'w') as f:
-            f.write('unsat\n')
+            f.write(_verdict_str('unsat', _emit_style(args)) + '\n')
         os.replace(tmp, args.results_file)
     print('\nResult: unsat')
     return 0
@@ -1261,7 +1300,7 @@ def _emit_surrogate_result(args, verdict, witness, sat_state, cex_fmt='.17g',
             return
     if not sat_state.get('emitted'):
         with open(args.results_file, 'w') as f:
-            f.write(verdict + '\n')
+            f.write(_verdict_str(verdict, _emit_style(args)) + '\n')
 
 
 def _log_cex_values(x, y, log=print):
@@ -1327,7 +1366,7 @@ def _emit_result(args, spec, line, witness, sat_state, cex_fmt='.17g'):
     # complete new content — never a torn 'sat'.
     tmp = f'{args.results_file}.tmp'
     with open(tmp, 'w') as f:
-        f.write(line + '\n')
+        f.write(_verdict_str(line, _emit_style(args)) + '\n')
         if ce is not None:
             f.write(ce + '\n')
         f.flush()
@@ -1433,4 +1472,7 @@ def _counterexample_sexpr_orig(orig_onnx, witness, cex_fmt='.17g', version='1.0'
 
 
 if __name__ == '__main__':
-    main()
+    # Propagate the standard-CLI dispatch's return code under `python -m` too
+    # (the console script wrapper already sys.exit()s main()'s return value;
+    # the legacy path exits internally so this is a no-op for it).
+    sys.exit(main())

@@ -39,6 +39,22 @@ Common flags (see `--help` for the full list):
 Exit codes: `0` = verified, `1` = unknown, `2` = error (a verdict line is still
 written to `--results-file` when set).
 
+### VNN-LIB standard CLI
+
+vibecheck also implements the VNN-LIB standard's solver CLI (Chapter 5):
+`--name`/`--version`, `verify`, and `supports`:
+
+```bash
+vibecheck verify query.vnnlib --network f=model.onnx --timeout 60
+vibecheck supports --onnx-operators
+```
+
+`verify` prints the verdict (`sat`/`unsat`/`unknown`/`timed-out`) as the first
+stdout line, followed only by the satisfying assignment for `sat` (progress goes
+to stderr); `--serialise-assignments DIR` writes the assignment as ONNX
+TensorProtos instead. In `supports` output, a `*` after an identifier marks
+partial support, with a short note on the same line.
+
 ## Tests
 
 ```bash
