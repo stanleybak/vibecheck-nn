@@ -151,19 +151,32 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
             if not hasattr(rel, 'planes'):
                 raise NotImplementedError(
                     f'crown: no planes for nonlinearity {op.fn!r} yet')
-            al, bl, au, bu = rel.planes(l, h, op.params)
-            if alpha and name in alpha:
-                # optimizable lower slope on unstable neurons only
-                unstable = ((l < 0) & (h > 0)).unsqueeze(1)
-                al = torch.where(unstable, alpha[name].clamp(0.0, 1.0),
-                                 al.unsqueeze(1))
+            if (alpha and name in alpha and op.fn != 'relu'
+                    and hasattr(rel, 'alpha_planes')):
+                # S-shaped alpha: optimizer-controlled tangent positions
+                al, bl, au, bu = rel.alpha_planes(
+                    l.unsqueeze(1), h.unsqueeze(1),
+                    alpha[name].clamp(0.0, 1.0), op.params)
+            else:
+                al, bl, au, bu = rel.planes(l, h, op.params)
+                if alpha and name in alpha:
+                    # relu: optimizable lower slope on unstable neurons only
+                    unstable = ((l < 0) & (h > 0)).unsqueeze(1)
+                    al = torch.where(unstable, alpha[name].clamp(0.0, 1.0),
+                                     al.unsqueeze(1))
             if al.dim() == 2:
                 al = al.unsqueeze(1)
+            if au.dim() == 2:
+                au = au.unsqueeze(1)
+            if bl.dim() == 2:
+                bl = bl.unsqueeze(1)
+            if bu.dim() == 2:
+                bu = bu.unsqueeze(1)
             Ap, An = _pos_part(Ao), _neg_part(Ao)
             # lower bound: positive adjoint takes the lower plane,
             # negative adjoint the upper plane
-            Ain = Ap * al + An * au.unsqueeze(1)
-            d = d + (Ap * bl.unsqueeze(1) + An * bu.unsqueeze(1)).sum(dim=2)
+            Ain = Ap * al + An * au
+            d = d + (Ap * bl + An * bu).sum(dim=2)
             if beta and name in beta and cl is not None:
                 # split-constraint Lagrangian: pos split (z>=0) adds -beta*z,
                 # neg split (z<=0) adds +beta*z to the objective (beta>=0)
@@ -299,7 +312,9 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
     alpha, beta = {}, {}
     for name in net.order:
         op = net.ops[name]
-        if op.kind == 'nonlin' and op.fn == 'relu':
+        if op.kind != 'nonlin':
+            continue
+        if op.fn == 'relu':
             l, h = inter[name]
             cl = clamps.get(name)
             if cl is not None:
@@ -310,6 +325,12 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
             if cl is not None and bool((cl != 0).any()):
                 beta[name] = torch.zeros(B, qd, l.shape[1], device=dev,
                                          dtype=dt, requires_grad=True)
+        elif hasattr(REL[op.fn], 'alpha_planes'):
+            l, h = inter[name]
+            crossing = ((l < 0) & (h > 0)).to(l.dtype)
+            t0 = (0.5 * (1 - crossing)).unsqueeze(1).unsqueeze(1) \
+                .expand(B, qd, 2, l.shape[1]).contiguous()
+            alpha[name] = t0.requires_grad_(True)
     params = list(alpha.values()) + list(beta.values())
     if not params:
         return crown(net, lo, hi, W, inter, clamps=clamps,
@@ -354,11 +375,19 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
     alpha = {}
     for name in net.order:
         op = net.ops[name]
-        if op.kind == 'nonlin' and op.fn == 'relu':
+        if op.kind != 'nonlin':
+            continue
+        if op.fn == 'relu':
             l, h = inter[name]
             al0 = REL['relu'].planes(l, h)[0]           # adaptive default
             alpha[name] = al0.detach().clone().unsqueeze(1) \
                 .expand(B, q, l.shape[1]).contiguous().requires_grad_(True)
+        elif hasattr(REL[op.fn], 'alpha_planes'):
+            l, h = inter[name]
+            crossing = ((l < 0) & (h > 0)).to(l.dtype)
+            t0 = (0.5 * (1 - crossing)).unsqueeze(1).unsqueeze(1) \
+                .expand(B, q, 2, l.shape[1]).contiguous()
+            alpha[name] = t0.requires_grad_(True)
     if not alpha:
         return crown(net, lo, hi, W, inter)
     opt = torch.optim.Adam(list(alpha.values()), lr=lr)

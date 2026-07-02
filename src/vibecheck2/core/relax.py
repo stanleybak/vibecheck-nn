@@ -99,19 +99,104 @@ def _band(f, lo, hi, lam, crit_xs):
 
 
 class _SShaped:
-    """Shared plane construction for strictly increasing S-shaped ops
-    (sigmoid, tanh): chord slope + closed-form critical points."""
+    """Plane construction for strictly increasing S-shaped ops (sigmoid,
+    tanh; inflection at 0, convex left, concave right).
 
-    def planes(self, lo, hi, params=None):
+    Asymmetric CROWN planes per region:
+      convex side (hi <= 0):  lower = tangent at midpoint, upper = chord
+      concave side (lo >= 0): lower = chord, upper = tangent at midpoint
+      crossing:  lower = tangent from (lo, f(lo)) touching the concave arm,
+                 upper = tangent from (hi, f(hi)) touching the convex arm,
+                 tangent point found by bisection CONVERGING FROM THE SAFE
+                 SIDE (a tangent point further out only rotates the line
+                 away from f), so the result is sound at any precision.
+    """
+
+    def _cross_lower_point(self, lo, hi, iters=30):
+        """Safe tangent point d <= 0 for the crossing-region LOWER plane
+        (line through (hi, f(hi)) tangent to the convex arm). Any d' in
+        [d, 0] has slope >= the critical tangent slope, hence stays sound;
+        the bisection returns the sound endpoint of its bracket."""
+        f, fp = self.point, self._slope_at
+        y1 = f(hi)
+        a = -torch.full_like(lo, 24.0)
+        b = torch.zeros_like(lo)
+        for _ in range(iters):
+            d = (a + b) / 2
+            sound = y1 + fp(d) * (d - hi) <= f(d)     # slope already >= s*
+            b = torch.where(sound, d, b)
+            a = torch.where(sound, a, d)
+        return b
+
+    def _cross_upper_point(self, lo, hi, iters=30):
+        """Safe tangent point d >= 0 for the crossing-region UPPER plane
+        (line through (lo, f(lo)) tangent to the concave arm); any d' in
+        [0, d] stays sound."""
+        f, fp = self.point, self._slope_at
+        y0 = f(lo)
+        a = torch.zeros_like(lo)
+        b = torch.full_like(lo, 24.0)
+        for _ in range(iters):
+            d = (a + b) / 2
+            sound = y0 + fp(d) * (d - lo) >= f(d)     # slope already >= s*
+            a = torch.where(sound, d, a)
+            b = torch.where(sound, b, d)
+        return a
+
+    def planes(self, lo, hi, params=None, t_low=None, t_up=None):
+        """Sound planes; t_low/t_up in [0,1] are OPTIONAL tangent-position
+        parameters (alpha): every value in [0,1] yields a sound plane, so
+        the optimizer may move them freely.
+
+        one-sided regions: the tangent point slides across [lo, hi];
+        crossing: the tangent point slides from the safe bisection bracket
+        toward the inflection (slope >= the critical tangent slope stays
+        sound; see _cross_lower/_cross_upper)."""
+        f = self.point
+        # defaults: midpoint tangent on one-sided regions, the exact
+        # anchored tangent (t=0) on crossing ones (tightest of the family)
+        t_side_l = 0.5 if t_low is None else t_low
+        t_side_u = 0.5 if t_up is None else t_up
+        t_cross_l = 0.0 if t_low is None else t_low
+        t_cross_u = 0.0 if t_up is None else t_up
+        chord = (f(hi) - f(lo)) / (hi - lo).clamp_min(1e-12)
+        chord = torch.where(hi > lo, chord, self._slope_at(lo)).clamp_min(0.0)
+        convex = hi <= 0
+        concave = lo >= 0
+        tl = lo + t_side_l * (hi - lo)       # tangent positions (broadcast)
+        tu = lo + t_side_u * (hi - lo)
+        sl_t, su_t = self._slope_at(tl), self._slope_at(tu)
+        al = torch.where(convex, sl_t, chord * torch.ones_like(sl_t))
+        bl = torch.where(convex, f(tl) - sl_t * tl, f(lo) - chord * lo)
+        au = torch.where(concave, su_t, chord * torch.ones_like(su_t))
+        bu = torch.where(concave, f(tu) - su_t * tu, f(lo) - chord * lo)
+        crossing = ~(convex | concave)
+        if bool(crossing.any()):
+            dl = self._cross_lower_point(lo, hi)
+            d = dl * (1 - t_cross_l)         # slide toward 0: slope >= s*
+            s = self._slope_at(d)
+            al = torch.where(crossing, s, al)
+            bl = torch.where(crossing, f(hi) - s * hi, bl)
+            du = self._cross_upper_point(lo, hi)
+            d2 = du * (1 - t_cross_u)
+            s2 = self._slope_at(d2)
+            au = torch.where(crossing, s2, au)
+            bu = torch.where(crossing, f(lo) - s2 * lo, bu)
+        return al, bl, au, bu
+
+    def alpha_planes(self, lo, hi, alpha, params=None):
+        """planes() with optimizer-controlled tangent positions; alpha is
+        (..., 2, n): channel 0 moves the lower plane, channel 1 the upper."""
+        return self.planes(lo, hi, params, t_low=alpha[..., 0, :],
+                           t_up=alpha[..., 1, :])
+
+    def band(self, lo, hi, params=None):
+        # single-slope zono band: chord + closed-form critical points
         f = self.point
         lam = (f(hi) - f(lo)) / (hi - lo).clamp_min(1e-12)
         lam = torch.where(hi > lo, lam, self._slope_at(lo)).clamp_min(0.0)
         bl, bu = _band(f, lo, hi, lam, self._crit(lam))
-        return lam, bl, lam, bu
-
-    def band(self, lo, hi, params=None):
-        al, bl, _au, bu = self.planes(lo, hi)
-        return al, (bl + bu) / 2, (bu - bl) / 2
+        return lam, (bl + bu) / 2, (bu - bl) / 2
 
 
 class Sigmoid(_SShaped):
