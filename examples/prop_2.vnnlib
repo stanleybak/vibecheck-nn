@@ -1,0 +1,35 @@
+(vnnlib-version <2.0>)
+
+(declare-network N
+    (declare-input  X float32 [1, 1, 1, 5])
+    (declare-output Y float32 [1, 5])
+)
+; ACAS Xu property 2.0
+
+
+
+; Unscaled Input 0.0: (55947.691, 60760.0)
+(assert (<= X[0,0,0,0] 0.679857769))
+(assert (>= X[0,0,0,0] 0.6))
+
+; Unscaled Input 1.0: (-3.141592653589793, 3.141592653589793)
+(assert (<= X[0,0,0,1] 0.5))
+(assert (>= X[0,0,0,1] -0.5))
+
+; Unscaled Input 2.0: (-3.141592653589793, 3.141592653589793)
+(assert (<= X[0,0,0,2] 0.5))
+(assert (>= X[0,0,0,2] -0.5))
+
+; Unscaled Input 3.0: (1145.0, 1200.0)
+(assert (<= X[0,0,0,3] 0.5))
+(assert (>= X[0,0,0,3] 0.45))
+
+; Unscaled Input 4.0: (0.0, 60.0)
+(assert (<= X[0,0,0,4] -0.45))
+(assert (>= X[0,0,0,4] -0.5))
+
+; Unsafe if COC is maximal
+(assert (<= Y[0,1] Y[0,0]))
+(assert (<= Y[0,2] Y[0,0]))
+(assert (<= Y[0,3] Y[0,0]))
+(assert (<= Y[0,4] Y[0,0]))

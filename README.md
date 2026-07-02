@@ -21,32 +21,13 @@ The tool and tests can then be invoked with `.venv/bin/python`.
 
 ## Usage
 
-```bash
-.venv/bin/python -m vibecheck.main --net model.onnx --spec property.vnnlib
-```
-
-Common flags (see `--help` for the full list):
-
-- `--config configs/<benchmark>.yaml`: per-benchmark overrides on top of
-  `default_settings()`. When omitted, a profile is auto-detected from the network
-  and spec.
-- `--results-file PATH`: write a single VNNCOMP-style verdict line (`unsat` =
-  verified, `sat` = counterexample, `unknown`, or `timeout`). **This is the
-  authoritative verdict**; read it rather than inferring from the exit code.
-- `--timeout SECONDS`: tool timeout (default 30).
-- `--device {gpu,cpu}`, `--bits {16,32,64}`, `--mode {graph,bnb}`.
-
-Exit codes: `0` = verified, `1` = unknown, `2` = error (a verdict line is still
-written to `--results-file` when set).
-
-### VNN-LIB standard CLI
-
-vibecheck also implements the VNN-LIB standard's solver CLI (Chapter 5):
-`--name`/`--version`, `verify`, and `supports`:
+vibecheck implements the VNN-LIB standard's solver CLI (Chapter 5):
 
 ```bash
-vibecheck verify query.vnnlib --network f=model.onnx --timeout 60
-vibecheck supports --onnx-operators
+vibecheck verify <query.vnnlib> --network NAME=<model.onnx> [--timeout SECONDS] \
+                 [--serialise-assignments DIR]
+vibecheck supports <capability>        # e.g. --onnx-operators
+vibecheck --name | --version
 ```
 
 `verify` prints the verdict (`sat`/`unsat`/`unknown`/`timed-out`) as the first
@@ -54,6 +35,25 @@ stdout line, followed only by the satisfying assignment for `sat` (progress goes
 to stderr); `--serialise-assignments DIR` writes the assignment as ONNX
 TensorProtos instead. In `supports` output, a `*` after an identifier marks
 partial support, with a short note on the same line.
+
+Example, on the bundled ACAS-Xu network (`examples/`) with a property that holds
+and one that is violated:
+
+```console
+$ vibecheck verify examples/prop_1.vnnlib --network N=examples/ACASXU_run2a_2_2_batch_2000.onnx --timeout 60
+unsat
+
+$ vibecheck verify examples/prop_2.vnnlib --network N=examples/ACASXU_run2a_2_2_batch_2000.onnx --timeout 60
+sat
+X float32 [1,1,1,5]
+0.6208617091178894
+-0.01862180233001709
+...
+```
+
+The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
+--results-file out.txt`, the form the VNNCOMP harness drives) is unchanged; see
+`vibecheck --help`.
 
 ## Tests
 
