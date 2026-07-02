@@ -24,6 +24,11 @@ untouched as the reference implementation, verdict oracle, and reused front end
   `handlers/` strategies on top of the core, never special cases inside it.
 - Back causal claims with a measurement, a code reference (`file:line`), or an
   observed log line, not "probably".
+- **Never live-edit `src/` while a sweep is running.** Sweep subprocesses
+  import the tree per case; an edit window (even an uncommitted one) taints
+  every verdict produced during it. Freeze a copy (`git archive` to a temp
+  dir) for the sweep, or hold edits until it finishes. A mid-sweep unsound
+  plane once silently invalidated ~200 sweep rows.
 
 ## What is vibecheck?
 
