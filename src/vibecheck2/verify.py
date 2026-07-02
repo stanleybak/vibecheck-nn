@@ -97,14 +97,18 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
         verdict, open_d = _verdict_from_lbs(lb + b, di, len(spec.disjuncts))
         log(f'[vc2] alpha-crown: worst={float((lb + b).min()):.4f} '
             f'open={len(open_d)}/{len(spec.disjuncts)}')
-    if verdict != 'unsat' and net.n_in <= 32:
-        # low input dimension: branch and bound over input subboxes
-        from .core.search import input_split_bab
-        verdict, binfo = input_split_bab(
+    if verdict != 'unsat':
+        # branch and bound: input splits for low-dimensional inputs, relu
+        # phase splits otherwise (unified scoring across both is the design
+        # target; the two loops share bound/attack machinery meanwhile)
+        from .core.search import input_split_bab, relu_split_bab
+        bab = input_split_bab if net.n_in <= 32 else relu_split_bab
+        verdict, binfo = bab(
             net, spec, W, b, di, lo[0], hi[0],
             deadline=t0 + timeout - 2.0, device=device,
             onnx_path=onnx_path, log=log)
-        log(f'[vc2] input-split bab: {verdict} {binfo}')
+        log(f'[vc2] {bab.__name__}: {verdict} '
+            f'{ {k: v for k, v in binfo.items() if k != "witness"} }')
         if verdict == 'sat':
             return 'sat', {'witness': binfo['witness'],
                            'time': time.time() - t0}

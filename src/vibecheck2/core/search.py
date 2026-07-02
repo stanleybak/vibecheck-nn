@@ -100,7 +100,8 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         if open_mask.any() and alpha_iters > 0:
             # short alpha pass on the still-open domains only
             oi = torch.nonzero(open_mask, as_tuple=False).flatten()
-            inter_o = {k2: (v[0][oi], v[1][oi]) for k2, v in inter.items()}
+            inter_o = {k2: tuple(t[oi] for t in v)
+                       for k2, v in inter.items()}
             lb_a = backward.alpha_crown(net, blo[oi], bhi[oi], W, inter_o,
                                         iters=alpha_iters, thresholds=-bias)
             lbq[oi] = torch.maximum(lbq[oi], lb_a)
@@ -170,3 +171,120 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 f'bounded={n_bounded} t={time.time() - t0:.1f}s')
     return 'unsat', {'bounded': n_bounded, 'splits': n_split,
                      'rounds': rounds}
+
+
+def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
+                   device='cpu', batch=256, beta_iters=12, onnx_path=None,
+                   attack_every=16, log=lambda m: None):
+    """ReLU-phase splitting BaB (no-reforward): intermediates stay ROOT
+    bounds; each domain carries sign clamps, and the bound comes from
+    alpha+beta CROWN under those clamps (v1 _crown_bab_noreforward / abcrown
+    beta-CROWN style). Action score is BaBSR: |pre-act adjoint| x triangle
+    intercept, from the same backward pass that produced the bound.
+
+    Domains are (worst_lb, splits) with splits a tuple of
+    (relu_name, neuron, sign); clamps materialize densely per batch.
+    """
+    import heapq
+    dev = torch.device(device)
+    dt = torch.float32
+    W = W.to(dev, dt)
+    bias = bias.to(dev, dt)
+    q = W.shape[0]
+    D = int(disj_idx.max()) + 1 if disj_idx.numel() else 0
+    sel = torch.zeros(D, q, device=dev, dtype=torch.bool)
+    sel[disj_idx, torch.arange(q)] = True
+    lo1 = lo.reshape(1, -1).to(dev, dt)
+    hi1 = hi.reshape(1, -1).to(dev, dt)
+
+    root_inter = backward.intermediates(net, lo1, hi1)
+    relu_edges = [nm for nm in net.order
+                  if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'relu']
+
+    heap = [(-float('inf'), 0, ())]           # (worst_lb, tiebreak, splits)
+    tick = 1
+    n_bounded = rounds = 0
+    t0 = time.time()
+
+    def refuted_of(lbq):
+        pos = (lbq + bias) > 0
+        r = torch.zeros(lbq.shape[0], D, device=dev, dtype=torch.bool)
+        for dd in range(D):
+            r[:, dd] = (pos & sel[dd]).any(dim=1)
+        return r
+
+    while heap:
+        if time.time() > deadline:
+            return 'timeout', {'frontier': len(heap), 'bounded': n_bounded}
+        rounds += 1
+        batch_doms = [heapq.heappop(heap) for _ in range(min(batch, len(heap)))]
+        B = len(batch_doms)
+        blo = lo1.expand(B, -1)
+        bhi = hi1.expand(B, -1)
+        inter = {k: tuple(t.expand(B, -1) for t in v)
+                 for k, v in root_inter.items()}
+        clamps = {}
+        for bi, (_, _, splits) in enumerate(batch_doms):
+            for nm, j, sgn in splits:
+                if nm not in clamps:
+                    clamps[nm] = torch.zeros(B, net.ops[nm].n, device=dev,
+                                             dtype=torch.int8)
+                clamps[nm][bi, j] = sgn
+        adj = {}
+        lbq = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
+                             collect_adjoints=adj)
+        lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter, clamps,
+                                          iters=beta_iters, thresholds=-bias)
+        lbq = torch.maximum(lbq, lb_ab)
+        n_bounded += B
+        refuted = refuted_of(lbq)
+        open_mask = ~refuted.all(dim=1)
+        if open_mask.any():
+            # BaBSR score per relu edge; argmax action per open domain
+            best_score = torch.full((B,), -torch.inf, device=dev)
+            best_edge = [None] * B
+            best_j = torch.zeros(B, dtype=torch.long, device=dev)
+            for nm in relu_edges:
+                l, h = inter[nm]
+                cl = clamps.get(nm)
+                if cl is not None:
+                    l, h = backward.clamped_bounds((l, h), cl)
+                unstable = (l < 0) & (h > 0)
+                if not bool(unstable.any()):
+                    continue
+                intercept = (-h * l / (h - l).clamp_min(1e-30)).clamp_min(0.0)
+                a = adj.get(nm)
+                s = (a.abs().amax(dim=1) if a is not None else
+                     torch.ones_like(l)) * intercept * unstable
+                v, j = s.max(dim=1)
+                better = v > best_score
+                best_score = torch.where(better, v, best_score)
+                best_j = torch.where(better, j, best_j)
+                for bi in torch.nonzero(better, as_tuple=False).flatten().tolist():
+                    best_edge[bi] = nm
+            w_dom = (lbq + bias).min(dim=1).values
+            for bi in torch.nonzero(open_mask, as_tuple=False).flatten().tolist():
+                if best_edge[bi] is None:
+                    # no unstable relu left: relaxation exact -> the domain
+                    # can only be sat; try to falsify, else give up loudly
+                    return 'unknown', {'reason': 'exhausted splits',
+                                       'bounded': n_bounded}
+                base = batch_doms[bi][2]
+                for sgn in (1, -1):
+                    heapq.heappush(heap, (float(w_dom[bi]), tick,
+                                          base + ((best_edge[bi],
+                                                   int(best_j[bi]), sgn),)))
+                    tick += 1
+            if onnx_path is not None and rounds % attack_every == 1:
+                cand, _ = attack.pgd(net, spec, lo=lo1[0], hi=hi1[0],
+                                     restarts=128, iters=60, device=device,
+                                     time_budget=1.5, seed=rounds)
+                if cand is not None:
+                    ok, vinfo = attack.validate(onnx_path, spec, cand)
+                    if ok:
+                        return 'sat', {'witness': np.asarray(
+                            vinfo.get('witness_inbox', cand))}
+        if rounds % 16 == 0:
+            log(f'[vc2/rbab] round={rounds} frontier={len(heap)} '
+                f'bounded={n_bounded} t={time.time() - t0:.1f}s')
+    return 'unsat', {'bounded': n_bounded, 'rounds': rounds}

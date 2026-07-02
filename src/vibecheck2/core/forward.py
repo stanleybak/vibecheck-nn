@@ -241,9 +241,22 @@ def zono(net, lo, hi, return_state=False):
                 c2[:, p] = zp.c
                 G2[:, p.unsqueeze(1), torch.as_tensor(cols, device=dev)] = zp.G
             state[name] = ZonoState(c2, G2, syms)
-        elif op.kind in ('mul', 'maxpool'):
+        elif op.kind == 'mul':
+            # bilinear product: sound box collapse (correlation through the
+            # product is dropped; McCormick-in-zono can tighten later)
+            za, zb = state[op.inputs[0]], state[op.inputs[1]]
+            (la, ha), (lb_, hb_) = za.bounds(), zb.bounds()
+            cands = torch.stack([la * lb_, la * hb_, ha * lb_, ha * hb_])
+            mlo = cands.min(dim=0).values
+            mhi = cands.max(dim=0).values
+            c2 = (mhi + mlo) / 2
+            delta = (mhi - mlo) / 2
+            G2 = torch.diag_embed(delta)
+            sym = [(name, i) for i in range(c2.shape[1])]
+            state[name] = ZonoState(c2, G2, sym)
+        elif op.kind == 'maxpool':
             raise NotImplementedError(
-                f'zono: {op.kind} arrives with its category (design 3.4)')
+                'zono: maxpool arrives with M5 (relu decomposition)')
         else:
             raise NotImplementedError(f'zono: op kind {op.kind!r}')
     zout = state[net.output_name]
