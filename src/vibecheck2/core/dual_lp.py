@@ -24,7 +24,165 @@ import torch
 from . import forward as fwd
 
 
-def build_state(net, lo, hi, inter=None):
+def build_state_backward(net, lo, hi, inter, slopes=None, device='cpu'):
+    """v1 reverse_g ported onto the vc2 IR: the alpha-zono LP state built by
+    BACKWARD passes (one seeded at each relu layer's unstable neurons, one at
+    the output), with NO forward zonotope. Memory-bounded: only unstable
+    rows materialize, seeds chunk through the memory service, and every
+    layout detail lives in LinMap.lin_t (patches-ready by construction).
+
+    The walk is the SLOPE-LINEAR adjoint (y = lam*z + mu + mu*e_new at each
+    relu: scale by lam, deposit mu on the fresh column), NOT the sign-split
+    CROWN planes; `slopes` optionally overrides lam per relu (any value in
+    [0,1] is sound; default DeepZ h/(h-l)).
+    """
+    import scipy.sparse as sp
+
+    from . import memory
+    from .relax import REL
+    dev = torch.device(device)
+    dt = torch.float32
+    lo2 = lo.reshape(1, -1).to(dev, dt)
+    hi2 = hi.reshape(1, -1).to(dev, dt)
+    n_in = net.n_in
+    radii = ((hi2 - lo2) / 2)[0]
+
+    # per-relu band coefficients from the (refined) bounds
+    relu_ops = [nm for nm in net.order
+                if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'relu']
+    lam_L, mu_L, ust_L, pre_lh = {}, {}, {}, {}
+    col = n_in
+    e_col = {}
+    for nm in relu_ops:
+        l, h = inter[nm]
+        l, h = l[0].to(dev, dt), h[0].to(dev, dt)
+        if slopes and nm in slopes:
+            a = slopes[nm].reshape(-1).to(dev, dt).clamp(0.0, 1.0)
+            lam = torch.where(l >= 0, torch.ones_like(l),
+                              torch.where(h <= 0, torch.zeros_like(l), a))
+            mu = torch.where((l < 0) & (h > 0),
+                             torch.maximum((1 - lam) * h, -lam * l) / 2,
+                             torch.zeros_like(l))
+        else:
+            lam, mu, _d = REL['relu'].band(l.unsqueeze(0), h.unsqueeze(0))
+            lam, mu = lam[0], mu[0]
+        lam_L[nm], mu_L[nm], pre_lh[nm] = lam, mu, (l, h)
+        u = torch.nonzero((l < 0) & (h > 0), as_tuple=False).flatten()
+        ust_L[nm] = u
+        for j in u.tolist():
+            e_col[(nm, j)] = col
+            col += 1
+    n_gens = col
+
+    # centers by one slope-linear forward point pass (relu -> lam*z + mu)
+    center = {net.input_name: ((lo2 + hi2) / 2)[0]}
+    pre_center = {}
+    for name in net.order:
+        op = net.ops[name]
+        if op.kind == 'linmap':
+            center[name] = op.lm.point(center[op.inputs[0]].unsqueeze(0))[0]
+        elif op.kind == 'nonlin' and op.fn == 'relu':
+            z = center[op.inputs[0]]
+            pre_center[name] = z
+            center[name] = lam_L[name] * z + mu_L[name]
+        elif op.kind == 'add':
+            center[name] = center[op.inputs[0]] + center[op.inputs[1]]
+        elif op.kind == 'concat':
+            out = torch.as_tensor(op.params['base'], device=dev,
+                                  dtype=dt).clone()
+            for src, pos in zip(op.inputs, op.params['positions']):
+                out[torch.as_tensor(pos, device=dev)] = center[src]
+            center[name] = out
+        else:
+            raise NotImplementedError(
+                f'state_backward center: {op.kind}/{op.fn} (relu nets only)')
+
+    def backward_rows(seed_edge, seed_idx, self_relu):
+        """(len(seed_idx), n_gens) generator rows of the seeded neurons."""
+        ns = len(seed_idx)
+        rowG = torch.zeros(ns, n_gens, device=dev, dtype=dt)
+        sens = {seed_edge: torch.zeros(ns, net.ops[seed_edge].n,
+                                       device=dev, dtype=dt)}
+        sens[seed_edge][torch.arange(ns, device=dev),
+                        torch.as_tensor(seed_idx, device=dev)] = 1.0
+        for name in reversed(net.order):
+            if name not in sens:
+                continue
+            sx = sens.pop(name)
+            op = net.ops[name]
+            if op.kind == 'linmap':
+                add = op.lm.lin_t(sx)
+            elif op.kind == 'nonlin' and op.fn == 'relu':
+                if name != self_relu:
+                    u = ust_L[name]
+                    if u.numel():
+                        cols = torch.as_tensor(
+                            [e_col[(name, int(j))] for j in u.tolist()],
+                            device=dev)
+                        rowG[:, cols] += sx[:, u] * mu_L[name][u].unsqueeze(0)
+                    sx = sx * lam_L[name].unsqueeze(0)
+                add = sx
+            elif op.kind == 'add':
+                sens[op.inputs[1]] = sens.get(op.inputs[1], 0) + sx
+                add = sx
+            elif op.kind == 'concat':
+                for src, pos in zip(op.inputs, op.params['positions']):
+                    p = torch.as_tensor(pos, device=dev)
+                    sens[src] = sens.get(src, 0) + sx[:, p]
+                continue
+            else:
+                raise NotImplementedError(
+                    f'state_backward: {op.kind}/{op.fn}')
+            sens[op.inputs[0]] = sens.get(op.inputs[0], 0) + add
+        s_in = sens.get(net.input_name)
+        if s_in is not None:
+            rowG[:, :n_in] += s_in * radii.unsqueeze(0)
+        return rowG
+
+    widest = max(net.ops[o].n for o in net.order)
+    per_row = widest * 4 * 6
+    unstable_list = []
+    for nm in relu_ops:
+        u = ust_L[nm]
+        if not u.numel():
+            continue
+        pre_edge = net.ops[nm].inputs[0]
+        rows_out = []
+
+        def take(sel, _pre=pre_edge, _nm=nm, _acc=rows_out):
+            _acc.append(backward_rows(_pre, sel.tolist(), _nm))
+
+        memory.chunked_indices(take, u, per_row)
+        rowG = torch.cat(rows_out).cpu().numpy()
+        for i, j in enumerate(u.tolist()):
+            nz = np.nonzero(rowG[i])[0]
+            unstable_list.append({
+                'layer_idx': nm, 'neuron_idx': int(j),
+                'lam': float(lam_L[nm][j]), 'mu': float(mu_L[nm][j]),
+                'c_in': float(pre_center[nm][j]),
+                'e_new_col': e_col[(nm, int(j))],
+                'row_indices': nz.tolist(),
+                'row_values': rowG[i, nz].astype(np.float64).tolist(),
+            })
+    obj_rows = []
+
+    def take_out(sel, _acc=obj_rows):
+        _acc.append(backward_rows(net.output_name, sel.tolist(), None))
+
+    memory.chunked_indices(take_out, torch.arange(net.n_out, device=dev),
+                           per_row)
+    obj_G = torch.cat(obj_rows).cpu().numpy()
+    state = {
+        'n_gens': int(n_gens), 'n_input': int(n_in),
+        'unstable_list': unstable_list,
+        'obj_G_out_csr': sp.csr_matrix(obj_G.astype(np.float64)),
+        'obj_c_out': center[net.output_name].cpu().numpy().astype(np.float64),
+    }
+    keys = [(u['layer_idx'], u['neuron_idx']) for u in unstable_list]
+    return state, keys
+
+
+def build_state(net, lo, hi, inter=None, slopes=None):
     """One recorded zonotope pass -> the v1 gen-state dict (single box).
     `inter` (CROWN-refined pre-activation bounds) clamps every band, which
     is what makes the LP state competitive with v1's tightened states.
@@ -39,7 +197,8 @@ def build_state(net, lo, hi, inter=None):
         clamp = {k: (v[0], v[1]) for k, v in inter.items()
                  if len(v) == 2}
     _lo, _hi, zstate = fwd.zono(net, lo, hi, return_state=True,
-                                record=record, clamp_bounds=clamp)
+                                record=record, clamp_bounds=clamp,
+                                slope_override=slopes)
     out = zstate[net.output_name]
     final_sym = out.sym
     n_gens = len(final_sym)
@@ -128,12 +287,21 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
     # state's bands inherit them, which is what makes the dual competitive
     # with v1's tightened states
     inter = backward.intermediates_crown(net, lo, hi, base_inter=inter)
-    state, keys = build_state(net, lo, hi, inter=inter)
-    if not keys:
-        return set()
+    # per-query direction-adaptive slopes (v1 build_dir_adaptive_alpha):
+    # the optimized alpha of each open query row becomes that query's
+    # zonotope slope, tightening its OWN LP state
+    open_rows = [r for d in open_d
+                 for r in torch.nonzero(disj_idx == d,
+                                        as_tuple=False).flatten().tolist()]
+    W_open = W[open_rows]
+    _lb, alpha = backward.alpha_crown(net, lo, hi, W_open, inter,
+                                      iters=25, thresholds=-bias[open_rows],
+                                      return_alpha=True)
+    row_pos = {r: i for i, r in enumerate(open_rows)}
     refuted = set()
     dev = str(torch.device(device))
     ver = _verifier(dev)
+    state_cache = {}
     for d in open_d:
         rows = torch.nonzero(disj_idx == d, as_tuple=False).flatten().tolist()
         left = deadline - time.time()
@@ -143,6 +311,17 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
         for r in rows:
             qw = W[r].cpu().numpy()
             qb = float(bias[r])
+            # NOTE: naively reusing CROWN alphas as zonotope slopes makes
+            # the state LOOSER (measured: img96 dual went unsat 3.5s ->
+            # frontier OOM); DeepZ slopes + refined bounds win. State comes
+            # from the BACKWARD builder (v1 reverse_g port): no forward
+            # zonotope, unstable rows only, LinMap-generic.
+            if r not in state_cache:
+                state_cache[r] = build_state_backward(
+                    net, lo, hi, inter, device=device)
+            state, keys = state_cache[r]
+            if not keys:
+                continue
             sk = score_keys(net, lo, hi, W[r:r + 1], inter, keys)
             extra = [(W[r2].cpu().numpy(), float(bias[r2]))
                      for r2 in rows if r2 != r]

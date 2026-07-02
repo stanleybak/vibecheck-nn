@@ -230,3 +230,28 @@ def test_floor_planes_bracket():
         y = torch.floor(x)
         assert (al * x + bl <= y + 1e-5).all()
         assert (y <= au * x + bu + 1e-5).all()
+
+
+def test_backward_state_matches_forward(tmp_path):
+    """dual_lp: the reverse-built LP state equals the forward-recorded one
+    (v1 reverse_g invariant) on a random relu net."""
+    from vibecheck2.core import backward as bwd
+    from vibecheck2.core import dual_lp
+    net = _fc_relu_net(tmp_path, sizes=(5, 12, 12, 3))
+    lo, hi = _box(net.n_in, w=2.0)
+    inter = bwd.intermediates(net, lo, hi)
+    s_f, k_f = dual_lp.build_state(net, lo, hi, inter=inter)
+    s_b, k_b = dual_lp.build_state_backward(net, lo, hi, inter)
+    assert s_f['n_gens'] == s_b['n_gens'] and k_f == k_b
+    assert np.allclose(s_f['obj_c_out'], s_b['obj_c_out'], atol=1e-4)
+    Gf = s_f['obj_G_out_csr'].toarray()
+    Gb = s_b['obj_G_out_csr'].toarray()
+    assert np.allclose(Gf, Gb, atol=1e-4), np.abs(Gf - Gb).max()
+    for uf, ub in zip(s_f['unstable_list'], s_b['unstable_list']):
+        assert uf['layer_idx'] == ub['layer_idx']
+        assert uf['neuron_idx'] == ub['neuron_idx']
+        assert abs(uf['lam'] - ub['lam']) < 1e-5
+        assert abs(uf['c_in'] - ub['c_in']) < 1e-4
+        rf = np.zeros(s_f['n_gens']); rf[uf['row_indices']] = uf['row_values']
+        rb = np.zeros(s_b['n_gens']); rb[ub['row_indices']] = ub['row_values']
+        assert np.allclose(rf, rb, atol=1e-4), np.abs(rf - rb).max()

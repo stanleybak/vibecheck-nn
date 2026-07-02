@@ -394,7 +394,7 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
 
 
 def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
-                thresholds=None, budget=None):
+                thresholds=None, budget=None, return_alpha=False):
     """Adam-optimized alpha-CROWN lower bounds (fixed intermediates).
 
     Maximizes each query's lb independently (sum of hinged bounds: a query
@@ -442,4 +442,7 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
             for t in alpha.values():
                 t.clamp_(0.0, 1.0)
     lb = crown(net, lo, hi, W, inter, alpha)
-    return torch.maximum(best, lb.detach())
+    best = torch.maximum(best, lb.detach())
+    if return_alpha:
+        return best, {k: v.detach() for k, v in alpha.items()}
+    return best

@@ -207,7 +207,8 @@ class ZonoState:
         return self.c - r, self.c + r
 
 
-def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None):
+def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None,
+         slope_override=None):
     """DeepZ forward. Boxes (B, n_in) -> output bounds (+ per-edge states).
 
     record: optional dict; when given, each relu op stores its
@@ -215,7 +216,11 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None):
     for the dual-ascent LP state builder (core.dual_lp).
     clamp_bounds: optional {nonlin op: (lo, hi)} EXTERNAL pre-activation
     bounds (e.g. CROWN-refined) intersected before each band; sound, and
-    the resulting bands/state get much tighter."""
+    the resulting bands/state get much tighter.
+    slope_override: optional {relu op: (B, n) lam in [0, 1]} per-neuron
+    slopes (e.g. a query's optimized alphas); the band offset is recomputed
+    for the given slope (relu deviation spans [0, max(-lam*l, (1-lam)*h)]),
+    so ANY slope in [0, 1] stays sound."""
     lo, hi = _as2d(lo), _as2d(hi)
     B, n = lo.shape
     dev, dt = lo.device, lo.dtype
@@ -265,6 +270,14 @@ def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None):
             # (relu: DeepZ triangle; sigmoid/tanh: chord band; each op's
             # RelaxLib entry owns its closed-form construction)
             lam, mu, delta = rel.band(zl, zh, op.params)
+            if (slope_override and op.fn == 'relu'
+                    and name in slope_override):
+                lam_o = slope_override[name].clamp(0.0, 1.0)
+                unst = (zl < 0) & (zh > 0)
+                dev_max = torch.maximum(-lam_o * zl, (1 - lam_o) * zh)
+                lam = torch.where(unst, lam_o, lam)
+                mu = torch.where(unst, dev_max / 2, mu)
+                delta = torch.where(unst, dev_max / 2, delta)
             if record is not None and op.fn == 'relu':
                 # pre-activation snapshot for dual_lp.build_state:
                 # z_j = c_pre[j] + G_pre[j] . e  and  y = lam z + mu + mu e_new
