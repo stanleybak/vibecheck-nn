@@ -77,7 +77,7 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False):
             f = REL[op.fn].point
             flo, fhi = f(ci - ri, op.params), f(ci + ri, op.params)
             if op.fn in ('relu', 'leaky_relu', 'sigmoid', 'tanh', 'exp',
-                         'floor', 'sign'):
+                         'floor', 'sign', 'reciprocal'):
                 pass                      # monotone: endpoint eval is exact
             elif op.fn in ('sin', 'cos', 'pow'):
                 flo, fhi = _nonmono_interval(op, ci - ri, ci + ri, flo, fhi)

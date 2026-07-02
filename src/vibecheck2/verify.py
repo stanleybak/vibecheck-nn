@@ -80,12 +80,15 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     if len(groups) == 1:
         return _verify_one(net, spec, onnx_path, timeout, device,
                            alpha_iters, pgd_budget, log, t0)
-    if len(groups) > 64:
-        raise NotImplementedError(
-            f'{len(groups)} input subbox groups: the mega-disjunct handler '
-            f'(design 3.6) is not implemented yet')
     log(f'[vc2] {len(groups)} input-subbox groups (per-disjunct boxes)')
-    share = (timeout - (time.time() - t0)) / len(groups)
+    if len(groups) > 16:
+        # mega-disjunct screening (nn4sys-style): one batched CROWN pass
+        # over ALL subboxes refutes the easy mass; only survivors get the
+        # full per-group pipeline
+        groups = _screen_subbox_groups(net, spec, groups, device, log)
+        log(f'[vc2] {len(groups)} groups open after batched screening')
+    share = ((timeout - (time.time() - t0)) / max(1, len(groups))
+             if groups else 0.0)
     for glo, ghi, idxs in groups:
         sub = VNNSpec(x_lo=np.asarray(glo, dtype=np.float64),
                       x_hi=np.asarray(ghi, dtype=np.float64),
@@ -97,6 +100,32 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
             details['time'] = time.time() - t0
             return verdict, details
     return 'unsat', {'time': time.time() - t0}
+
+
+def _screen_subbox_groups(net, spec, groups, device, log):
+    """Batched-CROWN refutation screen over subbox groups; returns the
+    still-open subset. Sound: only provably-refuted groups are dropped."""
+    from .core import backward, memory
+    dev = torch.device(device)
+    W_all, b_all, di_all = _spec_queries(spec, net.n_out)
+    W_all, b_all = W_all.to(dev), b_all.to(dev)
+    open_groups = []
+    widest = max(net.ops[o].n for o in net.order)
+    per_dom = W_all.shape[0] * widest * 4 * 8
+    cs = memory.chunk_size(len(groups), per_dom, dev)
+    for i in range(0, len(groups), cs):
+        chunk = groups[i:i + cs]
+        lo = torch.tensor(np.stack([g[0] for g in chunk]),
+                          dtype=torch.float32, device=dev)
+        hi = torch.tensor(np.stack([g[1] for g in chunk]),
+                          dtype=torch.float32, device=dev)
+        lbq = backward.crown(net, lo, hi, W_all) + b_all
+        for k, (glo, ghi, idxs) in enumerate(chunk):
+            refuted = all(
+                bool((lbq[k][di_all == d] > 0).any()) for d in idxs)
+            if not refuted:
+                open_groups.append((glo, ghi, idxs))
+    return open_groups
 
 
 def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,

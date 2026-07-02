@@ -160,6 +160,41 @@ class Exp:
         return torch.exp(x)
 
 
+class Reciprocal:
+    """1/y on sign-definite ranges: convex for y>0 (tangent below, chord
+    above), concave for y<0 (mirrored). A range straddling 0 has no sound
+    linear relaxation and raises loudly."""
+
+    def point(self, x, params=None):
+        return 1.0 / x
+
+    def planes(self, lo, hi, params=None):
+        if bool(((lo <= 0) & (hi >= 0)).any()):
+            raise NotImplementedError(
+                'reciprocal over a range containing 0 is unbounded')
+        m = (lo + hi) / 2
+        tan_a = -1.0 / (m * m)
+        tan_b = 2.0 / m
+        chord_a = -1.0 / (lo * hi)
+        chord_b = 1.0 / lo + 1.0 / hi
+        pos = lo > 0
+        al = torch.where(pos, tan_a, chord_a)
+        bl = torch.where(pos, tan_b, chord_b)
+        au = torch.where(pos, chord_a, tan_a)
+        bu = torch.where(pos, chord_b, tan_b)
+        return al, bl, au, bu
+
+    def band(self, lo, hi, params=None):
+        # chord slope band: g(y) = 1/y - lam*y has its interior stationary
+        # point at y = -1/sqrt(-lam... ) i.e. g'(y) = -1/y^2 - lam = 0 ->
+        # y* = +/- sqrt(-1/lam) (lam < 0 always for 1/y on sign-definite y)
+        lam = -1.0 / (lo * hi)
+        y_star = torch.sqrt((-1.0 / lam).clamp_min(1e-30))
+        y_star = torch.where(lo > 0, y_star, -y_star)
+        bl, bu = _band(lambda y: 1.0 / y, lo, hi, lam, [y_star])
+        return lam, (bl + bu) / 2, (bu - bl) / 2
+
+
 class Pow(_V1Band):
     def point(self, x, params=None):
         return x ** (params or {})['exponent']
@@ -181,4 +216,5 @@ class Floor:
 
 REL = {'relu': Relu(), 'leaky_relu': LeakyRelu(), 'sigmoid': Sigmoid(),
        'tanh': Tanh(), 'sin': Sin(), 'cos': Cos(), 'exp': Exp(),
-       'pow': Pow(), 'sign': SignFn(), 'floor': Floor()}
+       'pow': Pow(), 'sign': SignFn(), 'floor': Floor(),
+       'reciprocal': Reciprocal()}

@@ -450,10 +450,17 @@ def from_compute_graph(cg, true_shapes=None) -> Net:
                 inp, _n = broadcast_in(node, out_shape)
                 emit(name, 'linmap', [inp], out_shape,
                      lm=lm.ScaleShift(a, None, n_out))
-            elif t == 'Mul' and len(node.inputs) == 2:
-                # elementwise bilinear product of two live edges (lsnc
-                # lyapunov squares, ml4acopf); McCormick relaxation arrives
-                # with its category, point/interval eval work now
+            elif len(node.inputs) == 2:
+                # bilinear: Mul is native; Div lowers to mul(a, recip(b))
+                if t == 'Div':
+                    bshape = v1shape(node.inputs[1])
+                    rname = name + '/recip'
+                    emit(rname, 'nonlin', [src(node.inputs[1])],
+                         _drop_batch(bshape), nd_shape=bshape,
+                         fn='reciprocal')
+                    import types
+                    node = types.SimpleNamespace(
+                        name=node.name, inputs=[node.inputs[0], rname])
                 na, nb, full = broadcast_pair(node)
                 emit(name, 'mul', [na, nb], full)
             else:
