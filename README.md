@@ -57,7 +57,7 @@ Result: verified
 unsat
 ```
 
-And a violated property — stdout is the verdict plus the satisfying assignment:
+And a violated property, where stdout is the verdict plus the satisfying assignment:
 
 ```console
 $ vibecheck verify examples/prop_2.vnnlib --network N=examples/ACASXU_run2a_2_2_batch_2000.onnx --timeout 60  2>/dev/null
@@ -79,8 +79,7 @@ Y float32 [1,5]
 The `Auto-config:` line shows config selection: with no `--config`, vibecheck
 picks a bundled per-benchmark config (`configs/*.yaml`) from the structure of
 the network and spec (input dim, conv/transformer/nonlinear ops, network-pair
-kind) and logs which rule fired. Override it with `--config configs/<name>.yaml`,
-or override any single setting with `--set KEY=VALUE`.
+kind) and logs which rule fired. Override it with `--config configs/<name>.yaml`.
 
 The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
 --results-file out.txt`, the form the VNNCOMP harness drives) is unchanged; see
