@@ -217,3 +217,16 @@ def test_bmm_interval_sound(tmp_path):
     xs = torch.rand(1024, net.n_in) * (hi - lo) + lo
     ys = forward.point(net, xs)
     assert (ys >= ilo - 1e-4).all() and (ys <= ihi + 1e-4).all()
+
+
+def test_floor_planes_bracket():
+    from vibecheck2.core.relax import REL
+    rel = REL['floor']
+    lo = torch.tensor([[-2.7, 0.2, 3.0, -0.5]])
+    hi = torch.tensor([[1.3, 0.8, 3.9, 2.5]])
+    al, bl, au, bu = rel.planes(lo, hi)
+    for t in torch.linspace(0, 1, 401):
+        x = lo + t * (hi - lo)
+        y = torch.floor(x)
+        assert (al * x + bl <= y + 1e-5).all()
+        assert (y <= au * x + bu + 1e-5).all()

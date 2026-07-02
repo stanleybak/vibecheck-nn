@@ -339,8 +339,25 @@ class SignFn:
 
 
 class Floor:
+    """floor(x): exact constant when the range holds one integer step,
+    else the unit band x-1 < floor(x) <= x."""
+
     def point(self, x, params=None):
         return torch.floor(x)
+
+    def planes(self, lo, hi, params=None):
+        fl, fh = torch.floor(lo), torch.floor(hi)
+        same = fl == fh                       # constant on the whole range
+        one = torch.ones_like(lo)
+        al = torch.where(same, torch.zeros_like(lo), one)
+        bl = torch.where(same, fl, -one)
+        au = torch.where(same, torch.zeros_like(lo), one)
+        bu = torch.where(same, fl, torch.zeros_like(lo))
+        return al, bl, au, bu
+
+    def band(self, lo, hi, params=None):
+        al, bl, au, bu = self.planes(lo, hi, params)
+        return al, (bl + bu) / 2, (bu - bl) / 2
 
 
 REL = {'relu': Relu(), 'leaky_relu': LeakyRelu(), 'sigmoid': Sigmoid(),

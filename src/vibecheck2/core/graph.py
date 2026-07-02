@@ -717,7 +717,13 @@ def load(onnx_path, dtype=np.float32) -> Net:
                                           maxpool_to_relu, min_max_to_relu)
     cg = ComputeGraph.from_onnx(onnx_path, dtype=dtype)
     drop_identity_pads(cg)
-    maxpool_to_relu(cg)
+    try:
+        maxpool_to_relu(cg)
+    except NotImplementedError as e:
+        # padded MaxPool pads with -inf, which the exact ReLU decomposition
+        # cannot express (v1 refuses loudly). Keep the native maxpool kind:
+        # point eval / attack work; the bound side raises if ever reached.
+        print(f'[vc2] maxpool_to_relu skipped ({e}); keeping native maxpool')
     min_max_to_relu(cg)
     net = from_compute_graph(cg, true_shapes=_onnx_true_shapes(onnx_path))
     net.onnx_path = onnx_path
