@@ -204,6 +204,18 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         verdict, open_d = _verdict_from_lbs(lb + b, di, len(spec.disjuncts))
         log(f'[vc2] alpha-crown: worst={float((lb + b).min()):.4f} '
             f'open={len(open_d)}/{len(spec.disjuncts)}')
+        worst = float((lb + b).min())
+        if verdict != 'unsat' and -1.0 < worst <= 0 and budget.remaining() > 20:
+            # near-zero gap: a longer, lower-lr polish often closes it
+            # outright (abcrown runs ~100 root iters; the quick pass is 20)
+            lb2 = backward.alpha_crown(net, lo, hi, W, inter, iters=150,
+                                       lr=0.1, thresholds=-b,
+                                       budget=budget)[0]
+            lb = torch.maximum(lb, lb2)
+            verdict, open_d = _verdict_from_lbs(lb + b, di,
+                                                len(spec.disjuncts))
+            log(f'[vc2] alpha-polish: worst={float((lb + b).min()):.4f} '
+                f'open={len(open_d)}/{len(spec.disjuncts)}')
     if verdict != 'unsat':
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query

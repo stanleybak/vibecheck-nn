@@ -276,6 +276,18 @@ def score_keys(net, lo, hi, W_open, inter, keys):
     return sorted(keys, key=lambda k: -scores[k])
 
 
+def _state_for(net, lo, hi, inter, slopes, device):
+    """Backward state build with the forward-recorded fallback for nets
+    carrying non-slope-linear ops (mul/sigmoid free-block generators)."""
+    try:
+        return build_state_backward(net, lo, hi, inter, device=device,
+                                    slopes=slopes)
+    except NotImplementedError:
+        return build_state(net, lo, hi, inter=inter,
+                           slopes={k: v.unsqueeze(0)
+                                   for k, v in slopes.items()})
+
+
 def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                     deadline, device='cpu', log=lambda m: None):
     """Refute the still-open disjuncts with the dual-ascent BaB, one query
@@ -333,17 +345,9 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             # from the BACKWARD builder (v1 reverse_g port): no forward
             # zonotope, unstable rows only, LinMap-generic.
             if r not in state_cache:
-                sl = dir_adaptive_slopes(row_pos[r])
-                try:
-                    state_cache[r] = build_state_backward(
-                        net, lo, hi, inter, device=device, slopes=sl)
-                except NotImplementedError:
-                    # nets with non-slope-linear ops (mul, sigmoid): the
-                    # forward-recorded builder handles them as free-block
-                    # generators; slopes still apply to the relus
-                    state_cache[r] = build_state(
-                        net, lo, hi, inter=inter,
-                        slopes={k: v.unsqueeze(0) for k, v in sl.items()})
+                state_cache[r] = _state_for(
+                    net, lo, hi, inter, dir_adaptive_slopes(row_pos[r]),
+                    device)
             state, keys = state_cache[r]
             if not keys:
                 continue
@@ -366,9 +370,9 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                     gamma_inter[d] = backward.intermediates_crown(
                         net, lo, hi, base_inter=inter,
                         gamma_rows=(Wg, bg))
-                g_state, g_keys = build_state_backward(
-                    net, lo, hi, gamma_inter[d], device=device,
-                    slopes=dir_adaptive_slopes(row_pos[r]))
+                g_state, g_keys = _state_for(
+                    net, lo, hi, gamma_inter[d],
+                    dir_adaptive_slopes(row_pos[r]), device)
                 sk2 = score_keys(net, lo, hi, W[r:r + 1], gamma_inter[d],
                                  g_keys)
                 verdict, info = ver.verify_query(
