@@ -194,35 +194,56 @@ def zono(net, lo, hi, return_state=False):
                                za.G[:, :, k:], zb.G[:, :, k:]], dim=2)
                 sym = za.sym[:k] + za.sym[k:] + zb.sym[k:]
             state[name] = ZonoState(za.c + zb.c, G, sym)
-        elif op.kind == 'nonlin' and op.fn == 'relu':
+        elif op.kind == 'nonlin':
+            rel = REL[op.fn]
+            if not hasattr(rel, 'band'):
+                raise NotImplementedError(
+                    f'zono: no affine band for {op.fn!r} yet (design 3.4)')
             z = state[op.inputs[0]]
             zl, zh = z.bounds()
-            # DeepZ relu: on unstable neurons y = lam*x + mu + mu*e_new with
-            # lam = h/(h-l), mu = -lam*l/2 (relu(x)-lam*x spans [0, -lam*l]);
-            # exact identity/zero on stable ones.
-            unstable = (zl < 0) & (zh > 0)
-            lam = torch.where(unstable, zh / (zh - zl).clamp_min(1e-30),
-                              (zl >= 0).to(zl.dtype))
-            mu = torch.where(unstable,
-                             -zh * zl / (zh - zl).clamp_min(1e-30) / 2,
-                             torch.zeros_like(zl))
+            # generic DeepZ affine band: y = lam*x + mu + delta*e_new
+            # (relu: DeepZ triangle; sigmoid/tanh: chord band; each op's
+            # RelaxLib entry owns its closed-form construction)
+            lam, mu, delta = rel.band(zl, zh)
             c2 = lam * z.c + mu
             G2 = lam.unsqueeze(2) * z.G
-            # fresh symbol per element unstable ANYWHERE in the batch
-            unstable_any = ((zl < 0) & (zh > 0)).any(dim=0)
-            new_idx = torch.nonzero(unstable_any, as_tuple=False).flatten()
+            # fresh symbol per element with a nonzero band ANYWHERE in batch
+            new_idx = torch.nonzero((delta > 0).any(dim=0),
+                                    as_tuple=False).flatten()
             if new_idx.numel():
                 cols = torch.zeros(B, z.c.shape[1], new_idx.numel(),
                                    device=dev, dtype=dt)
                 cols[:, new_idx, torch.arange(new_idx.numel(), device=dev)] = \
-                    mu[:, new_idx]
+                    delta[:, new_idx]
                 G2 = torch.cat([G2, cols], dim=2)
             sym = z.sym + [(name, int(i)) for i in new_idx.tolist()]
             state[name] = ZonoState(c2, G2, sym)
-        elif op.kind in ('nonlin', 'maxpool', 'concat'):
+        elif op.kind == 'concat':
+            z_parts = [state[s] for s in op.inputs]
+            base = torch.as_tensor(op.params['base'], device=dev, dtype=dt)
+            n_out = op.params['n_out']
+            # union the symbol lists (shared prefix + tails, as in add)
+            syms, gmap = [], []
+            for zp in z_parts:
+                cols = []
+                for s in zp.sym:
+                    if syms and s in syms:      # rare; only shared prefixes
+                        cols.append(syms.index(s))
+                    else:
+                        syms.append(s)
+                        cols.append(len(syms) - 1)
+                gmap.append(cols)
+            c2 = base.expand(B, -1).clone()
+            G2 = torch.zeros(B, n_out, len(syms), device=dev, dtype=dt)
+            for zp, cols, pos in zip(z_parts, gmap,
+                                     op.params['positions']):
+                p = torch.as_tensor(pos, device=dev)
+                c2[:, p] = zp.c
+                G2[:, p.unsqueeze(1), torch.as_tensor(cols, device=dev)] = zp.G
+            state[name] = ZonoState(c2, G2, syms)
+        elif op.kind in ('mul', 'maxpool'):
             raise NotImplementedError(
-                f'zono: {op.kind}/{getattr(op, "fn", "")} arrives with its '
-                f'category (design 3.4); use interval or CROWN meanwhile')
+                f'zono: {op.kind} arrives with its category (design 3.4)')
         else:
             raise NotImplementedError(f'zono: op kind {op.kind!r}')
     zout = state[net.output_name]

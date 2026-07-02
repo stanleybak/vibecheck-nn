@@ -36,6 +36,16 @@ class Relu:
         bl = torch.zeros_like(lo)
         return al, bl, au, bu
 
+    def band(self, lo, hi):
+        """DeepZ affine band (lam, mu, delta): f(x) in lam*x + mu +/- delta."""
+        unstable = (lo < 0) & (hi > 0)
+        lam = torch.where(unstable, hi / (hi - lo).clamp_min(1e-30),
+                          (lo >= 0).to(lo.dtype))
+        mu = torch.where(unstable,
+                         -hi * lo / (hi - lo).clamp_min(1e-30) / 2,
+                         torch.zeros_like(lo))
+        return lam, mu, mu.clone()
+
 
 class LeakyRelu:
     def point(self, x, params=None):
@@ -43,14 +53,70 @@ class LeakyRelu:
         return torch.nn.functional.leaky_relu(x, alpha)
 
 
-class Sigmoid:
+def _band(f, lo, hi, lam, crit_xs):
+    """Closed-form affine band for smooth f: with slope lam, the deviation
+    g(x) = f(x) - lam*x on [lo, hi] attains its extrema at the endpoints or
+    at the finitely many stationary points f'(x) = lam (supplied in closed
+    form via crit_xs). Returns (bl, bu) with lam*x+bl <= f(x) <= lam*x+bu.
+    Ported from v1 nl_sigmoid_tanh._band_from_candidates (sound by
+    construction; no sampling)."""
+    g_lo, g_hi = f(lo) - lam * lo, f(hi) - lam * hi
+    gmax = torch.maximum(g_lo, g_hi)
+    gmin = torch.minimum(g_lo, g_hi)
+    for xc in crit_xs:
+        ok = (xc >= lo) & (xc <= hi) & torch.isfinite(xc)
+        gx = torch.where(ok, f(xc) - lam * xc, gmin)
+        gmin = torch.minimum(gmin, gx)
+        gmax = torch.maximum(gmax, torch.where(ok, gx, gmax))
+    return gmin, gmax
+
+
+class _SShaped:
+    """Shared plane construction for strictly increasing S-shaped ops
+    (sigmoid, tanh): chord slope + closed-form critical points."""
+
+    def planes(self, lo, hi):
+        f = self.point
+        lam = (f(hi) - f(lo)) / (hi - lo).clamp_min(1e-12)
+        lam = torch.where(hi > lo, lam, self._slope_at(lo)).clamp_min(0.0)
+        bl, bu = _band(f, lo, hi, lam, self._crit(lam))
+        return lam, bl, lam, bu
+
+    def band(self, lo, hi):
+        al, bl, _au, bu = self.planes(lo, hi)
+        return al, (bl + bu) / 2, (bu - bl) / 2
+
+
+class Sigmoid(_SShaped):
     def point(self, x, params=None):
         return torch.sigmoid(x)
 
+    def _slope_at(self, x):
+        s = torch.sigmoid(x)
+        return s * (1 - s)
 
-class Tanh:
+    def _crit(self, lam):
+        # f'(x) = s(1-s) = lam  =>  s = (1 +/- sqrt(1-4*lam))/2, x = logit(s)
+        root = torch.sqrt((1 - 4 * lam).clamp_min(0.0))
+        xs = []
+        for s in ((1 + root) / 2, (1 - root) / 2):
+            s = s.clamp(1e-12, 1 - 1e-12)
+            xs.append(torch.log(s / (1 - s)))
+        return xs
+
+
+class Tanh(_SShaped):
     def point(self, x, params=None):
         return torch.tanh(x)
+
+    def _slope_at(self, x):
+        t = torch.tanh(x)
+        return 1 - t * t
+
+    def _crit(self, lam):
+        # f'(x) = 1 - t^2 = lam  =>  t = +/- sqrt(1-lam), x = atanh(t)
+        t = torch.sqrt((1 - lam).clamp_min(0.0)).clamp(max=1 - 1e-12)
+        return [torch.atanh(t), torch.atanh(-t)]
 
 
 class Sin:

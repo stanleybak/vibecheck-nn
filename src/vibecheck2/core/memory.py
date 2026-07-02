@@ -32,6 +32,27 @@ def chunk_size(n_items: int, bytes_per_item: float, device) -> int:
     return max(1, min(n_items, fit))
 
 
+def chunked_indices(fn, idx: torch.Tensor, bytes_per_item: float):
+    """Apply `fn(index_chunk)` over chunks of an index vector, predictively
+    sized with the same halve-on-OOM backstop as `chunked`. fn's outputs are
+    the caller's to place (it typically scatters into a result); returns None.
+    """
+    n = idx.numel()
+    cs = chunk_size(n, bytes_per_item, idx.device)
+    i = 0
+    while i < n:
+        try:
+            fn(idx[i:i + cs])
+            i += cs
+        except torch.cuda.OutOfMemoryError:
+            if cs <= _MIN_CHUNK:
+                raise
+            torch.cuda.empty_cache()
+            cs = max(_MIN_CHUNK, cs // 2)
+            print(f'[memory] CUDA OOM at chunk={2*cs}; retrying with {cs}',
+                  file=sys.stderr, flush=True)
+
+
 def chunked(fn, X: torch.Tensor, bytes_per_item: float):
     """Apply `fn` over the leading dim of X in memory-budgeted chunks.
 

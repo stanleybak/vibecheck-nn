@@ -1,0 +1,121 @@
+"""vibecheck2 verification entry point.
+
+Thin orchestration for the current milestone: load net + spec (v1 front end),
+forward bounds for intermediates, alpha-CROWN on the spec query rows, verdict
+by per-disjunct refutation. Grows into the scheduler of design 2.5; the
+results-file discipline matches v1 (the file is the verdict authority).
+
+Disjunct semantics (v1 spec.py): a counterexample must satisfy EVERY
+constraint of SOME disjunct. A disjunct is refuted when ANY of its query
+rows w.y + b has a positive proven lower bound; `unsat` when every disjunct
+is refuted.
+"""
+from __future__ import annotations
+
+import os
+import time
+
+import numpy as np
+import torch
+
+from .core import backward, forward
+from .core.graph import load as load_net
+
+
+def _spec_queries(spec, n_out, dtype=torch.float32):
+    """(W (q, n_out), bias (q,), disj_idx (q,)) from the v1 VNNSpec."""
+    rows = spec.as_linear_queries(n_out)
+    W = torch.tensor(np.stack([w for _, w, _ in rows]), dtype=dtype)
+    b = torch.tensor([bias for _, _, bias in rows], dtype=dtype)
+    di = torch.tensor([d for d, _, _ in rows])
+    return W, b, di
+
+
+def _verdict_from_lbs(lb_plus_bias, disj_idx, n_disjuncts):
+    """'unsat' iff every disjunct has some strictly-positive query row."""
+    refuted = set()
+    for d in range(n_disjuncts):
+        rows = lb_plus_bias[disj_idx == d]
+        if rows.numel() and rows.max() > 0:
+            refuted.add(d)
+    open_d = [d for d in range(n_disjuncts) if d not in refuted]
+    return ('unsat' if not open_d else 'unknown'), open_d
+
+
+def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
+           alpha_iters=20, log=print):
+    """Returns (verdict, details). Milestone M2: bound-only (no BaB/attack)."""
+    from vibecheck.vnnlib_loader import load_vnnlib
+    t0 = time.time()
+    net = load_net(onnx_path)
+    spec = load_vnnlib(vnnlib_path)
+    log(f'[vc2] {net}')
+
+    dev = torch.device(device)
+    lo = torch.tensor(spec.x_lo, dtype=torch.float32, device=dev).unsqueeze(0)
+    hi = torch.tensor(spec.x_hi, dtype=torch.float32, device=dev).unsqueeze(0)
+    W, b, di = _spec_queries(spec, net.n_out)
+    W, b = W.to(dev), b.to(dev)
+
+    inter = backward.intermediates(net, lo, hi)
+    lb0 = backward.crown(net, lo, hi, W, inter)[0]
+    verdict, open_d = _verdict_from_lbs(lb0 + b, di, len(spec.disjuncts))
+    log(f'[vc2] crown: worst={float((lb0 + b).min()):.4f} '
+        f'open={len(open_d)}/{len(spec.disjuncts)}')
+    if verdict != 'unsat':
+        from .core import memory
+        from .core.backward import _zono_cost_bytes
+        if (_zono_cost_bytes(net, 1)
+                >= memory.free_bytes(lo.device) * memory.SAFETY):
+            # big net: the interval intermediates were the bottleneck;
+            # recompute them by per-edge backward CROWN (chunked)
+            inter = backward.intermediates_crown(net, lo, hi)
+            lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
+            verdict, open_d = _verdict_from_lbs(lb0 + b, di,
+                                                len(spec.disjuncts))
+            log(f'[vc2] crown-inter: worst={float((lb0 + b).min()):.4f} '
+                f'open={len(open_d)}/{len(spec.disjuncts)}')
+    if verdict != 'unsat' and alpha_iters > 0:
+        lb = backward.alpha_crown(net, lo, hi, W, inter,
+                                  iters=alpha_iters, thresholds=-b)[0]
+        lb = torch.maximum(lb, lb0)
+        verdict, open_d = _verdict_from_lbs(lb + b, di, len(spec.disjuncts))
+        log(f'[vc2] alpha-crown: worst={float((lb + b).min()):.4f} '
+            f'open={len(open_d)}/{len(spec.disjuncts)}')
+    return verdict, {'open_disjuncts': open_d, 'time': time.time() - t0}
+
+
+def main(argv=None):
+    """Minimal CLI mirroring v1's verdict conventions for parity harnesses."""
+    import argparse
+    p = argparse.ArgumentParser(prog='vibecheck2')
+    p.add_argument('--net', required=True)
+    p.add_argument('--spec', required=True)
+    p.add_argument('--timeout', type=float, default=60.0)
+    p.add_argument('--device', default='cpu', choices=['cpu', 'cuda'])
+    p.add_argument('--results-file', default=None)
+    a = p.parse_args(argv)
+    if a.results_file:                        # pre-seed like v1
+        with open(a.results_file, 'w') as f:
+            f.write('timeout\n')
+    try:
+        verdict, details = verify(a.net, a.spec, a.timeout, a.device)
+    except BaseException as e:                # crash -> 'error' (v1 discipline)
+        import traceback
+        traceback.print_exc()
+        if a.results_file:
+            with open(a.results_file, 'w') as f:
+                f.write(f'error\n{type(e).__name__}: {str(e)[:300]}\n')
+        return 2
+    if a.results_file:
+        tmp = a.results_file + '.tmp'
+        with open(tmp, 'w') as f:
+            f.write(verdict + '\n')
+        os.replace(tmp, a.results_file)
+    print(f'[vc2] verdict: {verdict}  ({details["time"]:.2f}s)')
+    return 0 if verdict == 'unsat' else 1
+
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(main())
