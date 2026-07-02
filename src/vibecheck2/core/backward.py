@@ -209,7 +209,8 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
     return lb
 
 
-def intermediates_crown(net, lo, hi, base_inter=None, budget=None):
+def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
+                        clamps=None):
     """Pre-activation bounds per nonlin edge via per-edge backward CROWN
     (chunked identity queries, both signs in one pass). Strictly tighter
     than interval; the regime for conv nets whose dense zonotope does not
@@ -235,6 +236,9 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None):
         e = op.inputs[0]
         n = net.ops[e].n
         l0, h0 = inter[name]
+        if clamps and name in clamps:
+            l0, h0 = clamped_bounds((l0, h0), clamps[name])
+            inter[name] = (l0, h0)
         idx = torch.nonzero(((l0 < 0) & (h0 > 0)).any(dim=0),
                             as_tuple=False).flatten()
         if not idx.numel():
@@ -254,7 +258,7 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None):
             Wc[ar, sel] = 1.0
             Wc[m + ar, sel] = -1.0
             out = crown(net, lo, hi, Wc.unsqueeze(0).expand(B, -1, -1),
-                        inter, start=_e)
+                        inter, start=_e, clamps=clamps)
             _lb[:, sel] = torch.maximum(_lb[:, sel], out[:, :m])
             _ub[:, sel] = torch.minimum(_ub[:, sel], -out[:, m:])
 

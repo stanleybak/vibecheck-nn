@@ -247,6 +247,12 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                 merged.append(torch.maximum(rv[j2], iv[j2]))
                 merged.append(torch.minimum(rv[j2 + 1], iv[j2 + 1]))
             inter[k2] = tuple(merged)
+        if n_relu_total <= 20000:
+            # small net: per-batch CROWN refinement of the merged bounds
+            # under the clamps (the tightener that carried input-split)
+            inter = backward.intermediates_crown(net, blo, bhi,
+                                                 base_inter=inter,
+                                                 clamps=clamps)
         adj = {}
         lbq = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
                              collect_adjoints=adj)
