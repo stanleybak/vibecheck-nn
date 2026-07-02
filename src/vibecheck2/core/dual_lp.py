@@ -332,9 +332,17 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             # from the BACKWARD builder (v1 reverse_g port): no forward
             # zonotope, unstable rows only, LinMap-generic.
             if r not in state_cache:
-                state_cache[r] = build_state_backward(
-                    net, lo, hi, inter, device=device,
-                    slopes=dir_adaptive_slopes(row_pos[r]))
+                sl = dir_adaptive_slopes(row_pos[r])
+                try:
+                    state_cache[r] = build_state_backward(
+                        net, lo, hi, inter, device=device, slopes=sl)
+                except NotImplementedError:
+                    # nets with non-slope-linear ops (mul, sigmoid): the
+                    # forward-recorded builder handles them as free-block
+                    # generators; slopes still apply to the relus
+                    state_cache[r] = build_state(
+                        net, lo, hi, inter=inter,
+                        slopes={k: v.unsqueeze(0) for k, v in sl.items()})
             state, keys = state_cache[r]
             if not keys:
                 continue
@@ -351,4 +359,11 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             if verdict == 'unsat':
                 refuted.add(d)
                 break
+            if info.get('reason') == 'splits_exhausted':
+                # every relu split used and the frontier is still open: the
+                # slack lives in unsplittable (free-block) generators, so no
+                # other row of this state can close either -- hand the time
+                # back to the outer BaB (which shrinks those generators)
+                log('[vc2/dual] splits exhausted; state too loose, bailing')
+                return refuted
     return refuted
