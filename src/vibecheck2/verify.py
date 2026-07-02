@@ -42,18 +42,70 @@ def _verdict_from_lbs(lb_plus_bias, disj_idx, n_disjuncts):
     return ('unsat' if not open_d else 'unknown'), open_d
 
 
+def _subbox_groups(spec):
+    """Group disjuncts by their per-conjunct input subbox (acasxu prop_6,
+    nn4sys lindex). Returns [(x_lo, x_hi, [disjunct indices])]; a single
+    group with the global box when no disjunct declares one."""
+    groups = {}
+    for i, c in enumerate(spec.disjuncts):
+        if c.input_lo is not None:
+            key = (tuple(np.asarray(c.input_lo).ravel()),
+                   tuple(np.asarray(c.input_hi).ravel()))
+        else:
+            key = None
+        groups.setdefault(key, []).append(i)
+    out = []
+    for key, idxs in groups.items():
+        if key is None:
+            out.append((spec.x_lo, spec.x_hi, idxs))
+        else:
+            out.append((np.asarray(key[0]), np.asarray(key[1]), idxs))
+    return out
+
+
 def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
            alpha_iters=20, pgd_budget=5.0, log=print):
-    """Returns (verdict, details); details carries 'witness' for 'sat'."""
-    from vibecheck.vnnlib_loader import load_vnnlib
+    """Returns (verdict, details); details carries 'witness' for 'sat'.
 
-    from .core import attack
-    from .core.budget import Budget, OutOfTime
+    Disjuncts carrying their own input subboxes (acasxu prop_6) decompose
+    into independent sub-instances: 'sat' if any, 'unsat' iff all."""
+    from vibecheck.spec import VNNSpec
+    from vibecheck.vnnlib_loader import load_vnnlib
     t0 = time.time()
-    budget = Budget(timeout)
     net = load_net(onnx_path)
     spec = load_vnnlib(vnnlib_path)
     log(f'[vc2] {net}')
+
+    groups = _subbox_groups(spec)
+    if len(groups) == 1:
+        return _verify_one(net, spec, onnx_path, timeout, device,
+                           alpha_iters, pgd_budget, log, t0)
+    if len(groups) > 64:
+        raise NotImplementedError(
+            f'{len(groups)} input subbox groups: the mega-disjunct handler '
+            f'(design 3.6) is not implemented yet')
+    log(f'[vc2] {len(groups)} input-subbox groups (per-disjunct boxes)')
+    share = (timeout - (time.time() - t0)) / len(groups)
+    for glo, ghi, idxs in groups:
+        sub = VNNSpec(x_lo=np.asarray(glo, dtype=np.float64),
+                      x_hi=np.asarray(ghi, dtype=np.float64),
+                      disjuncts=[spec.disjuncts[i] for i in idxs])
+        verdict, details = _verify_one(net, sub, onnx_path, share, device,
+                                       alpha_iters, pgd_budget, log,
+                                       time.time())
+        if verdict != 'unsat':
+            details['time'] = time.time() - t0
+            return verdict, details
+    return 'unsat', {'time': time.time() - t0}
+
+
+def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
+                pgd_budget, log, t0):
+    from .core import attack
+    from .core.budget import Budget, OutOfTime
+    budget = Budget(timeout, margin=0.0)
+    budget.t0 = t0
+    budget.deadline = t0 + timeout - 2.0
 
     # Phase A: falsification first (cheap, decides most sat instances).
     # A candidate is only a 'sat' after the ORT chokepoint accepts it.
