@@ -190,3 +190,30 @@ def test_leaky_relu_planes_bracket():
         assert (al * x + bl <= y + 1e-5).all()
         assert (y <= au * x + bu + 1e-5).all()
         assert ((y - (lam * x + mu)).abs() <= delta + 1e-5).all()
+
+
+def test_bmm_interval_sound(tmp_path):
+    import onnx
+    from onnx import TensorProto, helper
+    X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1, 24])
+    Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 16])
+    ini = [onnx.numpy_helper.from_array(np.array(v, np.int64), k)
+           for k, v in [('s0', [0]), ('e0', [8]), ('s1', [8]), ('e1', [24]),
+                        ('ax', [1]), ('sh_a', [4, 2]), ('sh_b', [2, 8])]]
+    g = helper.make_graph(
+        [helper.make_node('Slice', ['X', 's0', 'e0', 'ax'], ['a']),
+         helper.make_node('Slice', ['X', 's1', 'e1', 'ax'], ['b']),
+         helper.make_node('Reshape', ['a', 'sh_a'], ['a2']),
+         helper.make_node('Reshape', ['b', 'sh_b'], ['b2']),
+         helper.make_node('MatMul', ['a2', 'b2'], ['Y'])],
+        'g', [X], [Y], ini)
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 13)])
+    m.ir_version = 7
+    p = str(tmp_path / 'bmm.onnx')
+    onnx.save(m, p)
+    net = g2.load(p)
+    lo, hi = _box(net.n_in, w=1.0)
+    ilo, ihi = forward.interval(net, lo, hi)
+    xs = torch.rand(1024, net.n_in) * (hi - lo) + lo
+    ys = forward.point(net, xs)
+    assert (ys >= ilo - 1e-4).all() and (ys <= ihi + 1e-4).all()

@@ -113,12 +113,33 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False):
             flo = _maxpool_point(op, ci - ri)
             fhi = _maxpool_point(op, ci + ri)
             state[name] = ((fhi + flo) / 2, (fhi - flo) / 2)
+        elif op.kind == 'bmm':
+            mlo, mhi = _bmm_interval(op, state[op.inputs[0]],
+                                     state[op.inputs[1]])
+            state[name] = ((mhi + mlo) / 2, (mhi - mlo) / 2)
         else:
             raise NotImplementedError(f'interval: op kind {op.kind!r}')
     if return_state:
         return {k: (v[0] - v[1], v[0] + v[1]) for k, v in state.items()}
     co, ro = state[net.output_name]
     return co - ro, co + ro
+
+
+def _bmm_interval(op, sa_state, sb_state):
+    """Sound interval matmul via per-product corner enumeration, summed
+    over the contraction axis. Memory is (B, ..., m, k, n); attention-sized
+    operands only (the McCormick adjoint version arrives with M6)."""
+    (ca, ra), (cb, rb) = sa_state, sb_state
+    B = ca.shape[0]
+    sa, sb = op.params['a_shape'], op.params['b_shape']
+    al = (ca - ra).reshape(B, *sa).unsqueeze(-1)
+    ah = (ca + ra).reshape(B, *sa).unsqueeze(-1)
+    bl = (cb - rb).reshape(B, *sb).unsqueeze(-3)
+    bh = (cb + rb).reshape(B, *sb).unsqueeze(-3)
+    cands = torch.stack([al * bl, al * bh, ah * bl, ah * bh])
+    plo = cands.min(dim=0).values.sum(dim=-2)
+    phi = cands.max(dim=0).values.sum(dim=-2)
+    return plo.reshape(B, -1), phi.reshape(B, -1)
 
 
 def _nonmono_interval(op, xlo, xhi, flo, fhi):
@@ -259,6 +280,14 @@ def zono(net, lo, hi, return_state=False):
             G2 = torch.diag_embed(delta)
             sym = [(name, i) for i in range(c2.shape[1])]
             state[name] = ZonoState(c2, G2, sym)
+        elif op.kind == 'bmm':
+            za, zb = state[op.inputs[0]], state[op.inputs[1]]
+            mlo, mhi = _bmm_interval(op, ((za.c + 0), za.G.abs().sum(dim=2)),
+                                     ((zb.c + 0), zb.G.abs().sum(dim=2)))
+            c2 = (mhi + mlo) / 2
+            delta = (mhi - mlo) / 2
+            state[name] = ZonoState(c2, torch.diag_embed(delta),
+                                    [(name, i) for i in range(c2.shape[1])])
         elif op.kind == 'maxpool':
             raise NotImplementedError(
                 'zono: maxpool arrives with M5 (relu decomposition)')
