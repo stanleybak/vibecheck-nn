@@ -48,7 +48,9 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     from vibecheck.vnnlib_loader import load_vnnlib
 
     from .core import attack
+    from .core.budget import Budget, OutOfTime
     t0 = time.time()
+    budget = Budget(timeout)
     net = load_net(onnx_path)
     spec = load_vnnlib(vnnlib_path)
     log(f'[vc2] {net}')
@@ -72,7 +74,10 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     W, b, di = _spec_queries(spec, net.n_out)
     W, b = W.to(dev), b.to(dev)
 
-    inter = backward.intermediates(net, lo, hi)
+    try:
+        inter = backward.intermediates(net, lo, hi)
+    except OutOfTime:
+        return 'timeout', {'time': time.time() - t0}
     lb0 = backward.crown(net, lo, hi, W, inter)[0]
     verdict, open_d = _verdict_from_lbs(lb0 + b, di, len(spec.disjuncts))
     log(f'[vc2] crown: worst={float((lb0 + b).min()):.4f} '
@@ -84,7 +89,11 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
                 >= memory.free_bytes(lo.device) * memory.SAFETY):
             # big net: the interval intermediates were the bottleneck;
             # recompute them by per-edge backward CROWN (chunked)
-            inter = backward.intermediates_crown(net, lo, hi)
+            try:
+                inter = backward.intermediates_crown(net, lo, hi,
+                                                     budget=budget)
+            except OutOfTime:
+                return 'timeout', {'time': time.time() - t0}
             lb0 = torch.maximum(lb0, backward.crown(net, lo, hi, W, inter)[0])
             verdict, open_d = _verdict_from_lbs(lb0 + b, di,
                                                 len(spec.disjuncts))
@@ -92,7 +101,8 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
                 f'open={len(open_d)}/{len(spec.disjuncts)}')
     if verdict != 'unsat' and alpha_iters > 0:
         lb = backward.alpha_crown(net, lo, hi, W, inter,
-                                  iters=alpha_iters, thresholds=-b)[0]
+                                  iters=alpha_iters, thresholds=-b,
+                                  budget=budget)[0]
         lb = torch.maximum(lb, lb0)
         verdict, open_d = _verdict_from_lbs(lb + b, di, len(spec.disjuncts))
         log(f'[vc2] alpha-crown: worst={float((lb + b).min()):.4f} '

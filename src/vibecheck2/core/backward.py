@@ -217,7 +217,7 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
     return lb
 
 
-def intermediates_crown(net, lo, hi, base_inter=None):
+def intermediates_crown(net, lo, hi, base_inter=None, budget=None):
     """Pre-activation bounds per nonlin edge via per-edge backward CROWN
     (chunked identity queries, both signs in one pass). Strictly tighter
     than interval; the regime for conv nets whose dense zonotope does not
@@ -235,6 +235,8 @@ def intermediates_crown(net, lo, hi, base_inter=None):
     inter = dict(base_inter)
     widest = max(net.ops[o].n for o in net.order)
     for name in net.order:
+        if budget is not None:
+            budget.check()
         op = net.ops[name]
         if op.kind != 'nonlin':
             continue
@@ -270,7 +272,7 @@ def intermediates_crown(net, lo, hi, base_inter=None):
 
 
 def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
-                     thresholds=None):
+                     thresholds=None, budget=None):
     """Jointly Adam-optimized alpha (relaxation slopes) + beta (split
     multipliers) lower bounds for a batch of BaB domains under sign clamps.
     Every iterate is a sound bound (beta projected to >= 0); returns the
@@ -300,6 +302,8 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
            else thresholds.to(dev, dt))
     best = None
     for _ in range(max(1, iters)):
+        if budget is not None and budget.over():
+            break
         lb = crown(net, lo, hi, W, inter, alpha=alpha, clamps=clamps,
                    beta=beta)
         best = lb.detach() if best is None else torch.maximum(best, lb.detach())
@@ -317,7 +321,7 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
 
 
 def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
-                thresholds=None):
+                thresholds=None, budget=None):
     """Adam-optimized alpha-CROWN lower bounds (fixed intermediates).
 
     Maximizes each query's lb independently (sum of hinged bounds: a query
@@ -344,6 +348,8 @@ def alpha_crown(net, lo, hi, W, inter=None, iters=20, lr=0.25,
     thr = (torch.zeros(q, device=lo.device, dtype=lo.dtype)
            if thresholds is None else thresholds)
     for _ in range(max(1, iters)):
+        if budget is not None and budget.over():
+            break
         lb = crown(net, lo, hi, W, inter, alpha)
         best = lb.detach() if best is None \
             else torch.maximum(best, lb.detach())
