@@ -84,7 +84,8 @@ from .forward import clamped_bounds  # single definition (forward.py)
 
 def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
           return_input_adjoint=False, clamps=None, beta=None,
-          collect_adjoints=None, range_clamps=None):
+          collect_adjoints=None, range_clamps=None, gamma=None,
+          gamma_rows=None):
     """Lower bounds on W @ y_edge for x in [lo, hi], where y_edge is the
     value of edge `start` (default: the network output). Bounding an
     INTERMEDIATE edge is the same walk seeded there; ops after it never
@@ -113,6 +114,19 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
 
     A = {start or net.output_name: W.to(device=dev, dtype=dt)}
     d = torch.zeros(B, q, device=dev, dtype=dt)
+    if gamma is not None:
+        # INVPROP / gamma: any counterexample satisfies the spec's output
+        # rows w_m.y + b_m <= 0, so adding gamma_m * (w_m.y + b_m) with
+        # gamma >= 0 to the objective only lowers it ON THE CE REGION; its
+        # lower bound therefore stays a sound refutation bound there.
+        Wg, bg = gamma_rows
+        Wg = torch.as_tensor(Wg, device=dev, dtype=dt)
+        bg = torch.as_tensor(bg, device=dev, dtype=dt)
+        g = gamma.clamp_min(0.0)
+        contrib = torch.einsum('bqm,mn->bqn', g, Wg)
+        nm_out = net.output_name
+        A[nm_out] = (A[nm_out] + contrib) if nm_out in A else contrib
+        d = d + torch.einsum('bqm,m->bq', g, bg)
 
     def take(name):
         """Pop the accumulated adjoint for edge `name` (zeros if unused)."""
@@ -229,7 +243,8 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
 
 
 def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
-                        clamps=None, range_clamps=None):
+                        clamps=None, range_clamps=None, gamma_rows=None,
+                        gamma_iters=8):
     """Pre-activation bounds per nonlin edge via per-edge backward CROWN
     (chunked identity queries, both signs in one pass). Strictly tighter
     than interval; the regime for conv nets whose dense zonotope does not
@@ -314,9 +329,28 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
             ar = torch.arange(m, device=dev)
             Wc[ar, sel] = 1.0
             Wc[m + ar, sel] = -1.0
-            out = crown(net, lo, hi, Wc.unsqueeze(0).expand(B, -1, -1),
-                        inter, start=_e, clamps=clamps,
+            Wb = Wc.unsqueeze(0).expand(B, -1, -1)
+            out = crown(net, lo, hi, Wb, inter, start=_e, clamps=clamps,
                         range_clamps=range_clamps)
+            if gamma_rows is not None:
+                # gamma (INVPROP): Adam-ascend output-row multipliers; the
+                # refined bounds are CONDITIONAL on the CE region of the
+                # spec rows supplied -- callers must scope them to that
+                # disjunct's refutation only
+                mg = len(gamma_rows[1])
+                gam = torch.zeros(B, 2 * m, mg, device=dev, dtype=dt,
+                                  requires_grad=True)
+                opt = torch.optim.Adam([gam], lr=0.5)
+                for _ in range(max(1, gamma_iters)):
+                    ob = crown(net, lo, hi, Wb, inter, start=_e,
+                               clamps=clamps, range_clamps=range_clamps,
+                               gamma=gam, gamma_rows=gamma_rows)
+                    out = torch.maximum(out, ob.detach())
+                    (-ob.sum()).backward()
+                    opt.step()
+                    opt.zero_grad(set_to_none=True)
+                    with torch.no_grad():
+                        gam.clamp_(min=0.0)
             _lb[:, sel] = torch.maximum(_lb[:, sel], out[:, :m])
             _ub[:, sel] = torch.minimum(_ub[:, sel], -out[:, m:])
 

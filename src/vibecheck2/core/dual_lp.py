@@ -317,6 +317,7 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
     dev = str(torch.device(device))
     ver = _verifier(dev)
     state_cache = {}
+    gamma_inter = {}
     for d in open_d:
         rows = torch.nonzero(disj_idx == d, as_tuple=False).flatten().tolist()
         left = deadline - time.time()
@@ -353,6 +354,30 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
                 state, qw, qb, sk, time_limit=min(per_q,
                                                   deadline - time.time()),
                 extra_hs=extra)
+            if (verdict != 'unsat'
+                    and info.get('reason') != 'splits_exhausted'
+                    and deadline - time.time() > 5.0):
+                # gamma retry: refine THIS disjunct's intermediates under
+                # its own output rows (INVPROP; conditional on the CE
+                # region, so scoped strictly to this disjunct) and rerun
+                if d not in gamma_inter:
+                    Wg = W[rows].cpu().numpy()
+                    bg = bias[rows].cpu().numpy()
+                    gamma_inter[d] = backward.intermediates_crown(
+                        net, lo, hi, base_inter=inter,
+                        gamma_rows=(Wg, bg))
+                g_state, g_keys = build_state_backward(
+                    net, lo, hi, gamma_inter[d], device=device,
+                    slopes=dir_adaptive_slopes(row_pos[r]))
+                sk2 = score_keys(net, lo, hi, W[r:r + 1], gamma_inter[d],
+                                 g_keys)
+                verdict, info = ver.verify_query(
+                    g_state, qw, qb, sk2,
+                    time_limit=min(per_q, deadline - time.time()),
+                    extra_hs=extra)
+                log(f'[vc2/dual]   gamma retry: {verdict} '
+                    f'nodes={info.get("nodes")} '
+                    f'wall={info.get("wall", 0):.2f}s')
             log(f'[vc2/dual] disj {d} row {r}: {verdict} '
                 f'nodes={info.get("nodes")} wall={info.get("wall", 0):.2f}s '
                 f'reason={info.get("reason", "-")} open={info.get("open", 0)}')

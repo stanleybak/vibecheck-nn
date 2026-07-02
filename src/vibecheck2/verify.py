@@ -207,19 +207,17 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
     if verdict != 'unsat':
         # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
         # state, ported v1 fast_dual_ascent): the strongest per-query
-        # refuter when the state fits; survivors fall through to BaB
-        from .core import memory as _mem
-        from .core.backward import _zono_cost_bytes as _zc
-        if _zc(net, 1) < _mem.free_bytes(torch.device(device)) * _mem.SAFETY:
-            from .core.dual_lp import certify_queries
-            refuted = certify_queries(
-                net, spec, W, b, di, lo, hi, inter, open_d,
-                deadline=t0 + timeout - 2.0, device=device, log=log)
-            open_d = [d for d in open_d if d not in refuted]
-            log(f'[vc2] dual-lp: {len(refuted)} disjuncts refuted, '
-                f'{len(open_d)} open')
-            if not open_d:
-                return 'unsat', {'time': time.time() - t0}
+        # refuter. The state builds BACKWARD (unstable rows only, chunked),
+        # so no forward-zonotope gate; survivors fall through to BaB.
+        from .core.dual_lp import certify_queries
+        refuted = certify_queries(
+            net, spec, W, b, di, lo, hi, inter, open_d,
+            deadline=t0 + timeout - 2.0, device=device, log=log)
+        open_d = [d for d in open_d if d not in refuted]
+        log(f'[vc2] dual-lp: {len(refuted)} disjuncts refuted, '
+            f'{len(open_d)} open')
+        if not open_d:
+            return 'unsat', {'time': time.time() - t0}
     if verdict != 'unsat':
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
