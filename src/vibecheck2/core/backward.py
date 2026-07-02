@@ -84,7 +84,7 @@ from .forward import clamped_bounds  # single definition (forward.py)
 
 def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
           return_input_adjoint=False, clamps=None, beta=None,
-          collect_adjoints=None):
+          collect_adjoints=None, range_clamps=None):
     """Lower bounds on W @ y_edge for x in [lo, hi], where y_edge is the
     value of edge `start` (default: the network output). Bounding an
     INTERMEDIATE edge is the same walk seeded there; ops after it never
@@ -143,6 +143,10 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
             cl = clamps.get(name) if clamps else None
             if cl is not None:
                 l, h = clamped_bounds((l, h), cl)
+            if range_clamps and name in range_clamps:
+                rlo, rhi = range_clamps[name]
+                l = torch.maximum(l, rlo)
+                h = torch.minimum(h, torch.maximum(rhi, l))
             rel = REL[op.fn]
             if not hasattr(rel, 'planes'):
                 raise NotImplementedError(
@@ -165,7 +169,7 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
                 # neg split (z<=0) adds +beta*z to the objective (beta>=0)
                 sgn = -cl.sign().unsqueeze(1).to(dt)
                 Ain = Ain + sgn * beta[name].clamp_min(0.0)
-            if collect_adjoints is not None and op.fn == 'relu':
+            if collect_adjoints is not None:
                 collect_adjoints[name] = Ain.detach()
             put(op.inputs[0], Ain)
         elif op.kind == 'mul':
@@ -210,7 +214,7 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
 
 
 def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
-                        clamps=None):
+                        clamps=None, range_clamps=None):
     """Pre-activation bounds per nonlin edge via per-edge backward CROWN
     (chunked identity queries, both signs in one pass). Strictly tighter
     than interval; the regime for conv nets whose dense zonotope does not
@@ -238,7 +242,11 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
         l0, h0 = inter[name]
         if clamps and name in clamps:
             l0, h0 = clamped_bounds((l0, h0), clamps[name])
-            inter[name] = (l0, h0)
+        if range_clamps and name in range_clamps:
+            rlo, rhi = range_clamps[name]
+            l0 = torch.maximum(l0, rlo)
+            h0 = torch.minimum(h0, torch.maximum(rhi, l0))
+        inter[name] = (l0, h0)
         idx = torch.nonzero(((l0 < 0) & (h0 > 0)).any(dim=0),
                             as_tuple=False).flatten()
         if not idx.numel():
@@ -258,7 +266,8 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
             Wc[ar, sel] = 1.0
             Wc[m + ar, sel] = -1.0
             out = crown(net, lo, hi, Wc.unsqueeze(0).expand(B, -1, -1),
-                        inter, start=_e, clamps=clamps)
+                        inter, start=_e, clamps=clamps,
+                        range_clamps=range_clamps)
             _lb[:, sel] = torch.maximum(_lb[:, sel], out[:, :m])
             _ub[:, sel] = torch.minimum(_ub[:, sel], -out[:, m:])
 
@@ -268,7 +277,8 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
 
 
 def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
-                     thresholds=None, budget=None, share_q=None):
+                     thresholds=None, budget=None, share_q=None,
+                     range_clamps=None):
     """Jointly Adam-optimized alpha (relaxation slopes) + beta (split
     multipliers) lower bounds for a batch of BaB domains under sign clamps.
     Every iterate is a sound bound (beta projected to >= 0); returns the
@@ -302,7 +312,8 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                                          dtype=dt, requires_grad=True)
     params = list(alpha.values()) + list(beta.values())
     if not params:
-        return crown(net, lo, hi, W, inter, clamps=clamps)
+        return crown(net, lo, hi, W, inter, clamps=clamps,
+                     range_clamps=range_clamps)
     opt = torch.optim.Adam(params, lr=lr)
     thr = (torch.zeros(q, device=dev, dtype=dt) if thresholds is None
            else thresholds.to(dev, dt))
@@ -311,7 +322,7 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
         if budget is not None and budget.over():
             break
         lb = crown(net, lo, hi, W, inter, alpha=alpha, clamps=clamps,
-                   beta=beta)
+                   beta=beta, range_clamps=range_clamps)
         best = lb.detach() if best is None else torch.maximum(best, lb.detach())
         loss = -(torch.minimum(lb, thr.unsqueeze(0) + 1.0)).sum()
         opt.zero_grad(set_to_none=True)
@@ -322,7 +333,8 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                 t.clamp_(0.0, 1.0)
             for t in beta.values():
                 t.clamp_(min=0.0)
-    lb = crown(net, lo, hi, W, inter, alpha=alpha, clamps=clamps, beta=beta)
+    lb = crown(net, lo, hi, W, inter, alpha=alpha, clamps=clamps, beta=beta,
+               range_clamps=range_clamps)
     return torch.maximum(best, lb.detach())
 
 

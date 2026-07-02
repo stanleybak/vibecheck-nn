@@ -201,6 +201,12 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         root_inter = backward.intermediates(net, lo1, hi1)
     relu_edges = [nm for nm in net.order
                   if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'relu']
+    # smooth single-input nonlins are RANGE-splittable: same action ranking,
+    # children constrain the pre-activation interval instead of a sign
+    smooth_edges = [nm for nm in net.order
+                    if net.ops[nm].kind == 'nonlin'
+                    and net.ops[nm].fn in ('sigmoid', 'tanh', 'sin', 'cos',
+                                           'exp', 'reciprocal', 'pow')]
 
     heap = [(-float('inf'), 0, ())]           # (worst_lb, tiebreak, splits)
     tick = 1
@@ -227,16 +233,28 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         blo = lo1.expand(B, -1)
         bhi = hi1.expand(B, -1)
         clamps = {}
+        range_clamps = {}
         for bi, (_, _, splits) in enumerate(batch_doms):
-            for nm, j, sgn in splits:
-                if nm not in clamps:
-                    clamps[nm] = torch.zeros(B, net.ops[nm].n, device=dev,
-                                             dtype=torch.int8)
-                clamps[nm][bi, j] = sgn
+            for nm, j, spec_ in splits:
+                if isinstance(spec_, tuple):          # smooth range split
+                    if nm not in range_clamps:
+                        n_e = net.ops[nm].n
+                        range_clamps[nm] = (
+                            torch.full((B, n_e), -torch.inf, device=dev),
+                            torch.full((B, n_e), torch.inf, device=dev))
+                    rlo, rhi = range_clamps[nm]
+                    rlo[bi, j] = max(float(rlo[bi, j]), spec_[0])
+                    rhi[bi, j] = min(float(rhi[bi, j]), spec_[1])
+                else:                                  # relu sign split
+                    if nm not in clamps:
+                        clamps[nm] = torch.zeros(B, net.ops[nm].n, device=dev,
+                                                 dtype=torch.int8)
+                    clamps[nm][bi, j] = spec_
         # reforward-IBP under the clamps, intersected with the (tighter at
         # the root, clamp-blind) root intermediates: best of both regimes
         ib_state = backward.fwd.interval(net, blo, bhi, return_state=True,
-                                         clamps=clamps)
+                                         clamps=clamps,
+                                         range_clamps=range_clamps)
         ib = backward._inter_from_state(net, lambda e: ib_state[e])
         inter = {}
         for k2, v in root_inter.items():
@@ -252,21 +270,41 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
             # under the clamps (the tightener that carried input-split)
             inter = backward.intermediates_crown(net, blo, bhi,
                                                  base_inter=inter,
-                                                 clamps=clamps)
+                                                 clamps=clamps,
+                                                 range_clamps=range_clamps)
         adj = {}
         lbq = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
-                             collect_adjoints=adj)
+                             range_clamps=range_clamps, collect_adjoints=adj)
         lb_ab = backward.alpha_beta_crown(net, blo, bhi, W, inter, clamps,
-                                          iters=beta_iters, thresholds=-bias)
+                                          iters=beta_iters, thresholds=-bias,
+                                          range_clamps=range_clamps)
         lbq = torch.maximum(lbq, lb_ab)
         n_bounded += B
         refuted = refuted_of(lbq)
         open_mask = ~refuted.all(dim=1)
         if open_mask.any():
-            # BaBSR score per relu edge; argmax action per open domain
+            # unified action ranking: relu sign splits score by BaBSR
+            # (|adjoint| x triangle intercept), smooth range splits by
+            # |adjoint| x band delta -- both estimate removable slack
             best_score = torch.full((B,), -torch.inf, device=dev)
             best_edge = [None] * B
             best_j = torch.zeros(B, dtype=torch.long, device=dev)
+            best_mid = torch.zeros(B, device=dev)
+            best_kind = [''] * B
+
+            def consider(nm, s_scores, kind, mid=None):
+                nonlocal best_score
+                v, j = s_scores.max(dim=1)
+                better = v > best_score
+                best_score = torch.where(better, v, best_score)
+                best_j[better] = j[better]
+                if mid is not None:
+                    best_mid[better] = mid.gather(1, j.unsqueeze(1))[:, 0][better]
+                for bi in torch.nonzero(better,
+                                        as_tuple=False).flatten().tolist():
+                    best_edge[bi] = nm
+                    best_kind[bi] = kind
+
             for nm in relu_edges:
                 l, h = inter[nm]
                 cl = clamps.get(nm)
@@ -277,14 +315,18 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     continue
                 intercept = (-h * l / (h - l).clamp_min(1e-30)).clamp_min(0.0)
                 a = adj.get(nm)
-                s = (a.abs().amax(dim=1) if a is not None else
-                     torch.ones_like(l)) * intercept * unstable
-                v, j = s.max(dim=1)
-                better = v > best_score
-                best_score = torch.where(better, v, best_score)
-                best_j = torch.where(better, j, best_j)
-                for bi in torch.nonzero(better, as_tuple=False).flatten().tolist():
-                    best_edge[bi] = nm
+                consider(nm, (a.abs().amax(dim=1) if a is not None
+                              else torch.ones_like(l)) * intercept * unstable,
+                         'sign')
+            from .relax import REL
+            for nm in smooth_edges:
+                l, h = inter[nm]
+                _lam, _mu, delta = REL[net.ops[nm].fn].band(
+                    l, h, net.ops[nm].params)
+                a = adj.get(nm)
+                consider(nm, (a.abs().amax(dim=1) if a is not None
+                              else torch.ones_like(l)) * delta,
+                         'range', mid=(l + h) / 2)
             w_dom = (lbq + bias).min(dim=1).values
             for bi in torch.nonzero(open_mask, as_tuple=False).flatten().tolist():
                 if best_edge[bi] is None:
@@ -293,10 +335,15 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     return 'unknown', {'reason': 'exhausted splits',
                                        'bounded': n_bounded}
                 base = batch_doms[bi][2]
-                for sgn in (1, -1):
+                if best_kind[bi] == 'range':
+                    m = float(best_mid[bi])
+                    children = ((-np.inf, m), (m, np.inf))
+                else:
+                    children = (1, -1)
+                for ch in children:
                     heapq.heappush(heap, (float(w_dom[bi]), tick,
                                           base + ((best_edge[bi],
-                                                   int(best_j[bi]), sgn),)))
+                                                   int(best_j[bi]), ch),)))
                     tick += 1
             if onnx_path is not None and rounds % attack_every == 1:
                 cand, _ = attack.pgd(net, spec, lo=lo1[0], hi=hi1[0],

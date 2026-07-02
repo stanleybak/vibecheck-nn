@@ -79,7 +79,7 @@ def point(net, x: torch.Tensor) -> torch.Tensor:
 
 
 def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
-             clamps=None):
+             clamps=None, range_clamps=None):
     """IBP bounds, (B, n_in) boxes -> (B, n_out) bounds (per-edge if asked).
     clamps: BaB sign splits per relu op; intersecting the pre-activation
     range here REFRESHES all downstream bounds under the split (the
@@ -96,6 +96,11 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
             ci, ri = state[op.inputs[0]]
             if clamps and name in clamps:
                 xl, xh = clamped_bounds((ci - ri, ci + ri), clamps[name])
+                ci, ri = (xl + xh) / 2, (xh - xl) / 2
+            if range_clamps and name in range_clamps:
+                rlo, rhi = range_clamps[name]
+                xl = torch.maximum(ci - ri, rlo)
+                xh = torch.minimum(ci + ri, torch.maximum(rhi, xl))
                 ci, ri = (xl + xh) / 2, (xh - xl) / 2
             f = REL[op.fn].point
             flo, fhi = f(ci - ri, op.params), f(ci + ri, op.params)
