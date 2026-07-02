@@ -426,3 +426,35 @@ competition checker; wall time within 1.5x of old vibecheck (ratchet down over t
    ab-only vit/traffic wins as stretch targets.
 7. handlers/ ports (quant_surrogate, mega_disjunct, discrete_enum, monotone_invert).
    Exit: full Tier-1 + Tier-2 green; old pipeline deleted benchmark by benchmark.
+
+## Part 5: implementation log (updated as built; measurements, branch clean-slate)
+
+Status after the first build night (2026-07-02, src/vibecheck2/):
+
+- M1-M4a landed: IR/LinMap/RelaxLib/memory/forward, backward alpha/beta CROWN,
+  attack engine, input-split BaB, relu-split BaB (no-reforward), subbox
+  decomposition, pair merge + nonlinear augment front ends, mega-disjunct
+  screening. 42 Tier-0 tests.
+- Measured decisions worth keeping:
+  - Per-edge CROWN-refined intermediates (identity queries, chunked, only the
+    interval-ambiguous neurons) are THE decisive tightener: acasxu BaB domains
+    at depth 13 were 85% open under zono intermediates, 0% under refined ones;
+    tinyimagenet resnet unsat went unknown -> 6s (v1 15.5s, abcrown timeout).
+  - ABC-style input clipping + per-restart-disjunct PGD targeting + OSI init
+    recovered the remaining acasxu rows (186/186, prop_7 sat 3.1s).
+  - VNNLIB constraints are NON-strict: candidate acceptance must be <= 0
+    (sat_relu rows sit exactly on the boundary); the ORT chokepoint stays the
+    only authority.
+  - onnx.shape_inference must be the ND-shape oracle; v1's recorded shapes go
+    stale around broadcasts (ml4acopf concat declared 160 vs ORT 186).
+  - alpha/beta tensors per (domain, query) explode on conv nets; share across
+    queries ((B,1,n)) when the full size passes ~1GB.
+- Categories at parity (60s dev budget): acasxu 186/186, easy/sat suites 33/33,
+  fast-category sweep running clean (0 misses in the first 160), ml4acopf +
+  adaptive_cruise + nn4sys(mscn_128d/lindex) + pairs + cgan/lsnc anchors pass.
+- Open: conv borderline rows (cifar100/tinyimagenet hard unsat) need relu-BaB
+  bound quality (per-domain intermediates refresh / patches); vit needs the
+  bmm McCormick adjoint (softmax decomposition + interval bmm are in); vgg
+  needs the generator lifecycle + patches (M5); handlers for quant surrogate /
+  cctsdb enumeration / monotone invert not started; augment sat CEs validate
+  on the augmented net pending the strict original-spec disposition.
