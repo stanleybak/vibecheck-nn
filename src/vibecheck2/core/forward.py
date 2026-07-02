@@ -57,6 +57,11 @@ def point(net, x: torch.Tensor) -> torch.Tensor:
             state[name] = out
         elif op.kind == 'maxpool':
             state[name] = _maxpool_point(op, state[op.inputs[0]])
+        elif op.kind == 'bmm':
+            B = x.shape[0]
+            a = state[op.inputs[0]].reshape(B, *op.params['a_shape'])
+            bmat = state[op.inputs[1]].reshape(B, *op.params['b_shape'])
+            state[name] = torch.matmul(a, bmat).reshape(B, -1)
         else:
             raise NotImplementedError(f'point: op kind {op.kind!r}')
     return state[net.output_name]

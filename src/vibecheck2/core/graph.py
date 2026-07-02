@@ -270,8 +270,40 @@ def from_compute_graph(cg, true_shapes=None) -> Net:
                  fn='leaky_relu', params={'alpha': node.params.get('alpha', 0.01)})
 
         elif t in ('Gemm', 'MatMul') and 'W' not in node.params:
-            raise NotImplementedError(
-                f'{name}: variable-weight MatMul (attention) arrives in M6')
+            # variable-weight matmul (attention QK^T / AV): batched over the
+            # leading dims of both operands. Point/attack support now; the
+            # bilinear McCormick relaxation is the M6 core work.
+            sa, sb = v1shape(node.inputs[0]), v1shape(node.inputs[1])
+            if len(sa) < 2 or len(sb) < 2 or sa[-1] != sb[-2]:
+                raise NotImplementedError(
+                    f'{name}: bmm shapes {sa} @ {sb}')
+            emit(name, 'bmm', [src(node.inputs[0]), src(node.inputs[1])],
+                 out_shape, params={'a_shape': sa, 'b_shape': sb})
+
+        elif t == 'Softmax':
+            # decompose into existing RelaxLib ops: softmax(x) =
+            # exp(x) * broadcast(1 / sum_axis(exp(x))) -- every stage has
+            # sound planes, so bounds compose without a monolithic op
+            ish = v1shape(node.inputs[0])
+            axis = node.params.get('axis', -1)
+            a = axis if axis >= 0 else len(ish) + axis
+            pre, k, post = _flat(ish[:a]), ish[a], _flat(ish[a + 1:])
+            e = name + '/exp'
+            emit(e, 'nonlin', [src(node.inputs[0])], _drop_batch(ish),
+                 nd_shape=ish, fn='exp')
+            sm = name + '/sum'
+            emit(sm, 'linmap', [e], (pre, post),
+                 nd_shape=(pre, 1, post), lm=lm.SumAxis(pre, k, post))
+            rc = name + '/recip'
+            emit(rc, 'nonlin', [sm], (pre, post), nd_shape=(pre, 1, post),
+                 fn='reciprocal')
+            bc = name + '/bcast'
+            grid = np.arange(pre * post).reshape(pre, 1, post)
+            idx = np.ascontiguousarray(
+                np.broadcast_to(grid, (pre, k, post))).reshape(-1)
+            emit(bc, 'linmap', [rc], _drop_batch(ish), nd_shape=ish,
+                 lm=lm.Select(idx, pre * post))
+            emit(name, 'mul', [e, bc], out_shape, nd_shape=ish)
 
         elif t in ('Gemm', 'MatMul'):
             W, b = node.params['W'], node.params.get('b')
@@ -583,6 +615,11 @@ def _validate_sizes(net):
         elif op.kind in ('add', 'mul'):
             if ins[0] != ins[1] or ins[0] != op.n:
                 raise ValueError(f'{name}: {op.kind} sizes {ins} -> {op.n}')
+        elif op.kind == 'bmm':
+            fa = _flat(op.params['a_shape'])
+            fb = _flat(op.params['b_shape'])
+            if ins[0] != fa or ins[1] != fb:
+                raise ValueError(f'{name}: bmm sizes {ins} vs {fa},{fb}')
         elif op.kind == 'concat':
             for src_n, pos in zip(ins, op.params['positions']):
                 if src_n != len(pos):

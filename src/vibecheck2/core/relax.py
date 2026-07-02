@@ -183,8 +183,25 @@ class Cos(_V1Band):
 
 
 class Exp:
+    """Convex: chord above; below, the tangent whose slope equals the chord
+    (at x* = ln(chord)), the tightest same-slope band."""
+
     def point(self, x, params=None):
         return torch.exp(x)
+
+    def planes(self, lo, hi, params=None):
+        w = (hi - lo).clamp_min(1e-12)
+        chord = (torch.exp(hi) - torch.exp(lo)) / w
+        chord = torch.where(hi > lo, chord, torch.exp(lo))
+        bu = torch.exp(lo) - chord * lo
+        # exp(x) >= chord*x + chord*(1 - ln(chord))  (tangent at ln(chord))
+        xstar = torch.log(chord.clamp_min(1e-30))
+        bl = chord * (1 - xstar)
+        return chord, bl, chord, bu
+
+    def band(self, lo, hi, params=None):
+        al, bl, _au, bu = self.planes(lo, hi)
+        return al, (bl + bu) / 2, (bu - bl) / 2
 
 
 class Reciprocal:
