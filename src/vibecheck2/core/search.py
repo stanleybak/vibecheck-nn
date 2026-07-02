@@ -225,8 +225,6 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         B = len(batch_doms)
         blo = lo1.expand(B, -1)
         bhi = hi1.expand(B, -1)
-        inter = {k: tuple(t.expand(B, -1) for t in v)
-                 for k, v in root_inter.items()}
         clamps = {}
         for bi, (_, _, splits) in enumerate(batch_doms):
             for nm, j, sgn in splits:
@@ -234,6 +232,20 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                     clamps[nm] = torch.zeros(B, net.ops[nm].n, device=dev,
                                              dtype=torch.int8)
                 clamps[nm][bi, j] = sgn
+        # reforward-IBP under the clamps, intersected with the (tighter at
+        # the root, clamp-blind) root intermediates: best of both regimes
+        ib_state = backward.fwd.interval(net, blo, bhi, return_state=True,
+                                         clamps=clamps)
+        ib = backward._inter_from_state(net, lambda e: ib_state[e])
+        inter = {}
+        for k2, v in root_inter.items():
+            rv = tuple(t.expand(B, -1) for t in v)
+            iv = ib[k2]
+            merged = []
+            for j2 in range(0, len(rv), 2):
+                merged.append(torch.maximum(rv[j2], iv[j2]))
+                merged.append(torch.minimum(rv[j2 + 1], iv[j2 + 1]))
+            inter[k2] = tuple(merged)
         adj = {}
         lbq = backward.crown(net, blo, bhi, W, inter, clamps=clamps,
                              collect_adjoints=adj)

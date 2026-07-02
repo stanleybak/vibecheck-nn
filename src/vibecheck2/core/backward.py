@@ -79,15 +79,7 @@ def intermediates(net, lo, hi):
     return _inter_from_state(net, lambda e: state[e])
 
 
-def clamped_bounds(inter_lh, clamp):
-    """Intersect pre-activation bounds with a BaB sign clamp (+1 forces
-    z >= 0, -1 forces z <= 0, 0 free). Sound: the clamp is the domain."""
-    l, h = inter_lh
-    l = torch.where(clamp > 0, l.clamp_min(0.0), l)
-    h = torch.where(clamp > 0, h.clamp_min(0.0), h)
-    l = torch.where(clamp < 0, l.clamp_max(0.0), l)
-    h = torch.where(clamp < 0, h.clamp_max(0.0), h)
-    return l, h
+from .forward import clamped_bounds  # single definition (forward.py)
 
 
 def crown(net, lo, hi, W, inter=None, alpha=None, start=None,

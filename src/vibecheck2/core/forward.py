@@ -25,6 +25,17 @@ def _as2d(x):
     return x if x.dim() == 2 else x.unsqueeze(0)
 
 
+def clamped_bounds(inter_lh, clamp):
+    """Intersect pre-activation bounds with a BaB sign clamp (+1 forces
+    z >= 0, -1 forces z <= 0, 0 free). Sound: the clamp is the domain."""
+    l, h = inter_lh
+    l = torch.where(clamp > 0, l.clamp_min(0.0), l)
+    h = torch.where(clamp > 0, h.clamp_min(0.0), h)
+    l = torch.where(clamp < 0, l.clamp_max(0.0), l)
+    h = torch.where(clamp < 0, h.clamp_max(0.0), h)
+    return l, h
+
+
 def _maxpool_point(op, x):
     B = x.shape[0]
     p = op.params
@@ -67,8 +78,12 @@ def point(net, x: torch.Tensor) -> torch.Tensor:
     return state[net.output_name]
 
 
-def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False):
-    """IBP bounds, (B, n_in) boxes -> (B, n_out) bounds (per-edge if asked)."""
+def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False,
+             clamps=None):
+    """IBP bounds, (B, n_in) boxes -> (B, n_out) bounds (per-edge if asked).
+    clamps: BaB sign splits per relu op; intersecting the pre-activation
+    range here REFRESHES all downstream bounds under the split (the
+    reforward-IBP regime of relu-split BaB)."""
     lo, hi = _as2d(lo), _as2d(hi)
     c, r = (hi + lo) / 2, (hi - lo) / 2
     state = {net.input_name: (c, r)}
@@ -79,6 +94,9 @@ def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False):
             state[name] = (op.lm.point(ci), op.lm.lin_abs(ri))
         elif op.kind == 'nonlin':
             ci, ri = state[op.inputs[0]]
+            if clamps and name in clamps:
+                xl, xh = clamped_bounds((ci - ri, ci + ri), clamps[name])
+                ci, ri = (xl + xh) / 2, (xh - xl) / 2
             f = REL[op.fn].point
             flo, fhi = f(ci - ri, op.params), f(ci + ri, op.params)
             if op.fn in ('relu', 'leaky_relu', 'sigmoid', 'tanh', 'exp',
