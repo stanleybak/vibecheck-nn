@@ -63,8 +63,12 @@ def _subbox_groups(spec):
     return out
 
 
+def _log_flush(m):
+    print(m, flush=True)
+
+
 def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
-           alpha_iters=20, pgd_budget=5.0, log=print):
+           alpha_iters=20, pgd_budget=5.0, log=_log_flush):
     """Returns (verdict, details); details carries 'witness' for 'sat'.
 
     Disjuncts carrying their own input subboxes (acasxu prop_6) decompose
