@@ -189,6 +189,12 @@ def main(argv=None):
     p.add_argument('--device', default='cpu', choices=['cpu', 'cuda'])
     p.add_argument('--results-file', default=None)
     a = p.parse_args(argv)
+    if a.net.lstrip().startswith('['):
+        # network-pair instance (isomorphic/monotonic acasxu): reuse the v1
+        # front end to merge the pair into one onnx + v1 spec (exact,
+        # ORT-oracle-gated), then verify normally (design: frontends port)
+        from vibecheck import network_pair as npair
+        a.net, a.spec = npair.build_merged_instance(a.net, a.spec)
     if a.results_file:                        # pre-seed like v1
         with open(a.results_file, 'w') as f:
             f.write('timeout\n')

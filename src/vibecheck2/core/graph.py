@@ -515,6 +515,12 @@ def from_compute_graph(cg, true_shapes=None) -> Net:
             if node.params.get('indices') is None:
                 raise NotImplementedError(f'{name}: dynamic Gather indices')
             indices = np.asarray(node.params['indices'])
+            if not np.issubdtype(indices.dtype, np.integer):
+                # some producers store gather indices as float consts
+                if not np.all(indices == np.round(indices)):
+                    raise NotImplementedError(
+                        f'{name}: non-integral Gather indices')
+                indices = indices.astype(np.int64)
             grid = np.arange(_flat(ish)).reshape(ish)
             ggrid = np.take(grid, indices, axis=axis if axis >= 0
                             else len(ish) + axis)
@@ -658,9 +664,17 @@ def _emit_split(cg, node, name, t, out_shape, v1shape, src, emit, alias):
 
 def load(onnx_path, dtype=np.float32) -> Net:
     """ONNX file -> Net via the v1 front end (folding + optimizer reuse),
-    with onnx.shape_inference as the ND-shape oracle."""
+    with onnx.shape_inference as the ND-shape oracle. The v1 EXACT rewrites
+    run first (identity-pad drop, MaxPool -> ReLU decomposition, Min/Max ->
+    ReLU+affine); all are semantics-preserving, so the parity gates against
+    ORT still bind."""
     from vibecheck.network import ComputeGraph
+    from vibecheck.onnx_optimizer import (drop_identity_pads,
+                                          maxpool_to_relu, min_max_to_relu)
     cg = ComputeGraph.from_onnx(onnx_path, dtype=dtype)
+    drop_identity_pads(cg)
+    maxpool_to_relu(cg)
+    min_max_to_relu(cg)
     net = from_compute_graph(cg, true_shapes=_onnx_true_shapes(onnx_path))
     net.onnx_path = onnx_path
     return net
