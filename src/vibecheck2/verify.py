@@ -43,13 +43,28 @@ def _verdict_from_lbs(lb_plus_bias, disj_idx, n_disjuncts):
 
 
 def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
-           alpha_iters=20, log=print):
-    """Returns (verdict, details). Milestone M2: bound-only (no BaB/attack)."""
+           alpha_iters=20, pgd_budget=5.0, log=print):
+    """Returns (verdict, details); details carries 'witness' for 'sat'."""
     from vibecheck.vnnlib_loader import load_vnnlib
+
+    from .core import attack
     t0 = time.time()
     net = load_net(onnx_path)
     spec = load_vnnlib(vnnlib_path)
     log(f'[vc2] {net}')
+
+    # Phase A: falsification first (cheap, decides most sat instances).
+    # A candidate is only a 'sat' after the ORT chokepoint accepts it.
+    if pgd_budget > 0:
+        w, _info = attack.pgd(net, spec, device=device,
+                              time_budget=pgd_budget, log=log)
+        if w is not None:
+            ok, vinfo = attack.validate(onnx_path, spec, w)
+            if ok:
+                w_emit = vinfo.get('witness_inbox', w)
+                return 'sat', {'witness': np.asarray(w_emit),
+                               'time': time.time() - t0}
+            log('[vc2] pgd candidate rejected by ORT chokepoint; continuing')
 
     dev = torch.device(device)
     lo = torch.tensor(spec.x_lo, dtype=torch.float32, device=dev).unsqueeze(0)
@@ -108,9 +123,23 @@ def main(argv=None):
                 f.write(f'error\n{type(e).__name__}: {str(e)[:300]}\n')
         return 2
     if a.results_file:
+        ce = None
+        if verdict == 'sat' and details.get('witness') is not None:
+            # v1's CE formatting: version/io names resolved from the spec,
+            # Y recomputed by the same ORT forward the scorer replays
+            from vibecheck.main import (_counterexample_sexpr,
+                                        _resolve_cex_io_meta,
+                                        _vnnlib_version)
+            from vibecheck.vnnlib_loader import load_vnnlib
+            ce = _counterexample_sexpr(
+                a.net, load_vnnlib(a.spec), details['witness'],
+                version=_vnnlib_version(a.spec),
+                io_meta=_resolve_cex_io_meta(a.spec))
         tmp = a.results_file + '.tmp'
         with open(tmp, 'w') as f:
             f.write(verdict + '\n')
+            if ce is not None:
+                f.write(ce + '\n')
         os.replace(tmp, a.results_file)
     print(f'[vc2] verdict: {verdict}  ({details["time"]:.2f}s)')
     return 0 if verdict == 'unsat' else 1
