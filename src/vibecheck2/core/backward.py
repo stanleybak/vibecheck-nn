@@ -66,7 +66,8 @@ def intermediates(net, lo, hi):
             for name in net.order if net.ops[name].kind == 'nonlin'}
 
 
-def crown(net, lo, hi, W, inter=None, alpha=None, start=None):
+def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
+          return_input_adjoint=False):
     """Lower bounds on W @ y_edge for x in [lo, hi], where y_edge is the
     value of edge `start` (default: the network output). Bounding an
     INTERMEDIATE edge is the same walk seeded there; ops after it never
@@ -142,8 +143,11 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None):
     assert not A, f'unconsumed adjoints: {list(A)}'
     c = (hi + lo) / 2
     r = (hi - lo) / 2
-    return d + torch.einsum('bqn,bn->bq', Ain, c) \
-             - torch.einsum('bqn,bn->bq', Ain.abs(), r)
+    lb = d + torch.einsum('bqn,bn->bq', Ain, c) \
+           - torch.einsum('bqn,bn->bq', Ain.abs(), r)
+    if return_input_adjoint:
+        return lb, Ain
+    return lb
 
 
 def intermediates_crown(net, lo, hi, base_inter=None):

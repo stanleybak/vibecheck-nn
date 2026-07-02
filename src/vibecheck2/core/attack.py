@@ -48,21 +48,52 @@ def spec_margins(spec, n_out, device, dtype):
     return margins
 
 
-def _init_points(lo, hi, restarts, mode, seeds, generator):
-    n = lo.shape[-1]
-    parts = []
+def _restart_boxes(lo, hi, restarts, device, dtype):
+    """Per-restart boxes (R, n): a single box tiles; a (K, n) batch of boxes
+    (BaB subdomains) is assigned round-robin so every box gets restarts."""
+    lo = lo.to(device, dtype)
+    hi = hi.to(device, dtype)
+    if lo.dim() == 1:
+        return (lo.unsqueeze(0).expand(restarts, -1),
+                hi.unsqueeze(0).expand(restarts, -1))
+    idx = torch.arange(restarts, device=device) % lo.shape[0]
+    return lo[idx], hi[idx]
+
+
+def _init_points(lo_r, hi_r, mode, seeds, generator):
+    """Start points inside per-restart boxes (R, n)."""
+    R, n = lo_r.shape
+    u = torch.rand(R, n, device=lo_r.device, dtype=lo_r.dtype,
+                   generator=generator)
+    if mode == 'vertex':
+        u = (u > 0.5).to(lo_r.dtype)
+    x = lo_r + u * (hi_r - lo_r)
+    x[0] = (lo_r[0] + hi_r[0]) / 2                     # one center start
     if seeds is not None and len(seeds):
-        parts.append(torch.as_tensor(np.asarray(seeds), device=lo.device,
-                                     dtype=lo.dtype).reshape(-1, n))
-    parts.append(((lo + hi) / 2).reshape(1, n))
-    k = max(0, restarts - sum(p.shape[0] for p in parts))
-    if k:
-        u = torch.rand(k, n, device=lo.device, dtype=lo.dtype,
-                       generator=generator)
-        if mode == 'vertex':
-            u = (u > 0.5).to(lo.dtype)
-        parts.append(lo + u * (hi - lo))
-    return torch.cat(parts)[:max(restarts, 1)]
+        s = torch.as_tensor(np.asarray(seeds), device=lo_r.device,
+                            dtype=lo_r.dtype).reshape(-1, n)[:R]
+        x[-s.shape[0]:] = torch.maximum(torch.minimum(s, hi_r[-s.shape[0]:]),
+                                        lo_r[-s.shape[0]:])
+    return x
+
+
+def _osi_diversify(net, x, lo, hi, generator, steps=30):
+    """Output-space diversification (abcrown's diversed PGD / v1 OSI init):
+    push each restart toward a random output direction with sign-gradient
+    steps, spreading the starting points across the reachable output set
+    before the real attack. Sound: purely an init heuristic."""
+    y0 = forward.point(net, x[:1])
+    d = torch.randn(x.shape[0], y0.shape[1], device=x.device, dtype=x.dtype,
+                    generator=generator)
+    step = 0.1 * (hi - lo)
+    x = x.detach().clone().requires_grad_(True)
+    for _ in range(steps):
+        obj = (forward.point(net, x) * d).sum()
+        g, = torch.autograd.grad(obj, x)
+        with torch.no_grad():
+            x += step * g.sign()
+            x.clamp_(lo, hi)
+    return x.detach()
 
 
 def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
@@ -79,19 +110,27 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         lo = torch.tensor(spec.x_lo, dtype=dt)
     if hi is None:
         hi = torch.tensor(spec.x_hi, dtype=dt)
-    lo = lo.to(dev, dt).reshape(-1)
-    hi = hi.to(dev, dt).reshape(-1)
     gen = torch.Generator(device=dev)
     gen.manual_seed(seed)
     margins = spec_margins(spec, net.n_out, dev, dt)
 
-    x = _init_points(lo, hi, restarts, init, seeds, gen).clone() \
-        .requires_grad_(True)
+    lo, hi = _restart_boxes(lo, hi, restarts, dev, dt)   # (R, n) each
+    x = _init_points(lo, hi, init, seeds, gen)
+    if init == 'osi':
+        x = _osi_diversify(net, x, lo, hi, gen)
+    x = x.clone().requires_grad_(True)
     opt = torch.optim.Adam([x], lr=float(lr_frac * (hi - lo).max()))
+    # NB: lr is global; per-restart boxes of very different width could
+    # warrant per-restart lr (not needed by current categories)
     sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=lr_decay)
     t0 = time.time()
     best_m = torch.full((x.shape[0],), torch.inf, device=dev)
     best_x = x.detach().clone()
+    # per-restart disjunct targeting (v1 pgd_per_restart_disjunct): restart r
+    # descends disjunct r mod D, so every disjunct gets dedicated restarts
+    # and the gradient signal is dense instead of min-of-max sparse
+    D = len(spec.disjuncts)
+    target = torch.arange(x.shape[0], device=dev) % max(D, 1)
     since_improve = 0
     it = 0
     for it in range(iters):
@@ -103,8 +142,7 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
         best_m = torch.minimum(best_m, overall)
         if (best_m <= 0).any():        # VNNLIB constraints are NON-strict:
             break                      # equality satisfies (sat_relu Y_1<=0)
-        # hinged loss keeps gradient on near-miss disjuncts only
-        loss = m.clamp(min=-0.05).min(dim=1).values.sum()
+        loss = m.gather(1, target.unsqueeze(1)).clamp(min=-0.05).sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
