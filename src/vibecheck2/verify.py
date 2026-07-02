@@ -193,11 +193,16 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         # phase splits otherwise (unified scoring across both is the design
         # target; the two loops share bound/attack machinery meanwhile)
         from .core.search import input_split_bab, relu_split_bab
-        bab = input_split_bab if net.n_in <= 32 else relu_split_bab
+        kw = {}
+        if net.n_in <= 32:
+            bab = input_split_bab
+        else:
+            bab = relu_split_bab
+            kw['root_inter'] = inter        # the crown-refined root bounds
         verdict, binfo = bab(
             net, spec, W, b, di, lo[0], hi[0],
             deadline=t0 + timeout - 2.0, device=device,
-            onnx_path=onnx_path, log=log)
+            onnx_path=onnx_path, log=log, **kw)
         log(f'[vc2] {bab.__name__}: {verdict} '
             f'{ {k: v for k, v in binfo.items() if k != "witness"} }')
         if verdict == 'sat':

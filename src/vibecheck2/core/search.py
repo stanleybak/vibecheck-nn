@@ -175,7 +175,7 @@ def input_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
 
 def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
                    device='cpu', batch=256, beta_iters=12, onnx_path=None,
-                   attack_every=16, log=lambda m: None):
+                   attack_every=16, root_inter=None, log=lambda m: None):
     """ReLU-phase splitting BaB (no-reforward): intermediates stay ROOT
     bounds; each domain carries sign clamps, and the bound comes from
     alpha+beta CROWN under those clamps (v1 _crown_bab_noreforward / abcrown
@@ -197,7 +197,8 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
     lo1 = lo.reshape(1, -1).to(dev, dt)
     hi1 = hi.reshape(1, -1).to(dev, dt)
 
-    root_inter = backward.intermediates(net, lo1, hi1)
+    if root_inter is None:
+        root_inter = backward.intermediates(net, lo1, hi1)
     relu_edges = [nm for nm in net.order
                   if net.ops[nm].kind == 'nonlin' and net.ops[nm].fn == 'relu']
 
