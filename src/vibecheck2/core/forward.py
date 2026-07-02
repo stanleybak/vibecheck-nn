@@ -1,0 +1,232 @@
+"""The forward propagator: point, interval, and zonotope in one DAG sweep.
+
+One implementation, DAG-native (forks and residual merges are the normal
+case), batched over a leading domain dimension B. The three modes share the
+same traversal; only the per-op state transformer differs:
+
+  point:    x                              exact evaluation
+  interval: (lo, hi)                       IBP
+  zono:     (c, G) affine over shared noise symbols; relu adds one fresh
+            symbol per (batch-anywhere-unstable) element, so the generator
+            layout stays rectangular across the batch (a stable sample just
+            carries a zero column).
+
+Generator lifecycle (reduce / drop-and-continue) hooks in here (M5).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from .relax import REL
+
+
+def _as2d(x):
+    return x if x.dim() == 2 else x.unsqueeze(0)
+
+
+def _maxpool_point(op, x):
+    B = x.shape[0]
+    p = op.params
+    x4 = x.reshape(B, *p['in_shape'])
+    y = F.max_pool2d(x4, kernel_size=p['kernel_shape'], stride=p['stride'],
+                     padding=p['padding'])
+    return y.reshape(B, -1)
+
+
+def point(net, x: torch.Tensor) -> torch.Tensor:
+    """Exact forward evaluation, (B, n_in) -> (B, n_out)."""
+    x = _as2d(x)
+    state = {net.input_name: x}
+    for name in net.order:
+        op = net.ops[name]
+        if op.kind == 'linmap':
+            state[name] = op.lm.point(state[op.inputs[0]])
+        elif op.kind == 'nonlin':
+            state[name] = REL[op.fn].point(state[op.inputs[0]], op.params)
+        elif op.kind == 'add':
+            state[name] = state[op.inputs[0]] + state[op.inputs[1]]
+        elif op.kind == 'mul':
+            state[name] = state[op.inputs[0]] * state[op.inputs[1]]
+        elif op.kind == 'concat':
+            B = x.shape[0]
+            out = torch.as_tensor(op.params['base'], device=x.device,
+                                  dtype=x.dtype).expand(B, -1).clone()
+            for src, pos in zip(op.inputs, op.params['positions']):
+                out[:, torch.as_tensor(pos, device=x.device)] = state[src]
+            state[name] = out
+        elif op.kind == 'maxpool':
+            state[name] = _maxpool_point(op, state[op.inputs[0]])
+        else:
+            raise NotImplementedError(f'point: op kind {op.kind!r}')
+    return state[net.output_name]
+
+
+def interval(net, lo: torch.Tensor, hi: torch.Tensor, return_state=False):
+    """IBP bounds, (B, n_in) boxes -> (B, n_out) bounds (per-edge if asked)."""
+    lo, hi = _as2d(lo), _as2d(hi)
+    c, r = (hi + lo) / 2, (hi - lo) / 2
+    state = {net.input_name: (c, r)}
+    for name in net.order:
+        op = net.ops[name]
+        if op.kind == 'linmap':
+            ci, ri = state[op.inputs[0]]
+            state[name] = (op.lm.point(ci), op.lm.lin_abs(ri))
+        elif op.kind == 'nonlin':
+            ci, ri = state[op.inputs[0]]
+            f = REL[op.fn].point
+            flo, fhi = f(ci - ri, op.params), f(ci + ri, op.params)
+            if op.fn in ('relu', 'leaky_relu', 'sigmoid', 'tanh', 'exp',
+                         'floor', 'sign'):
+                pass                      # monotone: endpoint eval is exact
+            elif op.fn in ('sin', 'cos', 'pow'):
+                flo, fhi = _nonmono_interval(op, ci - ri, ci + ri, flo, fhi)
+            else:
+                raise NotImplementedError(f'interval: nonlin {op.fn!r}')
+            lo_hi = torch.minimum(flo, fhi), torch.maximum(flo, fhi)
+            state[name] = ((lo_hi[1] + lo_hi[0]) / 2, (lo_hi[1] - lo_hi[0]) / 2)
+        elif op.kind == 'add':
+            (c1, r1), (c2, r2) = state[op.inputs[0]], state[op.inputs[1]]
+            state[name] = (c1 + c2, r1 + r2)
+        elif op.kind == 'mul':
+            (c1, r1), (c2, r2) = state[op.inputs[0]], state[op.inputs[1]]
+            cands = torch.stack([(c1 - r1) * (c2 - r2), (c1 - r1) * (c2 + r2),
+                                 (c1 + r1) * (c2 - r2), (c1 + r1) * (c2 + r2)])
+            mlo, mhi = cands.min(dim=0).values, cands.max(dim=0).values
+            state[name] = ((mhi + mlo) / 2, (mhi - mlo) / 2)
+        elif op.kind == 'concat':
+            B = c.shape[0]
+            bc = torch.as_tensor(op.params['base'], device=c.device,
+                                 dtype=c.dtype).expand(B, -1).clone()
+            br = torch.zeros_like(bc)
+            for src, pos in zip(op.inputs, op.params['positions']):
+                p = torch.as_tensor(pos, device=c.device)
+                bc[:, p], br[:, p] = state[src][0], state[src][1]
+            state[name] = (bc, br)
+        elif op.kind == 'maxpool':
+            ci, ri = state[op.inputs[0]]
+            flo = _maxpool_point(op, ci - ri)
+            fhi = _maxpool_point(op, ci + ri)
+            state[name] = ((fhi + flo) / 2, (fhi - flo) / 2)
+        else:
+            raise NotImplementedError(f'interval: op kind {op.kind!r}')
+    if return_state:
+        return {k: (v[0] - v[1], v[0] + v[1]) for k, v in state.items()}
+    co, ro = state[net.output_name]
+    return co - ro, co + ro
+
+
+def _nonmono_interval(op, xlo, xhi, flo, fhi):
+    """Exact interval images for the non-monotone elementwise ops."""
+    if op.fn == 'pow':
+        p = op.params['exponent']
+        if p == int(p) and int(p) % 2 == 0:
+            crosses = (xlo < 0) & (xhi > 0)
+            m = torch.maximum(flo, fhi)
+            return torch.where(crosses, torch.zeros_like(flo),
+                               torch.minimum(flo, fhi)), m
+        return flo, fhi           # odd integer / monotone on their domains
+    # sin/cos: check whether an interior extremum (+/-1) lies in [xlo, xhi]
+    two_pi = 2 * torch.pi
+    shift = 0.0 if op.fn == 'sin' else torch.pi / 2
+    lo_ = torch.minimum(flo, fhi)
+    hi_ = torch.maximum(flo, fhi)
+    # max at x = pi/2 + 2k pi (sin) / 0 + 2k pi (cos)
+    kmax = torch.ceil((xlo - (torch.pi / 2 - shift)) / two_pi)
+    has_max = (torch.pi / 2 - shift) + kmax * two_pi <= xhi
+    kmin = torch.ceil((xlo - (-torch.pi / 2 - shift)) / two_pi)
+    has_min = (-torch.pi / 2 - shift) + kmin * two_pi <= xhi
+    hi_ = torch.where(has_max, torch.ones_like(hi_), hi_)
+    lo_ = torch.where(has_min, -torch.ones_like(lo_), lo_)
+    return lo_, hi_
+
+
+class ZonoState:
+    """Batched zonotope: c (B,n), G (B,n,g) over shared noise symbols.
+
+    Column layout is identical across the batch (input symbols first, then
+    one column per relu-introduced symbol); a sample where the neuron was
+    stable simply has a zero column. `sym` names the op/element each column
+    came from so BaB splitting can address them.
+    """
+
+    def __init__(self, c, G, sym):
+        self.c, self.G, self.sym = c, G, sym
+
+    def bounds(self):
+        r = self.G.abs().sum(dim=2)
+        return self.c - r, self.c + r
+
+
+def zono(net, lo, hi, return_state=False):
+    """DeepZ forward. Boxes (B, n_in) -> output bounds (+ per-edge states)."""
+    lo, hi = _as2d(lo), _as2d(hi)
+    B, n = lo.shape
+    dev, dt = lo.device, lo.dtype
+    c = (hi + lo) / 2
+    G = torch.diag_embed((hi - lo) / 2)                    # (B, n, n)
+    sym = [('input', i) for i in range(n)]
+    state = {net.input_name: ZonoState(c, G, sym)}
+
+    def lin_cols(lmap, G):
+        Bv, nv, g = G.shape
+        cols = G.permute(0, 2, 1).reshape(Bv * g, nv)
+        out = lmap.lin(cols)
+        return out.reshape(Bv, g, -1).permute(0, 2, 1)
+
+    for name in net.order:
+        op = net.ops[name]
+        if op.kind == 'linmap':
+            z = state[op.inputs[0]]
+            state[name] = ZonoState(op.lm.point(z.c), lin_cols(op.lm, z.G), z.sym)
+        elif op.kind == 'add':
+            za, zb = state[op.inputs[0]], state[op.inputs[1]]
+            ga, gb = za.G.shape[2], zb.G.shape[2]
+            # shared prefix of symbols is summed; distinct tails concatenate
+            k = 0
+            while k < min(ga, gb) and za.sym[k] == zb.sym[k]:
+                k += 1
+            if k == ga == gb:
+                G = za.G + zb.G
+                sym = za.sym
+            else:
+                G = torch.cat([za.G[:, :, :k] + zb.G[:, :, :k],
+                               za.G[:, :, k:], zb.G[:, :, k:]], dim=2)
+                sym = za.sym[:k] + za.sym[k:] + zb.sym[k:]
+            state[name] = ZonoState(za.c + zb.c, G, sym)
+        elif op.kind == 'nonlin' and op.fn == 'relu':
+            z = state[op.inputs[0]]
+            zl, zh = z.bounds()
+            # DeepZ relu: on unstable neurons y = lam*x + mu + mu*e_new with
+            # lam = h/(h-l), mu = -lam*l/2 (relu(x)-lam*x spans [0, -lam*l]);
+            # exact identity/zero on stable ones.
+            unstable = (zl < 0) & (zh > 0)
+            lam = torch.where(unstable, zh / (zh - zl).clamp_min(1e-30),
+                              (zl >= 0).to(zl.dtype))
+            mu = torch.where(unstable,
+                             -zh * zl / (zh - zl).clamp_min(1e-30) / 2,
+                             torch.zeros_like(zl))
+            c2 = lam * z.c + mu
+            G2 = lam.unsqueeze(2) * z.G
+            # fresh symbol per element unstable ANYWHERE in the batch
+            unstable_any = ((zl < 0) & (zh > 0)).any(dim=0)
+            new_idx = torch.nonzero(unstable_any, as_tuple=False).flatten()
+            if new_idx.numel():
+                cols = torch.zeros(B, z.c.shape[1], new_idx.numel(),
+                                   device=dev, dtype=dt)
+                cols[:, new_idx, torch.arange(new_idx.numel(), device=dev)] = \
+                    mu[:, new_idx]
+                G2 = torch.cat([G2, cols], dim=2)
+            sym = z.sym + [(name, int(i)) for i in new_idx.tolist()]
+            state[name] = ZonoState(c2, G2, sym)
+        elif op.kind in ('nonlin', 'maxpool', 'concat'):
+            raise NotImplementedError(
+                f'zono: {op.kind}/{getattr(op, "fn", "")} arrives with its '
+                f'category (design 3.4); use interval or CROWN meanwhile')
+        else:
+            raise NotImplementedError(f'zono: op kind {op.kind!r}')
+    zout = state[net.output_name]
+    lo_o, hi_o = zout.bounds()
+    if return_state:
+        return lo_o, hi_o, state
+    return lo_o, hi_o
