@@ -174,3 +174,19 @@ def test_reciprocal_planes_bracket():
     import pytest as _pytest
     with _pytest.raises(NotImplementedError):
         rel.planes(torch.tensor([[-1.0]]), torch.tensor([[1.0]]))
+
+
+def test_leaky_relu_planes_bracket():
+    from vibecheck2.core.relax import REL
+    rel = REL['leaky_relu']
+    p = {'alpha': 0.1}
+    lo = torch.tensor([[-2.0, -1.0, 0.5, -3.0]])
+    hi = torch.tensor([[1.0, 2.0, 2.0, -0.5]])
+    al, bl, au, bu = rel.planes(lo, hi, p)
+    lam, mu, delta = rel.band(lo, hi, p)
+    for t in torch.linspace(0, 1, 201):
+        x = lo + t * (hi - lo)
+        y = rel.point(x, p)
+        assert (al * x + bl <= y + 1e-5).all()
+        assert (y <= au * x + bu + 1e-5).all()
+        assert ((y - (lam * x + mu)).abs() <= delta + 1e-5).all()

@@ -48,9 +48,36 @@ class Relu:
 
 
 class LeakyRelu:
+    """Piecewise-linear with slope a<1 on x<0: convex, so tangents (slope a
+    or 1, both through 0) bound below and the chord bounds above."""
+
     def point(self, x, params=None):
         alpha = (params or {}).get('alpha', 0.01)
         return torch.nn.functional.leaky_relu(x, alpha)
+
+    def planes(self, lo, hi, params=None):
+        a = float((params or {}).get('alpha', 0.01))
+        if a > 1.0:
+            raise NotImplementedError('leaky_relu with slope > 1 (concave)')
+        unstable = (lo < 0) & (hi > 0)
+        pos = lo >= 0
+        denom = (hi - lo).clamp_min(1e-30)
+        chord = (hi - a * lo) / denom
+        au = torch.where(unstable, chord,
+                         torch.where(pos, torch.ones_like(lo),
+                                     torch.full_like(lo, a)))
+        bu = torch.where(unstable, hi * (1 - chord), torch.zeros_like(lo))
+        al = torch.where(unstable,
+                         torch.where(hi >= -lo, torch.ones_like(lo),
+                                     torch.full_like(lo, a)),
+                         au)
+        bl = torch.zeros_like(lo)
+        return al, bl, au, bu
+
+    def band(self, lo, hi, params=None):
+        al, bl, au, bu = self.planes(lo, hi, params)
+        # single-slope band at the chord: deviation spans [0, bu]
+        return au, bu / 2, bu / 2
 
 
 def _band(f, lo, hi, lam, crit_xs):
