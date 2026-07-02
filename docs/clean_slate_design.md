@@ -458,3 +458,33 @@ Status after the first build night (2026-07-02, src/vibecheck2/):
   needs the generator lifecycle + patches (M5); handlers for quant surrogate /
   cctsdb enumeration / monotone invert not started; augment sat CEs validate
   on the augmented net pending the strict original-spec disposition.
+
+### Day-2 log: dual-ascent certifier (M4 finisher)
+
+- `core/dual_lp.py` runs v1's compiled fast_dual_ascent unchanged; states
+  build BACKWARD (reverse_g port, LinMap-generic, no forward zonotope,
+  unstable rows only, bit-equivalent to the forward-recorded build) with
+  a forward-recorded fallback for non-slope-linear nets (mul/sigmoid free
+  blocks).
+- Measured kernel: 0.8-4.3M node bounds/s compiled on the 8GB laptop GPU.
+- The two state-tightness levers, in order of measured impact:
+  1. CROWN-refined pre-activation bounds clamped into the bands
+     (raw DeepZ state 17.6M nodes unknown -> refined 2.8M nodes unsat).
+  2. Dir-adaptive slopes (build_dir_adaptive_alpha port: per query row,
+     optimized alpha where the output-side adjoint ew>0, chord otherwise):
+     2.77M nodes/3.5s -> 2,486 nodes/0.01s on the same refutation.
+  Naive alpha-everywhere is MEASURABLY WORSE than DeepZ+refined; the
+  ew-sign rule is what makes alphas usable as state slopes.
+- Wins: cora cifar10-set img96 unsat 5.6s (former miss); TinyYOLO unsat
+  13.5s (v1 28.7s); collins yolov5 1.2M-input sat 18.3s (v1 28.7s) after
+  Resize-as-Select + point-forward edge freeing + budgeted attack restarts.
+- Diagnosed remaining (each with the pinned next lever):
+  - dist_shift / lsnc: splits_exhausted with open frontier -- the slack is
+    in sigmoid/mul FREE-BLOCK generators the relu-only dual cannot split.
+    Port v1's nonlinear split caches (dual_ascent_bab
+    build_nonlinear_split_caches + nonlinear_split_dual) or run the dual
+    as leaf certifier inside the range-split BaB.
+  - cora img100 / iso 2_6-instance_3: frontier OOM at 4-8M open on 8GB;
+    v1 closed with LP-tightened intermediates (phase 1/2.5). Levers:
+    gamma (INVPROP output rows) in intermediates_crown, box+halfspace LP
+    tightening rounds, frontier spill.
