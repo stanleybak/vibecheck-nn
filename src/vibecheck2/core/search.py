@@ -217,7 +217,11 @@ def relu_split_bab(net, spec, W, bias, disj_idx, lo, hi, deadline,
         if time.time() > deadline:
             return 'timeout', {'frontier': len(heap), 'bounded': n_bounded}
         rounds += 1
-        batch_doms = [heapq.heappop(heap) for _ in range(min(batch, len(heap)))]
+        n_relu_total = sum(net.ops[nm].n for nm in relu_edges)
+        widest = max(net.ops[o].n for o in net.order)
+        per_dom = (n_relu_total * 10 + q * widest * 12) * 4   # alpha/beta/adam + adjoints
+        bs = min(batch, memory.chunk_size(len(heap), per_dom, dev))
+        batch_doms = [heapq.heappop(heap) for _ in range(min(bs, len(heap)))]
         B = len(batch_doms)
         blo = lo1.expand(B, -1)
         bhi = hi1.expand(B, -1)

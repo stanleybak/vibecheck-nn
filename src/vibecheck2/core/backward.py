@@ -272,14 +272,24 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None):
 
 
 def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
-                     thresholds=None, budget=None):
+                     thresholds=None, budget=None, share_q=None):
     """Jointly Adam-optimized alpha (relaxation slopes) + beta (split
     multipliers) lower bounds for a batch of BaB domains under sign clamps.
     Every iterate is a sound bound (beta projected to >= 0); returns the
-    elementwise best."""
+    elementwise best.
+
+    share_q: share the alpha/beta tensors across query rows ((B,1,n)
+    broadcast instead of (B,q,n)). Slightly looser, q-times smaller; the
+    default shares whenever the full tensors would be large."""
     B = lo.shape[0]
     q = W.shape[-2]
     dev, dt = lo.device, lo.dtype
+    n_relu_total = sum(net.ops[nm].n for nm in net.order
+                       if net.ops[nm].kind == 'nonlin'
+                       and net.ops[nm].fn == 'relu')
+    if share_q is None:
+        share_q = B * q * n_relu_total * 4 * 8 > 1 << 30
+    qd = 1 if share_q else q
     alpha, beta = {}, {}
     for name in net.order:
         op = net.ops[name]
@@ -290,9 +300,9 @@ def alpha_beta_crown(net, lo, hi, W, inter, clamps, iters=15, lr=0.1,
                 l, h = clamped_bounds((l, h), cl)
             al0 = REL['relu'].planes(l, h)[0]
             alpha[name] = al0.detach().clone().unsqueeze(1) \
-                .expand(B, q, l.shape[1]).contiguous().requires_grad_(True)
+                .expand(B, qd, l.shape[1]).contiguous().requires_grad_(True)
             if cl is not None and bool((cl != 0).any()):
-                beta[name] = torch.zeros(B, q, l.shape[1], device=dev,
+                beta[name] = torch.zeros(B, qd, l.shape[1], device=dev,
                                          dtype=dt, requires_grad=True)
     params = list(alpha.values()) + list(beta.values())
     if not params:
