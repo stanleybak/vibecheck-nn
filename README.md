@@ -21,7 +21,7 @@ The tool and tests can then be invoked with `.venv/bin/python`.
 
 ## Usage
 
-vibecheck implements the VNN-LIB standard's solver CLI (Chapter 5):
+vibecheck implements the VNN-LIB standard's solver CLI:
 
 ```bash
 vibecheck verify <query.vnnlib> --network NAME=<model.onnx> [--timeout SECONDS] \
@@ -80,8 +80,7 @@ The `Auto-config:` line shows config selection: with no `--config`, vibecheck
 picks a bundled per-benchmark config (`configs/*.yaml`) from the structure of
 the network and spec (input dim, conv/transformer/nonlinear ops, network-pair
 kind) and logs which rule fired. Override it with `--config configs/<name>.yaml`,
-or override any single setting with `--set KEY=VALUE` (repeatable; wins over the
-config).
+or override any single setting with `--set KEY=VALUE`.
 
 The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
 --results-file out.txt`, the form the VNNCOMP harness drives) is unchanged; see
