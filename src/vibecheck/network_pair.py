@@ -49,27 +49,32 @@ ORACLE_TOL = 1e-3      # max |merged - reference| allowed before we refuse the m
 # --------------------------------------------------------------------------- io
 
 def _load_onnx(path):
-    """Load an onnx model from the EXACT path given; the `.gz` sibling is only a
-    fallback when the exact path doesn't exist. (The caller is handed a concrete
-    path by the harness/instances.csv — that file is authoritative; reaching for a
-    `.gz` first read a stale sibling and merged the wrong network.)"""
-    if os.path.exists(path):
-        return onnx.load(path)
-    if os.path.exists(path + '.gz'):
-        with gzip.open(path + '.gz') as fh:
+    """Load an onnx model from the EXACT path given (gunzipping if it names a
+    `.gz` file); the `.gz` sibling is only a fallback when the exact path doesn't
+    exist. (The caller is handed a concrete path by the harness/instances.csv —
+    that file is authoritative; reaching for a `.gz` first read a stale sibling
+    and merged the wrong network.)"""
+    if not os.path.exists(path) and os.path.exists(str(path) + '.gz'):
+        path = str(path) + '.gz'
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    if str(path).endswith('.gz'):
+        with gzip.open(path) as fh:
             return onnx.load_model_from_string(fh.read())
-    raise FileNotFoundError(path)
+    return onnx.load(path)
 
 
 def _read_vnnlib_text(path):
-    """Read the spec from the EXACT path given; `.gz` is only a fallback when the
-    exact path doesn't exist (same rationale as `_load_onnx`)."""
-    if os.path.exists(path):
-        return open(path).read()
-    if os.path.exists(path + '.gz'):
-        with gzip.open(path + '.gz', 'rt') as fh:
-            return fh.read()
-    raise FileNotFoundError(path)
+    """Read the spec from the EXACT path given (gunzipping if it names a `.gz`
+    file); `.gz` is only a fallback when the exact path doesn't exist (same
+    rationale as `_load_onnx`)."""
+    if not os.path.exists(path) and os.path.exists(str(path) + '.gz'):
+        path = str(path) + '.gz'
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    opener = (lambda p: gzip.open(p, 'rt')) if str(path).endswith('.gz') else open
+    with opener(path) as fh:
+        return fh.read()
 
 
 def _serialize(path):

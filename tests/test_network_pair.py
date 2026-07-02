@@ -362,6 +362,23 @@ def test_loaders_missing_file_raise(tmp_path):
         npair._read_vnnlib_text(str(tmp_path / 'nope.vnnlib'))
 
 
+def test_loaders_accept_direct_gz_path(tmp_path):
+    """The EXACT path given may itself be a `.gz` file (test suites and users pass
+    `foo.onnx.gz`/`foo.vnnlib.gz` directly); the loaders must gunzip it rather
+    than parse the compressed bytes (once a UnicodeDecodeError in auto-config
+    detection). Plain paths keep working (loaded everywhere else)."""
+    f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
+    _tiny_acasxu(f, seed=3); _mono_spec(spec)
+    with open(f, 'rb') as fh, gzip.open(f + '.gz', 'wb') as gz:
+        gz.write(fh.read())
+    with open(spec, 'rb') as fh, gzip.open(spec + '.gz', 'wb') as gz:
+        gz.write(fh.read())
+    m = npair._load_onnx(f + '.gz')
+    assert [n.op_type for n in m.graph.node] == \
+        [n.op_type for n in npair._load_onnx(f).graph.node]
+    assert npair._read_vnnlib_text(spec + '.gz') == npair._read_vnnlib_text(spec)
+
+
 def test_build_from_gz_no_oracle(tmp_path):
     # gzip the onnx + vnnlib (the authoritative repo form); loaders must prefer .gz.
     f = str(tmp_path / 'f.onnx'); spec = str(tmp_path / 's.vnnlib')
