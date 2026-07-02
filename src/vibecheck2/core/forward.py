@@ -207,8 +207,15 @@ class ZonoState:
         return self.c - r, self.c + r
 
 
-def zono(net, lo, hi, return_state=False):
-    """DeepZ forward. Boxes (B, n_in) -> output bounds (+ per-edge states)."""
+def zono(net, lo, hi, return_state=False, record=None, clamp_bounds=None):
+    """DeepZ forward. Boxes (B, n_in) -> output bounds (+ per-edge states).
+
+    record: optional dict; when given, each relu op stores its
+    pre-activation snapshot (center, generator rows, symbols, band coeffs)
+    for the dual-ascent LP state builder (core.dual_lp).
+    clamp_bounds: optional {nonlin op: (lo, hi)} EXTERNAL pre-activation
+    bounds (e.g. CROWN-refined) intersected before each band; sound, and
+    the resulting bands/state get much tighter."""
     lo, hi = _as2d(lo), _as2d(hi)
     B, n = lo.shape
     dev, dt = lo.device, lo.dtype
@@ -250,10 +257,21 @@ def zono(net, lo, hi, return_state=False):
                     f'zono: no affine band for {op.fn!r} yet (design 3.4)')
             z = state[op.inputs[0]]
             zl, zh = z.bounds()
+            if clamp_bounds and name in clamp_bounds:
+                cl, ch = clamp_bounds[name]
+                zl = torch.maximum(zl, cl)
+                zh = torch.minimum(zh, torch.maximum(ch, zl))
             # generic DeepZ affine band: y = lam*x + mu + delta*e_new
             # (relu: DeepZ triangle; sigmoid/tanh: chord band; each op's
             # RelaxLib entry owns its closed-form construction)
             lam, mu, delta = rel.band(zl, zh, op.params)
+            if record is not None and op.fn == 'relu':
+                # pre-activation snapshot for dual_lp.build_state:
+                # z_j = c_pre[j] + G_pre[j] . e  and  y = lam z + mu + mu e_new
+                record[name] = {'c_pre': z.c.detach(), 'G_pre': z.G.detach(),
+                                'sym': list(z.sym), 'lam': lam.detach(),
+                                'mu': mu.detach(), 'lo': zl.detach(),
+                                'hi': zh.detach()}
             c2 = lam * z.c + mu
             G2 = lam.unsqueeze(2) * z.G
             # fresh symbol per element with a nonzero band ANYWHERE in batch

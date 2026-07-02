@@ -204,6 +204,23 @@ def _verify_one(net, spec, onnx_path, timeout, device, alpha_iters,
         verdict, open_d = _verdict_from_lbs(lb + b, di, len(spec.disjuncts))
         log(f'[vc2] alpha-crown: worst={float((lb + b).min()):.4f} '
             f'open={len(open_d)}/{len(spec.disjuncts)}')
+    if verdict != 'unsat' and net.n_in > 32:
+        # dual-ascent LP certifier (compiled GPU BaB over the alpha-zono
+        # state, ported v1 fast_dual_ascent): the strongest per-query
+        # refuter when the dense zonotope state fits; survivors fall
+        # through to the relu BaB below
+        from .core import memory as _mem
+        from .core.backward import _zono_cost_bytes as _zc
+        if _zc(net, 1) < _mem.free_bytes(torch.device(device)) * _mem.SAFETY:
+            from .core.dual_lp import certify_queries
+            refuted = certify_queries(
+                net, spec, W, b, di, lo, hi, inter, open_d,
+                deadline=t0 + timeout - 2.0, device=device, log=log)
+            open_d = [d for d in open_d if d not in refuted]
+            log(f'[vc2] dual-lp: {len(refuted)} disjuncts refuted, '
+                f'{len(open_d)} open')
+            if not open_d:
+                return 'unsat', {'time': time.time() - t0}
     if verdict != 'unsat':
         # branch and bound: input splits for low-dimensional inputs, relu
         # phase splits otherwise (unified scoring across both is the design
