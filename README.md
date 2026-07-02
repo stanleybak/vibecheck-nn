@@ -36,20 +36,47 @@ to stderr); `--serialise-assignments DIR` writes the assignment as ONNX
 TensorProtos instead. In `supports` output, a `*` after an identifier marks
 partial support, with a short note on the same line.
 
-Example, on the bundled ACAS-Xu network (`examples/`) with a property that holds
-and one that is violated:
+Example, on the bundled ACAS-Xu network (`examples/`) with a property that holds.
+Everything except the final `unsat` is progress on stderr (trimmed here):
 
 ```console
 $ vibecheck verify examples/prop_1.vnnlib --network N=examples/ACASXU_run2a_2_2_batch_2000.onnx --timeout 60
-unsat
+Auto-config: acasxu_2023.yaml | rule 5: low input-dim (<=20) FC (input-split) | Low-dimensional ReLU FC (ACAS-Xu family): batched input-split BaB, hybrid ACAS-Xu path off.
+Loading network: examples/ACASXU_run2a_2_2_batch_2000.onnx
+  22 ops, 6 ReLU layers, 0 fork points, input shape: (1, 1, 1, 5)
+Loading spec: examples/prop_1.vnnlib
+  1 constraint(s), 1 disjunct(s)
+Running graph verification (device=gpu, impl=optimized, profile=auto:acasxu_2023.yaml(rule 5), timeout=60.0s)...
+[pgd] no CE: restarts=100 iters=100/100 gap(best_margin)=+4.012e+00 elapsed=0.29s
+[branch] iter=0 split X_1 (width=1.0000) leaves=1
+...
+[branch] iter=7 split X_2 (width=0.1250) leaves=17
 
-$ vibecheck verify examples/prop_2.vnnlib --network N=examples/ACASXU_run2a_2_2_batch_2000.onnx --timeout 60
+Result: verified
+  Time: 2.24s
+unsat
+```
+
+And a violated property — stdout is the verdict plus the satisfying assignment:
+
+```console
+$ vibecheck verify examples/prop_2.vnnlib --network N=examples/ACASXU_run2a_2_2_batch_2000.onnx --timeout 60  2>/dev/null
 sat
 X float32 [1,1,1,5]
 0.6208617091178894
 -0.01862180233001709
 ...
+Y float32 [1,5]
+0.023801768198609352
+...
 ```
+
+The `Auto-config:` line shows config selection: with no `--config`, vibecheck
+picks a bundled per-benchmark config (`configs/*.yaml`) from the structure of
+the network and spec (input dim, conv/transformer/nonlinear ops, network-pair
+kind) and logs which rule fired. Override it with `--config configs/<name>.yaml`,
+or override any single setting with `--set KEY=VALUE` (repeatable; wins over the
+config).
 
 The legacy flat CLI (`vibecheck --net model.onnx --spec property.vnnlib
 --results-file out.txt`, the form the VNNCOMP harness drives) is unchanged; see
