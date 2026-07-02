@@ -244,10 +244,44 @@ def intermediates_crown(net, lo, hi, base_inter=None, budget=None,
         base_inter = _inter_from_state(net, lambda e: state[e])
     inter = dict(base_inter)
     widest = max(net.ops[o].n for o in net.order)
+    refined = {}                      # factor edges already refined
     for name in net.order:
         if budget is not None:
             budget.check()
         op = net.ops[name]
+        if op.kind == 'mul':
+            # refine BOTH factor edges (McCormick quality tracks them);
+            # bounds land back in the (lx, hx, ly, hy) flat tuple
+            lx, hx, ly, hy = inter[name]
+            outs = []
+            for e2, (l2, h2) in ((op.inputs[0], (lx, hx)),
+                                 (op.inputs[1], (ly, hy))):
+                if e2 in refined:
+                    outs.append(refined[e2])
+                    continue
+                idx2 = torch.arange(net.ops[e2].n, device=dev)
+                lb2, ub2 = l2.clone(), h2.clone()
+                per_row2 = B * widest * 4 * 12
+
+                def refine2(sel, _e=e2, _lb=lb2, _ub=ub2):
+                    m = sel.numel()
+                    Wc = torch.zeros(2 * m, net.ops[_e].n, device=dev,
+                                     dtype=dt)
+                    ar = torch.arange(m, device=dev)
+                    Wc[ar, sel] = 1.0
+                    Wc[m + ar, sel] = -1.0
+                    out = crown(net, lo, hi,
+                                Wc.unsqueeze(0).expand(B, -1, -1), inter,
+                                start=_e, clamps=clamps,
+                                range_clamps=range_clamps)
+                    _lb[:, sel] = torch.maximum(_lb[:, sel], out[:, :m])
+                    _ub[:, sel] = torch.minimum(_ub[:, sel], -out[:, m:])
+
+                memory.chunked_indices(refine2, idx2, per_row2)
+                refined[e2] = (lb2, ub2)
+                outs.append((lb2, ub2))
+            inter[name] = (outs[0][0], outs[0][1], outs[1][0], outs[1][1])
+            continue
         if op.kind != 'nonlin':
             continue
         e = op.inputs[0]
