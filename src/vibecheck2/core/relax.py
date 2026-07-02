@@ -22,7 +22,7 @@ class Relu:
     def point(self, x, params=None):
         return torch.relu(x)
 
-    def planes(self, lo, hi):
+    def planes(self, lo, hi, params=None):
         """DeepZ/CROWN triangle: exact on stable neurons, slope=hi/(hi-lo)
         chord above, adaptive (0 or 1) tangent below on unstable ones."""
         unstable = (lo < 0) & (hi > 0)
@@ -36,7 +36,7 @@ class Relu:
         bl = torch.zeros_like(lo)
         return al, bl, au, bu
 
-    def band(self, lo, hi):
+    def band(self, lo, hi, params=None):
         """DeepZ affine band (lam, mu, delta): f(x) in lam*x + mu +/- delta."""
         unstable = (lo < 0) & (hi > 0)
         lam = torch.where(unstable, hi / (hi - lo).clamp_min(1e-30),
@@ -75,14 +75,14 @@ class _SShaped:
     """Shared plane construction for strictly increasing S-shaped ops
     (sigmoid, tanh): chord slope + closed-form critical points."""
 
-    def planes(self, lo, hi):
+    def planes(self, lo, hi, params=None):
         f = self.point
         lam = (f(hi) - f(lo)) / (hi - lo).clamp_min(1e-12)
         lam = torch.where(hi > lo, lam, self._slope_at(lo)).clamp_min(0.0)
         bl, bu = _band(f, lo, hi, lam, self._crit(lam))
         return lam, bl, lam, bu
 
-    def band(self, lo, hi):
+    def band(self, lo, hi, params=None):
         al, bl, _au, bu = self.planes(lo, hi)
         return al, (bl + bu) / 2, (bu - bl) / 2
 
@@ -119,14 +119,40 @@ class Tanh(_SShaped):
         return [torch.atanh(t), torch.atanh(-t)]
 
 
-class Sin:
+class _V1Band:
+    """Adapter over a v1 ScalarNonlinearRelax (nl_sin/nl_cos/nl_pow): those
+    modules already provide the closed-form affine band (lam, mu, delta)
+    with exhaustive critical-point enumeration; this is that ONE
+    implementation behind the RelaxLib interface."""
+
+    def _rel(self, params=None):
+        raise NotImplementedError
+
+    def band(self, lo, hi, params=None):
+        lam, mu, delta = self._rel(params).affine_band(lo, hi)
+        return (lam.to(lo.dtype), mu.to(lo.dtype), delta.to(lo.dtype))
+
+    def planes(self, lo, hi, params=None):
+        lam, mu, delta = self.band(lo, hi, params)
+        return lam, mu - delta, lam, mu + delta
+
+
+class Sin(_V1Band):
     def point(self, x, params=None):
         return torch.sin(x)
 
+    def _rel(self, params=None):
+        from vibecheck.nl_sin import SinRelax
+        return SinRelax()
 
-class Cos:
+
+class Cos(_V1Band):
     def point(self, x, params=None):
         return torch.cos(x)
+
+    def _rel(self, params=None):
+        from vibecheck.nl_cos import CosRelax
+        return CosRelax()
 
 
 class Exp:
@@ -134,9 +160,13 @@ class Exp:
         return torch.exp(x)
 
 
-class Pow:
+class Pow(_V1Band):
     def point(self, x, params=None):
         return x ** (params or {})['exponent']
+
+    def _rel(self, params=None):
+        from vibecheck.nl_pow import PowRelax
+        return PowRelax((params or {})['exponent'])
 
 
 class SignFn:

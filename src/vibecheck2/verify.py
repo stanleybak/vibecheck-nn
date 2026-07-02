@@ -195,6 +195,20 @@ def main(argv=None):
         # ORT-oracle-gated), then verify normally (design: frontends port)
         from vibecheck import network_pair as npair
         a.net, a.spec = npair.build_merged_instance(a.net, a.spec)
+    else:
+        # nonlinear v2 spec (adaptive_cruise): v1's ORT-oracle-gated
+        # transpile to an augmented onnx + linear v1 spec. NOTE: an unsat on
+        # the augmented instance is sound for the original; a sat witness is
+        # re-validated by the chokepoint on the AUGMENTED net here, and the
+        # strict original-spec disposition is handler work (v1
+        # _sat_disposition), so borderline CEs may differ from v1 for now.
+        from vibecheck import nonlinear_augment as nla
+        try:
+            text = nla._read_vnnlib_text(a.spec)
+        except (OSError, ValueError):
+            text = ''
+        if text and nla.is_nonlinear_v2_spec(text):
+            a.net, a.spec = nla.build_augmented_instance(a.net, a.spec)
     if a.results_file:                        # pre-seed like v1
         with open(a.results_file, 'w') as f:
             f.write('timeout\n')

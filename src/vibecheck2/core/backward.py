@@ -155,7 +155,7 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
             if not hasattr(rel, 'planes'):
                 raise NotImplementedError(
                     f'crown: no planes for nonlinearity {op.fn!r} yet')
-            al, bl, au, bu = rel.planes(l, h)
+            al, bl, au, bu = rel.planes(l, h, op.params)
             if alpha and name in alpha:
                 # optimizable lower slope on unstable neurons only
                 unstable = ((l < 0) & (h > 0)).unsqueeze(1)

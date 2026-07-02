@@ -204,7 +204,7 @@ def zono(net, lo, hi, return_state=False):
             # generic DeepZ affine band: y = lam*x + mu + delta*e_new
             # (relu: DeepZ triangle; sigmoid/tanh: chord band; each op's
             # RelaxLib entry owns its closed-form construction)
-            lam, mu, delta = rel.band(zl, zh)
+            lam, mu, delta = rel.band(zl, zh, op.params)
             c2 = lam * z.c + mu
             G2 = lam.unsqueeze(2) * z.G
             # fresh symbol per element with a nonzero band ANYWHERE in batch
