@@ -114,6 +114,11 @@ def pgd(net, spec, lo=None, hi=None, restarts=64, iters=100, seed=0,
     gen.manual_seed(seed)
     margins = spec_margins(spec, net.n_out, dev, dt)
 
+    # budget the restart batch: a forward holds a few live edges plus grads
+    from . import memory
+    widest = max(net.ops[o].n for o in net.order)
+    restarts = max(4, min(restarts,
+                          memory.chunk_size(restarts, widest * 4 * 12, dev)))
     lo, hi = _restart_boxes(lo, hi, restarts, dev, dt)   # (R, n) each
     x = _init_points(lo, hi, init, seeds, gen)
     if init == 'osi':

@@ -567,6 +567,25 @@ def from_compute_graph(cg, true_shapes=None) -> Net:
                  nd_shape=ggrid.shape,
                  lm=lm.Select(ggrid.reshape(-1), _flat(ish)))
 
+        elif t in ('Resize', 'Upsample'):
+            # nearest-neighbor resize: pure index map (each output element
+            # reads floor(coord/scale) of the input). YOLO upsamples 2x.
+            scales = node.params.get('scales')
+            if scales is None:
+                raise NotImplementedError(f'{name}: Resize without scales')
+            ish = v1shape(node.inputs[0])
+            if len(scales) != len(ish):
+                raise NotImplementedError(
+                    f'{name}: scales rank {len(scales)} vs shape {ish}')
+            osh_full = tuple(int(d * s) for d, s in zip(ish, scales))
+            grids = np.meshgrid(*[np.minimum((np.arange(o) / s).astype(np.int64),
+                                             d - 1)
+                                  for o, s, d in zip(osh_full, scales, ish)],
+                                indexing='ij')
+            flat_in = np.ravel_multi_index(tuple(grids), ish).reshape(-1)
+            emit(name, 'linmap', [src(node.inputs[0])], out_shape,
+                 nd_shape=osh_full, lm=lm.Select(flat_in, _flat(ish)))
+
         elif t in ('ReduceSum', 'ReduceMean'):
             ish = v1shape(node.inputs[0])
             axes = node.params.get('axes')

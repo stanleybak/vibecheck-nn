@@ -46,9 +46,12 @@ def _maxpool_point(op, x):
 
 
 def point(net, x: torch.Tensor) -> torch.Tensor:
-    """Exact forward evaluation, (B, n_in) -> (B, n_out)."""
+    """Exact forward evaluation, (B, n_in) -> (B, n_out). Edges free as
+    their last consumer runs (a 640x640 YOLO batch would otherwise hold
+    all ~180 edges live)."""
     x = _as2d(x)
     state = {net.input_name: x}
+    remaining = {e: len(c) for e, c in net.consumers().items()}
     for name in net.order:
         op = net.ops[name]
         if op.kind == 'linmap':
@@ -75,6 +78,10 @@ def point(net, x: torch.Tensor) -> torch.Tensor:
             state[name] = torch.matmul(a, bmat).reshape(B, -1)
         else:
             raise NotImplementedError(f'point: op kind {op.kind!r}')
+        for e in op.inputs:
+            remaining[e] -= 1
+            if remaining[e] == 0 and e != net.output_name:
+                del state[e]
     return state[net.output_name]
 
 
