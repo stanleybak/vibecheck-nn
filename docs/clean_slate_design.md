@@ -488,3 +488,15 @@ Status after the first build night (2026-07-02, src/vibecheck2/):
     v1 closed with LP-tightened intermediates (phase 1/2.5). Levers:
     gamma (INVPROP output rows) in intermediates_crown, box+halfspace LP
     tightening rounds, frontier spill.
+
+### Day-2 close (M4 complete)
+
+Gamma (INVPROP) landed in crown + per-disjunct refinement with a gamma
+retry in the dual (moved dist_shift index112 from instant splits-exhausted
+to a genuine 7.7M-node search); dual ungated for conv nets (the backward
+builder needs no forward zonotope; runs resnet adjoints at ~750k nodes/s);
+near-zero root gaps get a 150-iter alpha polish (plateaus at the
+fixed-intermediate ceiling). Anchors stay 33/33; M4 framework complete.
+Hard-tail rows and their pinned levers: cifar100 idx_8945-class = joint
+intermediate alpha optimization; dist_shift/lsnc = nonlinear splits in the
+dual; iso-deep/img100 = frontier memory + LP-tightening rounds.
