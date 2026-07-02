@@ -153,3 +153,24 @@ def test_sigmoid_tanh_planes_bracket():
             y = rel.point(x)
             assert (al * x + bl <= y + 1e-5).all(), fn
             assert (y <= au * x + bu + 1e-5).all(), fn
+
+
+def test_reciprocal_planes_bracket():
+    from vibecheck2.core.relax import REL
+    rel = REL['reciprocal']
+    lo = torch.tensor([[0.5, 2.0, -3.0, -0.7]])
+    hi = torch.tensor([[3.0, 2.0001, -0.5, -0.6]])
+    al, bl, au, bu = rel.planes(lo, hi)
+    for t in torch.linspace(0, 1, 301):
+        x = lo + t * (hi - lo)
+        y = 1.0 / x
+        assert (al * x + bl <= y + 1e-4).all()
+        assert (y <= au * x + bu + 1e-4).all()
+    lam, mu, delta = rel.band(lo, hi)
+    for t in torch.linspace(0, 1, 301):
+        x = lo + t * (hi - lo)
+        y = 1.0 / x
+        assert ((y - (lam * x + mu)).abs() <= delta + 1e-4).all()
+    import pytest as _pytest
+    with _pytest.raises(NotImplementedError):
+        rel.planes(torch.tensor([[-1.0]]), torch.tensor([[1.0]]))
