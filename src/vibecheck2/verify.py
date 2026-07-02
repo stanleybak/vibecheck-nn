@@ -72,7 +72,19 @@ def verify(onnx_path, vnnlib_path, timeout=60.0, device='cpu',
     from vibecheck.spec import VNNSpec
     from vibecheck.vnnlib_loader import load_vnnlib
     t0 = time.time()
-    net = load_net(onnx_path)
+    try:
+        net = load_net(onnx_path)
+    except Exception as e:                    # noqa: BLE001 - see re-raise
+        # a net the graph loader cannot model: try the discrete-grid
+        # handler (cctsdb); if the instance is not discrete either,
+        # re-raise the ORIGINAL load error (never silently swallowed)
+        from .handlers.discrete_enum import try_discrete_enum
+        log(f'[vc2] graph load failed ({type(e).__name__}: {str(e)[:80]}); '
+            f'trying discrete-enum handler')
+        try:
+            return try_discrete_enum(onnx_path, vnnlib_path, timeout, log)
+        except NotImplementedError:
+            raise e
     spec = load_vnnlib(vnnlib_path)
     log(f'[vc2] {net}')
 
