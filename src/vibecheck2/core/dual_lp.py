@@ -288,16 +288,31 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
     # with v1's tightened states
     inter = backward.intermediates_crown(net, lo, hi, base_inter=inter)
     # per-query direction-adaptive slopes (v1 build_dir_adaptive_alpha):
-    # the optimized alpha of each open query row becomes that query's
-    # zonotope slope, tightening its OWN LP state
+    # per neuron, the OPTIMIZED alpha where the query's adjoint ew > 0
+    # (lower plane binds) and the chord slope h/(h-l) where ew <= 0, so the
+    # single-slope state reproduces the backward alpha-CROWN bound
     open_rows = [r for d in open_d
                  for r in torch.nonzero(disj_idx == d,
                                         as_tuple=False).flatten().tolist()]
     W_open = W[open_rows]
     _lb, alpha = backward.alpha_crown(net, lo, hi, W_open, inter,
-                                      iters=25, thresholds=-bias[open_rows],
+                                      iters=60, thresholds=-bias[open_rows],
                                       return_alpha=True)
+    adj = {}
+    backward.crown(net, lo, hi, W_open, inter, alpha=alpha,
+                   collect_adjoints=adj)
     row_pos = {r: i for i, r in enumerate(open_rows)}
+
+    def dir_adaptive_slopes(row_i):
+        slopes = {}
+        for nm, a in alpha.items():
+            if a.dim() != 3 or nm not in adj:
+                continue                       # relu alphas only
+            l, h = inter[nm]
+            chord = (h[0] / (h[0] - l[0]).clamp_min(1e-30)).clamp(0.0, 1.0)
+            ew = adj[nm][0, row_i]
+            slopes[nm] = torch.where(ew > 0, a[0, row_i], chord)
+        return slopes
     refuted = set()
     dev = str(torch.device(device))
     ver = _verifier(dev)
@@ -318,7 +333,8 @@ def certify_queries(net, spec, W, bias, disj_idx, lo, hi, inter, open_d,
             # zonotope, unstable rows only, LinMap-generic.
             if r not in state_cache:
                 state_cache[r] = build_state_backward(
-                    net, lo, hi, inter, device=device)
+                    net, lo, hi, inter, device=device,
+                    slopes=dir_adaptive_slopes(row_pos[r]))
             state, keys = state_cache[r]
             if not keys:
                 continue

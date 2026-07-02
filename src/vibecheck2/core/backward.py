@@ -183,7 +183,9 @@ def crown(net, lo, hi, W, inter=None, alpha=None, start=None,
                 sgn = -cl.sign().unsqueeze(1).to(dt)
                 Ain = Ain + sgn * beta[name].clamp_min(0.0)
             if collect_adjoints is not None:
-                collect_adjoints[name] = Ain.detach()
+                # the adjoint ARRIVING at the nonlin output (ew): the sign
+                # tells which plane the backward binds (dir-adaptive states)
+                collect_adjoints[name] = Ao.detach()
             put(op.inputs[0], Ain)
         elif op.kind == 'mul':
             # McCormick planes for z = x*y over the factor boxes:
