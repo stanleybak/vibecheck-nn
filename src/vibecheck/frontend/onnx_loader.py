@@ -618,6 +618,16 @@ def _try_fold_constant(op, computed_inputs, params, const_fn):
         return -vals[0]
     elif op == 'Sigmoid':
         return 1.0 / (1.0 + np.exp(-vals[0]))
+    elif op == 'Tanh':
+        return np.tanh(vals[0])
+    elif op == 'Sin':
+        return np.sin(vals[0])
+    elif op == 'Cos':
+        return np.cos(vals[0])
+    elif op == 'Exp':
+        return np.exp(vals[0])
+    elif op == 'Floor':
+        return np.floor(vals[0])
     elif op in ('Flatten', 'Squeeze', 'Unsqueeze', 'Reshape',
                  'Dropout', 'Identity', 'Cast'):
         return vals[0]
